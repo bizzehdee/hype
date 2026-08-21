@@ -2991,6 +2991,31 @@ static void test_initrd_too_long_and_write_back(void) {
     }
 }
 
+
+static void test_tpm_key(void) {
+    const char *on =
+        "[vm.k]\nvcpus=1\nmem_mb=512\nboot=installer\ninstall_media=\\i.iso\n"
+        "target_disk=file:\\a.img\nfirmware=uefi\ntpm=on\nos_hint=linux\n";
+    const char *bad =
+        "[vm.k]\nvcpus=1\nmem_mb=512\nboot=installer\ninstall_media=\\i.iso\n"
+        "target_disk=file:\\a.img\nfirmware=uefi\ntpm=maybe\nos_hint=linux\n";
+    const char *dup =
+        "[vm.k]\nvcpus=1\nmem_mb=512\nboot=installer\ninstall_media=\\i.iso\n"
+        "target_disk=file:\\a.img\nfirmware=uefi\ntpm=on\ntpm=off\nos_hint=linux\n";
+    hype_cfg_t out;
+    static char text[4096];
+    hype_cfg_serialize_result_t sr;
+
+    CHECK_INT("tpm=on parses", HYPE_CFG_OK, parse_copy(on, &out).status);
+    CHECK_INT("tpm set", 1, out.vms[0].tpm);
+    /* round-trips */
+    sr = hype_cfg_serialize(&out, text, sizeof(text));
+    CHECK_INT("serializes", 0, sr.refused_overflow || sr.truncated);
+    CHECK_INT("tpm emitted", 1, strstr(text, "tpm = on") != 0);
+    CHECK_INT("bad tpm value refused", HYPE_CFG_ERR_BAD_VALUE, parse_copy(bad, &out).status);
+    CHECK_INT("duplicate tpm refused", HYPE_CFG_ERR_DUPLICATE_KEY, parse_copy(dup, &out).status);
+}
+
 int main(void) {
     test_label_from_the_spec_example_is_accepted();
     test_label_absent_leaves_an_empty_string();
@@ -3053,6 +3078,7 @@ int main(void) {
     test_initrd();
     test_initrd_rules();
     test_initrd_too_long_and_write_back();
+    test_tpm_key();
     test_cmdline_write_back();
     test_error_cases();
     test_too_many_vms();

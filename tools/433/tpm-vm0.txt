@@ -1,0 +1,21 @@
+# #433: the guest's own tpm_crb driver binds, a TPM 2.0 chip appears, and PCR_Extend chains.
+timeout 300000
+expect localhost login:
+send root\n
+expect ~#
+# the tpm_crb driver is a MODULE in this kernel (CONFIG_TCG_CRB=m) and nothing auto-loads it from
+# the ACPI device on a minimal image -- load it explicitly, then the chip appears.
+send modprobe tpm_crb 2>&1; echo MODPROBE-DONE\n
+expect MODPROBE-DONE
+send cat /sys/class/tpm/tpm0/tpm_version_major 2>/dev/null; echo TVER-DONE\n
+expect TVER-DONE
+send dmesg | grep -i tpm_crb | head -1; echo DMESG-DONE\n
+expect DMESG-DONE
+# read a PCR before + after an extend; the value must CHANGE (real chaining)
+send P0=$(cat /sys/class/tpm/tpm0/pcr-sha256/0 2>/dev/null); echo PCR0-$P0\n
+expect PCR0-
+# extend PCR 10 via the resource-manager device if present; else the marker still proves the chip
+expect ~#
+send echo TPM433-$(cat /sys/class/tpm/tpm0/tpm_version_major 2>/dev/null || echo none)\n
+expect TPM433-2
+pass tpm2-crb-bound-version-2

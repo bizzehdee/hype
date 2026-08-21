@@ -1134,6 +1134,12 @@ int hype_svm_vcpu_handle_bochs_vbe_npf(hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *d
 int hype_svm_vcpu_handle_hpet_npf(hype_vcpu_ctx_t *ctx, hype_hpet_t *hpet,
                                    uint64_t hpet_base_phys, const uint8_t *guest_insn_bytes);
 
+/* #433: guest TPM 2.0 CRB MMIO -- see the definition's comment. hype_tpm_crb_t is forward-
+ * declared so svm.h stays free of the devices/ include. */
+struct hype_tpm_crb;
+int hype_svm_vcpu_handle_tpm_crb_npf(hype_vcpu_ctx_t *ctx, struct hype_tpm_crb *crb,
+                                     uint64_t crb_base_phys, const uint8_t *guest_insn_bytes);
+
 int hype_svm_vcpu_handle_lapic_npf(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lapic,
                                     uint64_t lapic_base_phys, const uint8_t *guest_insn_bytes);
 

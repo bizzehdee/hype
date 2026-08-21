@@ -75,6 +75,8 @@ static hype_acpi_config_t make_config(uint8_t cpu_count) {
     cfg.pci_end_bus = 255;
     cfg.sci_interrupt = 9;
     cfg.pci_window_base = 0x80000000u; /* #355: the historical 2 GiB line, unless a test moves it */
+    cfg.tpm_present = 0; /* #433: tests opt in explicitly */
+    cfg.tpm_crb_base = 0xFED40000ull;
     return cfg;
 }
 
@@ -335,6 +337,69 @@ static void test_build_tables_blob_layout(void) {
     }
 }
 
+
+/* #433: with a TPM, a TPM2 table is emitted, carries the CRB control-area address, and is in
+ * the XSDT; without one, neither the table nor the entry appears. */
+static void test_tpm2_present_and_absent(void) {
+    static uint8_t buf[8192];
+    hype_acpi_layout_t layout;
+    hype_acpi_config_t cfg = make_config(1);
+
+    /* absent by default */
+    if (hype_acpi_build_tables_blob(buf, sizeof(buf), &cfg, &layout) != 0) {
+        printf("FAIL: build (no tpm)\n"); failures++; return;
+    }
+    if (layout.tpm2_length != 0u || layout.tpm2_offset != 0u) {
+        printf("FAIL: TPM2 emitted without a TPM\n"); failures++;
+    }
+
+    /* present */
+    cfg.tpm_present = 1;
+    cfg.tpm_crb_base = 0xFED40000ull;
+    if (hype_acpi_build_tables_blob(buf, sizeof(buf), &cfg, &layout) != 0) {
+        printf("FAIL: build (tpm)\n"); failures++; return;
+    }
+    if (layout.tpm2_length != 52u) { printf("FAIL: TPM2 length\n"); failures++; }
+    {
+        const uint8_t *t = buf + layout.tpm2_offset;
+        uint64_t ctrl;
+        unsigned i;
+        if (t[0] != 'T' || t[1] != 'P' || t[2] != 'M' || t[3] != '2') {
+            printf("FAIL: TPM2 signature\n"); failures++;
+        }
+        ctrl = 0;
+        for (i = 0; i < 8u; i++) ctrl |= (uint64_t)t[40 + i] << (8u * i);
+        if (ctrl != 0xFED40040ull) { printf("FAIL: control area addr 0x%llx\n",
+                                            (unsigned long long)ctrl); failures++; }
+        if (t[48] != 7u) { printf("FAIL: start method != CRB\n"); failures++; }
+        /* fill_header leaves the checksum byte 0 (the fw_cfg loader computes it at load, like
+         * every other table here); verify that computing it makes the bytes sum to 0. */
+        {
+            uint8_t ck = hype_acpi_checksum(t, layout.tpm2_length);
+            unsigned s = (unsigned)((ck + t[9]) & 0xFFu); /* offset 9 = checksum field */
+            unsigned j; unsigned sum;
+            /* recompute the whole-table sum with the computed checksum in place */
+            sum = ck;
+            for (j = 0; j < layout.tpm2_length; j++) sum = (sum + t[j]) & 0xFFu;
+            (void)s;
+            if (sum != 0u) { printf("FAIL: TPM2 checksum would not zero (%u)\n", sum); failures++; }
+        }
+    }
+    /* the XSDT gained an entry pointing at it */
+    {
+        const uint8_t *xsdt = buf + layout.xsdt_offset;
+        uint32_t xlen = read_le32(xsdt + 4);
+        unsigned n = (xlen - 36u) / 8u;
+        unsigned i;
+        int found = 0;
+        for (i = 0; i < n; i++) {
+            uint32_t e = read_le32(xsdt + 36u + i * 8u);
+            if (e == layout.tpm2_offset) found = 1;
+        }
+        if (!found) { printf("FAIL: TPM2 not in XSDT\n"); failures++; }
+    }
+}
+
 int main(void) {
     test_checksum_makes_sum_zero();
     test_checksum_all_zero_is_zero();
@@ -347,6 +412,7 @@ int main(void) {
     test_rejects_too_many_cpus();
     test_rejects_buffer_too_small();
     test_build_tables_blob_layout();
+    test_tpm2_present_and_absent();
 
     if (failures == 0) {
         printf("all tests passed\n");

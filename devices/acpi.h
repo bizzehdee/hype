@@ -309,6 +309,12 @@ typedef struct {
      * than emitting a table that describes the wrong memory.
      */
     uint64_t pci_window_base;
+
+    /* #433: emit a TPM2 table (and reserve room for it) when this VM has a guest TPM 2.0. The
+     * table carries the CRB control-area address, which is what makes a guest tpm_crb driver
+     * bind. Per-VM, so a VM without a TPM advertises none. */
+    int tpm_present;
+    uint64_t tpm_crb_base;
 } hype_acpi_config_t;
 
 /* Byte offsets/lengths of each table within the blob
@@ -352,6 +358,12 @@ typedef struct {
     /* #436: the HPET description table. */
     uint32_t hpet_offset;
     uint32_t hpet_length;
+    /* #433: the TPM2 table (present only when cfg->tpm_present). */
+    uint32_t tpm2_offset;
+    uint32_t tpm2_length;
+    /* #433: the TPM device-node SSDT (present only with a TPM). */
+    uint32_t ssdt_offset;
+    uint32_t ssdt_length;
     uint32_t total_length;
 } hype_acpi_layout_t;
 

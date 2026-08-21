@@ -3989,6 +3989,63 @@ int hype_svm_vcpu_absorb_mmio_npf(hype_vcpu_ctx_t *ctx, const uint8_t *guest_ins
  * either a whole register or one 32-bit half, so both widths are honoured
  * rather than rejected. Returns 0 when the access was the HPET's, -1 otherwise.
  */
+#include "../../../devices/tpm_crb.h"
+
+/*
+ * #433: the TPM 2.0 CRB window. Same decode shape as HPET, but 1/2/4-byte accesses (a tpm_crb
+ * driver does ioread32/iowrite32 on the control registers and byte/word copies into the data
+ * buffer). The pure model (devices/tpm_crb.c) does everything else, including running the command
+ * when the guest rings CTRL_START.
+ */
+int hype_svm_vcpu_handle_tpm_crb_npf(hype_vcpu_ctx_t *ctx, hype_tpm_crb_t *crb,
+                                     uint64_t crb_base_phys, const uint8_t *guest_insn_bytes) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_svm_npf_t npf;
+    hype_mmio_decode_t decoded;
+    uint64_t *reg;
+    uint32_t offset;
+
+    hype_svm_decode_npf_info(real->vmcb->control.exitinfo1, real->vmcb->control.exitinfo2, &npf);
+    if (npf.guest_phys_addr < crb_base_phys ||
+        npf.guest_phys_addr >= crb_base_phys + HYPE_TPM_CRB_SIZE) {
+        return -1;
+    }
+    offset = (uint32_t)(npf.guest_phys_addr - crb_base_phys);
+    if (guest_insn_bytes == 0 ||
+        hype_mmio_decode(guest_insn_bytes, HYPE_MMIO_MAX_INSTR_BYTES, &decoded) != 0) {
+        return -1;
+    }
+    if (decoded.is_write != npf.is_write) {
+        return -1;
+    }
+    if (decoded.size_bytes != 1u && decoded.size_bytes != 2u && decoded.size_bytes != 4u) {
+        return -1;
+    }
+    reg = decoded.has_imm ? 0 : gpr_ptr(real, decoded.reg);
+    if (reg == 0 && !decoded.has_imm) {
+        return -1;
+    }
+    if (decoded.is_write) {
+        uint64_t value;
+        if (decoded.mem_is_dst) {
+            uint64_t cur = hype_tpm_crb_read(crb, offset, decoded.size_bytes);
+            value = hype_mmio_rmw_value(&decoded, reg ? *reg : 0u, (uint32_t)cur,
+                                        &real->vmcb->save.rflags);
+        } else {
+            value = decoded.has_imm ? decoded.imm_value : *reg;
+        }
+        hype_tpm_crb_write(crb, offset, decoded.size_bytes, value);
+    } else {
+        uint64_t value = hype_tpm_crb_read(crb, offset, decoded.size_bytes);
+        if (reg == 0) {
+            return -1;
+        }
+        hype_mmio_complete_read(&decoded, reg, (uint32_t)value, &real->vmcb->save.rflags);
+    }
+    real->vmcb->save.rip += decoded.instr_len;
+    return 0;
+}
+
 int hype_svm_vcpu_handle_hpet_npf(hype_vcpu_ctx_t *ctx, hype_hpet_t *hpet,
                                    uint64_t hpet_base_phys, const uint8_t *guest_insn_bytes) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;

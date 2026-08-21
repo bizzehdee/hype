@@ -2,6 +2,7 @@
 #include "hpet.h"
 #include "cmos.h"
 #include "dsdt_aml.h" /* M4-6b2: compiled DSDT AML body (PCI host bridge + _PRT) */
+#include "tpm_ssdt_aml.h" /* #433: compiled SSDT AML body (\_SB.TPM, MSFT0101) */
 
 static const char HYPE_ACPI_OEM_ID[6] = {'H', 'Y', 'P', 'E', ' ', ' '};
 static const char HYPE_ACPI_CREATOR_ID[4] = {'H', 'Y', 'P', 'E'};
@@ -109,7 +110,8 @@ int hype_acpi_build_tables_blob(uint8_t *buf, uint32_t buf_size, const hype_acpi
 #else
     uint32_t xsdt_entry_count = 3; /* FADT, MADT, MCFG */
 #endif
-    uint32_t xsdt_length = (uint32_t)sizeof(hype_acpi_sdt_header_t) + xsdt_entry_count * 8u;
+    uint32_t xsdt_length = (uint32_t)sizeof(hype_acpi_sdt_header_t) +
+                           (xsdt_entry_count + (cfg->tpm_present ? 2u : 0u)) * 8u;
     uint32_t fadt_length = (uint32_t)sizeof(hype_acpi_fadt_t);
     uint32_t madt_length = (uint32_t)sizeof(hype_acpi_madt_header_t) +
                             (uint32_t)cfg->cpu_count * (uint32_t)sizeof(hype_acpi_madt_local_apic_t) +
@@ -122,8 +124,17 @@ int hype_acpi_build_tables_blob(uint8_t *buf, uint32_t buf_size, const hype_acpi
      * worst-case padding is budgeted here and applied when placing it. */
     uint32_t facs_length = 64u;
     uint32_t hpet_length = (uint32_t)sizeof(hype_acpi_hpet_t);
-    uint32_t total = xsdt_length + fadt_length + madt_length + mcfg_length + dsdt_length +
-                     hpet_length + facs_length + 63u;
+    /* #433: the TPM2 table is 52 bytes -- SDT header(36) + platform class(2) + reserved(2) +
+     * control-area address(8) + start method(4). Present only for a VM with a TPM, and its XSDT
+     * entry likewise. */
+    uint32_t tpm2_length = cfg->tpm_present ? 52u : 0u;
+    uint32_t ssdt_length = cfg->tpm_present
+                               ? (uint32_t)sizeof(hype_acpi_sdt_header_t) + HYPE_TPM_SSDT_AML_BODY_LEN
+                               : 0u;
+    /* two XSDT entries when a TPM is present: TPM2 + the SSDT device node */
+    uint32_t tpm2_entry = cfg->tpm_present ? 16u : 0u;
+    uint32_t total = xsdt_length + tpm2_entry + fadt_length + madt_length + mcfg_length +
+                     dsdt_length + hpet_length + tpm2_length + ssdt_length + facs_length + 63u;
     uint32_t i;
 
     if (cfg->cpu_count == 0 || cfg->cpu_count > HYPE_ACPI_MAX_CPUS) {
@@ -157,7 +168,11 @@ int hype_acpi_build_tables_blob(uint8_t *buf, uint32_t buf_size, const hype_acpi
     out->hpet_length = hpet_length;
     out->facs_offset = (out->hpet_offset + hpet_length + 63u) & ~63u;
     out->facs_length = facs_length;
-    out->total_length = out->facs_offset + facs_length;
+    out->tpm2_offset = cfg->tpm_present ? (out->facs_offset + facs_length) : 0u;
+    out->tpm2_length = tpm2_length;
+    out->ssdt_offset = cfg->tpm_present ? (out->tpm2_offset + tpm2_length) : 0u;
+    out->ssdt_length = ssdt_length;
+    out->total_length = out->facs_offset + facs_length + tpm2_length + ssdt_length;
 
     /* FACS: signature + length are the only fields a firmware-provided,
      * never-slept platform must populate. HardwareSignature stays 0 (no
@@ -401,17 +416,47 @@ int hype_acpi_build_tables_blob(uint8_t *buf, uint32_t buf_size, const hype_acpi
      * blob, same not-a-final-address convention as FADT's Dsdt/X_Dsdt
      * above. Written via write_le64() rather than a uint64_t* cast --
      * see that helper's own comment on why. */
+    /* #433: TPM2 table -- Platform Class 0 (client), Control Area at the CRB base + its control
+     * area offset, Start Method 7 (CRB). fill_header sets length + the loader recomputes the
+     * checksum. */
+    if (cfg->tpm_present) {
+        uint8_t *t = buf + out->tpm2_offset;
+        fill_header((hype_acpi_sdt_header_t *)t, "TPM2", out->tpm2_length, 4, "HYPETPM2");
+        t[36] = 0; t[37] = 0;                                  /* Platform Class: client */
+        t[38] = 0; t[39] = 0;                                  /* reserved */
+        write_le64(t + 40, cfg->tpm_crb_base + 0x40u);         /* Control Area address (ctrl regs) */
+        t[48] = 7; t[49] = 0; t[50] = 0; t[51] = 0;            /* Start Method: CRB */
+
+        /* #433: the SSDT device node the guest driver actually binds to. */
+        {
+            uint8_t *ss = buf + out->ssdt_offset;
+            uint32_t j;
+            fill_header((hype_acpi_sdt_header_t *)ss, "SSDT", out->ssdt_length, 2, "HYPETPM");
+            for (j = 0; j < HYPE_TPM_SSDT_AML_BODY_LEN; j++) {
+                ss[sizeof(hype_acpi_sdt_header_t) + j] = hype_tpm_ssdt_aml_body[j];
+            }
+        }
+    }
+
     {
         uint8_t *entries = buf + out->xsdt_offset + sizeof(hype_acpi_sdt_header_t);
         hype_acpi_sdt_header_t *xsdt = (hype_acpi_sdt_header_t *)(buf + out->xsdt_offset);
+        unsigned int ne = 3u;
 
         fill_header(xsdt, "XSDT", out->xsdt_length, 1, "HYPEXSDT");
         write_le64(entries + 0, out->fadt_offset);
         write_le64(entries + 8, out->madt_offset);
         write_le64(entries + 16, out->mcfg_offset);
 #ifdef HYPE_HPET_ADVERTISE
-        write_le64(entries + 24, out->hpet_offset); /* #436 */
+        write_le64(entries + (ne * 8u), out->hpet_offset); /* #436 */
+        ne++;
 #endif
+        if (cfg->tpm_present) {
+            write_le64(entries + (ne * 8u), out->tpm2_offset); /* #433 */
+            ne++;
+            write_le64(entries + (ne * 8u), out->ssdt_offset); /* #433: the device-node SSDT */
+            ne++;
+        }
     }
 
     return 0;

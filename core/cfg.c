@@ -329,6 +329,20 @@ static hype_cfg_status_t apply_field(hype_cfg_vm_t *vm, unsigned int *seen, char
         *seen |= HYPE_CFG_F_CMDLINE;
         return HYPE_CFG_OK;
     }
+    if (hype_streq(key, "tpm")) {
+        /* #433: a guest TPM 2.0. Default off -- most guests neither need nor probe one, and a VM
+         * that does not ask should not pay a device window. */
+        if (*seen & HYPE_CFG_F_TPM) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (hype_streq(val, "on") || hype_streq(val, "2.0") || hype_streq(val, "crb")) {
+            vm->tpm = 1;
+        } else if (hype_streq(val, "off") || hype_streq(val, "none")) {
+            vm->tpm = 0;
+        } else {
+            return HYPE_CFG_ERR_BAD_VALUE;
+        }
+        *seen |= HYPE_CFG_F_TPM;
+        return HYPE_CFG_OK;
+    }
     if (hype_streq(key, "initrd")) {
         /* #545: the initramfs for boot = kernel. A path, so empty is meaningless (unlike
          * cmdline's legitimate empty): omit the key for "no initrd". */
@@ -2167,6 +2181,9 @@ static void serialize_vm(hype_cfg_w_t *w, const hype_cfg_vm_t *vm) {
     }
     if (vm->has_initrd) {
         w_kv(w, "initrd", vm->initrd); /* #545 */
+    }
+    if (vm->tpm) {
+        w_kv(w, "tpm", "on"); /* #433 */
     }
     if (vm->has_install_media) {
         w_kv(w, "install_media", vm->install_media);

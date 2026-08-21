@@ -87,6 +87,24 @@ uint32_t hype_acpi_loader_build_script(hype_acpi_loader_entry_t *entries, const 
         &entries[n++], HYPE_ACPI_LOADER_FILE_TABLES, HYPE_ACPI_LOADER_FILE_TABLES,
         layout->xsdt_offset + (uint32_t)sizeof(hype_acpi_sdt_header_t) + 3u * 8u, 8);
 #endif
+    /* #433: the TPM2 entry's XSDT slot -- WITHOUT this ADD_POINTER the guest reads a raw file
+     * offset there and ignores the table, which is exactly what a first run showed (no tpm0).
+     * Its slot index is 3, plus one if the HPET occupies slot 3. */
+    if (layout->tpm2_length != 0u) {
+#ifdef HYPE_HPET_ADVERTISE
+        uint32_t tpm2_slot = 4u;
+#else
+        uint32_t tpm2_slot = 3u;
+#endif
+        hype_acpi_loader_build_add_pointer(
+            &entries[n++], HYPE_ACPI_LOADER_FILE_TABLES, HYPE_ACPI_LOADER_FILE_TABLES,
+            layout->xsdt_offset + (uint32_t)sizeof(hype_acpi_sdt_header_t) + tpm2_slot * 8u, 8);
+        /* #433: the SSDT device node occupies the next XSDT slot. */
+        hype_acpi_loader_build_add_pointer(
+            &entries[n++], HYPE_ACPI_LOADER_FILE_TABLES, HYPE_ACPI_LOADER_FILE_TABLES,
+            layout->xsdt_offset + (uint32_t)sizeof(hype_acpi_sdt_header_t) + (tpm2_slot + 1u) * 8u,
+            8);
+    }
 
     /* FADT.Dsdt (legacy 32-bit) and FADT.X_Dsdt (64-bit) -> DSDT,
      * within the same blob. */
@@ -130,6 +148,16 @@ uint32_t hype_acpi_loader_build_script(hype_acpi_loader_entry_t *entries, const 
         &entries[n++], HYPE_ACPI_LOADER_FILE_TABLES,
         layout->dsdt_offset + (uint32_t)offsetof(hype_acpi_sdt_header_t, checksum), layout->dsdt_offset,
         layout->dsdt_length);
+    if (layout->tpm2_length != 0u) { /* #433 */
+        hype_acpi_loader_build_add_checksum(
+            &entries[n++], HYPE_ACPI_LOADER_FILE_TABLES,
+            layout->tpm2_offset + (uint32_t)offsetof(hype_acpi_sdt_header_t, checksum),
+            layout->tpm2_offset, layout->tpm2_length);
+        hype_acpi_loader_build_add_checksum(
+            &entries[n++], HYPE_ACPI_LOADER_FILE_TABLES,
+            layout->ssdt_offset + (uint32_t)offsetof(hype_acpi_sdt_header_t, checksum),
+            layout->ssdt_offset, layout->ssdt_length);
+    }
 #ifdef HYPE_HPET_ADVERTISE
     hype_acpi_loader_build_add_checksum(
         &entries[n++], HYPE_ACPI_LOADER_FILE_TABLES,

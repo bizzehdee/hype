@@ -102,10 +102,13 @@ static void test_build_script_entry_count_and_shape(void) {
     layout.mcfg_length = 60;
     layout.dsdt_offset = 462;
     layout.dsdt_length = 36;
+    layout.hpet_offset = 0; layout.hpet_length = 0;
+    layout.tpm2_offset = 0; layout.tpm2_length = 0; /* #433: no TPM in this layout */
     layout.total_length = 498;
 
     n = hype_acpi_loader_build_script(entries, &layout);
-    CHECK_HEX("total entry count", HYPE_ACPI_LOADER_SCRIPT_ENTRIES, n);
+    /* base script: cap now reserves room for the optional TPM2 legs, so n <= cap, not == */
+    CHECK_HEX("base entry count", HYPE_ACPI_LOADER_SCRIPT_ENTRIES - 4u, n);
 
     for (i = 0; i < n; i++) {
         if (entries[i].command == HYPE_ACPI_LOADER_CMD_ALLOCATE) {
@@ -153,6 +156,17 @@ static void test_build_script_entry_count_and_shape(void) {
     CHECK_HEX("fadt->x_dsdt pointer offset", layout.fadt_offset + 140, entries[7].pointer.offset);
     CHECK_HEX("fadt->x_dsdt pointer size", 8, entries[7].pointer.size);
 #endif
+
+    /* #433: with a TPM2 table, exactly two more entries (its XSDT ADD_POINTER + ADD_CHECKSUM). */
+    layout.tpm2_offset = 498;
+    layout.tpm2_length = 52;
+    layout.ssdt_offset = 550;
+    layout.ssdt_length = 105;
+    layout.total_length = 655;
+    {
+        uint32_t n2 = hype_acpi_loader_build_script(entries, &layout);
+        CHECK_HEX("with-TPM2 entry count", n + 4u, n2);
+    }
 }
 
 int main(void) {

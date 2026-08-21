@@ -164,6 +164,7 @@ as the default display name.
 | `initrd` | path | (none) | **`boot = kernel` only** (#545): the initramfs, read through hype's own FS stack like `kernel` and placed as high as the image's `initrd_addr_max` allows. Rejected for the firmware boot modes, same rule as `kernel`/`cmdline` |
 | `firmware` | `uefi` \| `legacy` | `uefi` | |
 | `firmware` (contd) | `uefi-secboot` | — | **#432**: boots the vendored SECURE_BOOT_ENABLE OVMF with the enrolled varstore (`fw/OVMF_CODE.secboot.fd` + `OVMF_VARS.secboot.fd`, produced by `FW_SECBOOT=1 tools/build-fw.sh` + `tools/enroll-secboot.sh`). Unsigned media is refused by the guest firmware BY DESIGN — a per-VM choice, never a default |
+| `tpm` | `on` \| `off` | `off` | **#433**: a guest TPM 2.0 over the CRB interface at 0xFED40000, with a per-VM TPM2 ACPI table. Per-VM; a VM that does not ask gets no TPM device. |
 | `os_hint` | `windows`\|`linux`\|`bsd`\|`none` | `none` | drives `bus` defaults (§5.6) **and the NIC frontend** (§5.5, #82): `windows` gets an e1000, everything else virtio-net |
 | `disks` | `<disk-id>` list | (empty) | ordered hard disks (`type=disk` `[disk.*]`); **0..N**, mixed bus allowed (§5.7) |
 | `cdroms` | `<disk-id>` list | (empty) | ordered optical drives (`type=cdrom` `[disk.*]`); **0..N** (§5.4) |

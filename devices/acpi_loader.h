@@ -72,10 +72,14 @@ _Static_assert(sizeof(hype_acpi_loader_entry_t) == 128, "loader entry must be 12
  * #436: +2 for the FACS pointers. The HPET's pointer and checksum are only
  * emitted when the timer is advertised (see devices/acpi.c).
  */
+/* #433: +2 for the optional TPM2 table (its XSDT ADD_POINTER and its ADD_CHECKSUM), present
+ * only for a VM with a guest TPM -- the fixed cap covers the maximum either way. */
+/* #433: a TPM adds 4 loader entries -- an XSDT ADD_POINTER and an ADD_CHECKSUM for EACH of the
+ * TPM2 table and the device-node SSDT. */
 #ifdef HYPE_HPET_ADVERTISE
-#define HYPE_ACPI_LOADER_SCRIPT_ENTRIES 19
+#define HYPE_ACPI_LOADER_SCRIPT_ENTRIES 23
 #else
-#define HYPE_ACPI_LOADER_SCRIPT_ENTRIES 17
+#define HYPE_ACPI_LOADER_SCRIPT_ENTRIES 21
 #endif
 
 /*

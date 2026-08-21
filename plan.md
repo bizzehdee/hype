@@ -2787,6 +2787,31 @@ isn't lost.
     read costs one flooded frame — never a delivery outside the switch, which
     is the property that matters.
 
+54. **The guest TPM 2.0 is implemented in-tree, not integrated from
+    ms-tpm-20-ref/libtpms -- decided (2026-08-21), #433.** The reference
+    stacks assume a crypto library, a heap and an NV-storage abstraction that
+    a freestanding ring-0 module with no libc and no allocator does not have,
+    and pulling one in to answer a compatibility probe is a poor trade. The
+    scope is exactly what a Windows fTPM detection and a Linux `tpm_crb`
+    driver touch: Startup/Shutdown/SelfTest state gates, GetCapability
+    (family "2.0", the SHA-256 PCR bank, the command list), PCR_Read/Extend
+    over 24 PCRs with real SHA-256 chaining, and GetRandom/StirRandom on
+    host-mixed entropy. Every other command answers TPM_RC_COMMAND_CODE
+    honestly. EK/SRK creation, NV storage and attestation-adjacent commands
+    are a named follow-up -- they need key generation, which is where
+    integrate-vs-implement is revisited.
+
+    Two shape choices worth recording. **The CRB completes synchronously**:
+    the spec's only contract on CTRL_START is that it reads back 0 when the
+    command is done, and completing before the guest can re-read it is legal
+    and removes a whole async state machine. **The TPM2 ACPI table is per-VM
+    but the DSDT MSFT0101 device node is not yet emitted**: the DSDT is a
+    static compiled blob shared by every VM, and a TPM node in it would
+    advertise a TPM to VMs that configured none, whose CRB window is then
+    unmapped. The TPM2 table (which carries the CRB control-area address) is
+    what binds `tpm_crb` and what a compatibility probe reads; the DSDT node
+    for Windows needs a per-VM SSDT overlay and is the follow-up's.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what

@@ -238,6 +238,8 @@ typedef struct {
     int has_initrd;
     char initrd[HYPE_CFG_PATH_MAX];
 
+    int tpm; /* #433: guest TPM 2.0 (CRB) present */
+
     /*
      * #323: WHICH host drive the media (and file-backed image) lives on, matched by drive
      * serial/GUID -- the "where" axis to install_media's "which". Optional: unset means
@@ -343,7 +345,8 @@ enum {
     HYPE_CFG_F_CMDLINE = 1u << 19,    /* #546 */
     HYPE_CFG_F_DISPLAY = 1u << 20,    /* #565 */
     HYPE_CFG_F_NICS = 1u << 21,       /* #583 */
-    HYPE_CFG_F_INITRD = 1u << 22      /* #545 */
+    HYPE_CFG_F_INITRD = 1u << 22,     /* #545 */
+    HYPE_CFG_F_TPM = 1u << 23         /* #433 */
 };
 
 /*

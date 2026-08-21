@@ -3772,6 +3772,38 @@ int hype_vmx_vcpu_handle_lapic_npf(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lap
 }
 
 /* Guest I/O APIC MMIO. IOREGSEL/IOWIN are 32-bit only. */
+#include "../../../devices/tpm_crb.h"
+
+/* #433: the TPM 2.0 CRB window on the VMX backend -- ioapic's shape, variable size (1/2/4). */
+int hype_vmx_vcpu_handle_tpm_crb_npf(hype_vcpu_ctx_t *ctx, struct hype_tpm_crb *crb,
+                                     uint64_t crb_base_phys, const uint8_t *guest_insn_bytes) {
+    vmx_ensure_current(ctx);
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    struct vmx_mmio_access m;
+
+    if (vmx_mmio_begin_insn(real, crb_base_phys, HYPE_TPM_CRB_SIZE, guest_insn_bytes, &m) != 0) {
+        return -1;
+    }
+    if (m.decoded.size_bytes != 1u && m.decoded.size_bytes != 2u && m.decoded.size_bytes != 4u) {
+        return -1;
+    }
+    if (m.decoded.is_write) {
+        uint32_t cur = 0;
+        if (m.decoded.mem_is_dst) {
+            cur = (uint32_t)hype_tpm_crb_read(crb, m.offset, m.decoded.size_bytes);
+        }
+        {
+            uint32_t value = vmx_mmio_store_val(&m, cur);
+            hype_tpm_crb_write(crb, m.offset, m.decoded.size_bytes, value);
+        }
+    } else {
+        uint32_t value = (uint32_t)hype_tpm_crb_read(crb, m.offset, m.decoded.size_bytes);
+        vmx_mmio_finish_read(&m, value);
+    }
+    vmx_mmio_end(&m);
+    return 0;
+}
+
 int hype_vmx_vcpu_handle_ioapic_npf(hype_vcpu_ctx_t *ctx, hype_ioapic_t *ioapic,
                                     uint64_t ioapic_base_phys, const uint8_t *guest_insn_bytes) {
     vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */

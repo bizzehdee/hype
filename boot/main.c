@@ -29,6 +29,7 @@
 #include "../core/vm_delete.h" /* TERM-15 (#491) */
 #include "../core/l2switch.h" /* NET-6 (#223) */
 #include "../core/qcow2_create.h" /* TERM-11 (#487) */
+#include "../devices/tpm_crb.h" /* #433 */
 #include "../core/file_io.h"
 #include "../core/host_pci.h"
 #include "../core/e1000.h"
@@ -1025,6 +1026,9 @@ typedef struct hype_fw_vm {
     hype_guest_lapic_t lapic[HYPE_MAX_VCPUS_PER_VM];
     unsigned cur_vcpu;
     hype_hpet_t hpet;         /* #436: guest HPET (0xFED00000) */
+    hype_tpm_crb_t tpm_crb;   /* #433: guest TPM 2.0 CRB (0xFED40000), when firmware requests it */
+    int tpm_present;          /* #433: this VM has a TPM (config-gated) */
+    uint64_t tpm_entropy_state; /* #433 splitmix state */
     hype_ioapic_t ioapic;     /* M4-6b3: guest I/O APIC (0xFEC00000) */
     hype_guest_uart_t uart;   /* FW-1e: COM1 0x3F8 */
     hype_guest_uart_t uart2;  /* FW-1e: COM2 0x2F8 -- OVMF probes/uses both */
@@ -2439,6 +2443,7 @@ static int g_wizard_active;
 static void term_delete_begin(int idx);
 static void term_mkdisk_begin(const char *serial, const char *path, const char *gb_str);
 static void fw_1_mkdisk_pump(void);
+static uint64_t fw_1_tpm_entropy(void *ctx); /* #433 */
 static void term_delete_feed(const char *line);
 static int g_delete_active;
 
@@ -10139,6 +10144,13 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
     hype_ps2_kbd_reset(&g_fw_1_ps2);
     hype_scancode_queue_reset(&vm->host_ps2_queue);
     hype_hpet_reset(&vm->hpet);
+    {   /* #433: present a TPM only when this VM's config asked for one. */
+        unsigned int vidx_tpm = (unsigned)(vm - g_vms);
+        vm->tpm_present = vidx_tpm < g_hype_cfg.vm_count && g_hype_cfg.vms[vidx_tpm].tpm;
+        if (vm->tpm_present) {
+            hype_tpm_crb_reset(&vm->tpm_crb, fw_1_tpm_entropy, vm);
+        }
+    }
     __atomic_store_n(&vm->host_ps2_irqs, 0ull, __ATOMIC_RELAXED);
     hype_ps2_mouse_reset(&g_fw_1_mouse);
     hype_guest_ram_zero(vm->ramfb_config, sizeof(vm->ramfb_config));
@@ -10270,6 +10282,8 @@ static void fw_1_setup_fw_cfg(hype_fw_vm_t *vm) {
     cfg.pci_end_bus = 0;
     cfg.sci_interrupt = 9;
     cfg.pci_window_base = vm->ram_bytes;
+    cfg.tpm_present = vm->tpm_present; /* #433 */
+    cfg.tpm_crb_base = HYPE_TPM_CRB_BASE;
 
     if (hype_acpi_build_tables_blob(g_fw_1_tables_blob, sizeof(g_fw_1_tables_blob), &cfg,
                                     &layout) != 0) {
@@ -10428,7 +10442,8 @@ typedef enum {
     HYPE_FW_DEV_VBE,  /* #565 */
     HYPE_FW_DEV_NVME,
     HYPE_FW_DEV_DISK_SLOT,
-    HYPE_FW_DEV_FLASH
+    HYPE_FW_DEV_FLASH,
+    HYPE_FW_DEV_TPM /* #433 */
 } hype_fw_dev_t;
 
 typedef struct {
@@ -10436,6 +10451,17 @@ typedef struct {
     uint64_t base;      /* that window's base, so a report can say BAR+offset (#550) */
     unsigned int slot;  /* the disk slot, when dev == HYPE_FW_DEV_DISK_SLOT */
 } hype_fw_mmio_refusal_t;
+
+/* #433: the TPM's entropy -- TSC mixed through a splitmix64 step, per VM (the ctx is the VM, so
+ * two guests never share a stream). No RDRAND wrapper exists in-tree, and a TPM's RNG is only
+ * required to be unpredictable to the guest, not a specific source. */
+static uint64_t fw_1_tpm_entropy(void *ctx) {
+    hype_fw_vm_t *vm = (hype_fw_vm_t *)ctx;
+    uint64_t z = (vm->tpm_entropy_state += (hype_rdtsc() | 1ull) * 0x9E3779B97F4A7C15ull);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+    return z ^ (z >> 31);
+}
 
 static hype_fw_dev_t fw_1_shared_mmio_npf(hype_fw_vm_t *vm, hype_vmm_kind_t kind,
                                           hype_vcpu_ctx_t *ctx, const uint8_t *insn, int is_bsp,
@@ -10474,6 +10500,16 @@ static hype_fw_dev_t fw_1_shared_mmio_npf(hype_fw_vm_t *vm, hype_vmm_kind_t kind
     }
     if (vmm_handle_ioapic_npf(kind, ctx, &vm->ioapic, HYPE_FW_1_IOAPIC_GPA, insn) == 0) {
         return HYPE_FW_DEV_IOAPIC;
+    }
+    /* #433: the TPM CRB window at 0xFED40000, only for a VM that asked for one. Decoded and
+     * completed by the arch handler, the same shape as HPET. */
+    if (vm->tpm_present && kind == HYPE_VMM_KIND_SVM &&
+        hype_svm_vcpu_handle_tpm_crb_npf(ctx, &vm->tpm_crb, HYPE_TPM_CRB_BASE, insn) == 0) {
+        return HYPE_FW_DEV_TPM;
+    }
+    if (vm->tpm_present && kind == HYPE_VMM_KIND_VMX &&
+        hype_vmx_vcpu_handle_tpm_crb_npf(ctx, &vm->tpm_crb, HYPE_TPM_CRB_BASE, insn) == 0) {
+        return HYPE_FW_DEV_TPM;
     }
 
     vmm_get_last_npf(kind, ctx, &npf);
@@ -12842,6 +12878,13 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     hype_ps2_kbd_reset(&g_fw_1_ps2);
     hype_scancode_queue_reset(&vm->host_ps2_queue);
     hype_hpet_reset(&vm->hpet);
+    {   /* #433: present a TPM only when this VM's config asked for one. */
+        unsigned int vidx_tpm = (unsigned)(vm - g_vms);
+        vm->tpm_present = vidx_tpm < g_hype_cfg.vm_count && g_hype_cfg.vms[vidx_tpm].tpm;
+        if (vm->tpm_present) {
+            hype_tpm_crb_reset(&vm->tpm_crb, fw_1_tpm_entropy, vm);
+        }
+    }
     __atomic_store_n(&vm->host_ps2_irqs, 0ull, __ATOMIC_RELAXED);
     hype_ps2_mouse_reset(&g_fw_1_mouse);
     hype_pci_reset(&g_fw_1_pci);

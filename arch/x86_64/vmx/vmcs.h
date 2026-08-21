@@ -240,6 +240,11 @@ int hype_vmx_vcpu_handle_pflash_npf_insn(hype_vcpu_ctx_t *ctx, hype_pflash_t *pf
 void hype_vmx_vcpu_invept(hype_vcpu_ctx_t *ctx);
 int hype_vmx_vcpu_handle_ioapic_npf(hype_vcpu_ctx_t *ctx, hype_ioapic_t *ioapic,
                                     uint64_t ioapic_base_phys, const uint8_t *guest_insn_bytes);
+
+/* #433: guest TPM 2.0 CRB MMIO on VMX. */
+struct hype_tpm_crb;
+int hype_vmx_vcpu_handle_tpm_crb_npf(hype_vcpu_ctx_t *ctx, struct hype_tpm_crb *crb,
+                                     uint64_t crb_base_phys, const uint8_t *guest_insn_bytes);
 int hype_vmx_vcpu_handle_ahci_npf_map(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, hype_atapi_t *atapi,
                                       uint64_t ahci_base_phys, const hype_gpa_map_t *dma_map,
                                       const uint8_t *guest_insn_bytes);
