@@ -325,6 +325,10 @@ void hype_xhci_set_tsc_hz(uint64_t hz);
  * skipped, degrading to fewer controllers rather than back to sharing.
  */
 #define HYPE_XHCI_MAX_CTRL 2u
+/* #387: claimed MSC devices across all controllers (each owns its bulk rings + BOT bounce --
+ * ~72 KiB of BSS each). Matches HYPE_MEDIA_MAX_DEVS: a claimed stick exists to be a media
+ * device, and a block with no media slot to land in would be claimed for nothing. */
+#define HYPE_XHCI_MSC_MAX 4u
 
 typedef struct {
     uint64_t bar;            /* xHCI MMIO BAR0 (identity-mapped) */

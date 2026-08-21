@@ -18337,6 +18337,39 @@ static void media_select_ahci(void) {
 static const hype_blk_backend_t *g_media_usb_be;
 
 /*
+ * #387 (plan.md §10 decision 31): EXTRA claimed USB media devices -- sticks beyond hype's own
+ * boot/log medium, brought up with their own bulk rings (the per-device pool in xhci_hw.c) and
+ * registered as media sources under their captured serials. THREE instance slots + the boot
+ * medium = HYPE_MEDIA_MAX_DEVS. Each needs its own thunk pair because the media registry
+ * distinguishes devices by their read fn.
+ */
+#define HYPE_MEDIA_USBX 3u
+static hype_blk_usb_t g_musbx_hw[HYPE_MEDIA_USBX];
+static hype_blk_phys_t g_musbx_phys[HYPE_MEDIA_USBX];
+static hype_blk_backend_t g_musbx_be[HYPE_MEDIA_USBX];
+static hype_xhci_ctrl_t g_musbx_xc[HYPE_MEDIA_USBX];
+static hype_xhci_msc_eps_t g_musbx_eps[HYPE_MEDIA_USBX];
+static char g_musbx_serial[HYPE_MEDIA_USBX][64];
+static unsigned g_musbx_count;
+
+static int musbx_read_common(unsigned k, uint64_t lba, uint32_t count, void *dst) {
+    return hype_blk_backend_read(&g_musbx_be[k], lba, count, dst);
+}
+static int musbx_write_common(unsigned k, uint64_t lba, uint32_t count, const void *src) {
+    return hype_blk_backend_write(&g_musbx_be[k], lba, count, src);
+}
+static int musbx_read0(void *ctx, uint64_t lba, uint32_t count, void *dst) { (void)ctx; return musbx_read_common(0, lba, count, dst); }
+static int musbx_read1(void *ctx, uint64_t lba, uint32_t count, void *dst) { (void)ctx; return musbx_read_common(1, lba, count, dst); }
+static int musbx_read2(void *ctx, uint64_t lba, uint32_t count, void *dst) { (void)ctx; return musbx_read_common(2, lba, count, dst); }
+static int musbx_write0(void *ctx, uint64_t lba, uint32_t count, const void *src) { (void)ctx; return musbx_write_common(0, lba, count, src); }
+static int musbx_write1(void *ctx, uint64_t lba, uint32_t count, const void *src) { (void)ctx; return musbx_write_common(1, lba, count, src); }
+static int musbx_write2(void *ctx, uint64_t lba, uint32_t count, const void *src) { (void)ctx; return musbx_write_common(2, lba, count, src); }
+static int (*const g_musbx_rd[HYPE_MEDIA_USBX])(void *, uint64_t, uint32_t, void *) = {
+    musbx_read0, musbx_read1, musbx_read2};
+static int (*const g_musbx_wr[HYPE_MEDIA_USBX])(void *, uint64_t, uint32_t, const void *) = {
+    musbx_write0, musbx_write1, musbx_write2};
+
+/*
  * #365: who is actually reading the USB device?
  *
  * The stick moved 55.6 MB of READS (usb_write does not touch these counters) to deliver 12.9 MB
@@ -24119,9 +24152,74 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                      * feature will need beyond its position and identity.
                      */
                     if (msc_found) {
-                        hype_debug_print("host-xhci: port %u is a second MSC -- inventoried, not "
-                                         "claimed (hype already has its medium) [#241]\n", rp);
-                        hype_xhci_disable_slot(&xc, msc_slot);
+                        /*
+                         * #387 (decision 31): a second MSC becomes a MEDIA-ONLY claim -- full
+                         * datapath (its OWN bulk rings, per the xhci_hw pool), identity capture,
+                         * READ CAPACITY, then media registration under its real serial. The log
+                         * sink is NEVER re-pointed (#241's actual concern): the first MSC keeps
+                         * that role unconditionally.
+                         */
+                        if (g_musbx_count >= HYPE_MEDIA_USBX) {
+                            hype_debug_print("host-xhci: port %u is another MSC but the extra-"
+                                             "media slots are full (%u) -- inventoried only "
+                                             "[#387]\n", rp, HYPE_MEDIA_USBX);
+                            hype_xhci_disable_slot(&xc, msc_slot);
+                            continue;
+                        }
+                        if (hype_xhci_set_configuration(&xc, msc_slot, msc.config_value) != 0 ||
+                            hype_xhci_configure_bulk_endpoints(&xc, msc_slot, &msc_path,
+                                                               &msc) != 0) {
+                            hype_debug_print("host-xhci: port %u extra MSC bring-up FAILED -- "
+                                             "inventoried only [#387]\n", rp);
+                            hype_xhci_disable_slot(&xc, msc_slot);
+                            continue;
+                        }
+                        {
+                            unsigned k = g_musbx_count;
+                            uint32_t xlast = 0, xbsz = 0;
+                            /* identity while EP0 + bulk are both live (#340). The capture writes
+                             * g_hostusb_serial -- the SAME buffer the boot medium's registration
+                             * points at -- so it is saved and restored around the call, or the
+                             * first stick would silently take the second one's identity (found
+                             * live: media_disk selection then matched the WRONG device). */
+                            static char saved_serial[64];
+                            (void)hype_strlcpy(saved_serial, g_hostusb_serial,
+                                               sizeof(saved_serial));
+                            usb_capture_identity(&xc, msc_slot, &msc);
+                            (void)hype_strlcpy(g_musbx_serial[k], g_hostusb_serial,
+                                               sizeof(g_musbx_serial[k]));
+                            (void)hype_strlcpy(g_hostusb_serial, saved_serial,
+                                               sizeof(g_hostusb_serial));
+                            if (hype_xhci_msc_read_capacity(&xc, msc_slot, &msc, &xlast,
+                                                            &xbsz) != 0 || xbsz != 512u) {
+                                hype_debug_print("host-xhci: port %u extra MSC capacity FAILED "
+                                                 "(bsz=%u) -- inventoried only [#387]\n", rp,
+                                                 xbsz);
+                                hype_xhci_disable_slot(&xc, msc_slot);
+                                continue;
+                            }
+                            /* The controller handle + endpoints must OUTLIVE this scope. */
+                            g_musbx_xc[k] = xc;
+                            g_musbx_eps[k] = msc;
+                            hype_blk_usb_init(&g_musbx_hw[k], &g_musbx_phys[k], &g_musbx_be[k],
+                                              &g_musbx_xc[k], msc_slot, &g_musbx_eps[k], 512u,
+                                              (uint64_t)xlast + 1u);
+                            media_add_dev(g_musbx_rd[k], g_musbx_wr[k], "usb",
+                                          g_musbx_serial[k]);
+                            /* claimed: passthrough must never offer a device hype is using */
+                            hype_usb_inventory_claim(&g_usb_inv,
+                                                     hype_usb_inventory_find(&g_usb_inv,
+                                                                             xhci_count, rp,
+                                                                             msc_path.route),
+                                                     HYPE_USB_OWNER_HYPE);
+                            g_musbx_count++;
+                            hype_debug_print("host-xhci: port %u MSC claimed as MEDIA #%u -- "
+                                             "serial='%s', %llu sectors, own bulk rings [#387]\n",
+                                             rp, k,
+                                             g_musbx_serial[k][0] ? g_musbx_serial[k]
+                                                                  : "(none: auto-detect only)",
+                                             (unsigned long long)((uint64_t)xlast + 1u));
+                        }
                         continue;
                     }
 

@@ -115,17 +115,8 @@ typedef struct {
     unsigned int dev_used[DEVPOOL]; /* 1 if this pool slot is in use */
     unsigned int slot_dev[256];     /* slot id -> pool index + 1 (0 = none) */
 
-    /* MSC bulk endpoint transfer rings. */
-    uint8_t bulk_in_ring[XPAGE] __attribute__((aligned(XPAGE)));
-    uint8_t bulk_out_ring[XPAGE] __attribute__((aligned(XPAGE)));
-    unsigned int bin_enq, bin_cyc, bout_enq, bout_cyc;
-    /* BOT command/status wrappers + a bulk data bounce buffer. */
-    uint8_t cbw[64] __attribute__((aligned(64)));
-    uint8_t csw[64] __attribute__((aligned(64)));
-    /* Page-aligned for DMA; larger than a page, but only page alignment is architecturally
-     * required. */
-    uint8_t data[XDATA] __attribute__((aligned(4096)));
-    uint32_t bot_tag;
+    /* #387: the MSC bulk rings + BOT state moved to the per-claimed-device pool below --
+     * per-CONTROLLER they were the reason a second stick could not be brought up at all. */
 
     /*
      * #266 defect 1: completions that arrive for another endpoint are parked here rather
@@ -148,6 +139,51 @@ typedef struct {
 } xhci_hw_t;
 
 static xhci_hw_t g_hw[HYPE_XHCI_MAX_CTRL];
+
+/*
+ * #387 (plan.md §10 decision 31): per-CLAIMED-DEVICE bulk transfer state. The bulk ring pair and
+ * BOT wrappers used to live in xhci_hw_t -- one set per controller -- which made "bring up a
+ * second stick" structurally impossible: configuring its endpoints would have re-pointed the
+ * first stick's rings out from under the log sink. Each claimed MSC now owns its own rings,
+ * wrappers and bounce; the controller-wide TRANSFER LOCK is unchanged, deliberately -- one
+ * transfer at a time per controller is the concurrency contract the #343/#377 corruption work
+ * proved. Per-device rings remove the bring-up limit, not the serialisation.
+ */
+typedef struct {
+    int used;
+    unsigned int ctrl; /* index into g_hw */
+    unsigned int slot;
+    uint8_t bulk_in_ring[XPAGE] __attribute__((aligned(XPAGE)));
+    uint8_t bulk_out_ring[XPAGE] __attribute__((aligned(XPAGE)));
+    unsigned int bin_enq, bin_cyc, bout_enq, bout_cyc;
+    uint8_t cbw[64] __attribute__((aligned(64)));
+    uint8_t csw[64] __attribute__((aligned(64)));
+    uint8_t data[XDATA] __attribute__((aligned(4096)));
+    uint32_t bot_tag;
+} xhci_msc_hw_t;
+
+static xhci_msc_hw_t g_msc_hw[HYPE_XHCI_MSC_MAX];
+
+/* The claimed-device block for (c, slot); allocates on first sight when `alloc` is set. */
+static xhci_msc_hw_t *msc_hw_for(const hype_xhci_ctrl_t *c, unsigned int slot, int alloc) {
+    unsigned int i, free_i = HYPE_XHCI_MSC_MAX;
+    for (i = 0; i < HYPE_XHCI_MSC_MAX; i++) {
+        if (g_msc_hw[i].used && g_msc_hw[i].ctrl == c->hw_slot && g_msc_hw[i].slot == slot) {
+            return &g_msc_hw[i];
+        }
+        if (!g_msc_hw[i].used && free_i == HYPE_XHCI_MSC_MAX) {
+            free_i = i;
+        }
+    }
+    if (!alloc || free_i == HYPE_XHCI_MSC_MAX) {
+        return 0;
+    }
+    g_msc_hw[free_i].used = 1;
+    g_msc_hw[free_i].ctrl = c->hw_slot;
+    g_msc_hw[free_i].slot = slot;
+    g_msc_hw[free_i].bot_tag = 0;
+    return &g_msc_hw[free_i];
+}
 
 /* This controller's block. hw_slot is set by hype_xhci_host_init() and is only
  * meaningful while c->inited; it is clamped so a caller that hands over an
@@ -677,15 +713,24 @@ int hype_xhci_configure_bulk_endpoints(hype_xhci_ctrl_t *c, unsigned int slot,
     unsigned int max_dci = (dci_in > dci_out) ? dci_in : dci_out;
     uint32_t ctx[8], cmd[4], evt[4];
 
+    xhci_msc_hw_t *m;
+
     if (!c->inited || slot == 0u) return -1;
+    /* #387: this device's OWN rings -- allocated here, the datapath's front door. */
+    m = msc_hw_for(c, slot, 1);
+    if (m == 0) {
+        hype_debug_print("host-xhci: no claimed-MSC block free (cap %u) -- slot %u not brought "
+                         "up [#387]\n", HYPE_XHCI_MSC_MAX, slot);
+        return -1;
+    }
 
     /* Fresh bulk transfer rings. */
-    zero(hw->bulk_in_ring, XPAGE);
-    zero(hw->bulk_out_ring, XPAGE);
-    ring_init_link(hw->bulk_in_ring);
-    ring_init_link(hw->bulk_out_ring);
-    hw->bin_enq = 0; hw->bin_cyc = 1;
-    hw->bout_enq = 0; hw->bout_cyc = 1;
+    zero(m->bulk_in_ring, XPAGE);
+    zero(m->bulk_out_ring, XPAGE);
+    ring_init_link(m->bulk_in_ring);
+    ring_init_link(m->bulk_out_ring);
+    m->bin_enq = 0; m->bin_cyc = 1;
+    m->bout_enq = 0; m->bout_cyc = 1;
 
     /* Input Context: add the Slot + both bulk endpoint contexts. The Slot
      * Context must re-provide the device's full topology (route/root/TT). */
@@ -695,9 +740,9 @@ int hype_xhci_configure_bulk_endpoints(hype_xhci_ctrl_t *c, unsigned int slot,
     hype_xhci_slot_ctx(ctx, path->route, path->speed, max_dci, path->root_port,
                        path->tt_hub_slot, path->tt_port); /* context entries = highest DCI */
     write_ctx(hw->input_ctx, cs, ctx);
-    hype_xhci_ep_ctx(ctx, HYPE_XHCI_EP_TYPE_BULK_IN, msc->bulk_in_mps, phys(hw->bulk_in_ring), 1);
+    hype_xhci_ep_ctx(ctx, HYPE_XHCI_EP_TYPE_BULK_IN, msc->bulk_in_mps, phys(m->bulk_in_ring), 1);
     write_ctx(hw->input_ctx, (1u + dci_in) * cs, ctx);
-    hype_xhci_ep_ctx(ctx, HYPE_XHCI_EP_TYPE_BULK_OUT, msc->bulk_out_mps, phys(hw->bulk_out_ring), 1);
+    hype_xhci_ep_ctx(ctx, HYPE_XHCI_EP_TYPE_BULK_OUT, msc->bulk_out_mps, phys(m->bulk_out_ring), 1);
     write_ctx(hw->input_ctx, (1u + dci_out) * cs, ctx);
 
     hype_xhci_trb_configure_endpoint(cmd, phys(hw->input_ctx), slot, (int)hw->cmd_cyc);
@@ -1105,8 +1150,12 @@ static int bot_recover(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_m
     hype_xhci_parked_drop_slot(&hw->parked, slot);
 
     /* Quiesce both rings first so nothing is in flight during the reset. */
-    if (ep_recover(c, slot, dci_in, hw->bulk_in_ring, &hw->bin_enq, &hw->bin_cyc) != 0) rc = -1;
-    if (ep_recover(c, slot, dci_out, hw->bulk_out_ring, &hw->bout_enq, &hw->bout_cyc) != 0) rc = -1;
+    {
+        xhci_msc_hw_t *m = msc_hw_for(c, slot, 0);
+        if (m == 0) return -1; /* never brought up: nothing to recover */
+        if (ep_recover(c, slot, dci_in, m->bulk_in_ring, &m->bin_enq, &m->bin_cyc) != 0) rc = -1;
+        if (ep_recover(c, slot, dci_out, m->bulk_out_ring, &m->bout_enq, &m->bout_cyc) != 0) rc = -1;
+    }
 
     /* Bulk-Only Mass Storage Reset: class request 0xFF to the interface. */
     if (control_transfer(c, slot, 0x21, 0xFF, 0, (uint16_t)msc->interface_num, 0, 0, 0) != 0) {
@@ -1158,37 +1207,40 @@ static void bounce_copy(uint8_t *dst, const uint8_t *src, unsigned int len) {
 static int bot_scsi_once(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_msc_eps_t *msc,
                     const uint8_t *cdb, unsigned int cdb_len, uint8_t *data, unsigned int data_len,
                     int dir_in) {
-    xhci_hw_t *hw = HW(c);
     unsigned int dci_in = hype_xhci_ep_dci(msc->bulk_in_ep);
     unsigned int dci_out = hype_xhci_ep_dci(msc->bulk_out_ep);
-    uint32_t tag = ++hw->bot_tag;
+    xhci_msc_hw_t *m = msc_hw_for(c, slot, 0); /* #387: this device's own rings + bounce */
+    uint32_t tag;
+
+    if (m == 0) return -1; /* endpoints never configured for this slot */
+    tag = ++m->bot_tag;
 
     if (data_len > XDATA) return -1;
 
     /* CBW on the bulk OUT endpoint. */
-    hype_usb_bot_cbw(hw->cbw, tag, data_len, dir_in, 0, cdb, cdb_len);
-    if (bulk_xfer(c, hw->bulk_out_ring, &hw->bout_enq, &hw->bout_cyc, slot, dci_out,
-                  phys(hw->cbw), HYPE_USB_CBW_LEN) != 0) return -1;
+    hype_usb_bot_cbw(m->cbw, tag, data_len, dir_in, 0, cdb, cdb_len);
+    if (bulk_xfer(c, m->bulk_out_ring, &m->bout_enq, &m->bout_cyc, slot, dci_out,
+                  phys(m->cbw), HYPE_USB_CBW_LEN) != 0) return -1;
 
-    /* Data phase (bounced through hw->data). */
+    /* Data phase (bounced through the device's own bounce). */
     if (data_len) {
         if (dir_in) {
-            if (bulk_xfer(c, hw->bulk_in_ring, &hw->bin_enq, &hw->bin_cyc, slot, dci_in,
-                          phys(hw->data), data_len) != 0) return -1;
+            if (bulk_xfer(c, m->bulk_in_ring, &m->bin_enq, &m->bin_cyc, slot, dci_in,
+                          phys(m->data), data_len) != 0) return -1;
             /* #365: word-at-a-time when both sides allow it. At 64 KiB a byte loop is 65536
              * iterations on the hot media path; this cuts it to 8192. */
-            bounce_copy(data, hw->data, data_len);
+            bounce_copy(data, m->data, data_len);
         } else {
-            bounce_copy(hw->data, data, data_len);
-            if (bulk_xfer(c, hw->bulk_out_ring, &hw->bout_enq, &hw->bout_cyc, slot, dci_out,
-                          phys(hw->data), data_len) != 0) return -1;
+            bounce_copy(m->data, data, data_len);
+            if (bulk_xfer(c, m->bulk_out_ring, &m->bout_enq, &m->bout_cyc, slot, dci_out,
+                          phys(m->data), data_len) != 0) return -1;
         }
     }
 
     /* CSW on the bulk IN endpoint. */
-    if (bulk_xfer(c, hw->bulk_in_ring, &hw->bin_enq, &hw->bin_cyc, slot, dci_in,
-                  phys(hw->csw), HYPE_USB_CSW_LEN) != 0) return -1;
-    if (hype_usb_bot_csw_ok(hw->csw, tag)) {
+    if (bulk_xfer(c, m->bulk_in_ring, &m->bin_enq, &m->bin_cyc, slot, dci_in,
+                  phys(m->csw), HYPE_USB_CSW_LEN) != 0) return -1;
+    if (hype_usb_bot_csw_ok(m->csw, tag)) {
         return 0;
     }
     /*
@@ -1201,13 +1253,13 @@ static int bot_scsi_once(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci
      * sink (whose create needed that write) stayed dead. The evidence -- WHICH command, WHAT
      * status -- was discarded exactly where it existed.
      */
-    if (hype_usb_bot_csw_valid(hw->csw, tag)) {
+    if (hype_usb_bot_csw_valid(m->csw, tag)) {
         static unsigned int csw_fail_reported = 0;
         if (csw_fail_reported++ < 16u) {
             hype_debug_print("host-xhci: #516 CSW: op=0x%02x FAILED status=%u residue=%u "
                              "(len=%u dir=%s) -- device verdict, transport healthy\n",
-                             cdb[0], hype_usb_bot_csw_status(hw->csw),
-                             hype_usb_bot_csw_residue(hw->csw), data_len, dir_in ? "in" : "out");
+                             cdb[0], hype_usb_bot_csw_status(m->csw),
+                             hype_usb_bot_csw_residue(m->csw), data_len, dir_in ? "in" : "out");
         }
         return 1; /* command failed cleanly: sense, don't reset */
     }
@@ -1374,16 +1426,17 @@ int hype_xhci_msc_read(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_m
 
 int hype_xhci_msc_write(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_msc_eps_t *msc,
                         uint32_t lba, unsigned int blocks, unsigned int block_size, const void *buf) {
-    xhci_hw_t *hw = HW(c);
+    xhci_msc_hw_t *m = msc_hw_for(c, slot, 0); /* #387 */
     uint8_t cdb[10];
     unsigned int len = blocks * block_size;
     unsigned int i;
+    if (m == 0) return -1;
     if (len == 0u || len > XDATA) return -1;
-    /* stage the caller's data (bot_scsi bounces from hw->data for OUT). */
-    for (i = 0; i < len; i++) ((uint8_t *)hw->data)[i] = ((const uint8_t *)buf)[i];
+    /* stage the caller's data (bot_scsi bounces from the device's bounce for OUT). */
+    for (i = 0; i < len; i++) ((uint8_t *)m->data)[i] = ((const uint8_t *)buf)[i];
     hype_scsi_cdb_write10(cdb, lba, (uint16_t)blocks);
-    /* pass hw->data as the data pointer so bot_scsi's OUT copy is a self-copy. */
-    return bot_scsi(c, slot, msc, cdb, 10u, (uint8_t *)hw->data, len, 0);
+    /* pass the bounce as the data pointer so bot_scsi's OUT copy is a self-copy. */
+    return bot_scsi(c, slot, msc, cdb, 10u, (uint8_t *)m->data, len, 0);
 }
 
 int hype_xhci_msc_inquiry_vpd(hype_xhci_ctrl_t *c, unsigned int slot,
@@ -1501,8 +1554,15 @@ int hype_xhci_host_init(uint64_t bar_phys, hype_xhci_ctrl_t *out) {
         hw->iin_cyc = 1u;
         hw->iin_armed = 0;
         hw->iin_pending_trb = 0;
-        hw->bin_enq = 0; hw->bin_cyc = 0; hw->bout_enq = 0; hw->bout_cyc = 0;
-        hw->bot_tag = 0;
+        /* #387: release this controller's claimed-MSC blocks with it. */
+        {
+            unsigned int mi;
+            for (mi = 0; mi < HYPE_XHCI_MSC_MAX; mi++) {
+                if (g_msc_hw[mi].used && g_msc_hw[mi].ctrl == out->hw_slot) {
+                    g_msc_hw[mi].used = 0;
+                }
+            }
+        }
         hype_xhci_parked_reset(&hw->parked);
     }
 
