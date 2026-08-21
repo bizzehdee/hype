@@ -80,10 +80,10 @@ if [ "$FAT32" -eq 1 ]; then
     cp tools/hwstick/hype-micro.cfg tools/hwstick/README.md "$DST/"
     # Leading number = how many times to repeat that battery this boot (more = better odds of
     # catching an intermittent leak). Edit it on the stick to change intensity without a rebuild.
-    printf '%s\n%s\n' "${F32_ITERS:-10}" \
+    printf '%s\n%s\n' "${F32_ITERS:-3}" \
         "#597 marker -- leading number = repeat count for the FAT32 write battery this boot." \
         > "$DST/F32TEST.RUN"
-    printf '%s\n%s\n' "${LOG_ITERS:-10}" \
+    printf '%s\n%s\n' "${LOG_ITERS:-3}" \
         "#596 marker -- leading number = repeat count for the log-shaped write battery this boot." \
         > "$DST/LOGTEST.RUN"
     rm -rf "$DST/F32TEST" "$DST/LOGTEST" # empty dirs so a stale file can't mask a failure

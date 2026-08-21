@@ -116,25 +116,39 @@ static void run_interleaved(hype_fs_t *fs, hype_fat32_selftest_result_t *res,
         }
     }
 
-    do {
-        progress = 0;
-        for (i = 0; i < n; i++) {
-            unsigned int chunk;
-            if (!active[i] || done[i] >= items[i].len) continue;
-            chunk = 149u + (done[i] & 0x1FFu); /* small, cluster-unaligned -- the log pattern */
-            if (chunk > items[i].len - done[i]) chunk = items[i].len - done[i];
-            if (chunk > CHUNK) chunk = CHUNK;
-            gen(items[i].seed, done[i], buf, chunk);
-            if (hype_fs_append(&files[i], buf, chunk) != 0) {
-                active[i] = 0;
-                res->files_refused++;
-                note_fail(res, "iappend ", items[i].path);
-                continue;
+    {
+        unsigned int pass = 0u;
+        do {
+            progress = 0;
+            for (i = 0; i < n; i++) {
+                unsigned int chunk;
+                if (!active[i] || done[i] >= items[i].len) continue;
+                chunk = 149u + (done[i] & 0x1FFu); /* small, cluster-unaligned -- the log pattern */
+                if (chunk > items[i].len - done[i]) chunk = items[i].len - done[i];
+                if (chunk > CHUNK) chunk = CHUNK;
+                gen(items[i].seed, done[i], buf, chunk);
+                if (hype_fs_append(&files[i], buf, chunk) != 0) {
+                    active[i] = 0;
+                    res->files_refused++;
+                    note_fail(res, "iappend ", items[i].path);
+                    continue;
+                }
+                done[i] += chunk;
+                progress = 1;
             }
-            done[i] += chunk;
-            progress = 1;
-        }
-    } while (progress);
+            /* Heartbeat: this phase is otherwise silent, so slow reads as hung. Flushed by the
+             * caller, it also leaves a trail on the medium right up to any hang point. */
+            if (log && progress && (++pass % 128u) == 0u) {
+                hype_fat32_selftest_event_t pev;
+                unsigned int td = 0u, tt = 0u, j;
+                for (j = 0; j < n; j++) { td += done[j]; tt += items[j].len; }
+                pev.idx = 9000u; pev.path = HYPE_FAT32_SELFTEST_DIR; pev.seed = pass;
+                pev.len = td; pev.mode = HYPE_FAT32_SELFTEST_APPEND_N; pev.first_cluster = tt;
+                pev.refused = 0; pev.selfcheck_ok = 1;
+                log(logctx, &pev);
+            }
+        } while (progress);
+    }
 
     for (i = 0; i < n; i++) {
         hype_fat32_selftest_event_t ev;
@@ -188,25 +202,37 @@ int hype_fat32_logtest_run(hype_fs_t *fs, const hype_rtc_time_t *now,
 
     /* Round-robin one ~4 KiB batch to each active file per pass -- the log writer's batch
      * granularity (HYPE_LOG_SINK_BATCH_BYTES), concurrent across files on the shared fs. */
-    do {
-        progress = 0;
-        for (i = 0; i < n; i++) {
-            unsigned int chunk;
-            if (!active[i] || done[i] >= items[i].len) continue;
-            chunk = HYPE_FAT32_LOGTEST_BATCH - ((done[i] >> 5) & 0x1FFu); /* ~3585..4096, varied */
-            if (chunk > items[i].len - done[i]) chunk = items[i].len - done[i];
-            if (chunk > CHUNK) chunk = CHUNK;
-            gen(items[i].seed, done[i], buf, chunk);
-            if (hype_fs_append(&files[i], buf, chunk) != 0) {
-                active[i] = 0;
-                res->files_refused++;
-                note_fail(res, "lappend ", items[i].path);
-                continue;
+    {
+        unsigned int pass = 0u;
+        do {
+            progress = 0;
+            for (i = 0; i < n; i++) {
+                unsigned int chunk;
+                if (!active[i] || done[i] >= items[i].len) continue;
+                chunk = HYPE_FAT32_LOGTEST_BATCH - ((done[i] >> 5) & 0x1FFu); /* ~3585..4096 */
+                if (chunk > items[i].len - done[i]) chunk = items[i].len - done[i];
+                if (chunk > CHUNK) chunk = CHUNK;
+                gen(items[i].seed, done[i], buf, chunk);
+                if (hype_fs_append(&files[i], buf, chunk) != 0) {
+                    active[i] = 0;
+                    res->files_refused++;
+                    note_fail(res, "lappend ", items[i].path);
+                    continue;
+                }
+                done[i] += chunk;
+                progress = 1;
             }
-            done[i] += chunk;
-            progress = 1;
-        }
-    } while (progress);
+            if (log && progress && (++pass % 16u) == 0u) { /* ~16 batches ~= 64 KiB/file */
+                hype_fat32_selftest_event_t pev;
+                unsigned int td = 0u, tt = 0u, j;
+                for (j = 0; j < n; j++) { td += done[j]; tt += items[j].len; }
+                pev.idx = 9100u; pev.path = HYPE_FAT32_LOGTEST_DIR; pev.seed = pass;
+                pev.len = td; pev.mode = HYPE_FAT32_SELFTEST_APPEND_N; pev.first_cluster = tt;
+                pev.refused = 0; pev.selfcheck_ok = 1;
+                log(logctx, &pev);
+            }
+        } while (progress);
+    }
 
     for (i = 0; i < n; i++) {
         hype_fat32_selftest_event_t ev;

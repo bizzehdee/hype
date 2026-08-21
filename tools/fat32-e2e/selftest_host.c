@@ -7,6 +7,7 @@
  * usage: selftest_host <image>
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "../../core/blk_io.h"
@@ -18,6 +19,10 @@ static FILE *g_img;
 
 static void logcb(void *ctx, const hype_fat32_selftest_event_t *ev) {
     (void)ctx;
+    if (ev->idx >= 9000u) {
+        printf("  PROGRESS %s pass=%u %u/%u bytes\n", ev->path, ev->seed, ev->len, ev->first_cluster);
+        return;
+    }
     printf("  [%u] %s seed=0x%x len=%u mode=%s first_cluster=%u -> %s\n", ev->idx, ev->path,
            ev->seed, ev->len, hype_fat32_selftest_mode_name(ev->mode), ev->first_cluster,
            ev->refused ? "REFUSED" : (ev->selfcheck_ok ? "OK" : "SELFCHECK-FAIL"));
@@ -43,7 +48,7 @@ int main(int argc, char **argv) {
     hype_fs_t fs;
     hype_rtc_time_t now;
     hype_fat32_selftest_result_t res;
-    int rc;
+    int rc = 0;
 
     if (argc < 2) {
         fprintf(stderr, "usage: %s <image>\n", argv[0]);
@@ -61,16 +66,32 @@ int main(int argc, char **argv) {
     memset(&now, 0, sizeof now);
     now.year = 2026; now.month = 8; now.day = 21; now.hour = 12;
 
-    rc = hype_fat32_selftest_run(&fs, &now, &res, logcb, 0);
-    printf("selftest: written=%u refused=%u selfcheck_fail=%u%s%s\n", res.files_written,
-           res.files_refused, res.selfcheck_fail, res.first_fail[0] ? " first=" : "", res.first_fail);
-
     {
-        hype_fat32_selftest_result_t lt;
-        int lrc = hype_fat32_logtest_run(&fs, &now, &lt, logcb, 0);
-        printf("logtest:  written=%u refused=%u selfcheck_fail=%u%s%s\n", lt.files_written,
-               lt.files_refused, lt.selfcheck_fail, lt.first_fail[0] ? " first=" : "", lt.first_fail);
-        if (lrc != 0 || lt.files_refused != 0) rc = 1;
+        /* #596: repeat the batteries like fw_1_run_fat_battery does on the stick. HYPE_ITERS
+         * (default 1) sets the count. The real device hung in the interleaved phase, most likely
+         * on iteration 2 (after iteration 1's files are all unlinked and rewritten) -- a path the
+         * single-shot smoke never ran. If a loop hangs here, a wrapping `timeout` catches it. */
+        const char *ie = getenv("HYPE_ITERS");
+        unsigned int iters = ie ? (unsigned int)atoi(ie) : 1u;
+        unsigned int k;
+        if (iters == 0u) iters = 1u;
+        for (k = 0; k < iters; k++) {
+            hype_fat32_selftest_result_t lt;
+            int rrc, lrc;
+            printf("=== iteration %u/%u ===\n", k + 1u, iters);
+            fflush(stdout);
+            rrc = hype_fat32_selftest_run(&fs, &now, &res, (k == 0u) ? logcb : 0, 0);
+            printf("selftest: written=%u refused=%u selfcheck_fail=%u%s%s\n", res.files_written,
+                   res.files_refused, res.selfcheck_fail, res.first_fail[0] ? " first=" : "",
+                   res.first_fail);
+            fflush(stdout);
+            lrc = hype_fat32_logtest_run(&fs, &now, &lt, (k == 0u) ? logcb : 0, 0);
+            printf("logtest:  written=%u refused=%u selfcheck_fail=%u%s%s\n", lt.files_written,
+                   lt.files_refused, lt.selfcheck_fail, lt.first_fail[0] ? " first=" : "",
+                   lt.first_fail);
+            fflush(stdout);
+            if (rrc != 0 || res.files_refused != 0 || lrc != 0 || lt.files_refused != 0) rc = 1;
+        }
     }
 
     fflush(g_img);

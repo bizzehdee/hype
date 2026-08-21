@@ -22522,6 +22522,17 @@ static void vm_log_name(unsigned int idx, const char *cfg_name, char *out, unsig
  * validate_stick failure maps back to the exact test (its first cluster, size class, write mode). */
 static void fw_1_fat32_selftest_log(void *ctx, const hype_fat32_selftest_event_t *ev) {
     (void)ctx;
+    if (ev->idx >= 9000u) {
+        /* Heartbeat from an otherwise-silent concurrent phase. Flush it to the medium immediately
+         * so a hang (which stops the drain loop that never runs before the VMs) still leaves a
+         * trail on the stick showing exactly how far it got. */
+        hype_debug_print("FAT32-STICK PROGRESS: %s pass=%u %u/%u bytes\n", ev->path, ev->seed,
+                         ev->len, ev->first_cluster);
+        if (g_hype_log_ready) {
+            (void)hype_log_sink_flush(&g_hype_log);
+        }
+        return;
+    }
     hype_debug_print("FAT32-STICK: [%u] %s seed=0x%x len=%u mode=%s first_cluster=%u -> %s\n",
                      ev->idx, ev->path, ev->seed, ev->len,
                      hype_fat32_selftest_mode_name(ev->mode), ev->first_cluster,
@@ -22566,14 +22577,21 @@ static void fw_1_run_fat_battery(const char *marker, const char *dir, const char
                      "volume\n", label, marker, iters);
     for (k = 0; k < iters; k++) {
         hype_fat32_selftest_result_t r;
-        int rc = run(&g_hype_log.fs, g_host_time_valid ? &g_host_time : 0, &r,
-                     (k == 0u) ? fw_1_fat32_selftest_log : (hype_fat32_selftest_log_fn)0, 0);
-        int failed = (rc != 0 || r.files_refused != 0);
+        int rc, failed;
+        hype_debug_print("%s iter %u/%u: starting\n", label, k + 1u, iters);
+        if (g_hype_log_ready) {
+            (void)hype_log_sink_flush(&g_hype_log); /* trail: prove we entered this iteration */
+        }
+        /* Log every iteration (not just the first): the hang was on a later one, and per-file
+         * boundaries + heartbeats are exactly what localise it. */
+        rc = run(&g_hype_log.fs, g_host_time_valid ? &g_host_time : 0, &r, fw_1_fat32_selftest_log, 0);
+        failed = (rc != 0 || r.files_refused != 0);
         if (failed) failing++;
-        if (k == 0u || failed) {
-            hype_debug_print("%s iter %u/%u: %s written=%u refused=%u selfcheck_fail=%u%s%s\n", label,
-                             k + 1u, iters, failed ? "FAIL" : "PASS", r.files_written, r.files_refused,
-                             r.selfcheck_fail, r.first_fail[0] ? " first=" : "", r.first_fail);
+        hype_debug_print("%s iter %u/%u: %s written=%u refused=%u selfcheck_fail=%u%s%s\n", label,
+                         k + 1u, iters, failed ? "FAIL" : "PASS", r.files_written, r.files_refused,
+                         r.selfcheck_fail, r.first_fail[0] ? " first=" : "", r.first_fail);
+        if (g_hype_log_ready) {
+            (void)hype_log_sink_flush(&g_hype_log); /* trail: this iteration completed */
         }
     }
     hype_debug_print("%s SELFTEST: %s -- %u iteration(s), %u failing. A LEAKED CLUSTER IS INVISIBLE "
