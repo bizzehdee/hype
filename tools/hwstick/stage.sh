@@ -80,6 +80,7 @@ if [ "$FAT32" -eq 1 ]; then
     cp tools/hwstick/hype-micro.cfg tools/hwstick/README.md "$DST/"
     printf '%s\n' "#597 marker -- its presence makes hype run the FAT32 write battery on this volume." \
         > "$DST/F32TEST.RUN"
+    rm -rf "$DST/F32TEST" # start the battery from an empty dir so a stale file can't mask a failure
     echo "fat32: staged \\hype.cfg = hype-fat32.cfg and dropped the \\F32TEST.RUN marker"
 else
     cp tools/hwstick/hype.cfg tools/hwstick/hype-micro.cfg tools/hwstick/README.md "$DST/"
