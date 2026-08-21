@@ -3359,6 +3359,22 @@ int hype_vmx_vcpu_take_injected_vector(hype_vcpu_ctx_t *ctx, uint8_t *out_vector
     return 0;
 }
 
+/* #599: owner-context post of one vector into the virtual-APIC page's vIRR + RVI.
+ * The page store is plain memory; the RVI update is a VMCS write and therefore
+ * only legal from the vCPU's owner core (decision 43) -- both callers are. */
+static void vmx_apicv_post_owner(struct hype_vcpu_ctx *real, uint8_t vector) {
+    volatile uint32_t *virr =
+        (volatile uint32_t *)(real->vapic + 0x200u + (uint32_t)(vector >> 5) * 0x10u);
+    int ok = 0;
+    uint64_t gis;
+    __atomic_fetch_or(virr, (uint32_t)1u << (vector & 31u), __ATOMIC_SEQ_CST);
+    gis = vmread(HYPE_VMCS_GUEST_INTERRUPT_STATUS, &ok);
+    if ((uint32_t)(gis & 0xFFu) < vector) {
+        vmwrite(HYPE_VMCS_GUEST_INTERRUPT_STATUS, (gis & ~0xFFull) | vector);
+    }
+    real->int_eventinj++;
+}
+
 void hype_vmx_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector) {
     vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
@@ -3372,16 +3388,7 @@ void hype_vmx_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector) {
      * two would race hardware's own RVI/SVI state.
      */
     if (real->apicv) {
-        volatile uint32_t *virr =
-            (volatile uint32_t *)(real->vapic + 0x200u + (uint32_t)(vector >> 5) * 0x10u);
-        int ok = 0;
-        uint64_t gis;
-        *virr |= (uint32_t)1u << (vector & 31u);
-        gis = vmread(HYPE_VMCS_GUEST_INTERRUPT_STATUS, &ok);
-        if ((uint32_t)(gis & 0xFFu) < vector) {
-            vmwrite(HYPE_VMCS_GUEST_INTERRUPT_STATUS, (gis & ~0xFFull) | vector);
-        }
-        real->int_eventinj++;
+        vmx_apicv_post_owner(real, vector);
         return;
     }
     int staged = vmx_entry_event_staged();
@@ -3434,6 +3441,25 @@ int hype_vmx_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx) {
     if (!hype_svm_irr_any(real->pending_irr)) {
         return 0;
     }
+    /*
+     * #599 APICv: cross-vCPU IPIs land in pending_irr from the SENDER's core (SMP-5 -- plain
+     * memory, the only thing another core may touch). Event-injecting them here would mix
+     * VM-entry injection with virtual-interrupt delivery; instead the owner (this core) moves
+     * every pending bit into the vIRR and lets the hardware deliver. Without this, Linux's
+     * first smp_call_function to the AP waited on its csd lock forever -- the BSP retried
+     * vector 0x99 broadcasts while the AP idled, and boot went silent after the bootloader.
+     */
+    if (real->apicv) {
+        int drained = 0;
+        while ((v = hype_svm_irr_highest(real->pending_irr)) >= 0) {
+            hype_svm_irr_clear(real->pending_irr, (uint8_t)v);
+            hype_svm_irr_clear(real->pending_pic, (uint8_t)v);
+            vmx_apicv_post_owner(real, (uint8_t)v);
+            vmx_note_injected(real, (uint8_t)v); /* #456 */
+            drained = 1;
+        }
+        return drained;
+    }
     if (vmx_entry_event_staged()) {
         return 0; /* an event is already staged for the next VM-entry */
     }
@@ -3463,6 +3489,11 @@ int hype_vmx_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx) {
 void hype_vmx_vcpu_handle_intr_window(hype_vcpu_ctx_t *ctx) {
     vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    if (real->apicv) {
+        (void)hype_vmx_vcpu_deliver_pending_if_ready(ctx); /* #599: vIRR path, never event-inject */
+        vmx_set_intr_window(0);
+        return;
+    }
     int v = hype_svm_irr_highest(real->pending_irr);
     if (v >= 0 && !vmx_entry_event_staged()) {
         hype_svm_irr_clear(real->pending_irr, (uint8_t)v);
