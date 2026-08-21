@@ -1043,8 +1043,15 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
     g_vmx_ctx_pool[slot].vapic = g_virtual_apic_page[slot];
     if (apicv_on) {
         uint8_t *vp = g_virtual_apic_page[slot];
+        /* An INIT/SIPI reset rebuilds this VMCS -- and this page. Real hardware's INIT resets
+         * every APIC register EXCEPT the ID, and OVMF's MpInitLib depends on that: the ID is
+         * stamped once at create (hype_vmx_apicv_set_id), the SIPI rebuild zeroed it, the AP
+         * read ID 0 from the page and never checked in -- MpInitLib waited forever and boot
+         * produced not one byte of console. Preserve it across the wipe. */
+        uint32_t prior_id = *(volatile uint32_t *)(vp + 0x020u);
         unsigned int vi_;
         for (vi_ = 0; vi_ < 4096u; vi_++) vp[vi_] = 0;
+        *(volatile uint32_t *)(vp + 0x020u) = prior_id;
         *(volatile uint32_t *)(vp + 0x030u) = 0x00050014u; /* version: xAPIC, 6 LVTs */
         *(volatile uint32_t *)(vp + 0x0F0u) = 0x000000FFu; /* SVR: software-disabled */
         *(volatile uint32_t *)(vp + 0x0E0u) = 0xFFFFFFFFu; /* DFR: flat */
@@ -3308,6 +3315,16 @@ uint32_t hype_vmx_apicv_read32(hype_vcpu_ctx_t *ctx, uint32_t offset) {
 void hype_vmx_apicv_sync_timer(hype_vcpu_ctx_t *ctx, uint32_t current_count) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     if (real == 0 || !real->apicv) return;
+#if HYPE_ENABLE_APICV
+    { /* bring-up probe: prove the sync runs, against which page, with moving values */
+        static unsigned sync_probe;
+        if (sync_probe < 3u || (sync_probe % 100000u) == 0u) {
+            hype_debug_print("vmx apicv-sync #%u: page=%llx ccr=%u\n", sync_probe,
+                             (unsigned long long)(uintptr_t)real->vapic, current_count);
+        }
+        sync_probe++;
+    }
+#endif
     *(volatile uint32_t *)(real->vapic + 0x390u) = current_count;
 }
 

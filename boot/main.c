@@ -17385,6 +17385,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          */
         if (kind == HYPE_VMM_KIND_VMX && info.reason == HYPE_VMX_EXIT_REASON_APIC_WRITE) {
             uint32_t aw_off = (uint32_t)(info.qualification & 0xFFFu);
+#if HYPE_ENABLE_APICV
+            hype_debug_print("vmx apicv-wr: off=0x%x val=0x%x rip=0x%llx\n", aw_off,
+                             hype_vmx_apicv_read32(ctx, aw_off),
+                             (unsigned long long)info.guest_rip); /* bring-up probe */
+#endif
             (void)hype_guest_lapic_write(&g_fw_1_lapic, aw_off, 4u,
                                          hype_vmx_apicv_read32(ctx, aw_off));
             /* An initial-count write re-arms the model; the guest's very next TMCCT read is
@@ -17399,6 +17404,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         }
         if (kind == HYPE_VMM_KIND_VMX && info.reason == HYPE_VMX_EXIT_REASON_APIC_ACCESS) {
             const uint8_t *aa_insn = fw_1_insn_bytes_via_ptwalk(vm, ctx, info.guest_rip);
+#if HYPE_ENABLE_APICV
+            hype_debug_print("vmx apicv-acc: qual=0x%llx rip=0x%llx\n",
+                             (unsigned long long)info.qualification,
+                             (unsigned long long)info.guest_rip); /* bring-up probe */
+#endif
             if (hype_vmx_vcpu_handle_lapic_access(ctx, &g_fw_1_lapic, aa_insn) != 0) {
                 hype_debug_print("fw-1: vm%u APIC-access exit not emulated (qual=0x%llx "
                                  "rip=0x%llx) [#599]\n", (unsigned)(vm - g_vms),
