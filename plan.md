@@ -1131,7 +1131,10 @@ isn't lost.
 6. **Interrupt/IPI model for SMP guests — decided: hardware-accelerated
    APICv (Intel) / AVIC (AMD) from the start**, not a trap-and-emulate
    software model with hardware acceleration added later. Built in at M2
-   (§9) rather than as a subsequent optimization pass.
+   (§9) rather than as a subsequent optimization pass. *Reaffirmed
+   2026-08-21: the §14.3 gap analysis found the code diverged (AVIC opt-in
+   default-OFF, no Intel APICv at all); decision 58 sets the path back —
+   enabled by default on both vendors once each is bare-metal-validated.*
 7. **Host storage driver scope — decided: adapt an existing small,
    GPLv3-compatible-licensed AHCI/NVMe driver** rather than write one fully
    from scratch, scoped to native AHCI mode + NVMe-over-PCIe only (no
@@ -2959,6 +2962,24 @@ isn't lost.
     rejected: all sinks share ONE `hype_fs_t` (decision behind #338), so
     per-sink ownership still races the allocator and FAT cache.
 
+58. **APICv/AVIC enabled by default on both vendors -- decided (2026-08-21).**
+    Decision 6 requires hardware-accelerated interrupt delivery from the
+    start; §14.3 found the code diverged: AVIC is build-time opt-in default
+    OFF (#193), and Intel has no APICv path at all. The ruling: the opt-in
+    default-OFF state is INTERIM ONLY. Target state on both backends is
+    accelerated interrupt delivery ON BY DEFAULT wherever the capability MSRs
+    grant it, with trap-and-emulate as the capability-absent fallback --
+    never the preferred path on capable hardware.
+
+    The gate to flipping each vendor's default is one bare-metal validation
+    run on that vendor (#600 AMD, #605 Intel; #599 is the Intel
+    implementation): a working bare-metal guest must not regress on the next
+    run (#193's own rule). Enabling before that validation was rejected --
+    an interrupt-delivery regression on real hardware costs a full
+    cold-boot-and-photograph cycle to even see. Keeping opt-in indefinitely
+    was rejected -- it silently makes the trap path the de-facto product,
+    which decision 6 already ruled out.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what
@@ -3167,10 +3188,12 @@ start." M2-4 (#30) is closed against that decision, but only structures and
 the AMD opt-in exist; no accelerated path is active by default on either
 vendor, and Intel has none at all.
 
-Disposition: three tickets. **#599** wires VMX APICv (opt-in, the #193
-shape). **#600** validates AVIC on bare-metal AMD and discharges #193's
-default-OFF condition. **#601** (Low) models x2APIC guest mode. Decision 6
-stays as written; #599/#600 are the path back to it.
+Disposition: four tickets, governed by decision 58 (defaults ON once
+bare-metal-validated per vendor). **#599** wires VMX APICv. **#600**
+validates AVIC on bare-metal AMD and flips the AMD default ON. **#605**
+validates APICv on bare-metal Intel and flips the Intel default ON.
+**#601** (Low) models x2APIC guest mode. Decision 6 stays as written;
+decision 58 + these tickets are the path back to it.
 
 ### 14.4 NPT/EPT corner cases
 
