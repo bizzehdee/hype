@@ -14,6 +14,7 @@
 #include "../../../devices/fw_cfg.h"
 #include "../../../devices/pci.h"
 #include "../../../devices/cmos.h"
+#include "../../../devices/hpet.h" /* #577: the VMX HPET window handler */
 #include "../../../devices/guest_lapic.h"
 #include "../../../devices/guest_uart.h"
 #include "../../../devices/ioapic.h"
@@ -219,6 +220,25 @@ void hype_vmx_vcpu_set_topology(hype_vcpu_ctx_t *ctx, uint32_t apic_id, uint32_t
 
 /* #456: the VMX mirror of hype_svm_vcpu_take_injected_vector. */
 int hype_vmx_vcpu_take_injected_vector(hype_vcpu_ctx_t *ctx, uint8_t *out_vector);
+
+/* #577: guest HPET MMIO -- the VMX twin of hype_svm_vcpu_handle_hpet_npf. */
+int hype_vmx_vcpu_handle_hpet_npf(hype_vcpu_ctx_t *ctx, hype_hpet_t *hpet,
+                                  uint64_t hpet_base_phys, const uint8_t *guest_insn_bytes);
+
+/*
+ * #599: APICv (decision 58). Compile-gated: -DHYPE_ENABLE_APICV=1 requests the
+ * accelerated path; the capability MSRs then decide per machine, all-or-nothing
+ * (see vmcs_hw.c). Default OFF until #605's bare-metal Intel validation flips it.
+ */
+#ifndef HYPE_ENABLE_APICV
+#define HYPE_ENABLE_APICV 0
+#endif
+int hype_vmx_apicv_supported(void);
+uint64_t hype_vmx_apic_access_page_phys(void);
+int hype_vmx_apicv_active(hype_vcpu_ctx_t *ctx);
+void hype_vmx_apicv_set_id(hype_vcpu_ctx_t *ctx, uint32_t apic_id);
+uint32_t hype_vmx_apicv_read32(hype_vcpu_ctx_t *ctx, uint32_t offset);
+void hype_vmx_apicv_note_delivered(hype_vcpu_ctx_t *ctx, uint8_t vector);
 void hype_vmx_vcpu_wake_hlt(hype_vcpu_ctx_t *ctx);
 void hype_vmx_vcpu_get_intr_state(hype_vcpu_ctx_t *ctx, hype_vmm_intr_state_t *out);
 int hype_vmx_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx);

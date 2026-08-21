@@ -154,6 +154,13 @@
  * they don't require EPT to be enabled. */
 #define HYPE_VMX_PROCBASED2_APIC_REGISTER_VIRT (1u << 8)
 #define HYPE_VMX_PROCBASED2_VIRTUAL_INTERRUPT_DELIVERY (1u << 9)
+/* #599: "virtualize APIC accesses" (bit 0) IS now used, by the APICv path: guest
+ * physical accesses to the page EPT-mapped onto the APIC-access page are either
+ * satisfied from the virtual-APIC page (most register reads, when
+ * APIC_REGISTER_VIRT is set), turned into trap-like APIC-write VM exits (reason
+ * 56), or reported as APIC-access VM exits (reason 44) for the offsets the CPU
+ * will not virtualize -- the timer's current count (390H) among them. */
+#define HYPE_VMX_PROCBASED2_VIRTUALIZE_APIC_ACCESSES (1u << 0)
 
 /* VM-entry control bits used here. IA32E_MODE_GUEST is deliberately
  * NOT set -- this project's minimal test guest starts in unpaged
@@ -309,6 +316,11 @@
 
 /* 64-bit fields (Table B-4/B-6). */
 #define HYPE_VMCS_VIRTUAL_APIC_PAGE_ADDR 0x2012u /* full; +1 = high (M2-4) */
+#define HYPE_VMCS_APIC_ACCESS_ADDR 0x2014u       /* #599: the APIC-access page */
+#define HYPE_VMCS_EOI_EXIT_BITMAP0 0x201Cu       /* #599: vectors whose EOI exits */
+#define HYPE_VMCS_EOI_EXIT_BITMAP1 0x201Eu
+#define HYPE_VMCS_EOI_EXIT_BITMAP2 0x2020u
+#define HYPE_VMCS_EOI_EXIT_BITMAP3 0x2022u
 #define HYPE_VMCS_EPT_POINTER 0x201Au /* full; +1 = high (M3-1) */
 #define HYPE_VMCS_VMCS_LINK_POINTER 0x2800u /* full; +1 = high */
 #define HYPE_VMCS_GUEST_IA32_EFER 0x2806u    /* 64-bit guest-state field */
@@ -407,6 +419,16 @@
 #define HYPE_VMX_EXIT_REASON_HLT 12u
 #define HYPE_VMX_EXIT_REASON_VMCALL 18u
 #define HYPE_VMX_EXIT_REASON_WBINVD 54u
+/* #599 APICv exit reasons. APIC_ACCESS covers the offsets the CPU refuses to
+ * virtualize (the live timer count chief among them) plus any non-register-
+ * shaped access; VIRTUALIZED_EOI delivers the EOI'd vector (exit qualification
+ * bits 7:0) for hype's IO-APIC level bookkeeping; APIC_WRITE is trap-like --
+ * the value is already stored in the virtual-APIC page at the qualification
+ * offset, and RIP has already advanced. */
+#define HYPE_VMX_EXIT_REASON_APIC_ACCESS 44u
+#define HYPE_VMX_EXIT_REASON_VIRTUALIZED_EOI 45u
+#define HYPE_VMX_EXIT_REASON_APIC_WRITE 56u
+#define HYPE_VMCS_GUEST_INTERRUPT_STATUS 0x0810u /* 16-bit: RVI (7:0) | SVI (15:8) */
 
 /* Retires an intercepted guest WBINVD without flushing any real cache, and counts it. */
 void hype_vmx_vcpu_handle_wbinvd(void);

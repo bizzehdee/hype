@@ -73,6 +73,42 @@ static unsigned g_vmx_pool_n;
  * VMCS as VIRTUAL_APIC_PAGE_ADDR, so two guests would share one TPR the moment the
  * capability negotiation granted USE_TPR_SHADOW. Same shape as #276's MSR areas. */
 static uint8_t (*g_virtual_apic_page)[4096];
+/*
+ * #599: ONE APIC-access page for every vCPU. It is a token: the CPU compares
+ * the translated host-physical address against APIC_ACCESS_ADDR to decide that
+ * an access "is to the APIC", then redirects to the per-vCPU virtual-APIC page
+ * -- nothing is ever read from or written to this page itself, so sharing it
+ * is architecturally fine and saves a page per vCPU.
+ */
+static uint8_t g_apic_access_page[4096] __attribute__((aligned(4096)));
+
+uint64_t hype_vmx_apic_access_page_phys(void) {
+    return (uint64_t)(uintptr_t)g_apic_access_page;
+}
+
+/*
+ * #599: can this machine run APICv at all? Pure capability read, no VMCS
+ * needed -- boot/main.c uses it to decide whether to split the LAPIC page out
+ * of the EPT hole BEFORE any vCPU exists (mapping the page without the
+ * controls would hand the guest a dead zero page instead of exits).
+ */
+int hype_vmx_apicv_supported(void) {
+#if HYPE_ENABLE_APICV
+    uint64_t basic = rdmsr(HYPE_MSR_IA32_VMX_BASIC);
+    int have_true_ctls = (basic & (1ull << 55)) != 0u;
+    uint64_t proc_cap = rdmsr(have_true_ctls ? HYPE_MSR_IA32_VMX_TRUE_PROCBASED_CTLS
+                                             : HYPE_MSR_IA32_VMX_PROCBASED_CTLS);
+    uint64_t proc2_cap = rdmsr(HYPE_MSR_IA32_VMX_PROCBASED_CTLS2);
+    uint32_t need2 = HYPE_VMX_PROCBASED2_VIRTUALIZE_APIC_ACCESSES |
+                     HYPE_VMX_PROCBASED2_APIC_REGISTER_VIRT |
+                     HYPE_VMX_PROCBASED2_VIRTUAL_INTERRUPT_DELIVERY;
+    if (((proc_cap >> 32) & HYPE_VMX_PROCBASED_USE_TPR_SHADOW) == 0u) return 0;
+    if (((proc2_cap >> 32) & need2) != need2) return 0;
+    return 1;
+#else
+    return 0;
+#endif
+}
 
 /* #248: did the CPU actually grant acknowledge-interrupt-on-exit? Set from the
  * ADJUSTED exit controls in hype_vmx_vcpu_create(), never from what was
@@ -305,6 +341,18 @@ struct hype_vcpu_ctx {
      * current so vmread is unavailable.
      */
     uint16_t vpid;
+    /*
+     * #599: APICv. `apicv` is 1 only when the capability MSRs granted ALL of
+     * USE_TPR_SHADOW + VIRTUALIZE_APIC_ACCESSES + APIC_REGISTER_VIRT +
+     * VIRTUAL_INTERRUPT_DELIVERY for this vCPU's VMCS -- a partial grant falls
+     * back to the trap-and-emulate path entirely, because half an APICv (say,
+     * register virtualization without virtual delivery) splits the interrupt
+     * state between hardware and software with no owner. `vapic` is this
+     * vCPU's virtual-APIC page, the hardware-owned register file while apicv
+     * is on (vIRR at 200H..270H, RVI/SVI in GUEST_INTERRUPT_STATUS).
+     */
+    int apicv;
+    uint8_t *vapic;
     /*
      * Pending external interrupts (INT-1/INT-2 on VMX), staged into
      * VM_ENTRY_INTR_INFO once the guest can accept one.
@@ -830,21 +878,50 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
      * virtual-APIC/posted-interrupt setup to pass VM-entry control checks,
      * and none of the M2-M4-5 test guests exercise APICv -- keeping the
      * control set minimal removes VM-entry failure surface. */
+    /* #599: decided by capability, not by hope -- hype_vmx_apicv_supported()
+     * checks the same MSRs adjust_controls() negotiates against, and the
+     * grant is verified again below by reading back the adjusted sets. */
+    int want_apicv = hype_vmx_apicv_supported();
     uint32_t proc_ctls = hype_vmx_adjust_controls(HYPE_VMX_PROCBASED_ACTIVATE_SECONDARY_CONTROLS |
                                                       HYPE_VMX_PROCBASED_HLT_EXITING |
-                                                      HYPE_VMX_PROCBASED_UNCOND_IO_EXITING,
+                                                      HYPE_VMX_PROCBASED_UNCOND_IO_EXITING |
+                                                      (want_apicv ? HYPE_VMX_PROCBASED_USE_TPR_SHADOW
+                                                                  : 0u),
                                                   proc_cap);
     /* Unrestricted guest (lets the guest run with CR0.PE=0 / CR0.PG=0, i.e.
      * real mode) architecturally REQUIRES EPT -- so both bits go together. */
     /* #273: request VPID only when this CPU can also invalidate it, and only for
      * a non-zero VPID -- ENABLE_VPID with VPID 0000H fails VM entry outright. */
     int want_vpid = (vpid != 0u) && hype_vmx_vpid_usable(rdmsr(HYPE_MSR_IA32_VMX_EPT_VPID_CAP));
+    uint32_t apicv_bits2 = HYPE_VMX_PROCBASED2_VIRTUALIZE_APIC_ACCESSES |
+                           HYPE_VMX_PROCBASED2_APIC_REGISTER_VIRT |
+                           HYPE_VMX_PROCBASED2_VIRTUAL_INTERRUPT_DELIVERY;
     uint32_t proc2_ctls = hype_vmx_adjust_controls(
         HYPE_VMX_PROCBASED2_ENABLE_EPT | HYPE_VMX_PROCBASED2_UNRESTRICTED_GUEST |
             HYPE_VMX_PROCBASED2_ENABLE_INVPCID | HYPE_VMX_PROCBASED2_ENABLE_RDTSCP |
             HYPE_VMX_PROCBASED2_WBINVD_EXITING |
-            (want_vpid ? HYPE_VMX_PROCBASED2_ENABLE_VPID : 0u),
+            (want_vpid ? HYPE_VMX_PROCBASED2_ENABLE_VPID : 0u) |
+            (want_apicv ? apicv_bits2 : 0u),
         proc2_cap);
+    /* #599: all-or-nothing, read back from the GRANTED sets (the adjust may
+     * legally strip bits): half an APICv leaves interrupt state with no owner.
+     * On a partial grant, strip the surviving APICv bits and run trap-and-
+     * emulate exactly as a non-APICv build would. */
+    int apicv_on = want_apicv && (proc_ctls & HYPE_VMX_PROCBASED_USE_TPR_SHADOW) != 0u &&
+                   (proc2_ctls & apicv_bits2) == apicv_bits2;
+    if (!apicv_on) {
+        proc_ctls &= ~HYPE_VMX_PROCBASED_USE_TPR_SHADOW;
+        proc2_ctls &= ~apicv_bits2;
+        /* Re-adjust: clearing a bit can never violate the allowed-1 mask, but
+         * the allowed-0 mask may FORCE one of these on some parts; refuse the
+         * inconsistent middle state loudly rather than launch with it. */
+        if ((hype_vmx_adjust_controls(proc_ctls, proc_cap) != proc_ctls) ||
+            (hype_vmx_adjust_controls(proc2_ctls, proc2_cap) != proc2_ctls)) {
+            hype_debug_print("vmx: APICv bits are FORCED-ON by this CPU but the full set was "
+                             "not granted -- refusing to launch this vCPU [#599]\n");
+            return -1;
+        }
+    }
     /* Read back what adjust_controls() actually granted rather than what was
      * asked for: if the capability MSR forbids VPID the bit is gone, and writing
      * a VPID (or issuing INVVPID) on that basis would be reasoning from a
@@ -946,6 +1023,42 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
      * TPR_THRESHOLD). 0 threshold = no TPR-masking VM-exits. */
     rc |= vmwrite(HYPE_VMCS_VIRTUAL_APIC_PAGE_ADDR, (uint64_t)(uintptr_t)g_virtual_apic_page[slot]);
     rc |= vmwrite(HYPE_VMCS_TPR_THRESHOLD, 0);
+    /* #599 APICv: the access page (a shared token -- see its comment), an
+     * ALL-ONES EOI-exit bitmap (every EOI takes the reason-45 exit, so hype's
+     * IO-APIC level bookkeeping and delivery accounting run exactly as on the
+     * trap path -- refine to level-only vectors once measured), RVI/SVI zero,
+     * and a register file the guest can READ: with APIC_REGISTER_VIRT most
+     * register reads are served from this page, so it must carry the same
+     * reset values the trap-path model reports -- LVTs masked, SVR software-
+     * disabled, DFR flat all-ones -- or the guest reads zeros where the model
+     * would have said "masked". The APIC ID is stamped later, by
+     * hype_vmx_apicv_set_id(), once the caller knows which vCPU this is. */
+    g_vmx_ctx_pool[slot].apicv = apicv_on;
+    g_vmx_ctx_pool[slot].vapic = g_virtual_apic_page[slot];
+    if (apicv_on) {
+        uint8_t *vp = g_virtual_apic_page[slot];
+        unsigned int vi_;
+        for (vi_ = 0; vi_ < 4096u; vi_++) vp[vi_] = 0;
+        *(volatile uint32_t *)(vp + 0x030u) = 0x00050014u; /* version: xAPIC, 6 LVTs */
+        *(volatile uint32_t *)(vp + 0x0F0u) = 0x000000FFu; /* SVR: software-disabled */
+        *(volatile uint32_t *)(vp + 0x0E0u) = 0xFFFFFFFFu; /* DFR: flat */
+        *(volatile uint32_t *)(vp + 0x320u) = 0x00010000u; /* LVT timer: masked */
+        *(volatile uint32_t *)(vp + 0x330u) = 0x00010000u; /* LVT thermal */
+        *(volatile uint32_t *)(vp + 0x340u) = 0x00010000u; /* LVT perf */
+        *(volatile uint32_t *)(vp + 0x350u) = 0x00010000u; /* LVT LINT0 */
+        *(volatile uint32_t *)(vp + 0x360u) = 0x00010000u; /* LVT LINT1 */
+        *(volatile uint32_t *)(vp + 0x370u) = 0x00010000u; /* LVT error */
+        rc |= vmwrite(HYPE_VMCS_APIC_ACCESS_ADDR, (uint64_t)(uintptr_t)g_apic_access_page);
+        rc |= vmwrite(HYPE_VMCS_EOI_EXIT_BITMAP0, ~0ull);
+        rc |= vmwrite(HYPE_VMCS_EOI_EXIT_BITMAP1, ~0ull);
+        rc |= vmwrite(HYPE_VMCS_EOI_EXIT_BITMAP2, ~0ull);
+        rc |= vmwrite(HYPE_VMCS_EOI_EXIT_BITMAP3, ~0ull);
+        rc |= vmwrite(HYPE_VMCS_GUEST_INTERRUPT_STATUS, 0);
+    }
+    hype_debug_print("vmx: apicv=%s (slot %u)%s [#599]\n", apicv_on ? "ON" : "off",
+                     (unsigned)slot,
+                     apicv_on ? " -- register reads/EOI/delivery through the virtual-APIC page"
+                              : "");
 
     /* Guest segments. Long mode: flat 64-bit -- base 0, 4GB limit, CS is a
      * long-mode code segment (AR 0xA09B: type=exec/read/accessed, S, P, L,
@@ -3148,6 +3261,39 @@ static void vmx_note_injected(struct hype_vcpu_ctx *real, uint8_t vector) {
     real->inj_notify[vector >> 5] |= (uint32_t)1u << (vector & 31u);
 }
 
+/* #599: is APICv live on this vCPU? Callers branch dispatch (reasons 44/45/56)
+ * and skip software-window bookkeeping on it. Cheap field read; no VMCS. */
+int hype_vmx_apicv_active(hype_vcpu_ctx_t *ctx) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    return real != 0 && real->apicv;
+}
+
+/* #599: stamp the guest-visible APIC ID into the virtual-APIC page. With
+ * APIC_REGISTER_VIRT the guest reads ID from the page, so the trap-path
+ * model's value must be mirrored here once the caller assigns it. */
+void hype_vmx_apicv_set_id(hype_vcpu_ctx_t *ctx, uint32_t apic_id) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    if (real == 0 || !real->apicv) return;
+    *(volatile uint32_t *)(real->vapic + 0x020u) = apic_id << 24;
+}
+
+/* #599: one 32-bit register image from the virtual-APIC page -- the APIC-write
+ * exit (reason 56) is trap-like, the value is already stored there. */
+uint32_t hype_vmx_apicv_read32(hype_vcpu_ctx_t *ctx, uint32_t offset) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    if (real == 0 || real->vapic == 0 || offset > 4092u) return 0;
+    return *(volatile uint32_t *)(real->vapic + offset);
+}
+
+/* #599: the reason-45 (virtualized EOI) exit names the completed vector; run
+ * the same delivered-vector notification the event-injection path records at
+ * injection time (#456), so the trap path's consumers keep working. */
+void hype_vmx_apicv_note_delivered(hype_vcpu_ctx_t *ctx, uint8_t vector) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    if (real == 0) return;
+    vmx_note_injected(real, vector);
+}
+
 int hype_vmx_vcpu_take_injected_vector(hype_vcpu_ctx_t *ctx, uint8_t *out_vector) {
     vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
@@ -3173,6 +3319,28 @@ int hype_vmx_vcpu_take_injected_vector(hype_vcpu_ctx_t *ctx, uint8_t *out_vector
 void hype_vmx_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector) {
     vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    /*
+     * #599 APICv: post into the virtual-APIC page's vIRR and raise RVI; the
+     * CPU evaluates deliverability (IF, PPR, interrupt shadow) and delivers
+     * through the guest IDT itself -- no software IRR, no event injection, no
+     * interrupt-window exit. The EOI-exit bitmap is all-ones, so completion
+     * accounting happens on the reason-45 exit instead of at injection.
+     * External-interrupt EVENT injection is never mixed with this path: the
+     * two would race hardware's own RVI/SVI state.
+     */
+    if (real->apicv) {
+        volatile uint32_t *virr =
+            (volatile uint32_t *)(real->vapic + 0x200u + (uint32_t)(vector >> 5) * 0x10u);
+        int ok = 0;
+        uint64_t gis;
+        *virr |= (uint32_t)1u << (vector & 31u);
+        gis = vmread(HYPE_VMCS_GUEST_INTERRUPT_STATUS, &ok);
+        if ((uint32_t)(gis & 0xFFu) < vector) {
+            vmwrite(HYPE_VMCS_GUEST_INTERRUPT_STATUS, (gis & ~0xFFull) | vector);
+        }
+        real->int_eventinj++;
+        return;
+    }
     int staged = vmx_entry_event_staged();
     int ready = vmx_can_accept_interrupt();
     /* Sampled BEFORE the IRR set, or "already pending" is always true of the bit
@@ -3808,8 +3976,60 @@ int hype_vmx_vcpu_handle_lapic_npf(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lap
     return 0;
 }
 
+/*
+ * #577: guest HPET MMIO on the VMX backend. The SVM twin has existed since
+ * #436; this side was NEVER WRITTEN, so a VMX guest's HPET reads fell through
+ * to the absorb path and returned all-ones -- FreeBSD read the capability
+ * register as "32 timers" in a 1 KiB window, refused the device
+ * ("hpet0: memory region width 1024 too small for 32 timers"), lost the HPET
+ * timecounter, and its LAPIC-eventtimer calibration then had no stable
+ * reference: "Statistical lapic calibration failed", a garbage rate from the
+ * slow fallback, every one-shot deadline computed wrong, and the idle loop
+ * spun re-arming at lapic_et_start forever (hlt=0, cpu=99%, boot never
+ * reaches mountroot). Same decode/RMW discipline as the SVM handler: 4- and
+ * 8-byte accesses, ALU forms through the shared helpers.
+ */
+int hype_vmx_vcpu_handle_hpet_npf(hype_vcpu_ctx_t *ctx, hype_hpet_t *hpet,
+                                  uint64_t hpet_base_phys, const uint8_t *guest_insn_bytes) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    struct vmx_mmio_access m;
+
+    if (vmx_mmio_begin_insn(real, hpet_base_phys, HYPE_HPET_MMIO_SIZE, guest_insn_bytes, &m) !=
+        0) {
+        return -1;
+    }
+    if (m.decoded.size_bytes != 4u && m.decoded.size_bytes != 8u) {
+        return -1;
+    }
+    if (m.decoded.is_write) {
+        uint64_t value;
+        if (m.decoded.mem_is_dst) {
+            uint64_t cur = hype_hpet_read(hpet, m.offset, m.decoded.size_bytes);
+            value = hype_mmio_rmw_value(&m.decoded, m.reg != 0 ? *m.reg : 0u, (uint32_t)cur,
+                                        &m.rflags);
+        } else {
+            value = m.decoded.has_imm ? m.decoded.imm_value : (m.reg != 0 ? *m.reg : 0u);
+        }
+        hype_hpet_write(hpet, m.offset, m.decoded.size_bytes, value);
+    } else {
+        uint64_t value = hype_hpet_read(hpet, m.offset, m.decoded.size_bytes);
+        if (m.reg == 0) {
+            return -1;
+        }
+        if (m.decoded.size_bytes == 8u) {
+            *m.reg = value;
+        } else {
+            hype_mmio_complete_read(&m.decoded, m.reg, (uint32_t)value, &m.rflags);
+        }
+    }
+    vmx_mmio_end(&m);
+    return 0;
+}
+
 /* Guest I/O APIC MMIO. IOREGSEL/IOWIN are 32-bit only. */
 #include "../../../devices/tpm_crb.h"
+#include "../../../devices/hpet.h" /* #577: the VMX HPET window handler above */
 
 /* #433: the TPM 2.0 CRB window on the VMX backend -- ioapic's shape, variable size (1/2/4). */
 

@@ -25,6 +25,7 @@ typedef uint64_t hype_ept_pte_t;
 /* EPT memory type field (bits 5:3), leaf entries only -- 6 = Write-Back,
  * the correct type for ordinary identity-mapped guest RAM. */
 #define HYPE_EPT_MEMTYPE_WB (6ULL << 3)
+#define HYPE_EPT_MEMTYPE_UC (0ULL << 3) /* #599: the APIC-access page maps UC */
 
 #define HYPE_EPT_ENTRIES_PER_TABLE 512
 
@@ -75,6 +76,8 @@ void hype_ept_map_range_ro(hype_ept_pte_t pd_tables[][HYPE_EPT_ENTRIES_PER_TABLE
                            uint64_t guest_phys_base, uint64_t host_phys_base, uint64_t size);
 void hype_ept_mark_not_present(hype_ept_pte_t pd_tables[][HYPE_EPT_ENTRIES_PER_TABLE],
                                uint64_t phys_addr);
+void hype_ept_split_map_4k(hype_ept_pte_t pd_tables[][HYPE_EPT_ENTRIES_PER_TABLE],
+                           hype_ept_pte_t *pt, uint64_t gpa_page, uint64_t hpa_page);
 void hype_ept_mark_range_not_present(hype_ept_pte_t pd_tables[][HYPE_EPT_ENTRIES_PER_TABLE],
                                      uint64_t base, uint64_t size);
 

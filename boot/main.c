@@ -10800,8 +10800,14 @@ static hype_fw_dev_t fw_1_shared_mmio_npf(hype_fw_vm_t *vm, hype_vmm_kind_t kind
     if (vmm_handle_pci_ecam_npf_insn(kind, ctx, &vm->pci, HYPE_FW_1_ECAM_GPA, insn) == 0) {
         return HYPE_FW_DEV_ECAM;
     }
-    if (kind == HYPE_VMM_KIND_SVM &&
-        hype_svm_vcpu_handle_hpet_npf(ctx, &vm->hpet, HYPE_HPET_MMIO_BASE, insn) == 0) {
+    /* #577: BOTH backends. This was SVM-gated because the VMX handler did not exist, so a VMX
+     * guest's HPET reads absorbed to all-ones: FreeBSD read "32 timers" in the 1 KiB window,
+     * rejected the device, lost the HPET timecounter, mis-calibrated its LAPIC eventtimer
+     * against the resulting noise, and spun in lapic_et_start forever (hlt=0, 99% cpu, boot
+     * never reached mountroot) -- while the same image on SVM booted to the installer. */
+    if ((kind == HYPE_VMM_KIND_SVM
+             ? hype_svm_vcpu_handle_hpet_npf(ctx, &vm->hpet, HYPE_HPET_MMIO_BASE, insn)
+             : hype_vmx_vcpu_handle_hpet_npf(ctx, &vm->hpet, HYPE_HPET_MMIO_BASE, insn)) == 0) {
         return HYPE_FW_DEV_HPET;
     }
     if (vmm_handle_ioapic_npf(kind, ctx, &vm->ioapic, HYPE_FW_1_IOAPIC_GPA, insn) == 0) {
@@ -14315,6 +14321,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * faulted; the backing-page-driven fast path is refined on AVIC hardware. Bounded log
              * so an AVIC bring-up run is legible without flooding a working boot.
              */
+            /* A bounded bring-up log budget shared by every VM keeps an AVIC session legible;
+             * the worst a race costs is a couple of extra lines: one-per-host intended (#563). */
             static unsigned avic_exit_logged;
             if (avic_exit_logged < 8u) {
                 avic_exit_logged++;

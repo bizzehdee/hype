@@ -99,3 +99,31 @@ void hype_ept_mark_range_not_present(hype_ept_pte_t pd_tables[][HYPE_EPT_ENTRIES
         hype_ept_mark_not_present(pd_tables, base + offset);
     }
 }
+
+/*
+ * #599 (APICv): the one 4 KiB mapping in an otherwise 2 MiB-leaf tree.
+ *
+ * "Virtualize APIC accesses" fires on a guest-physical access whose EPT
+ * translation lands on the APIC-access page, so GPA 0xFEE00000 must be PRESENT
+ * and must translate to exactly that host page -- a not-present hole (the
+ * pre-APICv arrangement) gives plain EPT violations instead, and a 2 MiB leaf
+ * cannot single out one 4 KiB frame. This splits the 2 MiB region containing
+ * `gpa_page` through a caller-provided, zeroed page table: one present 4 KiB
+ * entry for the APIC page (UC -- it is MMIO-shaped), all 511 siblings left
+ * not-present so they keep faulting to the device models exactly as the hole
+ * did. Callers pass a table whose storage lives as long as the VM.
+ */
+void hype_ept_split_map_4k(hype_ept_pte_t pd_tables[][HYPE_EPT_ENTRIES_PER_TABLE],
+                           hype_ept_pte_t *pt, uint64_t gpa_page, uint64_t hpa_page) {
+    uint64_t table_flags = HYPE_EPT_READ | HYPE_EPT_WRITE | HYPE_EPT_EXEC;
+    unsigned int gb = (unsigned int)(gpa_page / HYPE_PAGING_1GB);
+    unsigned int pd_index = (unsigned int)((gpa_page % HYPE_PAGING_1GB) / HYPE_PAGING_2MB);
+    unsigned int pt_index = (unsigned int)((gpa_page % HYPE_PAGING_2MB) / 4096u);
+    unsigned int i;
+
+    for (i = 0; i < HYPE_EPT_ENTRIES_PER_TABLE; i++) {
+        pt[i] = 0;
+    }
+    pt[pt_index] = hype_ept_encode_entry(hpa_page, table_flags | HYPE_EPT_MEMTYPE_UC);
+    pd_tables[gb][pd_index] = hype_ept_encode_entry((uint64_t)(uintptr_t)pt, table_flags);
+}
