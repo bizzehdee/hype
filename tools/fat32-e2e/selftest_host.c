@@ -16,6 +16,13 @@
 #define SECSZ 512u
 static FILE *g_img;
 
+static void logcb(void *ctx, const hype_fat32_selftest_event_t *ev) {
+    (void)ctx;
+    printf("  [%u] %s seed=0x%x len=%u mode=%s first_cluster=%u -> %s\n", ev->idx, ev->path,
+           ev->seed, ev->len, hype_fat32_selftest_mode_name(ev->mode), ev->first_cluster,
+           ev->refused ? "REFUSED" : (ev->selfcheck_ok ? "OK" : "SELFCHECK-FAIL"));
+}
+
 static int img_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
     (void)ctx;
     if (fseek(g_img, (long)(lba * SECSZ), SEEK_SET) != 0) return -1;
@@ -54,7 +61,7 @@ int main(int argc, char **argv) {
     memset(&now, 0, sizeof now);
     now.year = 2026; now.month = 8; now.day = 21; now.hour = 12;
 
-    rc = hype_fat32_selftest_run(&fs, &now, &res);
+    rc = hype_fat32_selftest_run(&fs, &now, &res, logcb, 0);
     printf("selftest: written=%u refused=%u selfcheck_fail=%u%s%s\n", res.files_written,
            res.files_refused, res.selfcheck_fail, res.first_fail[0] ? " first=" : "", res.first_fail);
     fflush(g_img);

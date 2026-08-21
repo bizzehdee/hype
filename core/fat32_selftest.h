@@ -121,6 +121,36 @@ typedef struct {
 } hype_fat32_selftest_result_t;
 
 /*
+ * Per-file boundary event. hype_fat32_selftest_run() emits one for EVERY file, in write order,
+ * BEFORE the aggregate verdict. Recording the boundary of each file -- its identity and its FIRST
+ * CLUSTER on the volume -- is what makes one failure distinguishable from another after the fact:
+ * when fsck.vfat later names a bad cluster or a bad file, or validate_stick names a byte offset,
+ * this log maps it straight back to the exact test (size class, write mode, seed) that produced
+ * it. Without it, a post-hoc fsck failure cannot be attributed to a specific test.
+ */
+typedef struct {
+    unsigned int idx;           /* battery index (write order) */
+    const char *path;           /* volume-relative path, e.g. F32TEST/L1.BIN */
+    unsigned int seed;          /* content seed */
+    unsigned int len;           /* intended byte length */
+    int mode;                   /* HYPE_FAT32_SELFTEST_APPEND_1 / _APPEND_N / _WRITEAT */
+    uint32_t first_cluster;     /* first data cluster the writer placed the file at (0 if empty/refused) */
+    int refused;                /* 1 if the writer refused this file (volume full / I/O) */
+    int selfcheck_ok;           /* 1 if hype read it back byte-exact, 0 otherwise */
+} hype_fat32_selftest_event_t;
+
+typedef void (*hype_fat32_selftest_log_fn)(void *ctx, const hype_fat32_selftest_event_t *ev);
+
+static inline const char *hype_fat32_selftest_mode_name(int mode) {
+    switch (mode) {
+        case HYPE_FAT32_SELFTEST_APPEND_1: return "append-1";
+        case HYPE_FAT32_SELFTEST_APPEND_N: return "append-N";
+        case HYPE_FAT32_SELFTEST_WRITEAT:  return "write_at";
+        default: return "?";
+    }
+}
+
+/*
  * Runs the battery against an already-mounted, writable FAT32 volume `fs`. Creates the F32TEST
  * directory, writes every battery file with deterministic content, and reads each back through
  * fs_ops to self-check byte-exact. Leaves every file in place for the host validator to judge
@@ -128,6 +158,7 @@ typedef struct {
  * `now` may be NULL (zero timestamps). Pure of hype globals -- takes the fs it is handed.
  */
 int hype_fat32_selftest_run(hype_fs_t *fs, const hype_rtc_time_t *now,
-                            hype_fat32_selftest_result_t *res);
+                            hype_fat32_selftest_result_t *res,
+                            hype_fat32_selftest_log_fn log, void *logctx);
 
 #endif /* HYPE_FAT32_SELFTEST_H */

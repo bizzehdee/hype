@@ -39,7 +39,8 @@ int main(int argc, char **argv) {
         files++;
         fp = fopen(full, "rb");
         if (!fp) {
-            printf("MISSING: %s at %s (%s)\n", it.path, full, strerror(errno));
+            printf("MISSING: %s [seed=0x%x len=%u mode=%s] at %s (%s)\n", it.path, it.seed, it.len,
+                   hype_fat32_selftest_mode_name(it.mode), full, strerror(errno));
             missing++;
             bad++;
             continue;
@@ -48,7 +49,8 @@ int main(int argc, char **argv) {
         sz = ftell(fp);
         fseek(fp, 0, SEEK_SET);
         if (sz != (long)it.len) {
-            printf("SIZE: %s got %ld expected %u\n", it.path, sz, it.len);
+            printf("SIZE: %s [seed=0x%x mode=%s] got %ld expected %u\n", it.path, it.seed,
+                   hype_fat32_selftest_mode_name(it.mode), sz, it.len);
             ok = 0;
         }
         while (off < it.len && ok) {
@@ -66,7 +68,8 @@ int main(int argc, char **argv) {
             }
             for (i = 0; i < n; i++) exp[i] = hype_fat32_selftest_byte(it.seed, off + i);
             if (memcmp(buf, exp, n) != 0) {
-                printf("CONTENT: %s mismatch at offset %u\n", it.path, off);
+                printf("CONTENT: %s [seed=0x%x len=%u mode=%s] mismatch at offset %u\n", it.path,
+                       it.seed, it.len, hype_fat32_selftest_mode_name(it.mode), off);
                 ok = 0;
                 break;
             }

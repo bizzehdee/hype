@@ -49,18 +49,21 @@ static int write_one(hype_fs_t *fs, const hype_fat32_selftest_item_t *it) {
 }
 
 /* Re-open the file and compare every byte to the deterministic content. Returns 0 if byte-exact,
- * -1 on any reopen/size/read/content failure. */
+ * -1 on any reopen/size/read/content failure. Writes the file's first cluster to *first_cluster
+ * (0 if it could not be opened) so the caller can log the on-volume boundary. */
 static int verify_one(hype_fs_t *fs, const hype_fat32_selftest_item_t *it,
-                      hype_fat32_selftest_result_t *res) {
+                      hype_fat32_selftest_result_t *res, uint32_t *first_cluster) {
     hype_fs_file_t f;
     uint8_t buf[CHUNK];
     uint8_t exp[CHUNK];
     uint64_t off = 0;
 
+    *first_cluster = 0u;
     if (hype_fs_lookup(fs, it->path, &f) != 0) {
         note_fail(res, "reopen ", it->path);
         return -1;
     }
+    *first_cluster = f.u.fat32.first_cluster; /* this is a FAT32 volume; the union arm is fat32 */
     if (f.size != (uint64_t)it->len) {
         note_fail(res, "size ", it->path);
         return -1;
@@ -86,7 +89,8 @@ static int verify_one(hype_fs_t *fs, const hype_fat32_selftest_item_t *it,
 }
 
 int hype_fat32_selftest_run(hype_fs_t *fs, const hype_rtc_time_t *now,
-                            hype_fat32_selftest_result_t *res) {
+                            hype_fat32_selftest_result_t *res,
+                            hype_fat32_selftest_log_fn log, void *logctx) {
     hype_fat32_selftest_item_t it;
     unsigned int idx;
     unsigned int i;
@@ -98,19 +102,34 @@ int hype_fat32_selftest_run(hype_fs_t *fs, const hype_rtc_time_t *now,
     }
     hype_fs_mkdir(fs, HYPE_FAT32_SELFTEST_DIR); /* ignore "exists": rerun-safe */
 
+    /* Write, verify, and log every file in one pass, in write order. Each file is logged with its
+     * on-volume first cluster and its own self-check result, so a later fsck.vfat or validate_stick
+     * failure is attributable to the exact test. Every failure is recorded (not just the first). */
     for (idx = 0; hype_fat32_selftest_item(idx, &it); idx++) {
-        if (write_one(fs, &it) == 0) {
-            res->files_written++;
-        } else {
+        hype_fat32_selftest_event_t ev;
+        int refused = (write_one(fs, &it) != 0);
+        uint32_t fc = 0u;
+        int ok = 0;
+
+        if (refused) {
             res->files_refused++;
             note_fail(res, "write ", it.path);
+        } else {
+            res->files_written++;
+            ok = (verify_one(fs, &it, res, &fc) == 0);
+            if (!ok) res->selfcheck_fail++;
         }
-    }
-    for (idx = 0; hype_fat32_selftest_item(idx, &it); idx++) {
-        if (verify_one(fs, &it, res) != 0) {
-            res->selfcheck_fail++;
-        }
+
+        ev.idx = idx;
+        ev.path = it.path;
+        ev.seed = it.seed;
+        ev.len = it.len;
+        ev.mode = it.mode;
+        ev.first_cluster = fc;
+        ev.refused = refused;
+        ev.selfcheck_ok = ok;
+        if (log) log(logctx, &ev);
     }
     hype_fs_sync(fs);
-    return res->selfcheck_fail ? -1 : 0;
+    return (res->selfcheck_fail || res->files_refused) ? -1 : 0;
 }

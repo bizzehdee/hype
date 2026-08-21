@@ -22518,6 +22518,16 @@ static void vm_log_name(unsigned int idx, const char *cfg_name, char *out, unsig
  * each open is independent, failures are reported by name and stage, and
  * \HYPEFULL.LOG keeps streaming regardless.
  */
+/* #597: log one boundary line per FAT32 self-test file, in write order, so a later fsck.vfat or
+ * validate_stick failure maps back to the exact test (its first cluster, size class, write mode). */
+static void fw_1_fat32_selftest_log(void *ctx, const hype_fat32_selftest_event_t *ev) {
+    (void)ctx;
+    hype_debug_print("FAT32-STICK: [%u] %s seed=0x%x len=%u mode=%s first_cluster=%u -> %s\n",
+                     ev->idx, ev->path, ev->seed, ev->len,
+                     hype_fat32_selftest_mode_name(ev->mode), ev->first_cluster,
+                     ev->refused ? "REFUSED" : (ev->selfcheck_ok ? "OK" : "SELFCHECK-FAIL"));
+}
+
 static void split_log_setup(void) {
     char name[16];
     unsigned int i;
@@ -25623,7 +25633,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             hype_debug_print("FAT32-STICK: marker \\%s found -- running the #597 write battery on "
                              "the boot volume\n", HYPE_FAT32_SELFTEST_MARKER);
             f32_rc = hype_fat32_selftest_run(&g_hype_log.fs,
-                                             g_host_time_valid ? &g_host_time : 0, &f32);
+                                             g_host_time_valid ? &g_host_time : 0, &f32,
+                                             fw_1_fat32_selftest_log, 0);
             hype_debug_print("FAT32-STICK SELFTEST: %s -- written=%u refused=%u selfcheck_fail=%u%s%s "
                              "[#597 #596]\n",
                              (f32_rc == 0 && f32.files_refused == 0) ? "PASS" : "FAIL",
