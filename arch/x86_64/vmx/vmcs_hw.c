@@ -3291,6 +3291,26 @@ uint32_t hype_vmx_apicv_read32(hype_vcpu_ctx_t *ctx, uint32_t offset) {
     return *(volatile uint32_t *)(real->vapic + offset);
 }
 
+/*
+ * #599: keep the virtual-APIC page's timer CURRENT COUNT (390H) live.
+ *
+ * The assumption that TMCCT reads always take an APIC-access exit does not
+ * hold everywhere: nested KVM's emulation of APIC-register virtualization
+ * serves 390H reads from the page like any other register, with NO exit --
+ * measured: OVMF's X86TimerLib polls TMCCT for every MicroSecondDelay, read a
+ * frozen 0, and spun the guest at one RIP with IF=0 forever (1.37M exits, all
+ * the host tick; zero NPFs; boot never produced a byte of console). So the
+ * model's live count is stored into the page at every exit -- the 1 ms host
+ * tick bounds the staleness even across exit-free guest spins -- and by the
+ * APIC-write handler right after an initial-count write, so the first read
+ * after arming never sees the pre-arm value.
+ */
+void hype_vmx_apicv_sync_timer(hype_vcpu_ctx_t *ctx, uint32_t current_count) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    if (real == 0 || !real->apicv) return;
+    *(volatile uint32_t *)(real->vapic + 0x390u) = current_count;
+}
+
 /* #599: the reason-45 (virtualized EOI) exit names the completed vector; run
  * the same delivered-vector notification the event-injection path records at
  * injection time (#456), so the trap path's consumers keep working. */

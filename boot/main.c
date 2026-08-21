@@ -11628,6 +11628,10 @@ wait_for_sipi:
                     hype_guest_lapic_advance(lapic, ap_lt);
                     g_ap_lapic_ticks[vm_idx][vi] += ap_lt;
                 }
+                /* #599: see the main loop's twin -- keep the page's TMCCT live. */
+                if (kind == HYPE_VMM_KIND_VMX) {
+                    hype_vmx_apicv_sync_timer(ctx, lapic->current_count);
+                }
             }
         }
         if (vmm_reason_is_cpuid(kind, info.reason)) {
@@ -11764,6 +11768,7 @@ wait_for_sipi:
             /* #599: trap-like -- see the run_fw_1_test twin for the reasoning. */
             uint32_t aw_off = (uint32_t)(info.qualification & 0xFFFu);
             (void)hype_guest_lapic_write(lapic, aw_off, 4u, hype_vmx_apicv_read32(ctx, aw_off));
+            hype_vmx_apicv_sync_timer(ctx, lapic->current_count); /* see main-loop twin */
         } else if (kind == HYPE_VMM_KIND_VMX &&
                    info.reason == HYPE_VMX_EXIT_REASON_VIRTUALIZED_EOI) {
             hype_vmx_apicv_note_delivered(ctx, (uint8_t)(info.qualification & 0xFFu));
@@ -16248,6 +16253,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     }
                     hype_guest_lapic_advance(&g_fw_1_lapic, lapic_ticks);
                 }
+                /* #599: mirror the model's live timer count into the virtual-APIC page --
+                 * register-virtualized TMCCT reads are served from the page with no exit. */
+                if (kind == HYPE_VMM_KIND_VMX) {
+                    hype_vmx_apicv_sync_timer(ctx, g_fw_1_lapic.current_count);
+                }
                 fw_1_hpet_step(vm, ctx, kind, delta);
                 /*
                  * #436: the RTC's periodic interrupt. hype modelled register B's
@@ -17377,6 +17387,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             uint32_t aw_off = (uint32_t)(info.qualification & 0xFFFu);
             (void)hype_guest_lapic_write(&g_fw_1_lapic, aw_off, 4u,
                                          hype_vmx_apicv_read32(ctx, aw_off));
+            /* An initial-count write re-arms the model; the guest's very next TMCCT read is
+             * served from the page without exiting, so refresh it before re-entry. */
+            hype_vmx_apicv_sync_timer(ctx, g_fw_1_lapic.current_count);
             continue;
         }
         if (kind == HYPE_VMM_KIND_VMX && info.reason == HYPE_VMX_EXIT_REASON_VIRTUALIZED_EOI) {
