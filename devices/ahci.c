@@ -18,6 +18,7 @@ void hype_ahci_reset(hype_ahci_t *ahci) {
     ahci->p_sig = HYPE_AHCI_SIG_ATAPI;
     ahci->p_ssts = 0x00000123u; /* IPM=1 (active), SPD=1 (Gen1), DET=3 (present, phy comm established) */
     ahci->p_tfd = 0x00000050u;  /* STATUS = DRDY|DSC, no ERR/BSY/DRQ */
+    ahci->p_cmd = HYPE_AHCI_PXCMD_HPCP; /* #489: advertise the port as hot-plug capable */
     /* #372: permissive by default -- see the field's comment in the header for why, and note that
      * the live path overrides it immediately with the guest's real PCI state. */
     ahci->bus_master = 1;
@@ -145,6 +146,8 @@ int hype_ahci_mmio_write(hype_ahci_t *ahci, uint32_t offset, uint8_t size_bytes,
             } else {
                 new_cmd &= ~(uint32_t)HYPE_AHCI_PCMD_FR;
             }
+            /* #489: HPCP is a read-only capability bit; a guest p_cmd write must not clear it. */
+            new_cmd |= HYPE_AHCI_PXCMD_HPCP;
             ahci->p_cmd = new_cmd;
             return 0;
         }
@@ -179,6 +182,36 @@ void hype_ahci_set_pis(hype_ahci_t *ahci, uint32_t bits) {
     if (!was && hype_ahci_irq_pending(ahci)) {
         ahci->irq_events++; /* #512 */
     }
+}
+
+/*
+ * #489 (TERM-13): AHCI hot-plug. A device insertion drives PxSSTS.DET to 3 (present, phy comm up),
+ * records the PhyRdy-change + Exchanged diagnostics in PxSERR, and raises the PhyRdy-change +
+ * connect-change interrupt bits in PxIS -- exactly the sequence a running libata reacts to by
+ * re-examining the port and enumerating the disk. Removal drives DET to 0 and raises the same
+ * change interrupt so the guest offlines the device. Both use hype_ahci_set_pis() so the MSI edge
+ * is counted (#512). The port must already advertise PxCMD.HPCP (set at reset) for the guest to
+ * treat these as hot-plug events.
+ */
+void hype_ahci_hotplug_attach(hype_ahci_t *ahci, uint32_t sig) {
+    if (ahci == 0) {
+        return;
+    }
+    ahci->p_sig = sig;
+    ahci->p_ssts = HYPE_AHCI_SSTS_PRESENT;
+    ahci->p_tfd = 0x00000050u; /* DRDY|DSC */
+    ahci->p_serr |= HYPE_AHCI_PXSERR_DIAG_N | HYPE_AHCI_PXSERR_DIAG_X;
+    hype_ahci_set_pis(ahci, HYPE_AHCI_PXIS_PRCS | HYPE_AHCI_PXIS_PCS);
+}
+
+void hype_ahci_hotplug_detach(hype_ahci_t *ahci) {
+    if (ahci == 0) {
+        return;
+    }
+    ahci->p_ssts = 0x00000000u; /* DET=0: no device detected */
+    ahci->p_sig = 0xFFFFFFFFu;
+    ahci->p_serr |= HYPE_AHCI_PXSERR_DIAG_N | HYPE_AHCI_PXSERR_DIAG_X;
+    hype_ahci_set_pis(ahci, HYPE_AHCI_PXIS_PRCS | HYPE_AHCI_PXIS_PCS);
 }
 
 void hype_ahci_decode_cmd_header(const uint8_t raw[32], hype_ahci_cmd_header_t *out) {

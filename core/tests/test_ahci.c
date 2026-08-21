@@ -23,7 +23,7 @@ static void test_reset_state(void) {
     CHECK_HEX("VS is 1.3.1", 0x00010301u, ahci.vs);
     CHECK_HEX("PxSIG is ATAPI", HYPE_AHCI_SIG_ATAPI, ahci.p_sig);
     CHECK_HEX("PxSSTS reports device present", 0x123u, ahci.p_ssts);
-    CHECK_HEX("PxCMD starts stopped", 0, ahci.p_cmd);
+    CHECK_HEX("PxCMD starts stopped (HPCP aside)", 0, ahci.p_cmd & ~(uint32_t)HYPE_AHCI_PXCMD_HPCP);
 }
 
 static void test_read_write_clb_fb(void) {
@@ -61,7 +61,7 @@ static void test_pcmd_start_mirrors_running_bits(void) {
 
     hype_ahci_mmio_write(&ahci, HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_CMD, 4, 0);
     hype_ahci_mmio_read(&ahci, HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_CMD, 4, &value);
-    CHECK_HEX("clearing ST/FRE clears CR/FR too", 0, value);
+    CHECK_HEX("clearing ST/FRE clears CR/FR too (HPCP aside)", 0, value & ~(uint32_t)HYPE_AHCI_PXCMD_HPCP);
 }
 
 static void test_ghc_hr_self_clears(void) {
@@ -658,6 +658,51 @@ static void test_global_is_reflects_the_port_level(void) {
     CHECK_HEX("and the line agrees", 0, hype_ahci_irq_pending(&ahci));
 }
 
+/* #489: AHCI hot-plug. */
+static void test_hotplug_capable_at_reset(void) {
+    hype_ahci_t a;
+    hype_ahci_reset(&a);
+    CHECK_HEX("port advertises HPCP at reset", HYPE_AHCI_PXCMD_HPCP,
+              a.p_cmd & HYPE_AHCI_PXCMD_HPCP);
+    /* A guest p_cmd write (ST|FRE) must not clear HPCP. */
+    (void)hype_ahci_mmio_write(&a, HYPE_AHCI_PORT_BASE + HYPE_AHCI_PREG_CMD, 4,
+                               HYPE_AHCI_PCMD_ST | HYPE_AHCI_PCMD_FRE);
+    CHECK_HEX("HPCP survives a p_cmd write", HYPE_AHCI_PXCMD_HPCP,
+              a.p_cmd & HYPE_AHCI_PXCMD_HPCP);
+}
+
+static void test_hotplug_attach_raises_connect_change(void) {
+    hype_ahci_t a;
+    unsigned long long edges_before;
+    hype_ahci_reset(&a);
+    /* Start from an empty port and enable interrupts so the attach raises an edge. */
+    a.p_ssts = 0;
+    a.ghc = HYPE_AHCI_GHC_IE;
+    a.p_ie = HYPE_AHCI_PXIS_PRCS | HYPE_AHCI_PXIS_PCS;
+    a.p_is = 0;
+    edges_before = a.irq_events;
+    hype_ahci_hotplug_attach(&a, HYPE_AHCI_SIG_ATA);
+    CHECK_HEX("DET=3 after attach", HYPE_AHCI_SSTS_PRESENT, a.p_ssts);
+    CHECK_HEX("signature set", HYPE_AHCI_SIG_ATA, a.p_sig);
+    CHECK_HEX("PhyRdy change in PxIS", HYPE_AHCI_PXIS_PRCS, a.p_is & HYPE_AHCI_PXIS_PRCS);
+    CHECK_HEX("connect change in PxIS", HYPE_AHCI_PXIS_PCS, a.p_is & HYPE_AHCI_PXIS_PCS);
+    CHECK_HEX("PhyRdy diag in PxSERR", HYPE_AHCI_PXSERR_DIAG_N, a.p_serr & HYPE_AHCI_PXSERR_DIAG_N);
+    CHECK_HEX("irq pending after attach", 1, hype_ahci_irq_pending(&a) != 0);
+    CHECK_HEX("one MSI edge counted", 1, (a.irq_events == edges_before + 1ull));
+}
+
+static void test_hotplug_detach_clears_det(void) {
+    hype_ahci_t a;
+    hype_ahci_reset(&a);
+    a.ghc = HYPE_AHCI_GHC_IE;
+    a.p_ie = HYPE_AHCI_PXIS_PRCS | HYPE_AHCI_PXIS_PCS;
+    a.p_is = 0;
+    hype_ahci_hotplug_detach(&a);
+    CHECK_HEX("DET=0 after detach", 0, a.p_ssts & 0xFu);
+    CHECK_HEX("change interrupt raised", HYPE_AHCI_PXIS_PRCS, a.p_is & HYPE_AHCI_PXIS_PRCS);
+    CHECK_HEX("irq pending after detach", 1, hype_ahci_irq_pending(&a) != 0);
+}
+
 int main(void) {
     test_reset_state();
     test_read_write_clb_fb();
@@ -689,6 +734,9 @@ int main(void) {
     test_pio_setup_fis_truncates_transfer_count_to_16_bits();
     test_signature_fis_is_a_d2h_fis();
     test_global_is_reflects_the_port_level();
+    test_hotplug_capable_at_reset();
+    test_hotplug_attach_raises_connect_change();
+    test_hotplug_detach_clears_det();
 
     if (failures == 0) {
         printf("all tests passed\n");

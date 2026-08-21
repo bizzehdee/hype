@@ -333,6 +333,20 @@ int hype_ahci_irq_pending(const hype_ahci_t *ahci);
  * be swallowed by the sampled-level race described at hype_ahci_t.irq_events. */
 void hype_ahci_set_pis(hype_ahci_t *ahci, uint32_t bits);
 
+/* #489 (TERM-13): AHCI hot-plug bits + primitives. HPCP marks a port hot-plug capable; the PxSERR
+ * diagnostics and PxIS change bits are what a device insert/removal raises. */
+#define HYPE_AHCI_PXCMD_HPCP 0x00040000u    /* PxCMD bit 18: Hot Plug Capable Port */
+#define HYPE_AHCI_PXSERR_DIAG_N 0x00010000u /* PxSERR DIAG.N: PhyRdy Change */
+#define HYPE_AHCI_PXSERR_DIAG_X 0x04000000u /* PxSERR DIAG.X: Exchanged (device present-change) */
+#define HYPE_AHCI_PXIS_PCS 0x00000040u      /* PxIS: Port Connect Change Status */
+#define HYPE_AHCI_PXIS_PRCS 0x00400000u     /* PxIS: PhyRdy Change Status */
+#define HYPE_AHCI_SSTS_PRESENT 0x00000123u  /* PxSSTS DET=3, IPM=1, SPD=1 */
+
+/* Raise a device-insertion (attach, with the disk's signature) or device-removal (detach) hot-plug
+ * event on the port, transitioning PxSSTS.DET and raising the change interrupt. */
+void hype_ahci_hotplug_attach(hype_ahci_t *ahci, uint32_t sig);
+void hype_ahci_hotplug_detach(hype_ahci_t *ahci);
+
 /*
  * Processes one issued AHCI command slot: walks the guest's Command List ->
  * Command Table -> PRDT, executes the SATA/ATAPI command against the device
