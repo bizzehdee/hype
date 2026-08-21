@@ -30,6 +30,7 @@ static hype_cmd_verb_t verb_of(const char *tok, unsigned len) {
     /* #529: `resolution`/`res` retired with the config key -- hype picks the mode nearest
      * 1920x1080 at boot, and SetMode is Boot Services so a runtime command could not work. */
     if (tok_eq(tok, len, "create")) return HYPE_CMD_CREATE; /* TERM-10 (#486) */
+    if (tok_eq(tok, len, "delete")) return HYPE_CMD_DELETE; /* TERM-15 (#491) */
     if (tok_eq(tok, len, "screenshot")) return HYPE_CMD_SCREENSHOT; /* #568 */
     if (tok_eq(tok, len, "config") || tok_eq(tok, len, "cfg")) return HYPE_CMD_CONFIG;
     if (tok_eq(tok, len, "host")) return HYPE_CMD_HOST; /* M9-2 (#175): host reboot|off */
@@ -98,6 +99,7 @@ static const char *const g_cmd_usage[] = {
     "focus <vm>",
     "confirm <serial>",
     "create",
+    "delete <vm>",
     "config <vm>",
     "host <reboot|off>",
     "set <vm> <key> <value>",

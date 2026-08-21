@@ -1406,6 +1406,141 @@ int hype_cfg_append_vm(hype_cfg_t *cfg, const hype_cfg_vm_t *vm) {
     return 0;
 }
 
+
+/* #491: freestanding build -- struct assignment of these large types lowers to memcpy, which
+ * does not exist here (the #freestanding-memcpy trap). Byte copy instead. */
+static void cfg_byte_copy(void *dst, const void *src, unsigned long long n) {
+    unsigned char *d = (unsigned char *)dst;
+    const unsigned char *s = (const unsigned char *)src;
+    unsigned long long i;
+    for (i = 0; i < n; i++) {
+        d[i] = s[i];
+    }
+}
+
+/* #491: does any OTHER non-deleted VM reference device `name` in list (disks/cdroms/nics)? */
+static int cfg_dev_referenced_elsewhere(const hype_cfg_t *cfg, unsigned int skip_vm,
+                                        const char *name, int is_nic) {
+    unsigned int vi, di;
+
+    for (vi = 0; vi < cfg->vm_count; vi++) {
+        const hype_cfg_vm_t *vm = &cfg->vms[vi];
+        if (vi == skip_vm || vm->deleted) {
+            continue;
+        }
+        if (is_nic) {
+            for (di = 0; di < vm->nics_count; di++) {
+                if (hype_streq(vm->nics[di], name)) {
+                    return 1;
+                }
+            }
+        } else {
+            for (di = 0; di < vm->disks_count; di++) {
+                if (hype_streq(vm->disks[di], name)) {
+                    return 1;
+                }
+            }
+            for (di = 0; di < vm->cdroms_count; di++) {
+                if (hype_streq(vm->cdroms[di], name)) {
+                    return 1;
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+/* #491: should sections[si] be removed when deleting vm_index? */
+static int cfg_section_belongs_to_vm(const hype_cfg_t *cfg, unsigned int si,
+                                     unsigned int vm_index) {
+    const hype_cfg_section_t *sec = &cfg->sections[si];
+    const hype_cfg_vm_t *vm = &cfg->vms[vm_index];
+    unsigned int di;
+
+    if (sec->kind == HYPE_CFG_SECTION_VM) {
+        return sec->index == (int)vm_index;
+    }
+    if (sec->kind == HYPE_CFG_SECTION_DISK) {
+        for (di = 0; di < vm->disks_count; di++) {
+            if (hype_streq(sec->name, vm->disks[di]) &&
+                !cfg_dev_referenced_elsewhere(cfg, vm_index, sec->name, 0)) {
+                return 1;
+            }
+        }
+        for (di = 0; di < vm->cdroms_count; di++) {
+            if (hype_streq(sec->name, vm->cdroms[di]) &&
+                !cfg_dev_referenced_elsewhere(cfg, vm_index, sec->name, 0)) {
+                return 1;
+            }
+        }
+        return 0;
+    }
+    if (sec->kind == HYPE_CFG_SECTION_NIC) {
+        for (di = 0; di < vm->nics_count; di++) {
+            if (hype_streq(sec->name, vm->nics[di]) &&
+                !cfg_dev_referenced_elsewhere(cfg, vm_index, sec->name, 1)) {
+                return 1;
+            }
+        }
+        return 0;
+    }
+    /* [hype], [switch.*] and unknown sections are never a VM's to take down. */
+    return 0;
+}
+
+int hype_cfg_delete_vm(hype_cfg_t *cfg, unsigned int vm_index) {
+    /* old section index -> new (or -1 = removed); bounded by the fixed section table. */
+    int remap[HYPE_CFG_MAX_SECTIONS];
+    unsigned int si, w, ri, rw;
+
+    if (cfg == 0 || vm_index >= cfg->vm_count || cfg->vms[vm_index].deleted) {
+        return -1;
+    }
+
+    w = 0;
+    for (si = 0; si < cfg->section_count; si++) {
+        if (cfg_section_belongs_to_vm(cfg, si, vm_index)) {
+            remap[si] = -1;
+            continue;
+        }
+        remap[si] = (int)w;
+        if (w != si) {
+            cfg_byte_copy(&cfg->sections[w], &cfg->sections[si], sizeof(cfg->sections[w]));
+        }
+        w++;
+    }
+    if (w == cfg->section_count) {
+        /* No [vm.*] section found for this index: the config and the caller disagree about what
+         * exists, and deleting nothing while reporting success would hide that. */
+        return -1;
+    }
+    cfg->section_count = w;
+
+    /*
+     * Retained lines: comments inside a removed section leave with it (the section is gone, and a
+     * comment about a machine that no longer exists anchored to nothing is noise at best); every
+     * other line's anchor is remapped so it stays with ITS section across the compaction.
+     */
+    rw = 0;
+    for (ri = 0; ri < cfg->retained_count; ri++) {
+        int sec = cfg->retained[ri].section;
+        if (sec >= 0) {
+            if (remap[sec] < 0) {
+                continue; /* belonged to a removed section */
+            }
+            cfg->retained[ri].section = remap[sec];
+        }
+        if (rw != ri) {
+            cfg_byte_copy(&cfg->retained[rw], &cfg->retained[ri], sizeof(cfg->retained[rw]));
+        }
+        rw++;
+    }
+    cfg->retained_count = rw;
+
+    cfg->vms[vm_index].deleted = 1;
+    return 0;
+}
+
 unsigned int hype_cfg_count_vms(const char *text) {
     unsigned int n = 0;
     const char *p = text;

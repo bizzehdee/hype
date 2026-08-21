@@ -28,6 +28,7 @@ typedef enum {
      * current setting). */
     /* #529: HYPE_CMD_RESOLUTION retired with the config key (decision 44). */
     HYPE_CMD_CREATE, /* TERM-10 (#486): interactive VM-creation wizard */
+    HYPE_CMD_DELETE, /* TERM-15 (#491): two-step-confirmed VM removal */
     /* TERM-6 (#444): arg = a VM name/index (the same addressing every other per-VM verb uses).
      * Prints that VM's full effective hype.cfg -- every field, tagged (default) or (set) --
      * into the dashboard's multi-line result panel (#460). */

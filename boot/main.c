@@ -26,6 +26,7 @@
 #include "../core/strutil.h"
 #include "../core/phys_guard.h"
 #include "../core/phys_confirm.h"
+#include "../core/vm_delete.h" /* TERM-15 (#491) */
 #include "../core/file_io.h"
 #include "../core/host_pci.h"
 #include "../core/e1000.h"
@@ -2184,16 +2185,22 @@ static int term_streq(const char *a, const char *b) {
     return a[i] == b[i];
 }
 
+/* #491: deleted VMs stay in their slot until the next boot (index alignment is load-bearing --
+ * the runtime index IS the config index in 35 places); this is the one question every list/
+ * resolve/render site asks instead of reimplementing the rule. Defined after g_hype_cfg. */
+static int fw_1_vm_is_deleted(unsigned int i);
+
 /* Resolve a command arg ("vm0"/"vm1" name or a 1-based index) to a VM index,
  * or -1 if it names no known VM. */
 static int term_resolve_vm(const char *arg) {
     if (!arg || !arg[0]) return -1;
     for (int i = 0; i < g_vm_count; i++) {
+        if (fw_1_vm_is_deleted((unsigned int)i)) continue; /* #491: gone from the operator's view */
         if (g_vms[i].name && term_streq(arg, g_vms[i].name)) return i;
     }
     if (arg[1] == '\0' && arg[0] >= '1' && arg[0] <= '9') {
         int k = arg[0] - '1';
-        if (k < g_vm_count) return k;
+        if (k < g_vm_count && !fw_1_vm_is_deleted((unsigned int)k)) return k;
     }
     return -1;
 }
@@ -2371,6 +2378,10 @@ static void term_set_cmd(int idx, const char *nm, const char *key, const char *v
 static void term_create_begin(const char *name_arg);
 static void term_create_feed(const char *line);
 static int g_wizard_active;
+/* TERM-15 (#491): the delete confirmation owns the command line while it is active. */
+static void term_delete_begin(int idx);
+static void term_delete_feed(const char *line);
+static int g_delete_active;
 
 /* Execute the current command line, replacing the previous result, then clear the line. */
 static void term_run_cmdline(void) {
@@ -2382,6 +2393,14 @@ static void term_run_cmdline(void) {
      */
     if (g_wizard_active) {
         term_create_feed(g_cmdline);
+        g_cmdline[0] = '\0';
+        g_cmdline_len = 0;
+        return;
+    }
+    /* TERM-15 (#491): same ownership rule for the delete confirmation -- an answer must never be
+     * parsed as a verb. */
+    if (g_delete_active) {
+        term_delete_feed(g_cmdline);
         g_cmdline[0] = '\0';
         g_cmdline_len = 0;
         return;
@@ -2530,6 +2549,13 @@ static void term_run_cmdline(void) {
                          (unsigned)HYPE_FW_1_SHUTDOWN_GRACE_S);
             break;
         }
+        case HYPE_CMD_DELETE:
+            if (idx < 0) {
+                term_resultf("delete: unknown vm '%s'", nm);
+            } else {
+                term_delete_begin(idx);
+            }
+            break;
         case HYPE_CMD_CREATE:
             term_create_begin(c.has_arg ? c.arg : 0);
             break;
@@ -5538,6 +5564,10 @@ static int vmm_handle_nvme_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_
  */
 static hype_cfg_t g_hype_cfg;
 
+static int fw_1_vm_is_deleted(unsigned int i) {
+    return i < g_hype_cfg.vm_count && g_hype_cfg.vms[i].deleted;
+}
+
 /* The uplink: hype's own address on the physical network, and the gateway's MAC once resolved. */
 static uint8_t g_uplink_ip[4];
 static uint8_t g_uplink_mask[4];
@@ -8128,25 +8158,29 @@ static void fw_1_render_console(void) {
         }
     } else { /* dashboard view (-1) */
         hype_vm_dash_info_t *info = g_dash_info;
-        unsigned ninfo = g_vm_count;
-        for (unsigned i = 0; i < ninfo; i++) {
+        unsigned ninfo = 0;
+        for (unsigned i = 0; i < (unsigned)g_vm_count; i++) {
             int ready = __atomic_load_n(&g_vm_ready[i], __ATOMIC_ACQUIRE) != 0;
+            if (fw_1_vm_is_deleted(i)) {
+                continue; /* #491: a deleted VM has no row -- `list` is the operator's truth */
+            }
             /* #357: show the operator's `label` when they set one; the section-id/vm0 identity is
              * what they TYPE, and stays available for commands either way. */
             /* #393: the fallbacks are per-VM strings built once (below), not a two-VM
              * ternary -- 'vm0 or else vm1' is a two-VM assumption in the dashboard. */
-            info[i].name = (g_vms[i].label != 0)
+            info[ninfo].name = (g_vms[i].label != 0)
                                ? g_vms[i].label
                                : (g_vms[i].name != 0 ? g_vms[i].name : fw_1_default_vm_name(i));
-            info[i].os_hint = g_vms[i].os_hint;
-            info[i].state = ready ? hype_vm_lifecycle_name(g_vms[i].lifecycle) : "no-vcpu";
-            info[i].cpu_pct = (ready && g_vms[i].lifecycle == HYPE_VM_RUNNING)
+            info[ninfo].os_hint = g_vms[i].os_hint;
+            info[ninfo].state = ready ? hype_vm_lifecycle_name(g_vms[i].lifecycle) : "no-vcpu";
+            info[ninfo].cpu_pct = (ready && g_vms[i].lifecycle == HYPE_VM_RUNNING)
                                   ? g_vms[i].stat_cpu_pct
                                   : 0u;
-            info[i].mem_mb = g_vms[i].mem_mb;
-            info[i].uptime_s = g_vms[i].stat_uptime_ms / 1000u;
-            info[i].media = g_vms[i].media != 0 ? g_vms[i].media : fw_1_default_media_name(i);
-            info[i].focused = 0;
+            info[ninfo].mem_mb = g_vms[i].mem_mb;
+            info[ninfo].uptime_s = g_vms[i].stat_uptime_ms / 1000u;
+            info[ninfo].media = g_vms[i].media != 0 ? g_vms[i].media : fw_1_default_media_name(i);
+            info[ninfo].focused = 0;
+            ninfo++;
         }
         {
             /* M10-5: a pending/accepted physical-write confirmation is the most
@@ -20212,8 +20246,10 @@ static void term_create_begin(const char *name_arg) {
     term_create_show();
 }
 
-/* Serialize the candidate config and write it through the verified boot volume. 0 on success. */
-static int term_create_write_cfg(const hype_cfg_t *cand) {
+/* Serialize the candidate config and write it through the verified boot volume. 0 on success.
+ * `verb` names the command on whose behalf the write happens (create/delete), so a refusal is
+ * attributed to the thing the operator typed. */
+static int term_write_cfg(const hype_cfg_t *cand, const char *verb) {
     /*
      * #567: 64 KiB, not 16. cfg.h states that "a 64 KiB buffer comfortably covers the structure's
      * own maximums" and this used 16 KiB, so the code and the guidance disagreed -- and the code
@@ -20235,30 +20271,30 @@ static int term_create_write_cfg(const hype_cfg_t *cand) {
      * operator to shrink a config that was not too large.
      */
     if (sr.refused_overflow) {
-        term_resultf("create: REFUSED to write hype.cfg -- this config has more than %u retained "
+        term_resultf("%s: REFUSED to write hype.cfg -- this config has more than %u retained "
                      "lines (comments and blank lines), so saving would DELETE the ones hype could "
                      "not hold. Nothing changed. Reduce the comments or raise "
                      "HYPE_CFG_MAX_RETAINED.",
-                     (unsigned)HYPE_CFG_MAX_RETAINED);
+                     verb, (unsigned)HYPE_CFG_MAX_RETAINED);
         return -1;
     }
     if (sr.truncated) {
-        term_resultf("create: the serialized config does not fit hype's %u-byte buffer -- nothing "
+        term_resultf("%s: the serialized config does not fit hype's %u-byte buffer -- nothing "
                      "changed",
-                     (unsigned)sizeof(text));
+                     verb, (unsigned)sizeof(text));
         return -1;
     }
     bv = fw_1_boot_volume();
     if (bv == 0) {
         /* Refusing rather than creating a RAM-only VM: a machine that exists until the next reboot
          * and then silently does not is worse than one that was never created. */
-        term_resultf("create: boot volume unavailable -- refusing to create a VM the next boot "
-                     "cannot see; nothing changed");
+        term_resultf("%s: boot volume unavailable -- refusing a config change the next boot "
+                     "cannot see; nothing changed", verb);
         return -1;
     }
     if (hype_fs_create(bv, "hype.cfg", &f) != 0 ||
         hype_fs_write_at(&f, 0, text, sr.len) != 0) {
-        term_resultf("create: writing hype.cfg failed -- nothing changed in RAM either");
+        term_resultf("%s: writing hype.cfg failed -- nothing changed in RAM either", verb);
         return -1;
     }
     (void)hype_fs_sync(bv);
@@ -20315,7 +20351,7 @@ static void term_create_finish(void) {
             return;
         }
     }
-    if (term_create_write_cfg(&cand) != 0) {
+    if (term_write_cfg(&cand, "create") != 0) {
         g_wizard_active = 0;
         return;
     }
@@ -20358,6 +20394,129 @@ static void term_create_feed(const char *line) {
         return;
     }
     term_create_show();
+}
+
+/*
+ * TERM-15 (#491): delete a VM, with exactly two confirmation steps (core/vm_delete.c is the
+ * testable flow). Deletion never touches backing disks; the step-2 prompt lists what stays.
+ */
+static hype_vm_delete_t g_delete;
+static int g_delete_idx = -1;
+
+static void term_delete_show(void) {
+    char line[384];
+    term_resultf("%s", hype_vm_delete_render(&g_delete, line, sizeof(line)));
+}
+
+/* The disk paths this deletion will leave in place -- target_disk plus every [disk.*] the VM
+ * references. Bounded, comma-separated; only for the operator's eyes in the step-2 prompt. */
+static void term_delete_disks_note(int idx, char *out, unsigned cap) {
+    const hype_cfg_vm_t *cv = ((unsigned)idx < g_hype_cfg.vm_count) ? &g_hype_cfg.vms[idx] : 0;
+    unsigned pos = 0, di, k;
+
+    out[0] = '\0';
+    if (cv == 0) {
+        return;
+    }
+    if (cv->target_disk.path_or_id[0] != '\0') {
+        for (k = 0; cv->target_disk.path_or_id[k] != '\0' && pos + 1u < cap; k++) {
+            out[pos++] = cv->target_disk.path_or_id[k];
+        }
+    }
+    for (di = 0; di < cv->disks_count; di++) {
+        unsigned int dj;
+        for (dj = 0; dj < g_hype_cfg.disk_count; dj++) {
+            if (!term_streq(g_hype_cfg.disks[dj].id, cv->disks[di])) {
+                continue;
+            }
+            if (pos != 0u && pos + 2u < cap) {
+                out[pos++] = ',';
+                out[pos++] = ' ';
+            }
+            for (k = 0; g_hype_cfg.disks[dj].path[k] != '\0' && pos + 1u < cap; k++) {
+                out[pos++] = g_hype_cfg.disks[dj].path[k];
+            }
+        }
+    }
+    out[pos] = '\0';
+}
+
+static void term_delete_begin(int idx) {
+    char disks[HYPE_VMD_DISKS_MAX];
+
+    term_delete_disks_note(idx, disks, sizeof(disks));
+    g_delete_idx = idx;
+    hype_vm_delete_begin(&g_delete, g_vms[idx].name != 0 ? g_vms[idx].name : "?", disks);
+    g_delete_active = 1;
+    HYPE_LOGF(HYPE_LOG_INFO, "fw-1 DELETE: confirmation started for vm%d '%s' [#491]\n", idx,
+              g_vms[idx].name != 0 ? g_vms[idx].name : "?");
+    term_delete_show();
+}
+
+static void term_delete_finish(void) {
+    static hype_cfg_t cand;
+    int idx = g_delete_idx;
+    int was_running;
+
+    g_delete_active = 0;
+    g_delete_idx = -1;
+    if (idx < 0 || (unsigned)idx >= g_hype_cfg.vm_count) {
+        term_resultf("delete: vm index went away -- nothing changed");
+        return;
+    }
+
+    /* Candidate = the live config minus the VM; written and adopted as a whole, so a refused
+     * write leaves nothing half-applied -- the same all-or-nothing shape create uses. */
+    hype_guest_ram_copy(&cand, &g_hype_cfg, sizeof(hype_cfg_t));
+    cand.vms = cand.vms_default;
+    hype_guest_ram_copy(cand.vms, g_hype_cfg.vms,
+                        sizeof(hype_cfg_vm_t) * (unsigned long long)g_hype_cfg.vm_count);
+    if (hype_cfg_delete_vm(&cand, (unsigned)idx) != 0) {
+        term_resultf("delete: the config holds no vm%d -- nothing changed", idx);
+        return;
+    }
+    if (term_write_cfg(&cand, "delete") != 0) {
+        return; /* the writer already reported; nothing changed in RAM either */
+    }
+
+    /* The write is durable -- now the runtime. Force power off AFTER the config write, not
+     * before: an operator whose write fails keeps a running, listed VM rather than a stopped
+     * ghost that resurrects on reboot. */
+    was_running = (g_vms[idx].lifecycle != HYPE_VM_OFF);
+    if (was_running) {
+        term_post(idx, HYPE_VM_EV_FORCE_OFF);
+    }
+
+    /* Adopt: sections + retained anchors from the candidate, and the tombstone flag. vms[] slots
+     * themselves stay put (index alignment, see fw_1_vm_is_deleted). */
+    hype_guest_ram_copy(g_hype_cfg.sections, cand.sections, sizeof(g_hype_cfg.sections));
+    g_hype_cfg.section_count = cand.section_count;
+    hype_guest_ram_copy(g_hype_cfg.retained, cand.retained, sizeof(g_hype_cfg.retained));
+    g_hype_cfg.retained_count = cand.retained_count;
+    g_hype_cfg.vms[idx].deleted = 1;
+
+    HYPE_LOGF(HYPE_LOG_INFO,
+              "fw-1 DELETE: vm%d '%s' removed from hype.cfg%s; backing disks untouched [#491]\n",
+              idx, g_vms[idx].name != 0 ? g_vms[idx].name : "?",
+              was_running ? " (was running -- force power off posted)" : "");
+    term_resultf("deleted '%s' from hype.cfg%s -- its slot frees fully at the next host boot; "
+                 "backing disks were NOT touched",
+                 g_vms[idx].name != 0 ? g_vms[idx].name : "?",
+                 was_running ? "; the running guest was force-powered off" : "");
+}
+
+static void term_delete_feed(const char *line) {
+    hype_vmd_step_t st = hype_vm_delete_feed(&g_delete, line);
+    if (st == HYPE_VMD_CONFIRMED) {
+        term_delete_finish();
+        return;
+    }
+    if (st == HYPE_VMD_ABORTED) {
+        g_delete_active = 0;
+        g_delete_idx = -1;
+        HYPE_LOGF(HYPE_LOG_INFO, "fw-1 DELETE: aborted by the operator -- nothing changed [#491]\n");
+    }
+    term_delete_show();
 }
 
 

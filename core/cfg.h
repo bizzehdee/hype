@@ -176,6 +176,15 @@ typedef struct {
     char name[HYPE_CFG_NAME_MAX];
 
     /*
+     * #491 (TERM-15): set by hype_cfg_delete_vm(). The entry STAYS in vms[] so every other VM's
+     * index -- which the runtime uses as its own -- is undisturbed until the next boot re-parses
+     * the written config and compacts naturally. The serializer walks sections[], and delete
+     * removes the section, so a deleted VM is never written back; this flag is for the RUNTIME
+     * (list/resolve skip it) and for admission-time callers that want to ignore the ghost.
+     */
+    int deleted;
+
+    /*
      * #357: the human-readable display name from `label = ...` (spec section 5).
      *
      * The spec used `label` in its own worked examples while core/cfg.c did not parse it, so a
@@ -729,6 +738,23 @@ unsigned int hype_cfg_count_vms(const char *text);
  * Returns 0 on success, -1 when either the VM array or the section table is full.
  */
 int hype_cfg_append_vm(hype_cfg_t *cfg, const hype_cfg_vm_t *vm);
+
+/*
+ * #491 (TERM-15): delete a VM from the config -- the write-back half of the terminal's `delete`.
+ *
+ * Removes from sections[] the VM's own [vm.*] section and every [disk.*]/[nic.*] section the VM
+ * references that NO other (non-deleted) VM also references -- admission forbids sharing, but a
+ * config can still SAY it, and deleting a section out from under another VM would be the worse
+ * failure. [switch.*] sections are never removed: switches are legitimately shared. Retained
+ * lines (comments) inside a removed section go with it; retained lines elsewhere keep their
+ * anchoring across the compaction.
+ *
+ * vms[]/disks[]/nics[] are deliberately NOT compacted (see the `deleted` flag's comment): the
+ * entry is flagged instead, and section indexes into those arrays stay valid.
+ *
+ * Returns 0, or -1 for a null cfg, an out-of-range index, or a VM already deleted.
+ */
+int hype_cfg_delete_vm(hype_cfg_t *cfg, unsigned int vm_index);
 
 /*
  * CONFIG-3 (#221): serialize `cfg` back into `hype.cfg` text, for the GUI/TUI
