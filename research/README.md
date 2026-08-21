@@ -3,8 +3,8 @@
 This directory is the local archive of external primary sources —
 vendor developer manuals (AMD APM, Intel SDM), datasheets, and any other
 hardware/spec documents consulted while building this hypervisor. The
-rule is in `AGENTS.md` ("Hardware/spec research provenance"); the short
-version:
+rule is in the `research-provenance` skill (`.claude/skills/research-provenance/`),
+summarised in `AGENTS.md`; the short version:
 
 **Check order before any web search or download:** (1) the relevant board
 ticket's description/comments, then (2) this directory, then — only if
