@@ -191,7 +191,7 @@ is one device; a VM references them by id in `disks =` / `cdroms =`.
 | `source_disk` | serial-or-GUID string | (auto-detect) | `backing=file`: **which host drive** holds `path` (#222/#323). Same axis and same rules as a VM's `media_disk` (§5.4a) — exact match, unidentified drives never match, positional selection refused. Distinct from `id_match`, which is this device's *own* identity when `backing=physical`. |
 | `format` | `raw` \| `qcow2` | (detected) | **an assertion, not a selector** (#336). hype identifies the format by header magic + full validation; if this key is given and disagrees with the image, hype **refuses** rather than sniffing on. Omit it and detection decides — which is what lets you swap a raw image for a qcow2 without editing the config. Ignored for cdrom (ISO). |
 | `size_gb` | int | — | `type=disk backing=file`: create at this size if absent |
-| `id_match` | serial-or-GUID string | — | `backing=physical`: identity phys_guard requires (#122/#124) |
+| `id_match` | serial-or-GUID string | — | `backing=physical`: identity phys_guard requires (#122/#124). **#586**: a first-disk `backing=physical` entry is normalized into the VM's `target_disk` at load, so the full destructive-write chain (arm, confirm, guard, attach) drives it exactly as the inline `target_disk = physical:` sugar. |
 | `partition` | int (1-based) \| `whole` | `whole` | `backing=physical`: GPT partition vs whole disk |
 | `bus` | disk: `virtio-blk`\|`ahci-sata`\|`nvme`; cdrom: `ahci-atapi` | disk: per `os_hint` (§5.6); cdrom: `ahci-atapi` | guest-facing front-end (#196/#202) |
 | `read_only` | bool | `false` (disk); always `true` (cdrom) | |

@@ -12374,6 +12374,44 @@ static void fw_1_phase1_config(void) {
     fw_1_write_prev_log();
     load_hype_cfg();
     /*
+     * #586: a `[disk.*] backing = physical` a VM references via `disks =` is now normalized into
+     * that VM's `target_disk`, so the whole decision-8 machinery (arm, #124/#243 guard, confirm,
+     * attach across AHCI/NVMe/USB) drives it -- previously it consulted `target_disk` only and a
+     * physical device-section bound nothing. First disk only (the single enumerated-scratch
+     * claim), and only when no inline `target_disk` is present (admission forbids both).
+     */
+    {
+        unsigned int vi2;
+        for (vi2 = 0; vi2 < g_hype_cfg.vm_count; vi2++) {
+            hype_cfg_vm_t *cv2 = &g_hype_cfg.vms[vi2];
+            unsigned int di2;
+            if (cv2->disks_count == 0u || hype_cfg_vm_has_target_disk(cv2)) {
+                continue;
+            }
+            for (di2 = 0; di2 < g_hype_cfg.disk_count; di2++) {
+                hype_cfg_disk_t *cd2 = &g_hype_cfg.disks[di2];
+                if (!hype_streq(cd2->id, cv2->disks[0]) ||
+                    cd2->backing != HYPE_CFG_BACKING_PHYSICAL) {
+                    continue;
+                }
+                if (!cd2->has_id_match || cd2->id_match[0] == '\0') {
+                    hype_debug_print("fw-1: vm%u disk '%s' is backing=physical with no id_match -- "
+                                     "no identity, no target (#323/#586)\n", vi2, cd2->id);
+                    break;
+                }
+                cv2->target_disk.kind = HYPE_CFG_DISK_PHYSICAL;
+                (void)hype_strlcpy(cv2->target_disk.path_or_id, cd2->id_match,
+                                   sizeof(cv2->target_disk.path_or_id));
+                cv2->target_disk.partition = cd2->partition;
+                cv2->target_disk.allow_overwrite = cd2->allow_overwrite;
+                hype_debug_print("fw-1: vm%u [disk.%s] backing=physical id_match='%s' -> target "
+                                 "(part=%u overwrite=%d) [#586]\n", vi2, cd2->id, cd2->id_match,
+                                 cd2->partition, cd2->allow_overwrite);
+                break;
+            }
+        }
+    }
+    /*
      * #533: apply the level and SAY which one is in force and where it came from -- ALWAYS, before
      * any line it could filter, including when no config was read at all.
      *
