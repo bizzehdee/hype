@@ -1201,6 +1201,7 @@ typedef struct hype_fw_vm {
     int kernel_loaded;
     const char *kernel_path;
     const char *kernel_cmdline; /* #546: 0 = no command line at all */
+    const char *kernel_initrd;  /* #545: 0 = no initrd */
     hype_kboot_plan_t kplan;
     const char *media;      /* boot-media short name; points at media_buf below */
     /*
@@ -9409,6 +9410,27 @@ vblk_pci:
                          "front-end (#333)\n", (int)(vm - &g_vms[0]));
         return;
     }
+    /*
+     * #545: a `boot = kernel` VM with NO storage configured gets no disk function at all. There is
+     * no guest firmware in that path, so nothing has programmed the function's BARs -- and a real
+     * kernel (unlike a microtest, which uses the fixed window) probes what it enumerates, wanders
+     * into the unprogrammed BAR and hangs its own boot. §5.2 already lets a kernel VM omit storage;
+     * presenting an unusable function to it is the #285 shape one layer down. A kernel VM that DOES
+     * configure a disk keeps the function -- making that combination actually usable (hype
+     * programming the BARs itself, as the firmware would have) is the follow-up filed with this
+     * change.
+     */
+    if (vm->kernel_boot) {
+        unsigned vi_kb = (unsigned)(vm - &g_vms[0]);
+        const hype_cfg_vm_t *cv_kb = (vi_kb < g_hype_cfg.vm_count) ? &g_hype_cfg.vms[vi_kb] : 0;
+        if (cv_kb != 0 && cv_kb->disks_count == 0u && cv_kb->cdroms_count == 0u &&
+            cv_kb->target_disk.path_or_id[0] == '\0') {
+            hype_debug_print("fw-1[vm %d]: virtio-blk NOT presented -- boot = kernel with no "
+                             "storage configured, and no firmware ran to program a BAR (#545)\n",
+                             (int)(vm - &g_vms[0]));
+            return;
+        }
+    }
     fw_1_virtio_pci_present(vm, HYPE_FW_1_PCI_DEV_VIRTIO_BLK);
 }
 
@@ -10039,11 +10061,22 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
                          0x00, 0x00);
     hype_pci_add_device(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ICH9_LPC, HYPE_FW_1_PCI_VENDOR_ID_INTEL,
                          HYPE_FW_1_PCI_DEVICE_ID_ICH9_LPC, 0x06, 0x01, 0x00);
-    hype_pci_add_device(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, HYPE_PCI_VENDOR_ID_HYPE, 0x0005u,
-                        0x01, 0x06, 0x01);
-    hype_pci_set_bar_size(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 5, 0x1000u);
-    hype_pci_set_interrupt(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 1, 11);
-    hype_pci_set_msi_capability(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI);
+    /*
+     * #545: the optical HBA only exists for a VM that can have media -- a `boot = kernel` VM with
+     * no cdroms has none, and no firmware ran to program the function's BARs, so a real kernel
+     * enumerating it ioremaps an unprogrammed ABAR and faults its own init (observed: alpine-virt
+     * 6.12, "BUG: unable to handle page fault" inside the ahci probe, init killed). #588 is hype
+     * programming the BARs itself; until then an unusable function is simply not presented.
+     */
+    if (!(vm->kernel_boot &&
+          ((unsigned)(vm - g_vms) >= g_hype_cfg.vm_count ||
+           g_hype_cfg.vms[(unsigned)(vm - g_vms)].cdroms_count == 0u))) {
+        hype_pci_add_device(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, HYPE_PCI_VENDOR_ID_HYPE, 0x0005u,
+                            0x01, 0x06, 0x01);
+        hype_pci_set_bar_size(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 5, 0x1000u);
+        hype_pci_set_interrupt(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 1, 11);
+        hype_pci_set_msi_capability(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI);
+    }
     hype_ahci_reset(&g_fw_1_ahci);
     fw_1_attach_storage(vm); /* #342 */
     {
@@ -11949,6 +11982,7 @@ static void fw_1_resolve_kernel(hype_fw_vm_t *vmp, const hype_cfg_t *cfg, unsign
     vmp->kernel_loaded = 0;
     vmp->kernel_path = 0;
     vmp->kernel_cmdline = 0;
+    vmp->kernel_initrd = 0;
     if (cv == 0 || cv->boot != HYPE_CFG_BOOT_KERNEL) {
         return;
     }
@@ -11957,6 +11991,7 @@ static void fw_1_resolve_kernel(hype_fw_vm_t *vmp, const hype_cfg_t *cfg, unsign
     /* #546: optional. A NULL pointer here means "no command line at all", which is what the kernel
      * sees as cmd_line_ptr == 0 -- deliberately distinct from a configured empty string. */
     vmp->kernel_cmdline = cv->has_cmdline ? cv->cmdline : 0;
+    vmp->kernel_initrd = cv->has_initrd ? cv->initrd : 0; /* #545 */
     HYPE_LOGF(HYPE_LOG_INFO,
               "fw-1 vm%u: boot = kernel -- '%s', no guest firmware in the path; cmdline %s%s%s "
               "[#535 #546]\n", vm_index, cv->kernel,
@@ -11976,11 +12011,13 @@ static void fw_1_resolve_kernel(hype_fw_vm_t *vmp, const hype_cfg_t *cfg, unsign
 static int fw_1_load_kernel(hype_fw_vm_t *vm, unsigned vi) {
     hype_fs_t *bv = fw_1_boot_volume();
     hype_fs_file_t f;
+    hype_fs_file_t fi; /* #545: the initrd, when configured */
     static unsigned char head[HYPE_KBOOT_HEAD_BYTES];
     hype_kboot_status_t st;
     unsigned char *ram;
     unsigned int head_read;
-    hype_linux_e820_entry_t e820[1];
+    hype_linux_e820_entry_t e820[HYPE_KBOOT_E820_MAX];
+    unsigned int e820_n;
 
     if (!vm->kernel_boot) {
         return 0;
@@ -12013,13 +12050,25 @@ static int fw_1_load_kernel(hype_fw_vm_t *vm, unsigned vi) {
     }
     {
         unsigned int cl_len = 0u;
+        uint64_t initrd_bytes = 0ull;
         if (vm->kernel_cmdline != 0) {
             while (vm->kernel_cmdline[cl_len] != '\0') {
                 cl_len++;
             }
         }
+        /* #545: the initrd's SIZE feeds the plan (admission + placement); the bytes are read
+         * only once the whole plan is accepted, so a refusal costs no I/O and leaves nothing
+         * half-placed. */
+        if (vm->kernel_initrd != 0) {
+            if (hype_fs_lookup(bv, vm->kernel_initrd, &fi) != 0) {
+                HYPE_LOGF(HYPE_LOG_ERROR, "fw-1 vm%u: initrd '%s' not found on the boot volume "
+                                          "[#545]\n", vi, vm->kernel_initrd);
+                return -1;
+            }
+            initrd_bytes = fi.size;
+        }
         st = hype_kboot_plan(head, head_read, f.size, vm->ram_bytes, cl_len,
-                             vm->kernel_cmdline != 0 ? 1 : 0, &vm->kplan);
+                             vm->kernel_cmdline != 0 ? 1 : 0, initrd_bytes, &vm->kplan);
     }
     if (st != HYPE_KBOOT_OK) {
         HYPE_LOGF(HYPE_LOG_ERROR,
@@ -12028,7 +12077,17 @@ static int fw_1_load_kernel(hype_fw_vm_t *vm, unsigned vi) {
                   vi, vm->kernel_path, hype_kboot_status_str(st), (unsigned long long)f.size,
                   (unsigned long long)(vm->ram_bytes / (1024ull * 1024ull)),
                   (unsigned long long)f.size,
-                  (unsigned long long)(hype_kboot_min_ram_bytes(f.size) / (1024ull * 1024ull) + 1ull));
+                  (unsigned long long)(hype_kboot_min_ram_bytes(
+                                           f.size,
+                                           (head_read >= HYPE_LINUX_SETUP_HEADER_OFFSET +
+                                                             sizeof(hype_linux_setup_header_t))
+                                               ? ((const hype_linux_setup_header_t
+                                                       *)(head + HYPE_LINUX_SETUP_HEADER_OFFSET))
+                                                     ->init_size
+                                               : 0ull,
+                                           0ull) /
+                                           (1024ull * 1024ull) +
+                                       1ull));
         return -1;
     }
     /* hype_fs_read_at takes a 32-bit length. A microtest kernel is kilobytes; anything near 4 GB
@@ -12054,6 +12113,17 @@ static int fw_1_load_kernel(hype_fw_vm_t *vm, unsigned vi) {
         return -1;
     }
 
+    /* #545: the initrd, at the high address the plan chose. Read through the same FS stack. */
+    if (vm->kplan.initrd_bytes != 0ull) {
+        if (vm->kplan.initrd_bytes > 0xFFFFFFFFull ||
+            hype_fs_read_at(&fi, 0ull, ram + vm->kplan.initrd_gpa,
+                            (unsigned int)vm->kplan.initrd_bytes) != 0) {
+            HYPE_LOGF(HYPE_LOG_ERROR, "fw-1 vm%u: initrd '%s' read failed [#545]\n", vi,
+                      vm->kernel_initrd);
+            return -1;
+        }
+    }
+
     /* The guest's OWN page tables, inside its OWN RAM -- see hype_paging_build_identity_at(). */
     hype_paging_build_identity_at(ram, HYPE_KBOOT_PML4_GPA, HYPE_KBOOT_PDPT_GPA,
                                   HYPE_KBOOT_PD0_GPA, vm->kplan.gb_to_map);
@@ -12069,24 +12139,27 @@ static int fw_1_load_kernel(hype_fw_vm_t *vm, unsigned vi) {
         dst[ci] = '\0';
     }
 
-    e820[0].addr = 0ull;
-    e820[0].size = vm->ram_bytes;
-    e820[0].type = HYPE_LINUX_E820_TYPE_RAM;
+    /* #545: the truthful map -- reserved page tables/zero page/cmdline and the PC hole, instead
+     * of one entry advertising them all as usable RAM. */
+    e820_n = hype_kboot_build_e820(vm->ram_bytes, e820);
     hype_linux_build_zero_page(
         (hype_linux_boot_params_t *)(ram + vm->kplan.zero_page_gpa),
-        (const hype_linux_setup_header_t *)(head + HYPE_LINUX_SETUP_HEADER_OFFSET), 0u, 0u,
-        (uint32_t)vm->kplan.cmdline_gpa, e820, 1u);
+        (const hype_linux_setup_header_t *)(head + HYPE_LINUX_SETUP_HEADER_OFFSET),
+        (uint32_t)vm->kplan.initrd_gpa, (uint32_t)vm->kplan.initrd_bytes,
+        (uint32_t)vm->kplan.cmdline_gpa, e820, (uint8_t)e820_n);
 
     vm->kernel_loaded = 1;
     HYPE_LOGF(HYPE_LOG_INFO,
               "fw-1 vm%u: kernel '%s' loaded -- %llu B payload @gpa 0x%llx, entry 0x%llx, cr3 "
-              "0x%llx, rsp 0x%llx, zero page 0x%llx, cmdline gpa 0x%llx, %u GB identity-mapped "
-              "[#535 #546]\n",
+              "0x%llx, rsp 0x%llx, zero page 0x%llx, cmdline gpa 0x%llx, initrd %llu B @0x%llx, "
+              "%u GB identity-mapped [#535 #546 #545]\n",
               vi, vm->kernel_path, (unsigned long long)vm->kplan.payload_bytes,
               (unsigned long long)vm->kplan.payload_load_gpa,
               (unsigned long long)vm->kplan.entry_gpa, (unsigned long long)vm->kplan.cr3_gpa,
               (unsigned long long)vm->kplan.rsp_gpa, (unsigned long long)vm->kplan.zero_page_gpa,
-              (unsigned long long)vm->kplan.cmdline_gpa, vm->kplan.gb_to_map);
+              (unsigned long long)vm->kplan.cmdline_gpa,
+              (unsigned long long)vm->kplan.initrd_bytes,
+              (unsigned long long)vm->kplan.initrd_gpa, vm->kplan.gb_to_map);
     return 0;
 }
 
@@ -12640,9 +12713,15 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                          0x00, 0x00);
     hype_pci_add_device(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ICH9_LPC, HYPE_FW_1_PCI_VENDOR_ID_INTEL,
                          HYPE_FW_1_PCI_DEVICE_ID_ICH9_LPC, 0x06, 0x01, 0x00);
-    hype_pci_add_device(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, HYPE_PCI_VENDOR_ID_HYPE, 0x0005u,
-                        0x01, 0x06, 0x01);
-    hype_pci_set_bar_size(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 5, 0x1000u);
+    /* #545: same media-less kernel-VM gate as the first-boot site above -- a restart must not
+     * resurrect a function the first boot deliberately withheld. */
+    if (!(vm->kernel_boot &&
+          ((unsigned)(vm - g_vms) >= g_hype_cfg.vm_count ||
+           g_hype_cfg.vms[(unsigned)(vm - g_vms)].cdroms_count == 0u))) {
+        hype_pci_add_device(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, HYPE_PCI_VENDOR_ID_HYPE, 0x0005u,
+                            0x01, 0x06, 0x01);
+        hype_pci_set_bar_size(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 5, 0x1000u);
+    }
     /* M4-6d2: advertise a legacy PCI interrupt on the AHCI function
      * (Interrupt Pin INTA=1) so the guest treats it as interrupt-capable
      * and libata uses its interrupt-driven path rather than the forced-
@@ -12652,8 +12731,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * Q35 routing and the guest reads that back, so the vCPU loop
      * delivers the completion IRQ on whatever line 0x3C actually holds
      * (hype_pci_get_interrupt_line), master or slave. */
-    hype_pci_set_interrupt(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 1, 11);
-    hype_pci_set_msi_capability(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI);
+    if (g_fw_1_pci.devices[HYPE_FW_1_PCI_DEV_AHCI].in_use) { /* #545 gate above */
+        hype_pci_set_interrupt(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 1, 11);
+        hype_pci_set_msi_capability(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI);
+    }
     hype_ahci_reset(&g_fw_1_ahci);
     fw_1_attach_storage(vm); /* #342 */
     /* FW-1h: per-command AHCI/ATAPI tracing is available for debugging

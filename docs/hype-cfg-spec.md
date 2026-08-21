@@ -161,6 +161,7 @@ as the default display name.
 | `boot` | `installer` \| `disk` \| `kernel` | `installer` | two-phase (§5.4 / plan.md §6d); `kernel` is the firmware-free direct kernel boot of §5.4b (#535) |
 | `kernel` | path | (none) | required when `boot = kernel`, and rejected otherwise — a raw guest kernel image loaded straight into guest RAM (§5.4b, #535) |
 | `cmdline` | free text | (none) | kernel command line, `boot = kernel` only and rejected otherwise (§5.4b, #546). Absent, empty and set are three distinct states |
+| `initrd` | path | (none) | **`boot = kernel` only** (#545): the initramfs, read through hype's own FS stack like `kernel` and placed as high as the image's `initrd_addr_max` allows. Rejected for the firmware boot modes, same rule as `kernel`/`cmdline` |
 | `firmware` | `uefi` \| `legacy` | `uefi` | |
 | `os_hint` | `windows`\|`linux`\|`bsd`\|`none` | `none` | drives `bus` defaults (§5.6) **and the NIC frontend** (§5.5, #82): `windows` gets an e1000, everything else virtio-net |
 | `disks` | `<disk-id>` list | (empty) | ordered hard disks (`type=disk` `[disk.*]`); **0..N**, mixed bus allowed (§5.7) |

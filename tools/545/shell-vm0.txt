@@ -1,0 +1,14 @@
+# #545: a REAL kernel + initramfs with no boot media reaches Alpine's initramfs
+# emergency shell -- a real /bin/sh from a real initramfs on the guest UART, which is
+# the ticket's bar. The marker is computed IN the guest so a log echo cannot satisfy it.
+timeout 300000
+fail-if Kernel panic
+fail-if Unable to mount root
+# Wait for the shell to actually exist before typing at it: sends fire sequentially from boot,
+# and a command typed into the kernel's own console noise never reaches a shell. busybox prints
+# this exact phrase when the recovery shell starts on a serial console.
+expect job control turned off
+send \n
+send echo KBOOT-SHELL-$((6*7))\n
+expect KBOOT-SHELL-42
+pass real-kernel-initramfs-shell

@@ -60,7 +60,15 @@ typedef enum {
     HYPE_KBOOT_ERR_NO_PAYLOAD,    /* header is valid but nothing follows the setup region */
     HYPE_KBOOT_ERR_RAM_TOO_SMALL, /* the payload will not fit in this VM's guest RAM */
     HYPE_KBOOT_ERR_HEAD_TOO_SMALL, /* caller passed fewer head bytes than the header needs */
-    HYPE_KBOOT_ERR_CMDLINE_TOO_LONG /* #546: longer than the layout, or than the kernel accepts */
+    HYPE_KBOOT_ERR_CMDLINE_TOO_LONG, /* #546: longer than the layout, or than the kernel accepts */
+    /*
+     * #545: the initrd cannot be placed. Either the image's own initrd_addr_max puts every legal
+     * address below the loaded kernel's ceiling, or the initrd is simply too large for the RAM
+     * left above that ceiling. Refused with the limit NAMED (the log line carries initrd_addr_max
+     * and the sizes) rather than placed out of reach: a kernel that cannot see its initramfs
+     * panics with "Unable to mount root fs", which says nothing about why.
+     */
+    HYPE_KBOOT_ERR_INITRD_UNREACHABLE
 } hype_kboot_status_t;
 
 typedef struct {
@@ -79,6 +87,13 @@ typedef struct {
      * same thing, and conflating them would make `cmdline =` indistinguishable from no key.
      */
     uint64_t cmdline_gpa;
+    /*
+     * #545: where the initrd goes (0 when there is none), placed as HIGH as the image's own
+     * initrd_addr_max and the VM's RAM allow, page-aligned down -- which is what every real
+     * bootloader does, and what keeps it clear of the kernel's decompression scratch (init_size).
+     */
+    uint64_t initrd_gpa;
+    uint64_t initrd_bytes;
 } hype_kboot_plan_t;
 
 /*
@@ -95,10 +110,15 @@ typedef struct {
  * refused rather than truncated: a truncated command line silently means something ELSE, and
  * `console=ttyS0` cut to `console=tty` is a valid, wrong setting.
  */
+/*
+ * #545: `initrd_bytes` is the initramfs file's size, or 0 for none. Placement respects the
+ * header's initrd_addr_max (the kernel's own statement of how high it can reach) and refuses --
+ * naming the limit -- rather than placing out of reach.
+ */
 hype_kboot_status_t hype_kboot_plan(const void *image_head, uint64_t head_bytes,
                                     uint64_t image_bytes, uint64_t ram_bytes,
                                     unsigned int cmdline_len, int have_cmdline,
-                                    hype_kboot_plan_t *out);
+                                    uint64_t initrd_bytes, hype_kboot_plan_t *out);
 
 /* The refusal reason, so every caller words it the same way. */
 const char *hype_kboot_status_str(hype_kboot_status_t s);
@@ -108,6 +128,24 @@ const char *hype_kboot_status_str(hype_kboot_status_t s);
  * alongside a HYPE_KBOOT_ERR_RAM_TOO_SMALL refusal so the operator is told what to set mem_mb
  * to, rather than only that the current value is wrong.
  */
-uint64_t hype_kboot_min_ram_bytes(uint64_t payload_bytes);
+/*
+ * #545: sized from max(payload, init_size) -- a real bzImage declares in init_size the scratch it
+ * decompresses into and runs early in, several times the compressed payload. The old
+ * payload-plus-headroom figure ADMITTED kernels into RAM they could not decompress in, which then
+ * failed somewhere inside the decompressor with no explanation. A microtest artifact declares
+ * init_size == payload size, so nothing changes for them -- which is the point: correct for real
+ * kernels with no special case. `initrd_bytes` (0 for none) joins the requirement.
+ */
+uint64_t hype_kboot_min_ram_bytes(uint64_t payload_bytes, uint64_t init_size,
+                                  uint64_t initrd_bytes);
+
+/*
+ * #545: the truthful e820, replacing the old single [0, ram) RAM entry that advertised the guest
+ * page tables, the zero page, the command line and the PC hole as usable. Fills up to
+ * HYPE_KBOOT_E820_MAX entries; returns the count. Pure.
+ */
+#define HYPE_KBOOT_E820_MAX 5u
+struct hype_linux_e820_entry;
+unsigned int hype_kboot_build_e820(uint64_t ram_bytes, void *out_entries);
 
 #endif /* HYPE_CORE_KBOOT_H */

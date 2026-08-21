@@ -229,6 +229,15 @@ typedef struct {
     char cmdline[HYPE_CFG_CMDLINE_MAX];
 
     /*
+     * #545: the initramfs for boot = kernel, read through hype's own FS stack like the kernel
+     * image, placed high in guest RAM bounded by the image's initrd_addr_max. Optional -- a
+     * microtest needs none -- and rejected for the firmware boot modes, same rule as `kernel`
+     * and `cmdline`.
+     */
+    int has_initrd;
+    char initrd[HYPE_CFG_PATH_MAX];
+
+    /*
      * #323: WHICH host drive the media (and file-backed image) lives on, matched by drive
      * serial/GUID -- the "where" axis to install_media's "which". Optional: unset means
      * auto-detect, which is what hype did exclusively before, so every existing config is
@@ -332,7 +341,8 @@ enum {
     HYPE_CFG_F_KERNEL = 1u << 18,     /* #535 */
     HYPE_CFG_F_CMDLINE = 1u << 19,    /* #546 */
     HYPE_CFG_F_DISPLAY = 1u << 20,    /* #565 */
-    HYPE_CFG_F_NICS = 1u << 21        /* #583 */
+    HYPE_CFG_F_NICS = 1u << 21,       /* #583 */
+    HYPE_CFG_F_INITRD = 1u << 22      /* #545 */
 };
 
 /*

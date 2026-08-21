@@ -110,6 +110,7 @@ _Static_assert(sizeof(hype_linux_e820_entry_t) == 20, "E820 entry must be exactl
 
 #define HYPE_LINUX_E820_MAX_ENTRIES 128
 #define HYPE_LINUX_E820_TYPE_RAM 1u
+#define HYPE_LINUX_E820_TYPE_RESERVED 2u /* #545 */
 
 /* struct boot_params (the "zero page"): exactly one 4KB page. Only
  * the fields this loader actually fills are named; everything else

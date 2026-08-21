@@ -2928,6 +2928,69 @@ static void test_uplink_none_and_switchless_mac(void) {
     CHECK_INT("mac last octet", 0x55, out.nics[0].mac[5]);
 }
 
+
+/* --- #545: the initrd key -- same rules as kernel/cmdline, minus the legitimate-empty case --- */
+
+static void test_initrd(void) {
+    const char *cfg =
+        "[vm.k]\nvcpus=1\nmem_mb=512\nboot=kernel\nkernel=\\k.bin\n"
+        "initrd=\\EFI\\hype\\micro\\initramfs-virt\nos_hint=none\n";
+    hype_cfg_t out;
+
+    CHECK_INT("initrd parses on a kernel VM", HYPE_CFG_OK, parse_copy(cfg, &out).status);
+    CHECK_INT("has_initrd set", 1, out.vms[0].has_initrd);
+    CHECK_STR("initrd value", "\\EFI\\hype\\micro\\initramfs-virt", out.vms[0].initrd);
+}
+
+static void test_initrd_rules(void) {
+    const char *nonkernel =
+        "[vm.a]\nvcpus=1\nmem_mb=512\nboot=installer\ninstall_media=\\i.iso\n"
+        "target_disk=file:\\a.img\nfirmware=uefi\ninitrd=\\x\nos_hint=linux\n";
+    const char *empty =
+        "[vm.k]\nvcpus=1\nmem_mb=512\nboot=kernel\nkernel=\\k.bin\ninitrd=\nos_hint=none\n";
+    const char *dup =
+        "[vm.k]\nvcpus=1\nmem_mb=512\nboot=kernel\nkernel=\\k.bin\n"
+        "initrd=\\a\ninitrd=\\b\nos_hint=none\n";
+    hype_cfg_t out;
+
+    /* A firmware-boot VM has no kernel to hand an initrd to -- same rule as cmdline. */
+    CHECK_INT("initrd on a non-kernel VM is refused", HYPE_CFG_ERR_BAD_VALUE,
+              parse_copy(nonkernel, &out).status);
+    /* A path, so empty is meaningless -- unlike cmdline's legitimate empty. */
+    CHECK_INT("empty initrd refused", HYPE_CFG_ERR_BAD_VALUE, parse_copy(empty, &out).status);
+    CHECK_INT("duplicate initrd refused", HYPE_CFG_ERR_DUPLICATE_KEY,
+              parse_copy(dup, &out).status);
+}
+
+static void test_initrd_too_long_and_write_back(void) {
+    static char cfg[HYPE_CFG_PATH_MAX + 256];
+    static char out_text[8192];
+    hype_cfg_t out;
+    hype_cfg_serialize_result_t sr;
+    unsigned i, n;
+
+    strcpy(cfg, "[vm.k]\nvcpus=1\nmem_mb=512\nboot=kernel\nkernel=\\k.bin\ninitrd=");
+    n = (unsigned)strlen(cfg);
+    for (i = 0; i < HYPE_CFG_PATH_MAX; i++) {
+        cfg[n + i] = 'x';
+    }
+    strcpy(cfg + n + i, "\nos_hint=none\n");
+    CHECK_INT("an over-long initrd path is refused", HYPE_CFG_ERR_VALUE_TOO_LONG,
+              parse_copy(cfg, &out).status);
+
+    /* Round-trip, or write-back would silently drop it. */
+    {
+        const char *rt =
+            "[vm.k]\nvcpus=1\nmem_mb=512\nboot=kernel\nkernel=\\k.bin\n"
+            "initrd=\\ird.img\nos_hint=none\n";
+        hype_cfg_t parsed;
+        CHECK_INT("rt parses", HYPE_CFG_OK, parse_copy(rt, &parsed).status);
+        sr = hype_cfg_serialize(&parsed, out_text, sizeof(out_text));
+        CHECK_INT("serializes", 0, sr.refused_overflow || sr.truncated);
+        CHECK_INT("initrd emitted", 1, strstr(out_text, "initrd = \\ird.img") != 0);
+    }
+}
+
 int main(void) {
     test_label_from_the_spec_example_is_accepted();
     test_label_absent_leaves_an_empty_string();
@@ -2987,6 +3050,9 @@ int main(void) {
     test_cmdline();
     test_cmdline_absent_vs_empty();
     test_cmdline_too_long();
+    test_initrd();
+    test_initrd_rules();
+    test_initrd_too_long_and_write_back();
     test_cmdline_write_back();
     test_error_cases();
     test_too_many_vms();

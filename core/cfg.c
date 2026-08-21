@@ -329,6 +329,18 @@ static hype_cfg_status_t apply_field(hype_cfg_vm_t *vm, unsigned int *seen, char
         *seen |= HYPE_CFG_F_CMDLINE;
         return HYPE_CFG_OK;
     }
+    if (hype_streq(key, "initrd")) {
+        /* #545: the initramfs for boot = kernel. A path, so empty is meaningless (unlike
+         * cmdline's legitimate empty): omit the key for "no initrd". */
+        unsigned long long len;
+        if (*seen & HYPE_CFG_F_INITRD) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        len = hype_strlcpy(vm->initrd, val, HYPE_CFG_PATH_MAX);
+        if (len >= HYPE_CFG_PATH_MAX) return HYPE_CFG_ERR_VALUE_TOO_LONG;
+        if (vm->initrd[0] == '\0') return HYPE_CFG_ERR_BAD_VALUE;
+        vm->has_initrd = 1;
+        *seen |= HYPE_CFG_F_INITRD;
+        return HYPE_CFG_OK;
+    }
     if (hype_streq(key, "media_disk")) {
         /* #323: the drive the media lives on, by serial/GUID. Optional -- absent means
          * auto-detect, preserving the pre-#323 behaviour for every existing config. */
@@ -526,6 +538,10 @@ static hype_cfg_status_t validate_required(const hype_cfg_vm_t *vm, unsigned int
     }
     /* #546: a command line with no kernel to give it to. */
     if (vm->boot != HYPE_CFG_BOOT_KERNEL && (seen & HYPE_CFG_F_CMDLINE)) {
+        return HYPE_CFG_ERR_BAD_VALUE;
+    }
+    /* #545: same rule for an initrd -- the firmware boot modes have no kernel to hand it to. */
+    if (vm->boot != HYPE_CFG_BOOT_KERNEL && (seen & HYPE_CFG_F_INITRD)) {
         return HYPE_CFG_ERR_BAD_VALUE;
     }
     return HYPE_CFG_OK;
@@ -2147,6 +2163,9 @@ static void serialize_vm(hype_cfg_w_t *w, const hype_cfg_vm_t *vm) {
     }
     if (vm->has_cmdline) {
         w_kv(w, "cmdline", vm->cmdline); /* #546 */
+    }
+    if (vm->has_initrd) {
+        w_kv(w, "initrd", vm->initrd); /* #545 */
     }
     if (vm->has_install_media) {
         w_kv(w, "install_media", vm->install_media);
