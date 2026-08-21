@@ -15717,6 +15717,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                              : "");
                     }
                 }
+#if HYPE_ENABLE_APICV
+                if (kind == HYPE_VMM_KIND_VMX) {
+                    hype_vmx_apicv_dump(ctx); /* #599 bring-up probe */
+                }
+#endif
                 hype_debug_print("fw-1 TIMERHIST: pit_irq0=%llu lapic_irq=%llu ahci_irq=%llu | "
                                  "PIT0 mode=%u reload=%u counter=%u | LAPIC lvt=0x%x(%s) init=%u cur=%u | "
                                  "svr=0x%x dcr=0x%x ever_armed=0x%x | "
@@ -17379,6 +17384,35 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             /* The VINTR window opened -- the guest can now take the
              * pending timer IRQ (INT-2). */
             g_436_loop_section[(unsigned)(vm-g_vms)]=782;
+            /*
+             * #577: feed this exit's RIP into the kernel-RIP histogram too. The host
+             * preemption tick loses the race to device exits on a busy guest, so KRIPHIST
+             * sampled exactly never while the FreeBSD guest span exit-free between LAPIC
+             * re-arms -- but the interrupt-window exit fires ~200/s during that spin and
+             * lands wherever IF=1, which is an unbiased sample of the code that will not
+             * otherwise exit. Same table, same resolve-against-guest-symbols workflow.
+             */
+            if (info.guest_rip >= 0xffff800000000000ULL) {
+                uint64_t krip = info.guest_rip;
+                int kh, kfound = -1, kfree = -1, kmin = -1;
+                for (kh = 0; kh < FW_1_RIPHIST_N; kh++) {
+                    if (kriphist_cnt[kh] == 0) {
+                        if (kfree < 0) kfree = kh;
+                        continue;
+                    }
+                    if (kriphist_rip[kh] == krip) { kfound = kh; break; }
+                    if (kmin < 0 || kriphist_cnt[kh] < kriphist_cnt[kmin]) kmin = kh;
+                }
+                if (kfound >= 0) {
+                    kriphist_cnt[kfound]++;
+                } else if (kfree >= 0) {
+                    kriphist_rip[kfree] = krip;
+                    kriphist_cnt[kfree] = 1;
+                } else if (kmin >= 0) {
+                    kriphist_rip[kmin] = krip;
+                    kriphist_cnt[kmin] = 1;
+                }
+            }
             vmm_prune_masked_pic_pending(kind, ctx, &g_fw_1_pic); /* #455 */
             vmm_handle_intr_window(kind, ctx, &g_fw_1_lapic);
             continue;
@@ -17410,12 +17444,15 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         }
         if (kind == HYPE_VMM_KIND_VMX && info.reason == HYPE_VMX_EXIT_REASON_VIRTUALIZED_EOI) {
 #if HYPE_ENABLE_APICV
-            { /* bring-up probe: which vectors EOI through reason 45, and how often */
+            { /* bring-up probe: which vectors EOI through reason 45, and how often.
+                 * A shared sample budget across VMs is fine for a probe: one-per-host (#563). */
                 static unsigned long long eoi45;
                 eoi45++;
-                if (eoi45 <= 8u || (eoi45 % 500u) == 0u) {
+                uint64_t ev = info.qualification & 0xFFu;
+                if (eoi45 <= 8u || (eoi45 % 500u) == 0u ||
+                    (ev != 0xecu && ev != 0x20u && ev != 0x30u && ev != 0xefu)) {
                     hype_debug_print("vmx apicv-eoi #%llu: vec=0x%llx\n", eoi45,
-                                     (unsigned long long)(info.qualification & 0xFFu));
+                                     (unsigned long long)ev);
                 }
             }
 #endif
