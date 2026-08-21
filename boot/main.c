@@ -2015,6 +2015,41 @@ static int g_phys_ahci_tgt_present;
 static uint64_t g_phys_ahci_tgt_abar;
 static unsigned int g_phys_ahci_tgt_port;
 static uint64_t g_phys_ahci_tgt_sectors;
+/* #388: a USB target -- the index into the #387 extra-claimed-stick pool, or -1. hype's own
+ * boot/log medium is refused BY IDENTITY before this is ever set (decision 32's rule 3). */
+static int g_phys_usb_tgt; /* set to -1 in fw_1_arm_physical_targets */
+/*
+ * #387 (plan.md §10 decision 31): EXTRA claimed USB media devices -- sticks beyond hype's own
+ * boot/log medium, brought up with their own bulk rings (the per-device pool in xhci_hw.c) and
+ * registered as media sources under their captured serials. THREE instance slots + the boot
+ * medium = HYPE_MEDIA_MAX_DEVS. Each needs its own thunk pair because the media registry
+ * distinguishes devices by their read fn.
+ */
+#define HYPE_MEDIA_USBX 3u
+static hype_blk_usb_t g_musbx_hw[HYPE_MEDIA_USBX];
+static hype_blk_phys_t g_musbx_phys[HYPE_MEDIA_USBX];
+static hype_blk_backend_t g_musbx_be[HYPE_MEDIA_USBX];
+static hype_xhci_ctrl_t g_musbx_xc[HYPE_MEDIA_USBX];
+static hype_xhci_msc_eps_t g_musbx_eps[HYPE_MEDIA_USBX];
+static char g_musbx_serial[HYPE_MEDIA_USBX][64];
+static unsigned g_musbx_count;
+
+static int musbx_read_common(unsigned k, uint64_t lba, uint32_t count, void *dst) {
+    return hype_blk_backend_read(&g_musbx_be[k], lba, count, dst);
+}
+static int musbx_write_common(unsigned k, uint64_t lba, uint32_t count, const void *src) {
+    return hype_blk_backend_write(&g_musbx_be[k], lba, count, src);
+}
+static int musbx_read0(void *ctx, uint64_t lba, uint32_t count, void *dst) { (void)ctx; return musbx_read_common(0, lba, count, dst); }
+static int musbx_read1(void *ctx, uint64_t lba, uint32_t count, void *dst) { (void)ctx; return musbx_read_common(1, lba, count, dst); }
+static int musbx_read2(void *ctx, uint64_t lba, uint32_t count, void *dst) { (void)ctx; return musbx_read_common(2, lba, count, dst); }
+static int musbx_write0(void *ctx, uint64_t lba, uint32_t count, const void *src) { (void)ctx; return musbx_write_common(0, lba, count, src); }
+static int musbx_write1(void *ctx, uint64_t lba, uint32_t count, const void *src) { (void)ctx; return musbx_write_common(1, lba, count, src); }
+static int musbx_write2(void *ctx, uint64_t lba, uint32_t count, const void *src) { (void)ctx; return musbx_write_common(2, lba, count, src); }
+static int (*const g_musbx_rd[HYPE_MEDIA_USBX])(void *, uint64_t, uint32_t, void *) = {
+    musbx_read0, musbx_read1, musbx_read2};
+static int (*const g_musbx_wr[HYPE_MEDIA_USBX])(void *, uint64_t, uint32_t, const void *) = {
+    musbx_write0, musbx_write1, musbx_write2};
 
 static char g_hostdisk_serial[21]; /* ATA serial -- matched against a confirmed
                                     * `physical:` target, exactly as g_hostnvme_serial */
@@ -8537,6 +8572,14 @@ static int fw_1_vblk_use_physical(hype_fw_vm_t *vm) {
  * disk enumerated as g_hostdisk_*. Same three gates as the NVMe path: operator
  * confirmation ACCEPTED, the confirmed serial matches THIS enumerated drive, and
  * the single writable physical backend isn't already claimed by another VM. */
+/* #388: a confirmed-identity USB target from the #387 claimed pool. */
+static int fw_1_vblk_use_physical_usb(hype_fw_vm_t *vm) {
+    int idx = (int)(vm - &g_vms[0]);
+    if (g_phys_backend_claimed_vm >= 0 && g_phys_backend_claimed_vm != idx) return 0;
+    if (g_phys_usb_tgt < 0) return 0;
+    return fw_1_phys_target_matches(g_musbx_serial[g_phys_usb_tgt]);
+}
+
 static int fw_1_vblk_use_physical_ahci(hype_fw_vm_t *vm) {
     int idx = (int)(vm - &g_vms[0]);
     if (g_phys_backend_claimed_vm >= 0 && g_phys_backend_claimed_vm != idx) return 0;
@@ -9324,6 +9367,43 @@ static void fw_1_setup_virtio_blk(hype_fw_vm_t *vm) {
 #if HYPE_M10_6_WRITE_SELFTEST
         fw_1_vblk_write_selftest(vm);
 #endif
+    } else if (fw_1_vblk_use_physical_usb(vm)) {
+        /*
+         * #388: the USB stick as a `physical:` guest disk -- blk_usb behind the same gates as
+         * AHCI/NVMe. Identity earned the ATTACH; only the #125 confirm earns the write path
+         * (#267): unconfirmed attaches read-only. The §6j LBA+count bounds check lives in
+         * hype_blk_backend_* exactly as for the other buses.
+         */
+        int idx = (int)(vm - &g_vms[0]);
+        unsigned k = (unsigned)g_phys_usb_tgt;
+        int writable = fw_1_phys_write_permitted(g_musbx_serial[k]);
+        unsigned int pnum = fw_1_phys_partition();
+        uint64_t pbase = 0, pcount = g_musbx_be[k].total_sectors;
+        if (fw_1_phys_scope(g_musbx_rd[k], pnum, g_musbx_be[k].total_sectors, &pbase,
+                            &pcount) != 0) {
+            hype_serial_print("virtio-blk[vm %d]: target names partition %u, which is not on the "
+                              "USB stick (sn '%s') -- REFUSING to attach rather than widening to "
+                              "the whole disk\n", idx, pnum, g_musbx_serial[k]);
+            return;
+        }
+        /* the guest consumes the CLAIMED stick's own backend (its own rings, #387); scope by
+         * re-pointing the chunker exactly as the AHCI partition path does */
+        vm->disk[0].be.read = g_musbx_be[k].read;
+        vm->disk[0].be.write = writable ? g_musbx_be[k].write : 0;
+        vm->disk[0].be.writev = 0;
+        vm->disk[0].be.ctx = g_musbx_be[k].ctx;
+        vm->disk[0].be.total_sectors = pcount;
+        if (pnum != 0u) {
+            g_musbx_phys[k].base_lba = pbase;
+        }
+        vm->disk[0].is_physical = 1;
+        g_phys_backend_claimed_vm = idx;
+        hype_virtio_blk_reset(&vm->disk[0].vblk, pcount);
+        hype_debug_print("virtio-blk[vm %d]: PHYSICAL USB backend (sn '%s', %llu sectors) %s "
+                         "[#388]\n", idx, g_musbx_serial[k], (unsigned long long)pcount,
+                         writable ? "[writable -- #125 confirm accepted]"
+                                  : "[READ-ONLY -- no write confirm (#267)]");
+        usb_log_flush();
     } else if (fw_1_vblk_use_physical_ahci(vm)) {
         /* M10-6b (#228): a `physical:` AHCI/SATA target whose identity matched.
          * Reaching here means the #124 identity check passed -- NOT that writing was
@@ -18336,38 +18416,7 @@ static void media_select_ahci(void) {
  */
 static const hype_blk_backend_t *g_media_usb_be;
 
-/*
- * #387 (plan.md §10 decision 31): EXTRA claimed USB media devices -- sticks beyond hype's own
- * boot/log medium, brought up with their own bulk rings (the per-device pool in xhci_hw.c) and
- * registered as media sources under their captured serials. THREE instance slots + the boot
- * medium = HYPE_MEDIA_MAX_DEVS. Each needs its own thunk pair because the media registry
- * distinguishes devices by their read fn.
- */
-#define HYPE_MEDIA_USBX 3u
-static hype_blk_usb_t g_musbx_hw[HYPE_MEDIA_USBX];
-static hype_blk_phys_t g_musbx_phys[HYPE_MEDIA_USBX];
-static hype_blk_backend_t g_musbx_be[HYPE_MEDIA_USBX];
-static hype_xhci_ctrl_t g_musbx_xc[HYPE_MEDIA_USBX];
-static hype_xhci_msc_eps_t g_musbx_eps[HYPE_MEDIA_USBX];
-static char g_musbx_serial[HYPE_MEDIA_USBX][64];
-static unsigned g_musbx_count;
-
-static int musbx_read_common(unsigned k, uint64_t lba, uint32_t count, void *dst) {
-    return hype_blk_backend_read(&g_musbx_be[k], lba, count, dst);
-}
-static int musbx_write_common(unsigned k, uint64_t lba, uint32_t count, const void *src) {
-    return hype_blk_backend_write(&g_musbx_be[k], lba, count, src);
-}
-static int musbx_read0(void *ctx, uint64_t lba, uint32_t count, void *dst) { (void)ctx; return musbx_read_common(0, lba, count, dst); }
-static int musbx_read1(void *ctx, uint64_t lba, uint32_t count, void *dst) { (void)ctx; return musbx_read_common(1, lba, count, dst); }
-static int musbx_read2(void *ctx, uint64_t lba, uint32_t count, void *dst) { (void)ctx; return musbx_read_common(2, lba, count, dst); }
-static int musbx_write0(void *ctx, uint64_t lba, uint32_t count, const void *src) { (void)ctx; return musbx_write_common(0, lba, count, src); }
-static int musbx_write1(void *ctx, uint64_t lba, uint32_t count, const void *src) { (void)ctx; return musbx_write_common(1, lba, count, src); }
-static int musbx_write2(void *ctx, uint64_t lba, uint32_t count, const void *src) { (void)ctx; return musbx_write_common(2, lba, count, src); }
-static int (*const g_musbx_rd[HYPE_MEDIA_USBX])(void *, uint64_t, uint32_t, void *) = {
-    musbx_read0, musbx_read1, musbx_read2};
-static int (*const g_musbx_wr[HYPE_MEDIA_USBX])(void *, uint64_t, uint32_t, const void *) = {
-    musbx_write0, musbx_write1, musbx_write2};
+/* #387: the extra-claimed USB media pool is declared earlier (before the phys-target users). */
 
 /*
  * #365: who is actually reading the USB device?
@@ -19865,8 +19914,43 @@ static void fw_1_arm_physical_targets(void) {
             any = 1;
         }
     }
+    g_phys_usb_tgt = -1;
     if (!any) {
         return;
+    }
+    /*
+     * #388 (decision 32): USB joins the chain as the third bus, IDENTICAL ceremony. Only the
+     * #387 extra-claimed sticks are candidates: hype's own boot/log medium is refused by
+     * IDENTITY (its serial simply is not in this pool -- rule 3), and a stick with no captured
+     * serial has an empty string here, which fw_1_cfg_names_physical_serial can never match
+     * (rule 4, #323's "no identity, no target").
+     */
+    {
+        unsigned int k;
+        for (k = 0; k < g_musbx_count; k++) {
+            if (g_musbx_serial[k][0] == '\0' ||
+                !fw_1_cfg_names_physical_serial(g_musbx_serial[k])) {
+                continue;
+            }
+            if (g_musbx_rd[k](0, 0u, 1u, s0) != 0 || g_musbx_rd[k](0, 1u, 1u, s1) != 0 ||
+                g_musbx_rd[k](0, 0u, 1u, v0) != 0 || g_musbx_rd[k](0, 1u, 1u, v1) != 0) {
+                hype_serial_print("phys-write: USB target '%s' LBA0/1 read failed -- not armed "
+                                  "[#388]\n", g_musbx_serial[k]);
+                continue;
+            }
+            if (!hype_phys_sectors_agree(s0, s1, v0, v1)) {
+                hype_serial_print("phys-write: two reads of USB target '%s' LBA0/1 DISAGREE -- "
+                                  "unreliable stick, not armed (#243) [#388]\n",
+                                  g_musbx_serial[k]);
+                continue;
+            }
+            g_phys_usb_tgt = (int)k;
+            hype_debug_print("phys-write: post-config arm for USB target '%s' (%llu sectors) "
+                             "[#388]\n", g_musbx_serial[k],
+                             (unsigned long long)g_musbx_be[k].total_sectors);
+            arm_physical_write_confirm(&g_hype_cfg, g_musbx_serial[k], "USB mass storage",
+                                       g_musbx_be[k].total_sectors, 0, s0, s1, g_musbx_rd[k]);
+        }
     }
     for (i = 0; i < g_disk_inv.count; i++) {
         const hype_disk_entry_t *e = &g_disk_inv.disks[i];

@@ -1,0 +1,10 @@
+# #388: prove guest writes land on the USB target stick and nowhere else.
+timeout 300000
+expect localhost login:
+send root\n
+expect ~#
+send echo USIZE-$(cat /sys/block/vda/size)\n
+expect USIZE-
+send printf 'HYPE388MARKER' | dd of=/dev/vda bs=512 seek=4096 conv=fsync 2>/dev/null && echo WR-OK\n
+expect WR-OK
+pass usb-physical-write-landed
