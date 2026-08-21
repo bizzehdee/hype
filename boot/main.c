@@ -17409,6 +17409,16 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             continue;
         }
         if (kind == HYPE_VMM_KIND_VMX && info.reason == HYPE_VMX_EXIT_REASON_VIRTUALIZED_EOI) {
+#if HYPE_ENABLE_APICV
+            { /* bring-up probe: which vectors EOI through reason 45, and how often */
+                static unsigned long long eoi45;
+                eoi45++;
+                if (eoi45 <= 8u || (eoi45 % 500u) == 0u) {
+                    hype_debug_print("vmx apicv-eoi #%llu: vec=0x%llx\n", eoi45,
+                                     (unsigned long long)(info.qualification & 0xFFu));
+                }
+            }
+#endif
             hype_vmx_apicv_note_delivered(ctx, (uint8_t)(info.qualification & 0xFFu));
             (void)hype_guest_lapic_write(&g_fw_1_lapic, HYPE_GUEST_LAPIC_REG_EOI, 4u, 0u);
             continue;
