@@ -112,6 +112,39 @@ static inline int hype_fat32_selftest_item(unsigned int idx, hype_fat32_selftest
     return 1;
 }
 
+/*
+ * Interleaved group: files grown CONCURRENTLY, round-robin small appends across all of them at
+ * once, mimicking hype's own log writer growing \HYPE.LOG + each per-VM log at the same time. This
+ * is the workload #584 (a cross-link between two logs from a stale FSInfo hint) and #596 point at
+ * -- the sequential battery writes one file to completion and cannot surface it. The allocator
+ * hands adjacent clusters to different files, so a stale next_free hint or a backward scan
+ * cross-links them. These files are written by hype_fat32_selftest_run's interleaved phase, not the
+ * per-item loop; the validator still checks them by iterating this schedule.
+ */
+#define HYPE_FAT32_SELFTEST_ILEAVE_N 6u
+
+static inline int hype_fat32_selftest_interleaved_item(unsigned int idx,
+                                                       hype_fat32_selftest_item_t *out) {
+    static const unsigned int sz[HYPE_FAT32_SELFTEST_ILEAVE_N] = {40000u,  96000u,  250000u,
+                                                                   32768u,  500000u, 130000u};
+    unsigned int pos = 0u, i;
+    const char *dir = HYPE_FAT32_SELFTEST_DIR;
+    if (idx >= HYPE_FAT32_SELFTEST_ILEAVE_N) return 0;
+    for (i = 0; dir[i]; i++) out->path[pos++] = dir[i];
+    out->path[pos++] = '/';
+    out->path[pos++] = 'I';
+    hype_fat32_selftest_num(out->path, &pos, idx, 1u);
+    out->path[pos++] = '.';
+    out->path[pos++] = 'B';
+    out->path[pos++] = 'I';
+    out->path[pos++] = 'N';
+    out->path[pos] = '\0';
+    out->seed = 0x500u + idx;
+    out->len = sz[idx];
+    out->mode = HYPE_FAT32_SELFTEST_APPEND_N; /* always the small-append log pattern */
+    return 1;
+}
+
 /* Result of an on-medium run. */
 typedef struct {
     unsigned int files_written; /* files the writer accepted */
