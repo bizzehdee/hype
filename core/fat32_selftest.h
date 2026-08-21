@@ -145,6 +145,46 @@ static inline int hype_fat32_selftest_interleaved_item(unsigned int idx,
     return 1;
 }
 
+/*
+ * Log-shaped phase: reproduce the FS-level write shape of hype's log writer (core/log_sink.c) on
+ * the live medium, which the sequential and interleaved phases do not. The log writer grows
+ * \HYPE.LOG + each per-VM log CONCURRENTLY through one shared fs, appending in <= 4 KiB BATCHES
+ * (HYPE_LOG_SINK_BATCH_BYTES), with the real device's durability barrier on every commit. The
+ * interleaved phase above uses tiny 149 B appends; this one uses ~4 KiB batches, a different
+ * allocation granularity, at the proportions of a real run (the combined log biggest).
+ *
+ * log_sink itself is hardwired to the singleton capture buffer that hype's OWN logging uses, so it
+ * cannot be driven cleanly on the live stick; this reproduces the bytes-to-disk shape instead,
+ * which is what could corrupt the volume (#596). Gated by its own marker so it can run alone.
+ */
+#define HYPE_FAT32_LOGTEST_MARKER "LOGTEST.RUN"
+#define HYPE_FAT32_LOGTEST_DIR "LOGTEST"
+#define HYPE_FAT32_LOGTEST_N 5u
+#define HYPE_FAT32_LOGTEST_BATCH 4096u /* == HYPE_LOG_SINK_BATCH_BYTES */
+
+static inline int hype_fat32_logtest_item(unsigned int idx, hype_fat32_selftest_item_t *out) {
+    /* Proportions of a real multi-VM run: the combined log dominates, per-VM logs trail. */
+    static const unsigned int sz[HYPE_FAT32_LOGTEST_N] = {720000u, 300000u, 300000u, 150000u, 90000u};
+    static const char *nm[HYPE_FAT32_LOGTEST_N] = {"LHYPE", "LV0", "LV1", "LV2", "LV3"};
+    unsigned int pos = 0u, i;
+    const char *dir = HYPE_FAT32_LOGTEST_DIR;
+    const char *n;
+    if (idx >= HYPE_FAT32_LOGTEST_N) return 0;
+    for (i = 0; dir[i]; i++) out->path[pos++] = dir[i];
+    out->path[pos++] = '/';
+    n = nm[idx];
+    for (i = 0; n[i]; i++) out->path[pos++] = n[i];
+    out->path[pos++] = '.';
+    out->path[pos++] = 'L';
+    out->path[pos++] = 'O';
+    out->path[pos++] = 'G';
+    out->path[pos] = '\0';
+    out->seed = 0x600u + idx;
+    out->len = sz[idx];
+    out->mode = HYPE_FAT32_SELFTEST_APPEND_N;
+    return 1;
+}
+
 /* Result of an on-medium run. */
 typedef struct {
     unsigned int files_written; /* files the writer accepted */
@@ -193,5 +233,15 @@ static inline const char *hype_fat32_selftest_mode_name(int mode) {
 int hype_fat32_selftest_run(hype_fs_t *fs, const hype_rtc_time_t *now,
                             hype_fat32_selftest_result_t *res,
                             hype_fat32_selftest_log_fn log, void *logctx);
+
+/*
+ * Log-shaped phase (see the HYPE_FAT32_LOGTEST_* block above): grow the LOGTEST files concurrently
+ * on `fs` with ~4 KiB batched appends, reproducing hype's log-writer output shape on the live
+ * medium. Fills *res, emits a per-file event, returns 0 if nothing self-check-failed. Same
+ * signature and result type as hype_fat32_selftest_run. Gated separately by \LOGTEST.RUN.
+ */
+int hype_fat32_logtest_run(hype_fs_t *fs, const hype_rtc_time_t *now,
+                           hype_fat32_selftest_result_t *res,
+                           hype_fat32_selftest_log_fn log, void *logctx);
 
 #endif /* HYPE_FAT32_SELFTEST_H */

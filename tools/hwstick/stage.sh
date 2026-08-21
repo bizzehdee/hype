@@ -80,12 +80,14 @@ if [ "$FAT32" -eq 1 ]; then
     cp tools/hwstick/hype-micro.cfg tools/hwstick/README.md "$DST/"
     printf '%s\n' "#597 marker -- its presence makes hype run the FAT32 write battery on this volume." \
         > "$DST/F32TEST.RUN"
-    rm -rf "$DST/F32TEST" # start the battery from an empty dir so a stale file can't mask a failure
+    printf '%s\n' "#596 marker -- its presence makes hype run the log-shaped write battery too." \
+        > "$DST/LOGTEST.RUN"
+    rm -rf "$DST/F32TEST" "$DST/LOGTEST" # empty dirs so a stale file can't mask a failure
     echo "fat32: staged \\hype.cfg = hype-fat32.cfg and dropped the \\F32TEST.RUN marker"
 else
     cp tools/hwstick/hype.cfg tools/hwstick/hype-micro.cfg tools/hwstick/README.md "$DST/"
     cp tools/hwstick/input/*.txt "$DST/input/"
-    rm -f "$DST/F32TEST.RUN" # a normal run must not accidentally trigger the battery
+    rm -f "$DST/F32TEST.RUN" "$DST/LOGTEST.RUN" # a normal run must not trigger either battery
 fi
 cp tools/hwstick/input-micro/*.txt "$DST/input-micro/"
 sync

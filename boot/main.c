@@ -25647,6 +25647,33 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     }
 
     /*
+     * #596: log-shaped write battery. If \LOGTEST.RUN is present, grow several files concurrently
+     * in ~4 KiB batches -- the FS-level output shape of hype's log writer -- against the live
+     * volume with the real device barrier. This targets the leaked-cluster class fsck found on the
+     * interleaved-run stick, which the raw-writer batteries do not exercise. Leaves \LOGTEST for
+     * the same validate-stick.sh + fsck.vfat pass. Gated on its own marker.
+     */
+    if (g_hype_log.active && g_hype_log_ready) {
+        hype_fs_file_t log_marker;
+        if (hype_fs_lookup(&g_hype_log.fs, HYPE_FAT32_LOGTEST_MARKER, &log_marker) == 0) {
+            hype_fat32_selftest_result_t lt;
+            int lt_rc;
+            hype_debug_print("LOGTEST-STICK: marker \\%s found -- running the #596 log-shaped write "
+                             "battery on the boot volume\n", HYPE_FAT32_LOGTEST_MARKER);
+            lt_rc = hype_fat32_logtest_run(&g_hype_log.fs, g_host_time_valid ? &g_host_time : 0, &lt,
+                                           fw_1_fat32_selftest_log, 0);
+            hype_debug_print("LOGTEST-STICK SELFTEST: %s -- written=%u refused=%u selfcheck_fail=%u%s%s "
+                             "[#596 #597]\n",
+                             (lt_rc == 0 && lt.files_refused == 0) ? "PASS" : "FAIL",
+                             lt.files_written, lt.files_refused, lt.selfcheck_fail,
+                             lt.first_fail[0] ? " first=" : "", lt.first_fail);
+            hype_debug_print("LOGTEST-STICK: files left in \\%s -- the fsck.vfat verdict is the one "
+                             "that matters (a leaked cluster is invisible to a file read-back)\n",
+                             HYPE_FAT32_LOGTEST_DIR);
+        }
+    }
+
+    /*
      * #326: resolve each VM's media, AFTER every host-discovery pass (NVMe, USB, then AHCI) has
      * registered its devices.
      *

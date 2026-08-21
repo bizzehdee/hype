@@ -90,6 +90,19 @@ int main(int argc, char **argv) {
         files++;
         if (!check_item(argv[1], &it, &miss)) { bad++; missing += miss; }
     }
+    for (idx = 0; hype_fat32_logtest_item(idx, &it); idx++) {
+        int miss;
+        /* only present if \LOGTEST.RUN ran; a missing whole set is not a failure of the F32 run */
+        char probe[512];
+        snprintf(probe, sizeof probe, "%s/%s", argv[1], it.path);
+        {
+            FILE *t = fopen(probe, "rb");
+            if (!t) continue; /* log-test not run on this stick */
+            fclose(t);
+        }
+        files++;
+        if (!check_item(argv[1], &it, &miss)) { bad++; missing += miss; }
+    }
 
     printf("---\n%u file(s) checked, %u OK, %u bad (%u missing)\n", files, files - bad, bad, missing);
     if (bad) {

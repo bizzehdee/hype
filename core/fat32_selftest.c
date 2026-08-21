@@ -158,6 +158,80 @@ static void run_interleaved(hype_fs_t *fs, hype_fat32_selftest_result_t *res,
     }
 }
 
+int hype_fat32_logtest_run(hype_fs_t *fs, const hype_rtc_time_t *now,
+                           hype_fat32_selftest_result_t *res,
+                           hype_fat32_selftest_log_fn log, void *logctx) {
+    static hype_fs_file_t files[HYPE_FAT32_LOGTEST_N];
+    hype_fat32_selftest_item_t items[HYPE_FAT32_LOGTEST_N];
+    unsigned int done[HYPE_FAT32_LOGTEST_N];
+    int active[HYPE_FAT32_LOGTEST_N];
+    uint8_t buf[CHUNK];
+    unsigned int n = 0, i;
+    int progress;
+
+    for (i = 0; i < sizeof *res; i++) ((uint8_t *)res)[i] = 0u;
+    if (now) hype_fs_set_time(fs, now);
+    hype_fs_mkdir(fs, HYPE_FAT32_LOGTEST_DIR); /* rerun-safe */
+
+    while (n < HYPE_FAT32_LOGTEST_N && hype_fat32_logtest_item(n, &items[n])) n++;
+    for (i = 0; i < n; i++) {
+        done[i] = 0u;
+        hype_fs_unlink(fs, items[i].path);
+        if (hype_fs_create(fs, items[i].path, &files[i]) != 0) {
+            active[i] = 0;
+            res->files_refused++;
+            note_fail(res, "lcreate ", items[i].path);
+        } else {
+            active[i] = 1;
+        }
+    }
+
+    /* Round-robin one ~4 KiB batch to each active file per pass -- the log writer's batch
+     * granularity (HYPE_LOG_SINK_BATCH_BYTES), concurrent across files on the shared fs. */
+    do {
+        progress = 0;
+        for (i = 0; i < n; i++) {
+            unsigned int chunk;
+            if (!active[i] || done[i] >= items[i].len) continue;
+            chunk = HYPE_FAT32_LOGTEST_BATCH - ((done[i] >> 5) & 0x1FFu); /* ~3585..4096, varied */
+            if (chunk > items[i].len - done[i]) chunk = items[i].len - done[i];
+            if (chunk > CHUNK) chunk = CHUNK;
+            gen(items[i].seed, done[i], buf, chunk);
+            if (hype_fs_append(&files[i], buf, chunk) != 0) {
+                active[i] = 0;
+                res->files_refused++;
+                note_fail(res, "lappend ", items[i].path);
+                continue;
+            }
+            done[i] += chunk;
+            progress = 1;
+        }
+    } while (progress);
+
+    for (i = 0; i < n; i++) {
+        hype_fat32_selftest_event_t ev;
+        uint32_t fc = 0u;
+        int ok = 0;
+        int complete = (done[i] >= items[i].len);
+        if (complete) {
+            res->files_written++;
+            ok = (verify_one(fs, &items[i], res, &fc) == 0);
+            if (!ok) res->selfcheck_fail++;
+        }
+        ev.idx = 2000u + i; /* 2000+ marks the log-shaped phase in the log */
+        ev.path = items[i].path;
+        ev.seed = items[i].seed;
+        ev.len = items[i].len;
+        ev.mode = items[i].mode;
+        ev.first_cluster = fc;
+        ev.refused = !complete;
+        ev.selfcheck_ok = ok;
+        if (log) log(logctx, &ev);
+    }
+    hype_fs_sync(fs);
+    return (res->selfcheck_fail || res->files_refused) ? -1 : 0;
+}
+
 int hype_fat32_selftest_run(hype_fs_t *fs, const hype_rtc_time_t *now,
                             hype_fat32_selftest_result_t *res,
                             hype_fat32_selftest_log_fn log, void *logctx) {

@@ -64,6 +64,15 @@ int main(int argc, char **argv) {
     rc = hype_fat32_selftest_run(&fs, &now, &res, logcb, 0);
     printf("selftest: written=%u refused=%u selfcheck_fail=%u%s%s\n", res.files_written,
            res.files_refused, res.selfcheck_fail, res.first_fail[0] ? " first=" : "", res.first_fail);
+
+    {
+        hype_fat32_selftest_result_t lt;
+        int lrc = hype_fat32_logtest_run(&fs, &now, &lt, logcb, 0);
+        printf("logtest:  written=%u refused=%u selfcheck_fail=%u%s%s\n", lt.files_written,
+               lt.files_refused, lt.selfcheck_fail, lt.first_fail[0] ? " first=" : "", lt.first_fail);
+        if (lrc != 0 || lt.files_refused != 0) rc = 1;
+    }
+
     fflush(g_img);
     fclose(g_img);
     return (rc == 0 && res.files_refused == 0) ? 0 : 1;
