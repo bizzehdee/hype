@@ -3997,6 +3997,43 @@ int hype_svm_vcpu_absorb_mmio_npf(hype_vcpu_ctx_t *ctx, const uint8_t *guest_ins
  * buffer). The pure model (devices/tpm_crb.c) does everything else, including running the command
  * when the guest rings CTRL_START.
  */
+
+/*
+ * #590: walk the guest's OWN page tables to turn a guest-LINEAR address into guest-physical.
+ * guest_dma_xlate does only guest-physical -> host, which is enough for an identity-mapped
+ * microtest but not for a real OS whose kernel pointers are high virtual addresses. 4-level
+ * long-mode walk (the only mode hype's guests run in), honouring 1 GiB and 2 MiB large pages;
+ * each table page is read host-side via guest_dma_xlate. Returns the guest-physical address, or
+ * ~0 on a not-present entry or an untranslatable table page.
+ */
+static uint64_t guest_linear_to_phys(const hype_gpa_map_t *dma_map, uint64_t cr3, uint64_t laddr) {
+    uint64_t table = cr3 & 0x000FFFFFFFFFF000ull;
+    int level;
+    /* PML4 -> PDPT -> PD -> PT; shift 39/30/21/12 */
+    static const unsigned shift[4] = {39u, 30u, 21u, 12u};
+    for (level = 0; level < 4; level++) {
+        uint64_t host = guest_dma_xlate(dma_map, table, 4096u);
+        uint64_t e;
+        unsigned idx;
+        if (host == 0) {
+            return ~0ull;
+        }
+        idx = (unsigned)((laddr >> shift[level]) & 0x1FFu);
+        e = ((const uint64_t *)(uintptr_t)host)[idx];
+        if ((e & 1ull) == 0ull) {
+            return ~0ull; /* not present */
+        }
+        if (level > 0 && level < 3 && (e & (1ull << 7)) != 0ull) {
+            /* large page: PS set at PDPT (1 GiB) or PD (2 MiB) */
+            uint64_t mask = (level == 1) ? 0x000FFFFFC0000000ull : 0x000FFFFFFFE00000ull;
+            uint64_t off_mask = (level == 1) ? 0x3FFFFFFFull : 0x1FFFFFull;
+            return (e & mask) | (laddr & off_mask);
+        }
+        table = e & 0x000FFFFFFFFFF000ull;
+    }
+    return table | (laddr & 0xFFFull);
+}
+
 int hype_svm_vcpu_handle_tpm_crb_npf(hype_vcpu_ctx_t *ctx, hype_tpm_crb_t *crb,
                                      uint64_t crb_base_phys, const hype_gpa_map_t *dma_map,
                                      const uint8_t *guest_insn_bytes) {
@@ -4024,34 +4061,51 @@ int hype_svm_vcpu_handle_tpm_crb_npf(hype_vcpu_ctx_t *ctx, hype_tpm_crb_t *crb,
             uint64_t *rsi = gpr_ptr(real, 6u);
             uint64_t *rdi = gpr_ptr(real, 7u);
             uint64_t *rcx = gpr_ptr(real, 1u);
+            uint64_t cr3 = real->vmcb->save.cr3;
             uint64_t count = is_rep ? (rcx ? *rcx : 0u) : 1u;
             int df = (real->vmcb->save.rflags & (1ull << 10)) ? 1 : 0;
             int64_t step = df ? -(int64_t)elem : (int64_t)elem;
             int to_mmio; /* 1 if RDI (dest) is the CRB window */
+            uint64_t rsi_phys, rdi_phys;
             if (rsi == 0 || rdi == 0) {
                 return -1;
             }
-            to_mmio = (*rdi >= crb_base_phys && *rdi < crb_base_phys + HYPE_TPM_CRB_SIZE);
+            /* The registers hold guest-LINEAR addresses -- for the MMIO side too (the kernel's
+             * ioremap VA), so neither equals the physical base. Walk both to guest-physical and
+             * let the one landing in the CRB window name the MMIO side. */
+            rsi_phys = guest_linear_to_phys(dma_map, cr3, *rsi);
+            rdi_phys = guest_linear_to_phys(dma_map, cr3, *rdi);
+            if (rdi_phys >= crb_base_phys && rdi_phys < crb_base_phys + HYPE_TPM_CRB_SIZE) {
+                to_mmio = 1;
+            } else if (rsi_phys >= crb_base_phys && rsi_phys < crb_base_phys + HYPE_TPM_CRB_SIZE) {
+                to_mmio = 0;
+            } else {
+                return -1; /* neither side is the CRB -- not ours */
+            }
             while (count > 0u) {
-                uint64_t mmio_gpa = to_mmio ? *rdi : *rsi;
-                uint64_t ram_gpa = to_mmio ? *rsi : *rdi;
-                uint32_t moff = (uint32_t)(mmio_gpa - crb_base_phys);
+                uint64_t mmio_phys = guest_linear_to_phys(dma_map, cr3, to_mmio ? *rdi : *rsi);
+                uint64_t ram_phys = guest_linear_to_phys(dma_map, cr3, to_mmio ? *rsi : *rdi);
+                uint32_t moff;
                 uint64_t ram_host;
-                if (mmio_gpa < crb_base_phys || mmio_gpa + elem > crb_base_phys + HYPE_TPM_CRB_SIZE) {
-                    return -1; /* one end must stay inside the window for the whole run */
+                unsigned k;
+                if (mmio_phys == ~0ull || ram_phys == ~0ull) {
+                    return -1;
                 }
-                ram_host = guest_dma_xlate(dma_map, ram_gpa, elem);
+                if (mmio_phys < crb_base_phys ||
+                    mmio_phys + elem > crb_base_phys + HYPE_TPM_CRB_SIZE) {
+                    return -1;
+                }
+                moff = (uint32_t)(mmio_phys - crb_base_phys);
+                ram_host = guest_dma_xlate(dma_map, ram_phys, elem);
                 if (ram_host == 0) {
                     return -1;
                 }
                 if (to_mmio) {
                     uint64_t v = 0;
-                    unsigned k;
                     for (k = 0; k < elem; k++) v |= (uint64_t)((uint8_t *)(uintptr_t)ram_host)[k] << (8u * k);
                     hype_tpm_crb_write(crb, moff, elem, v);
                 } else {
                     uint64_t v = hype_tpm_crb_read(crb, moff, elem);
-                    unsigned k;
                     for (k = 0; k < elem; k++) ((uint8_t *)(uintptr_t)ram_host)[k] = (uint8_t)(v >> (8u * k));
                 }
                 *rsi = (uint64_t)((int64_t)*rsi + step);

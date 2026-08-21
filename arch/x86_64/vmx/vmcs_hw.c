@@ -3775,6 +3775,36 @@ int hype_vmx_vcpu_handle_lapic_npf(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lap
 #include "../../../devices/tpm_crb.h"
 
 /* #433: the TPM 2.0 CRB window on the VMX backend -- ioapic's shape, variable size (1/2/4). */
+
+/* #590: guest linear -> physical walk, VMX flavour (see the SVM twin's comment). Reads each
+ * table page host-side via vmx_dma_xlate; guest CR3 comes from the VMCS. */
+static uint64_t vmx_guest_linear_to_phys(const hype_gpa_map_t *dma_map, uint64_t cr3,
+                                         uint64_t laddr) {
+    uint64_t table = cr3 & 0x000FFFFFFFFFF000ull;
+    int level;
+    static const unsigned shift[4] = {39u, 30u, 21u, 12u};
+    for (level = 0; level < 4; level++) {
+        uint64_t host = vmx_dma_xlate(dma_map, table, 4096u);
+        uint64_t e;
+        unsigned idx;
+        if (host == 0) {
+            return ~0ull;
+        }
+        idx = (unsigned)((laddr >> shift[level]) & 0x1FFu);
+        e = ((const uint64_t *)(uintptr_t)host)[idx];
+        if ((e & 1ull) == 0ull) {
+            return ~0ull;
+        }
+        if (level > 0 && level < 3 && (e & (1ull << 7)) != 0ull) {
+            uint64_t mask = (level == 1) ? 0x000FFFFFC0000000ull : 0x000FFFFFFFE00000ull;
+            uint64_t off_mask = (level == 1) ? 0x3FFFFFFFull : 0x1FFFFFull;
+            return (e & mask) | (laddr & off_mask);
+        }
+        table = e & 0x000FFFFFFFFFF000ull;
+    }
+    return table | (laddr & 0xFFFull);
+}
+
 int hype_vmx_vcpu_handle_tpm_crb_npf(hype_vcpu_ctx_t *ctx, struct hype_tpm_crb *crb,
                                      uint64_t crb_base_phys, const hype_gpa_map_t *dma_map,
                                      const uint8_t *guest_insn_bytes) {
@@ -3793,24 +3823,40 @@ int hype_vmx_vcpu_handle_tpm_crb_npf(hype_vcpu_ctx_t *ctx, struct hype_tpm_crb *
             uint64_t rsi = real->gprs[6], rdi = real->gprs[7], rcx = real->gprs[1];
             uint64_t rflags = vmread(HYPE_VMCS_GUEST_RFLAGS, &ok);
             uint64_t rip = vmread(HYPE_VMCS_GUEST_RIP, &ok);
+            uint64_t cr3 = vmread(HYPE_VMCS_GUEST_CR3, &ok);
             uint64_t count = is_rep ? rcx : 1u;
             int df = (rflags & (1ull << 10)) ? 1 : 0;
             int64_t step = df ? -(int64_t)elem : (int64_t)elem;
             int to_mmio;
+            uint64_t rsi_phys, rdi_phys;
             if (!ok) {
                 return -1;
             }
-            to_mmio = (rdi >= crb_base_phys && rdi < crb_base_phys + HYPE_TPM_CRB_SIZE);
+            /* registers hold guest-LINEAR addresses; walk both, the CRB-window side is MMIO */
+            rsi_phys = vmx_guest_linear_to_phys(dma_map, cr3, rsi);
+            rdi_phys = vmx_guest_linear_to_phys(dma_map, cr3, rdi);
+            if (rdi_phys >= crb_base_phys && rdi_phys < crb_base_phys + HYPE_TPM_CRB_SIZE) {
+                to_mmio = 1;
+            } else if (rsi_phys >= crb_base_phys && rsi_phys < crb_base_phys + HYPE_TPM_CRB_SIZE) {
+                to_mmio = 0;
+            } else {
+                return -1;
+            }
             while (count > 0u) {
-                uint64_t mmio_gpa = to_mmio ? rdi : rsi;
-                uint64_t ram_gpa = to_mmio ? rsi : rdi;
-                uint32_t moff = (uint32_t)(mmio_gpa - crb_base_phys);
+                uint64_t mmio_phys = vmx_guest_linear_to_phys(dma_map, cr3, to_mmio ? rdi : rsi);
+                uint64_t ram_phys = vmx_guest_linear_to_phys(dma_map, cr3, to_mmio ? rsi : rdi);
+                uint32_t moff;
                 uint64_t ram_host;
                 unsigned k;
-                if (mmio_gpa < crb_base_phys || mmio_gpa + elem > crb_base_phys + HYPE_TPM_CRB_SIZE) {
+                if (mmio_phys == ~0ull || ram_phys == ~0ull) {
                     return -1;
                 }
-                ram_host = vmx_dma_xlate(dma_map, ram_gpa, elem);
+                if (mmio_phys < crb_base_phys ||
+                    mmio_phys + elem > crb_base_phys + HYPE_TPM_CRB_SIZE) {
+                    return -1;
+                }
+                moff = (uint32_t)(mmio_phys - crb_base_phys);
+                ram_host = vmx_dma_xlate(dma_map, ram_phys, elem);
                 if (ram_host == 0) {
                     return -1;
                 }

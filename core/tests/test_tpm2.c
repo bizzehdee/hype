@@ -298,6 +298,13 @@ static void test_crb_registers(void) {
     CHECK("req cleared", hype_tpm_crb_read(&crb, HYPE_CRB_CTRL_REQ, 4) == 0u);
     hype_tpm_crb_write(&crb, HYPE_CRB_CTRL_CANCEL, 4, 1);
     hype_tpm_crb_write(&crb, HYPE_CRB_CTRL_INT_ENABLE, 4, 0xFFFFFFFFu);
+    /* #433: the locality handshake -- requestAccess sets locAssigned, Relinquish clears it. */
+    hype_tpm_crb_write(&crb, HYPE_CRB_LOC_CTRL, 4, 0x1u);
+    CHECK("requestAccess sets locAssigned",
+          (hype_tpm_crb_read(&crb, HYPE_CRB_LOC_STATE, 4) & 0x2u) != 0u);
+    hype_tpm_crb_write(&crb, HYPE_CRB_LOC_CTRL, 4, 0x4u);
+    CHECK("relinquish clears locAssigned",
+          (hype_tpm_crb_read(&crb, HYPE_CRB_LOC_STATE, 4) & 0x2u) == 0u);
     /* START with bit clear does nothing */
     hype_tpm_crb_write(&crb, HYPE_CRB_CTRL_START, 4, 0);
     CHECK("no command from clear START", crb.cmds == 0u);

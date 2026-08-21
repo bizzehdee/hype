@@ -102,6 +102,19 @@ void hype_tpm_crb_write(hype_tpm_crb_t *c, uint32_t offset, unsigned int size, u
         return;
     }
     switch (offset) {
+    case HYPE_CRB_LOC_CTRL:
+        /* #433/#590: the locality handshake. requestAccess(bit0) grants locality 0 and marks it
+         * assigned; Relinquish(bit2) releases it -- the driver polls LOC_STATE afterwards, and
+         * without honouring these it saw locAssigned stuck set and logged
+         * "TPM_LOC_STATE_x.Relinquish timed out". */
+        if (val & 0x1u) {        /* requestAccess */
+            c->loc_state |= 0x2u; /* locAssigned */
+            c->loc_sts = 0x1u;    /* granted */
+        }
+        if (val & 0x4u) {        /* Relinquish */
+            c->loc_state &= ~0x2u;
+        }
+        break;
     case HYPE_CRB_CTRL_REQ:
         /* cmdReady(bit0) / goIdle(bit1): acknowledge instantly -- this TPM is always ready */
         c->ctrl_req = 0;
@@ -113,10 +126,9 @@ void hype_tpm_crb_write(hype_tpm_crb_t *c, uint32_t offset, unsigned int size, u
         }
         break;
     case HYPE_CRB_CTRL_CANCEL:
-    case HYPE_CRB_LOC_CTRL:
     case HYPE_CRB_CTRL_INT_ENABLE:
     case HYPE_CRB_CTRL_INT_STS:
-        break; /* accepted, nothing to do: no interrupts, no multi-locality */
+        break; /* accepted, nothing to do: no interrupts */
     default:
         break; /* read-only or reserved: dropped, like real hardware */
     }
