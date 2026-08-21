@@ -1995,6 +1995,17 @@ static uint64_t g_hostdisk_total_sectors;
  */
 static char g_phys_target_serial[21];
 
+/*
+ * #587: the CONFIGURED physical target's own (abar, port, capacity), recorded by the post-config
+ * arm pass. Distinct from g_hostdisk_* on purpose: that global is the media/boot-volume disk, and
+ * one global serving two roles is the latent half of #587 -- an ESP on port 0 with a target on
+ * port 1 needs both at once. AHCI only; the NVMe target keeps g_hostnvme_*.
+ */
+static int g_phys_ahci_tgt_present;
+static uint64_t g_phys_ahci_tgt_abar;
+static unsigned int g_phys_ahci_tgt_port;
+static uint64_t g_phys_ahci_tgt_sectors;
+
 static char g_hostdisk_serial[21]; /* ATA serial -- matched against a confirmed
                                     * `physical:` target, exactly as g_hostnvme_serial */
 
@@ -2189,6 +2200,7 @@ static int term_streq(const char *a, const char *b) {
  * the runtime index IS the config index in 35 places); this is the one question every list/
  * resolve/render site asks instead of reimplementing the rule. Defined after g_hype_cfg. */
 static int fw_1_vm_is_deleted(unsigned int i);
+static void fw_1_arm_physical_targets(void); /* #587: defined after the guard machinery */
 
 /* Resolve a command arg ("vm0"/"vm1" name or a 1-based index) to a VM index,
  * or -1 if it names no known VM. */
@@ -8293,6 +8305,26 @@ static int fw_1_phys_target_matches(const char *drive_serial) {
 static int media_ahci_read(void *ctx, uint64_t lba, uint32_t count, void *dst);
 static int media_nvme_read(void *ctx, uint64_t lba, uint32_t count, void *dst);
 
+/* #587: same shape as media_ahci_read, against the TARGET's port rather than the media disk's. */
+static int phys_tgt_ahci_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
+    uint8_t *d = (uint8_t *)dst;
+    (void)ctx;
+    if (!g_phys_ahci_tgt_present) {
+        return -1;
+    }
+    while (count > 0u) {
+        uint32_t chunk = (count > 8192u) ? 8192u : count; /* uint16 FIS count, 4 MiB/cmd */
+        if (hype_ahci_host_read(g_phys_ahci_tgt_abar, g_phys_ahci_tgt_port, lba, (uint16_t)chunk,
+                                d) != 0) {
+            return -1;
+        }
+        lba += chunk;
+        d += (uint64_t)chunk * 512u;
+        count -= chunk;
+    }
+    return 0;
+}
+
 /*
  * #332: the disk-absolute scope a `physical:` target names -- the whole drive, or one GPT partition.
  *
@@ -8350,9 +8382,12 @@ static int fw_1_vblk_use_physical(hype_fw_vm_t *vm) {
  * the single writable physical backend isn't already claimed by another VM. */
 static int fw_1_vblk_use_physical_ahci(hype_fw_vm_t *vm) {
     int idx = (int)(vm - &g_vms[0]);
+    if (g_phys_backend_claimed_vm >= 0 && g_phys_backend_claimed_vm != idx) return 0;
+    /* #587: a target on its OWN port, recorded by the post-config arm pass -- the media disk
+     * (g_hostdisk_*) keeps its role untouched. */
+    if (g_phys_ahci_tgt_present && fw_1_phys_target_matches(g_phys_target_serial)) return 1;
     if (!g_hostdisk_present) return 0;
     if (!fw_1_phys_target_matches(g_hostdisk_serial)) return 0;
-    if (g_phys_backend_claimed_vm >= 0 && g_phys_backend_claimed_vm != idx) return 0;
     return 1;
 }
 
@@ -9141,20 +9176,28 @@ static void fw_1_setup_virtio_blk(hype_fw_vm_t *vm) {
          * already in g_pml4's identity map, so -- unlike the high-BAR NVMe path --
          * no remap/re-init is needed here. */
         int idx = (int)(vm - &g_vms[0]);
-        int writable = fw_1_phys_write_permitted(g_hostdisk_serial);
+        /* #587: the target's own coordinates when the post-config arm recorded one; the media
+         * disk's when the target IS the media disk (the pre-#587 single-disk shape). */
+        int own_port = g_phys_ahci_tgt_present && fw_1_phys_target_matches(g_phys_target_serial);
+        uint64_t t_abar = own_port ? g_phys_ahci_tgt_abar : g_hostdisk_abar;
+        unsigned int t_port = own_port ? g_phys_ahci_tgt_port : g_hostdisk_port;
+        uint64_t t_sectors = own_port ? g_phys_ahci_tgt_sectors : g_hostdisk_total_sectors;
+        const char *t_serial = own_port ? g_phys_target_serial : g_hostdisk_serial;
+        int writable = fw_1_phys_write_permitted(t_serial);
         /* #332: scope to the configured partition, or the whole drive when none was named. */
         unsigned int pnum = fw_1_phys_partition();
-        uint64_t pbase = 0, pcount = g_hostdisk_total_sectors;
-        if (fw_1_phys_scope(media_ahci_read, pnum, g_hostdisk_total_sectors, &pbase, &pcount) != 0) {
+        uint64_t pbase = 0, pcount = t_sectors;
+        if (fw_1_phys_scope(own_port ? phys_tgt_ahci_read : media_ahci_read, pnum, t_sectors,
+                            &pbase, &pcount) != 0) {
             /* REFUSE, never widen: silently giving the guest the whole drive because partition N was
              * missing is the worst possible response to a typo in a destructive target. */
             hype_serial_print("virtio-blk[vm %d]: target names partition %u, which is not on the "
                               "drive (sn '%s') -- REFUSING to attach rather than widening to the "
-                              "whole disk\n", idx, pnum, g_hostdisk_serial);
+                              "whole disk\n", idx, pnum, t_serial);
             return;
         }
         hype_blk_phys_ahci_init(&vm->disk[0].phys, &g_hostdisk_ahci, &vm->disk[0].be,
-                                g_hostdisk_abar, g_hostdisk_port, g_hostdisk_total_sectors);
+                                t_abar, t_port, t_sectors);
         if (pnum != 0u) {
             /* Re-point the already-wired backend at the partition: base offsets every transfer and
              * the clamped capacity is what the dispatcher confines the guest with. */
@@ -9177,7 +9220,7 @@ static void fw_1_setup_virtio_blk(hype_fw_vm_t *vm) {
          * the partition and every such access would be refused by the dispatcher. */
         hype_virtio_blk_reset(&vm->disk[0].vblk, pcount);
         hype_debug_print("virtio-blk[vm %d]: PHYSICAL AHCI/SATA backend (sn '%s', %llu sectors) "
-                         "%s\n", idx, g_hostdisk_serial, (unsigned long long)pcount,
+                         "%s\n", idx, t_serial, (unsigned long long)pcount,
                          writable ? "[writable -- #125 confirm accepted]"
                                   : "[READ-ONLY -- boot only; no write confirm (#267)]");
         /* Real-HW install: guarantee this "attached writable" confirmation reaches
@@ -11962,6 +12005,9 @@ static void fw_1_phase1_config(void) {
                             g_hype_cfg.vm_count != 0u ? "from hype.cfg"
                                                       : "the default, because no usable config was "
                                                         "read");
+    /* #587: `physical:` targets can only be armed once the config exists -- the enumeration-time
+     * arm ran before this function and saw zero VMs. */
+    fw_1_arm_physical_targets();
     fw_1_phase1_firmware();
     /*
      * M9-4 (#177): the previous shutdown's run-state, read once, here -- after the boot volume is
@@ -19482,6 +19528,86 @@ static void arm_physical_write_confirm(const hype_cfg_t *cfg, const char *drive_
                          v->name);
 #endif
         return; /* at most one pending confirmation at a time */
+    }
+}
+
+/*
+ * #587: arm `physical:` targets AFTER hype.cfg is parsed.
+ *
+ * The enumeration-time arm calls consult g_hype_cfg, and since #452 moved config loading post-EBS
+ * the enumeration runs FIRST -- so they iterate zero VMs and arm nothing, silently. This pass runs
+ * from fw_1_phase1_config() once the config exists, walks the #258 inventory, and runs the same
+ * #124/#243 ceremony (LBA0/1, verification re-read, GPT GUID) against the matched entry's OWN
+ * (abar, port) -- which also fixes the latent half: the target no longer has to BE the media disk.
+ */
+static void fw_1_arm_physical_targets(void) {
+    static uint8_t s0[512] __attribute__((aligned(4096)));
+    static uint8_t s1[512] __attribute__((aligned(4096)));
+    static uint8_t v0[512] __attribute__((aligned(4096)));
+    static uint8_t v1[512] __attribute__((aligned(4096)));
+    static uint8_t guid[16];
+    unsigned int i, vi;
+    int any = 0;
+
+    for (vi = 0; vi < g_hype_cfg.vm_count; vi++) {
+        const hype_cfg_target_disk_t *d = &g_hype_cfg.vms[vi].target_disk;
+        if (d->kind == HYPE_CFG_DISK_PHYSICAL && d->path_or_id[0] != '\0') {
+            any = 1;
+        }
+    }
+    if (!any) {
+        return;
+    }
+    for (i = 0; i < g_disk_inv.count; i++) {
+        const hype_disk_entry_t *e = &g_disk_inv.disks[i];
+        if (!fw_1_cfg_names_physical_serial(e->serial)) {
+            continue;
+        }
+        if (e->bus == HYPE_DISK_BUS_AHCI) {
+            int have_guid;
+            /* Record the target FIRST: phys_tgt_ahci_read and the attach path key off it. */
+            g_phys_ahci_tgt_abar = e->bar_phys;
+            g_phys_ahci_tgt_port = e->port;
+            g_phys_ahci_tgt_sectors = e->total_sectors;
+            g_phys_ahci_tgt_present = 1;
+            if (phys_tgt_ahci_read(0, 0u, 1u, s0) != 0 || phys_tgt_ahci_read(0, 1u, 1u, s1) != 0 ||
+                phys_tgt_ahci_read(0, 0u, 1u, v0) != 0 || phys_tgt_ahci_read(0, 1u, 1u, v1) != 0) {
+                hype_serial_print("phys-write: target '%s' LBA0/1 read failed -- not armed [#587]\n",
+                                  e->serial);
+                g_phys_ahci_tgt_present = 0;
+                continue;
+            }
+            if (!hype_phys_sectors_agree(s0, s1, v0, v1)) {
+                hype_serial_print("phys-write: two reads of target '%s' LBA0/1 DISAGREE -- "
+                                  "unreliable drive, not armed (#243) [#587]\n", e->serial);
+                g_phys_ahci_tgt_present = 0;
+                continue;
+            }
+            have_guid = (hype_gpt_disk_guid(phys_tgt_ahci_read, 0, guid) == 0);
+            hype_debug_print("phys-write: post-config arm for AHCI target '%s' (port %u, %llu "
+                             "sectors) [#587]\n", e->serial, e->port,
+                             (unsigned long long)e->total_sectors);
+            arm_physical_write_confirm(&g_hype_cfg, e->serial, e->model, e->total_sectors,
+                                       have_guid ? guid : 0, s0, s1, phys_tgt_ahci_read);
+        } else if (g_hostnvme_present && term_streq(e->serial, g_hostnvme_serial)) {
+            /* NVMe: one enumerated controller, identity already latched -- redo the ceremony
+             * against it now that the config can actually be consulted. */
+            if (hype_nvme_host_read(g_hostnvme_bar, 0u, 1u, s0) != 0 ||
+                hype_nvme_host_read(g_hostnvme_bar, 1u, 1u, s1) != 0 ||
+                hype_nvme_host_read(g_hostnvme_bar, 0u, 1u, v0) != 0 ||
+                hype_nvme_host_read(g_hostnvme_bar, 1u, 1u, v1) != 0) {
+                hype_serial_print("phys-write: NVMe target LBA0/1 read failed -- not armed [#587]\n");
+                continue;
+            }
+            if (!hype_phys_sectors_agree(s0, s1, v0, v1)) {
+                hype_serial_print("phys-write: two reads of NVMe target LBA0/1 DISAGREE -- "
+                                  "unreliable drive, not armed (#243) [#587]\n");
+                continue;
+            }
+            hype_debug_print("phys-write: post-config arm for NVMe target '%s' [#587]\n", e->serial);
+            arm_physical_write_confirm(&g_hype_cfg, g_hostnvme_serial, e->model,
+                                       g_hostnvme_total_sectors, 0, s0, s1, media_nvme_read);
+        }
     }
 }
 
