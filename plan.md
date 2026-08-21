@@ -2850,6 +2850,55 @@ isn't lost.
     Landing (a) before (b) before (c) is the natural order; (d) gates the
     epic's close.
 
+56. **Write durability on a device with no cache-flush barrier -- decided
+    (2026-08-21), #596.** hype's on-medium FAT32/exFAT/ext writers keep the
+    filesystem crash-consistent by ORDERING: a metadata pointer that reaches a
+    block (a FAT link before the directory size that spans it, #377; an exFAT
+    DataLength; an ext journal commit) must be durable before the pointer is
+    published. That ordering was enforced with a cache-flush barrier
+    (`SYNCHRONIZE CACHE` on USB MSC), invoked through the fs-agnostic
+    `fs->sync` callback.
+
+    **The defect (#596, reproduced on real hardware).** Some cheap flash sticks
+    reject `SYNCHRONIZE CACHE` as an unknown opcode. #516 handled that by
+    latching `sync_cache_unsupported` and treating the barrier as a no-op that
+    RETURNS SUCCESS -- on the assumption "rejects the flush ⟹ cacheless ⟹
+    nothing to flush." That assumption is UNSOUND: such a device can still
+    buffer/reorder/lose writes. So `flush_metadata` believed it had ordered the
+    FAT link, published the larger size, and the device then lost the
+    once-written tail FAT sectors while the repeatedly-rewritten directory entry
+    survived -- leaving a persistent `dirent size > cluster chain` (the exact
+    invariant #464 forbids), a leaked cluster, and a wrong free count, on the
+    real log writer's concurrently-grown per-VM logs. A no-op that reports
+    success is a lie the whole ordering rests on.
+
+    **Decided.** When the device has no working flush barrier, hype sets the
+    SCSI **FUA (Force Unit Access)** bit on every `WRITE(10)`. FUA is
+    per-command write-through: the write completes only when the block is on the
+    medium, so writes land in issue order and a metadata pointer can never
+    outlive the block it names -- the ordering the barrier used to provide,
+    obtained without a flush the device refuses. The fix lives at the shared
+    block layer (`core/xhci_hw.c` `hype_xhci_msc_write`), NOT in any one writer,
+    because the missing guarantee was in the fs-agnostic sync path: one change
+    covers FAT32, exFAT and ext. It applies ONLY to devices that reject
+    `SYNCHRONIZE CACHE`; a device with a working flush keeps write-back speed and
+    the flush barrier unchanged.
+
+    **Alternatives considered.** (i) Keep the no-op but have each writer
+    read-back-verify the chain before publishing the size -- rejected: a device
+    that serves un-durable buffered data on reads (read-your-writes) confirms a
+    link that is later lost, so read-back proves visibility, not durability. (ii)
+    Refuse durable appends on such a device -- rejected: it disables logging to
+    exactly the cheap boot sticks the field uses. (iii) Per-writer fixes --
+    rejected as redundant once the block layer is correct.
+
+    **Limit, stated plainly.** If a device ignores FUA as well (accepts it but
+    does not force to media), hype cannot manufacture a durability the hardware
+    refuses; such a device is not crash-consistent for any writer, and the
+    operator should use `SYNCHRONIZE CACHE`- or FUA-honouring media for durable
+    or `physical:` writes. Efficacy on a given controller is a
+    hardware-validation item, not a claim the code can make on its own.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what

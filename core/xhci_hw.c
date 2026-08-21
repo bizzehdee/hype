@@ -1426,6 +1426,7 @@ int hype_xhci_msc_read(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_m
 
 int hype_xhci_msc_write(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_msc_eps_t *msc,
                         uint32_t lba, unsigned int blocks, unsigned int block_size, const void *buf) {
+    xhci_hw_t *hw = HW(c);
     xhci_msc_hw_t *m = msc_hw_for(c, slot, 0); /* #387 */
     uint8_t cdb[10];
     unsigned int len = blocks * block_size;
@@ -1435,6 +1436,19 @@ int hype_xhci_msc_write(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_
     /* stage the caller's data (bot_scsi bounces from the device's bounce for OUT). */
     for (i = 0; i < len; i++) ((uint8_t *)m->data)[i] = ((const uint8_t *)buf)[i];
     hype_scsi_cdb_write10(cdb, lba, (uint16_t)blocks);
+    /*
+     * #596: on a device that rejects SYNCHRONIZE CACHE (#516) hype has no cache-flush barrier, so
+     * the durability ORDERING a filesystem writer relies on -- FAT link before the directory size
+     * that reaches it (#377), the exFAT DataLength, an ext journal commit -- cannot be established
+     * by a flush. Set FUA (Force Unit Access) on every WRITE(10) instead: each write goes straight
+     * to the medium and completes only when durable, so writes land in issue order and a metadata
+     * pointer never outlives the block it points at. Fs-agnostic: it fixes FAT32/exFAT/ext at once,
+     * because the missing guarantee was in the shared block/sync layer, not in any one writer.
+     * Only on such devices -- a stick with a working SYNCHRONIZE CACHE keeps write-back speed.
+     */
+    if (hw != 0 && hw->sync_cache_unsupported) {
+        cdb[1] |= 0x08u; /* FUA */
+    }
     /* pass the bounce as the data pointer so bot_scsi's OUT copy is a self-copy. */
     return bot_scsi(c, slot, msc, cdb, 10u, (uint8_t *)m->data, len, 0);
 }
@@ -1487,8 +1501,8 @@ int hype_xhci_msc_sync_cache(hype_xhci_ctrl_t *c, unsigned int slot,
     if (rc != 0 && hw->last_sense_key == 0x5u && hw->last_sense_asc == 0x20u) {
         hw->sync_cache_unsupported = 1;
         hype_debug_print("host-xhci: #516 device rejects SYNCHRONIZE CACHE (ILLEGAL REQUEST/"
-                         "invalid opcode) -- cacheless device, treating sync as a no-op from "
-                         "now on\n");
+                         "invalid opcode) -- no cache-flush barrier; switching all WRITE(10)s to "
+                         "FUA so writes are ordered/durable without it [#596]\n");
         return 0;
     }
     return rc;
