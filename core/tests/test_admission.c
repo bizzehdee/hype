@@ -1559,6 +1559,42 @@ static void test_network_less_vm_is_silent(void) {
     CHECK_INT("count", (int)HYPE_ADM_OK, (int)hype_adm_check_nic_count(&cfg, 1u).status);
 }
 
+/*
+ * #607: `firmware = legacy` has no boot path until #128 exists, so admission must refuse the VM
+ * rather than let it silently boot the UEFI OVMF path. A second, ordinary VM in the same config
+ * must be named as clean and untouched -- refusing one machine must never take the rest with it.
+ */
+static void test_firmware_legacy_is_refused(void) {
+    hype_cfg_t cfg;
+    hype_adm_result_t r;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 2;
+    make_vm(&cfg.vms[0], "old", 1, 512, "old.img");
+    cfg.vms[0].firmware = HYPE_CFG_FW_LEGACY;
+    make_vm(&cfg.vms[1], "modern", 1, 512, "modern.img"); /* stays HYPE_CFG_FW_UEFI via make_vm */
+
+    r = hype_adm_check_firmware(&cfg);
+    CHECK_INT("firmware = legacy is refused", (int)HYPE_ADM_ERR_FIRMWARE_LEGACY_UNSUPPORTED,
+              (int)r.status);
+    CHECK_INT("names the offending VM", 0, (int)r.vm_index_a);
+    CHECK_INT("no second VM implicated", HYPE_ADM_NO_VM, r.vm_index_b);
+}
+
+static void test_firmware_uefi_and_secboot_are_unaffected(void) {
+    hype_cfg_t cfg;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 2;
+    make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
+    cfg.vms[0].firmware = HYPE_CFG_FW_UEFI;
+    make_vm(&cfg.vms[1], "b", 1, 512, "b.img");
+    cfg.vms[1].firmware = HYPE_CFG_FW_UEFI_SECBOOT;
+
+    CHECK_INT("uefi and uefi-secboot are both fine, every VM in the config is unaffected",
+              (int)HYPE_ADM_OK, (int)hype_adm_check_firmware(&cfg).status);
+}
+
 int main(void) {
     test_peers_default_deny();
     test_peers_one_sided_listing_is_bidirectional();
@@ -1628,6 +1664,8 @@ int main(void) {
     test_unattached_nic_is_not_an_error();
     test_nic_count_over_the_machine_model();
     test_network_less_vm_is_silent();
+    test_firmware_legacy_is_refused();
+    test_firmware_uefi_and_secboot_are_unaffected();
 
     if (failures == 0) {
         printf("all tests passed\n");

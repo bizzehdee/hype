@@ -665,3 +665,14 @@ hype_adm_result_t hype_adm_check_vm_ranges(const hype_cfg_t *cfg,
     }
     return adm_ok();
 }
+
+hype_adm_result_t hype_adm_check_firmware(const hype_cfg_t *cfg) {
+    unsigned int i;
+
+    for (i = 0; i < cfg->vm_count; i++) {
+        if (cfg->vms[i].firmware == HYPE_CFG_FW_LEGACY) {
+            return adm_err(HYPE_ADM_ERR_FIRMWARE_LEGACY_UNSUPPORTED, i, HYPE_ADM_NO_VM);
+        }
+    }
+    return adm_ok();
+}

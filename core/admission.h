@@ -42,7 +42,9 @@ typedef enum {
     HYPE_ADM_ERR_NIC_REF_UNKNOWN,   /* nics= names no [nic.*] that exists */
     HYPE_ADM_ERR_SWITCH_REF_UNKNOWN, /* a [nic.*].switch names no [switch.*] that exists */
     HYPE_ADM_ERR_NIC_SHARED,        /* two VMs attach the same [nic.*] */
-    HYPE_ADM_ERR_NIC_COUNT_EXCEEDED /* a VM attaches more NICs than hype can present */
+    HYPE_ADM_ERR_NIC_COUNT_EXCEEDED, /* a VM attaches more NICs than hype can present */
+    /* #607 */
+    HYPE_ADM_ERR_FIRMWARE_LEGACY_UNSUPPORTED /* firmware = legacy has no boot path until #128 */
 } hype_adm_status_t;
 
 typedef struct {
@@ -291,5 +293,19 @@ hype_adm_result_t hype_adm_check_nic_sharing(const hype_cfg_t *cfg);
  * two of them silently never attached.
  */
 hype_adm_result_t hype_adm_check_nic_count(const hype_cfg_t *cfg, unsigned int max_nics_per_vm);
+
+/*
+ * #607 (plan.md §15.5, STRETCH-1 #128): `firmware = legacy` parses (§5.2's `uefi | legacy`) and
+ * round-trips through write-back, but there is no BIOS/CSM boot path -- #128 is an open stretch
+ * goal. Left unchecked, a VM configured `firmware = legacy` silently booted the normal UEFI OVMF
+ * path instead, which is the #285/#331/#339 shape: a key that reads as satisfied while doing
+ * nothing.
+ *
+ * Refuses ONLY starting the VM. The key itself must keep parsing and writing back
+ * byte-identically (#220/#221's lossless contract) -- this check runs at admission, never in the
+ * parser, so a config holding `firmware = legacy` still loads and saves cleanly; it just does not
+ * launch until #128 exists.
+ */
+hype_adm_result_t hype_adm_check_firmware(const hype_cfg_t *cfg);
 
 #endif /* HYPE_ADMISSION_H */
