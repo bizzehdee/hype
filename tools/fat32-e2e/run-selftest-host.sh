@@ -32,6 +32,7 @@ cat > "$OUT/stubs.c" <<'EOF'
 #include <stdio.h>
 void hype_fatal(const char *msg){ fprintf(stderr, "hype_fatal: %s\n", msg?msg:""); }
 void hype_serial_putc(char c){ (void)c; }
+void hype_debug_print(const char *fmt, ...){ (void)fmt; }
 EOF
 cc -O1 -g -fno-builtin -I"$ROOT" -o "$OUT/selftest_host" selftest_host.c "$OUT/stubs.c" $libs
 

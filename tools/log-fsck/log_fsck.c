@@ -22,6 +22,7 @@
 #include <string.h>
 
 #include "../../core/blk_io.h"
+#include "../../core/fat32_selftest.h"
 #include "../../core/fs_ops.h"
 #include "../../core/log_sink.h"
 #include "../../core/logbuf.h"
@@ -69,7 +70,14 @@ static void feed_hype(unsigned int i) {
 }
 static void feed_vm(unsigned int vm, unsigned int i) {
     char b[192];
+    /* #596: hype captures each guest line TWICE -- once from ttyS0, once from the on-screen
+     * terminal -- and both classify to the same VM, so the real per-VM sink gets both. Mirror
+     * that here; it is the record-arrival pattern QEMU/hardware produce that the earlier
+     * single-record harness did not. */
     snprintf(b, sizeof b, "fw-1 vm%u ttyS0| guest %u console line %u payload %u trailing bytes %u\n",
+             vm, i, i * 5u, i % 7u, i * 2u);
+    hype_logbuf_append(b);
+    snprintf(b, sizeof b, "fw-1 vm%u screen| guest %u console line %u payload %u trailing bytes %u\n",
              vm, i, i * 5u, i % 7u, i * 2u);
     hype_logbuf_append(b);
 }
@@ -169,6 +177,17 @@ int main(int argc, char **argv) {
             }
             all[1u + i] = &vm[i];
         }
+    }
+
+    /* #596: the missing ingredient. On the real stick the marker batteries churn the shared fs
+     * hard (create/unlink/rewrite dozens of files) BEFORE the per-VM logs are grown against that
+     * fs state -- and only the per-VM logs (grown incrementally, interleaved, after the churn)
+     * corrupt, never the batteries. Reproduce that order here: run both batteries on the SAME fs
+     * the sinks share, then grow the sinks. */
+    if (strcmp(scenario, "full") == 0) {
+        hype_fat32_selftest_result_t br;
+        hype_fat32_selftest_run(&hype_sink.fs, &now, &br, 0, 0);
+        hype_fat32_logtest_run(&hype_sink.fs, &now, &br, 0, 0);
     }
 
     /* Arm the flaky barrier only now: the sinks are opened at boot, when the barrier works. The
