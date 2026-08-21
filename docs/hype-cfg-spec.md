@@ -300,6 +300,13 @@ admission — every `nics` id must name a real `[nic.*]`, every `[nic.*].switch`
 `[switch.*]`, no two VMs may attach the same `[nic.*]`, and a VM's NIC count is capped at what
 hype can present. Sharing a **switch** is deliberately never an error: that is the feature.
 
+**Forwarded (#223):** a switch is now a live L2 segment (plan.md §10 decision 53). Members'
+frames bridge with their real MACs — learned unicast to exactly one member, broadcast and
+unknown unicast flooded to the rest. `uplink = nat` additionally lets member traffic take the
+host-NAT path (hype answers gateway ARP only for addresses no member owns); `uplink = none` is a
+fully private inter-VM LAN. A NIC with no `switch =` keeps its own isolated segment — the
+default-deny posture is unchanged for everyone not configured onto a switch.
+
 A VM attaches **0..N** NICs via `nics =`. Each `[nic.<id>]`:
 
 | key | type / domain | default | notes |

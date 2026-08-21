@@ -2753,6 +2753,40 @@ isn't lost.
     leak the other guest's hardware address across a boundary that exists to keep
     them apart.
 
+53. **The virtual switch is a learning bridge whose members keep their real
+    MACs, and hype's proxy ARP yields to the members — decided (2026-08-21),
+    NET-6 #223.** Three choices inside the §6e opt-in shared L2 segment:
+
+    **Bridge, not router, within a switch.** Frames between members are
+    delivered verbatim — real source MAC, no header rewrite. Decision 52's
+    router rewrite exists to keep hardware addresses from leaking across an
+    isolation boundary; a switch's members were explicitly configured onto ONE
+    segment, so between them that boundary does not exist and bridge semantics
+    (ARP between members, member-run DHCP, mDNS) are the point of the feature.
+    Decision 52 stands unchanged for every VM not on a switch and for every
+    pairing that crosses a switch boundary.
+
+    **hype answers a member's ARP request only when no member has been learned
+    to own the asked-for address.** Decision 52's answer-everything proxy ARP
+    would hijack member-to-member traffic on a shared segment (its own text
+    says so: "On a shared L2 segment proxy ARP would be a hijack"). The
+    alternative — configuring each switch's subnet so hype knows what is
+    on-link — was rejected for decision 52's own reason: config that must
+    mirror what is set inside the guests is wrong the first time they diverge.
+    Cost, accepted and documented: a member whose address hype has not yet
+    learned can race hype's answer once around boot; the member's own flooded
+    reply re-teaches the asker, so the race self-heals with ARP's normal
+    refresh.
+
+    **Unknown destinations flood, and a full MAC table evicts round-robin
+    rather than refusing to learn.** Flooding is the correct bridge behaviour
+    for an unlearned address and is bounded by the switch's own membership; a
+    table that refused new entries would flood forever, which is correct but
+    permanently slow and looks like working sluggishness. The table is
+    per-switch, mutated only under the sending guest's device lock, and a stale
+    read costs one flooded frame — never a delivery outside the switch, which
+    is the property that matters.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what

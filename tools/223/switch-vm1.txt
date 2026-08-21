@@ -1,0 +1,11 @@
+# #223: member B. Address itself, then ping A first (B boots second, A is already up).
+timeout 480000
+expect localhost login:
+send root\n
+expect ~#
+send ip link set eth0 up && ip addr add 10.223.0.2/24 dev eth0 && echo NETUP-B\n
+expect NETUP-B
+send ping -c 4 -W 3 10.223.0.1 && echo PING-B''A-OK || echo PING-B''A-FAIL\n
+fail-if PING-BA-FAIL
+expect PING-BA-OK
+pass switch-b-pinged-a

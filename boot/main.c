@@ -27,6 +27,7 @@
 #include "../core/phys_guard.h"
 #include "../core/phys_confirm.h"
 #include "../core/vm_delete.h" /* TERM-15 (#491) */
+#include "../core/l2switch.h" /* NET-6 (#223) */
 #include "../core/file_io.h"
 #include "../core/host_pci.h"
 #include "../core/e1000.h"
@@ -971,10 +972,17 @@ typedef struct hype_fw_vm {
      */
     uint8_t peer_inbox[4][HYPE_VIRTIO_NET_MAX_FRAME_LEN];
     unsigned int peer_inbox_len[4];
+    /* #223: 1 = a SWITCH frame, delivered verbatim (bridge semantics -- members opted into one
+     * segment and see each other's MACs); 0 = a routed net_peers frame, whose Ethernet header the
+     * pump rewrites so it arrives from hype (router semantics, the pre-switch behaviour). */
+    uint8_t peer_inbox_bridged[4];
     unsigned int peer_inbox_head;
     unsigned int peer_inbox_tail;
     unsigned int inbox_lock_next;
     unsigned int inbox_lock_owner;
+    /* #223: set per-frame by the tx sink -- this VM is a switch member whose frame is falling
+     * through to the uplink plane, so the routed guest-to-guest blocks must stand aside. */
+    uint8_t vnet_on_switch_uplink;
     unsigned long long vnet_peer_sent;
     unsigned long long vnet_peer_recv;
     unsigned long long vnet_peer_denied;
@@ -5607,6 +5615,18 @@ static unsigned long long g_nat_tick;
 static unsigned int g_uplink_lock_next;
 static unsigned int g_uplink_lock_owner;
 
+/*
+ * NET-6 (#223): the configured switches, built once at startup from [switch.*]/[nic.*]/nics=.
+ * g_vm_switch maps a VM index to its switch (-1 = not on one, the default-deny §6e case).
+ * Membership is fixed at boot; the learning tables inside mutate under the SENDER's device lock,
+ * which is the same single-writer discipline the per-VM vnet state already relies on -- two
+ * members transmitting concurrently DO race the table, so entries are only ever whole-slot
+ * writes and a stale read costs one flooded frame, never a wrong delivery outside the switch.
+ */
+static hype_l2switch_t g_switches[HYPE_CFG_MAX_SWITCHES];
+static unsigned int g_switch_count;
+static int g_vm_switch[HYPE_CFG_MAX_VMS];
+
 static int ip4_eq(const uint8_t a[4], const uint8_t b[4]) {
     return a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3];
 }
@@ -5651,6 +5671,111 @@ static int fw_1_vnet_to_guest(hype_fw_vm_t *vm, const uint8_t *frame, unsigned i
  * what is a routing decision. What must not be silent is WHY nothing was forwarded, and each reason
  * has its own counter.
  */
+/*
+ * NET-6 (#223): build the runtime switches from the parsed config, once, before any guest runs.
+ * A VM joins the switch its FIRST configured NIC names (admission already warned that hype
+ * presents one NIC, #583); a NIC with no `switch =` keeps its implicit private segment, which is
+ * the documented default and the §6e isolation posture.
+ */
+static void fw_1_build_switches(void) {
+    unsigned int si, vi, ni;
+
+    g_switch_count = g_hype_cfg.switch_count;
+    if (g_switch_count > HYPE_CFG_MAX_SWITCHES) {
+        g_switch_count = HYPE_CFG_MAX_SWITCHES;
+    }
+    for (si = 0; si < g_switch_count; si++) {
+        hype_l2sw_init(&g_switches[si],
+                       g_hype_cfg.switches[si].has_uplink &&
+                           g_hype_cfg.switches[si].uplink == HYPE_CFG_UPLINK_NAT);
+    }
+    for (vi = 0; vi < HYPE_CFG_MAX_VMS; vi++) {
+        g_vm_switch[vi] = -1;
+    }
+    for (vi = 0; vi < g_hype_cfg.vm_count && vi < HYPE_CFG_MAX_VMS; vi++) {
+        const hype_cfg_vm_t *cv = &g_hype_cfg.vms[vi];
+        if (cv->nics_count == 0u) {
+            continue;
+        }
+        for (ni = 0; ni < g_hype_cfg.nic_count; ni++) {
+            const hype_cfg_nic_t *nic = &g_hype_cfg.nics[ni];
+            if (!hype_streq(nic->id, cv->nics[0]) || !nic->has_switch) {
+                continue;
+            }
+            for (si = 0; si < g_switch_count; si++) {
+                if (hype_streq(g_hype_cfg.switches[si].id, nic->switch_id)) {
+                    if (hype_l2sw_add_member(&g_switches[si], vi) >= 0) {
+                        g_vm_switch[vi] = (int)si;
+                        HYPE_LOGF(HYPE_LOG_INFO,
+                                  "net: vm%u nic '%s' joins switch '%s' (uplink=%s) [#223]\n", vi,
+                                  nic->id, nic->switch_id,
+                                  g_switches[si].uplink_nat ? "nat" : "none");
+                    }
+                    break;
+                }
+            }
+            break;
+        }
+    }
+}
+
+/*
+ * Enqueue one frame into tv's mailbox. `bridged` selects the pump's delivery semantics (see the
+ * field). Takes only tv's inbox lock; callers on the tx path already hold the SENDER's device
+ * lock, and the pump's lock dance (copy out, release, then take the target's device lock) is what
+ * keeps this cycle-free -- nothing ever holds two of these at once.
+ */
+static void fw_1_peer_enqueue(hype_fw_vm_t *from, hype_fw_vm_t *tv, const uint8_t *frame,
+                              unsigned int len, int bridged) {
+    hype_ticket_lock_acquire(&tv->inbox_lock_next, &tv->inbox_lock_owner);
+    {
+        unsigned int next = (tv->peer_inbox_tail + 1u) % 4u;
+        (void)from;
+        if (next == tv->peer_inbox_head) {
+            tv->vnet_peer_inbox_full++;
+        } else {
+            unsigned int n = len;
+            unsigned int k;
+            if (n > HYPE_VIRTIO_NET_MAX_FRAME_LEN) {
+                n = HYPE_VIRTIO_NET_MAX_FRAME_LEN;
+            }
+            for (k = 0; k < n; k++) {
+                tv->peer_inbox[tv->peer_inbox_tail][k] = frame[k];
+            }
+            tv->peer_inbox_len[tv->peer_inbox_tail] = n;
+            tv->peer_inbox_bridged[tv->peer_inbox_tail] = bridged ? 1u : 0u;
+            tv->peer_inbox_tail = next;
+            from->vnet_peer_sent++;
+        }
+    }
+    hype_ticket_lock_release(&tv->inbox_lock_owner);
+}
+
+/*
+ * NET-6 (#223): the switch half of the tx path. Returns 1 when the frame's fate is fully decided
+ * here (delivered to members and NOT eligible for the uplink), 0 when the caller should continue
+ * into the routed/NAT path (uplink=nat traffic; the caller must then SKIP the routed peer and
+ * on-link checks -- the switch already made the guest-to-guest decision).
+ */
+static int fw_1_switch_tx(hype_fw_vm_t *vm, unsigned int me, const uint8_t *frame,
+                          unsigned int len) {
+    hype_l2switch_t *sw = &g_switches[g_vm_switch[me]];
+    int slot = hype_l2sw_member_slot(sw, me);
+    hype_l2sw_verdict_t v;
+    unsigned int i;
+
+    if (slot < 0) {
+        return 1; /* misbuilt membership -- deliver nowhere rather than somewhere wrong */
+    }
+    v = hype_l2sw_classify(sw, (unsigned int)slot, frame, len);
+    for (i = 0; i < sw->member_count; i++) {
+        if ((v.deliver_mask & (1u << i)) != 0u) {
+            fw_1_peer_enqueue(vm, &g_vms[sw->members[i]], frame, len, /*bridged=*/1);
+        }
+    }
+    return v.to_uplink ? 0 : 1;
+}
+
 static int fw_1_vnet_tx_sink(void *user, const uint8_t *frame, unsigned int len) {
     hype_fw_vm_t *vm = (hype_fw_vm_t *)user;
     uint16_t ethertype;
@@ -5660,6 +5785,26 @@ static int fw_1_vnet_tx_sink(void *user, const uint8_t *frame, unsigned int len)
         return 0;
     }
     ethertype = (uint16_t)(((uint16_t)frame[12] << 8) | (uint16_t)frame[13]);
+
+    /*
+     * NET-6 (#223): a switch member's frame goes to the other members FIRST (bridge semantics,
+     * decided by the pure classifier). A fully private switch (uplink=none), or a frame whose
+     * destination is a member's own MAC, ends here; only uplink=nat traffic falls through into
+     * the ARP/NAT plane below -- and there the routed guest-to-guest machinery (net_peers,
+     * on-link) is SKIPPED for members, because the switch is itself the operator's explicit
+     * guest-to-guest opt-in and made that decision already.
+     */
+    {
+        unsigned int me_sw = (unsigned int)(vm - g_vms);
+        if (me_sw < HYPE_CFG_MAX_VMS && g_vm_switch[me_sw] >= 0) {
+            if (fw_1_switch_tx(vm, me_sw, frame, len)) {
+                return 0;
+            }
+            vm->vnet_on_switch_uplink = 1u; /* consulted by the blocks below */
+        } else {
+            vm->vnet_on_switch_uplink = 0u;
+        }
+    }
 
     if (ethertype == 0x0806u) {
         hype_arp_t a;
@@ -5699,6 +5844,24 @@ static int fw_1_vnet_tx_sink(void *user, const uint8_t *frame, unsigned int len)
                 vm->vnet_onlink_count++;
             }
         }
+        /*
+         * #223: on a SWITCH, hype's proxy ARP yields to the members. Answering every request
+         * would hijack member-to-member traffic (the reply maps the member's IP to hype's router
+         * MAC), so hype answers only when no member has been learned to own the asked-for
+         * address. A member not yet learned can race this once at boot; the member's own reply
+         * arrives through the flood and re-teaches the asker, so the race self-heals with ARP's
+         * own refresh -- documented in plan.md decision 53.
+         */
+        if (vm->vnet_on_switch_uplink) {
+            hype_l2switch_t *sw = &g_switches[g_vm_switch[(unsigned int)(vm - g_vms)]];
+            unsigned int mi;
+            for (mi = 0; mi < sw->member_count; mi++) {
+                hype_fw_vm_t *mv = &g_vms[sw->members[mi]];
+                if (mv != vm && mv->vnet_guest_known && ip4_eq(mv->vnet_guest_ip, a.target_ip)) {
+                    return 0; /* a member owns it -- its own flooded reply is the answer */
+                }
+            }
+        }
         /* Answer for whatever was asked -- see the proxy-ARP reasoning above. */
         {
             unsigned int n = hype_arp_build_reply(out, sizeof(out), vm->vnet_router_mac, a.target_ip,
@@ -5727,7 +5890,7 @@ static int fw_1_vnet_tx_sink(void *user, const uint8_t *frame, unsigned int len)
      * counted. Guests are never reachable from each other by accident, which is the isolation
      * property, and the counter is how an operator finds out that is what happened.
      */
-    if (len >= HYPE_ETH_HDR_LEN + 20u) {
+    if (!vm->vnet_on_switch_uplink && len >= HYPE_ETH_HDR_LEN + 20u) {
         const uint8_t *dst_ip = frame + HYPE_ETH_HDR_LEN + 16u;
         unsigned int me = (unsigned int)(vm - g_vms);
         unsigned int vi;
@@ -5746,26 +5909,7 @@ static int fw_1_vnet_tx_sink(void *user, const uint8_t *frame, unsigned int len)
              * the peer's inbox lock is taken here, and this path already holds THIS vm's device
              * lock.
              */
-            hype_ticket_lock_acquire(&tv->inbox_lock_next, &tv->inbox_lock_owner);
-            {
-                unsigned int next = (tv->peer_inbox_tail + 1u) % 4u;
-                if (next == tv->peer_inbox_head) {
-                    tv->vnet_peer_inbox_full++;
-                } else {
-                    unsigned int n = len;
-                    unsigned int k;
-                    if (n > HYPE_VIRTIO_NET_MAX_FRAME_LEN) {
-                        n = HYPE_VIRTIO_NET_MAX_FRAME_LEN;
-                    }
-                    for (k = 0; k < n; k++) {
-                        tv->peer_inbox[tv->peer_inbox_tail][k] = frame[k];
-                    }
-                    tv->peer_inbox_len[tv->peer_inbox_tail] = n;
-                    tv->peer_inbox_tail = next;
-                    vm->vnet_peer_sent++;
-                }
-            }
-            hype_ticket_lock_release(&tv->inbox_lock_owner);
+            fw_1_peer_enqueue(vm, tv, frame, len, /*bridged=*/0);
             return 0;
         }
 
@@ -5886,10 +6030,12 @@ static unsigned int fw_1_uplink_pump(hype_vmm_kind_t kind) {
             if (!tv->shared_vnet_mapped) {
                 continue;
             }
+            unsigned int bridged = 0;
             hype_ticket_lock_acquire(&tv->inbox_lock_next, &tv->inbox_lock_owner);
             if (tv->peer_inbox_head != tv->peer_inbox_tail) {
                 unsigned int k;
                 plen = tv->peer_inbox_len[tv->peer_inbox_head];
+                bridged = tv->peer_inbox_bridged[tv->peer_inbox_head];
                 if (plen > sizeof(peer)) {
                     plen = sizeof(peer);
                 }
@@ -5911,7 +6057,10 @@ static unsigned int fw_1_uplink_pump(hype_vmm_kind_t kind) {
              * and it would leak the other guest's hardware address across a boundary that exists to
              * keep them apart.
              */
-            {
+            /* #223: a SWITCH frame arrives verbatim -- the members share a segment and the real
+             * source MAC is the semantics they opted into. Only routed net_peers frames get the
+             * router rewrite (see the reasoning above). */
+            if (!bridged) {
                 unsigned int k;
                 for (k = 0; k < 6u; k++) {
                     peer[k] = tv->vnet_guest_mac[k];
@@ -9356,7 +9505,12 @@ static void fw_1_guest_nic_present(hype_fw_vm_t *vm) {
                                                            : HYPE_CFG_NET_NONE;
     unsigned int dev = HYPE_FW_1_PCI_DEV_VIRTIO_NET;
 
-    if (want != HYPE_CFG_NET_NAT) {
+    /*
+     * #223: switch membership presents a NIC too. A fully private switch (uplink=none) is a LAN
+     * with no NAT anywhere, so keying the device's existence off net_mode alone would make the
+     * feature unreachable -- the member VMs would have no adapter to put on the segment.
+     */
+    if (want != HYPE_CFG_NET_NAT && !(idx < HYPE_CFG_MAX_VMS && g_vm_switch[idx] >= 0)) {
         return;
     }
 
@@ -9367,6 +9521,21 @@ static void fw_1_guest_nic_present(hype_fw_vm_t *vm) {
     mac[4] = (uint8_t)((idx >> 8) & 0xFFu);
     /* +1 so VM 0 never gets ...:00, which reads like an unset address in a packet capture. */
     mac[5] = (uint8_t)((idx & 0xFFu) + 1u);
+    /* #583/#223: an explicit `mac =` on this VM's [nic.*] wins over the derived one. The parser
+     * already refused multicast bits, so anything stored is a valid station address. */
+    if (idx < g_hype_cfg.vm_count && g_hype_cfg.vms[idx].nics_count > 0u) {
+        unsigned int ni2;
+        for (ni2 = 0; ni2 < g_hype_cfg.nic_count; ni2++) {
+            const hype_cfg_nic_t *nic2 = &g_hype_cfg.nics[ni2];
+            if (nic2->has_mac && hype_streq(nic2->id, g_hype_cfg.vms[idx].nics[0])) {
+                unsigned int mb;
+                for (mb = 0; mb < 6u; mb++) {
+                    mac[mb] = nic2->mac[mb];
+                }
+                break;
+            }
+        }
+    }
 
     /*
      * THE SAME MAC WHICHEVER FRONTEND, because the forwarding plane identifies a guest by its source
@@ -12241,6 +12410,8 @@ static void fw_1_phase1_config(void) {
                                  (ir.vm_index_a < g_hype_cfg.vm_count)
                                      ? g_hype_cfg.vms[ir.vm_index_a].nics_count : 0u);
             }
+            /* NET-6 (#223): the refs and sharing above are clean -- build the switches now. */
+            fw_1_build_switches();
             /*
              * ADM-6 (#224): host_cpu_budget, and each VM's own vCPU request.
              *
@@ -13816,6 +13987,23 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                      vm->vnet_stats.tx_frames, vm->vnet_stats.tx_bad_desc,
                                      vm->vnet_stats.tx_dropped, vm->vnet_stats.rx_delivered,
                                      vm->vnet_stats.rx_no_buffer, vm->vnet_no_plane);
+                    /* #223: one line per switch -- learned/moved say the bridge is bridging,
+                     * forwarded/flooded say whether the table is being HIT (all-flood forever
+                     * means learning is broken, which otherwise looks like working slowness). */
+                    {
+                        unsigned int swi2;
+                        for (swi2 = 0; swi2 < g_switch_count; swi2++) {
+                            const hype_l2switch_t *sw2 = &g_switches[swi2];
+                            if (sw2->member_count == 0u) {
+                                continue;
+                            }
+                            hype_debug_print("fw-1 SWITCH %u '%s': members=%u uplink=%s "
+                                             "learned=%llu moved=%llu fwd=%llu flood=%llu [#223]\n",
+                                             swi2, g_hype_cfg.switches[swi2].id, sw2->member_count,
+                                             sw2->uplink_nat ? "nat" : "none", sw2->learned,
+                                             sw2->moved, sw2->forwarded, sw2->flooded);
+                        }
+                    }
                 }
 #if HYPE_IO_HISTOGRAM
                 /* PERF-1: name the dominant IOIO ports (which the ioio= total
