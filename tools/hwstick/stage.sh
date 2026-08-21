@@ -106,7 +106,7 @@ echo "staged: $(LC_ALL=C strings build/hype.efi | grep -oE 'hype: build [0-9a-f]
 python3 - "$DST" <<'PY'
 import re, sys, os, glob
 dst = sys.argv[1]
-for cfg in sorted(glob.glob('tools/hwstick/*.cfg')):
+for cfg in sorted(glob.glob(os.path.join(dst, '*.cfg'))):
     for m in re.findall(r'^kernel = (.+)$', open(cfg).read(), re.M):
         p = os.path.join(dst, m.strip().replace('\\', '/').lstrip('/'))
         if not os.path.exists(p):
@@ -160,7 +160,7 @@ def sections(text):
     return out
 
 fatal, warn = [], []
-for cfg in sorted(glob.glob('tools/hwstick/*.cfg')):
+for cfg in sorted(glob.glob(os.path.join(dst, '*.cfg'))):
     for name, keys in sections(open(cfg).read()):
         boot = keys.get('boot', '')
         for key in ('install_media', 'target_disk'):
