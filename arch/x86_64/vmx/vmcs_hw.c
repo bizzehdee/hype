@@ -86,29 +86,6 @@ uint64_t hype_vmx_apic_access_page_phys(void) {
     return (uint64_t)(uintptr_t)g_apic_access_page;
 }
 
-/*
- * #599: can this machine run APICv at all? Pure capability read, no VMCS
- * needed -- boot/main.c uses it to decide whether to split the LAPIC page out
- * of the EPT hole BEFORE any vCPU exists (mapping the page without the
- * controls would hand the guest a dead zero page instead of exits).
- */
-int hype_vmx_apicv_supported(void) {
-#if HYPE_ENABLE_APICV
-    uint64_t basic = rdmsr(HYPE_MSR_IA32_VMX_BASIC);
-    int have_true_ctls = (basic & (1ull << 55)) != 0u;
-    uint64_t proc_cap = rdmsr(have_true_ctls ? HYPE_MSR_IA32_VMX_TRUE_PROCBASED_CTLS
-                                             : HYPE_MSR_IA32_VMX_PROCBASED_CTLS);
-    uint64_t proc2_cap = rdmsr(HYPE_MSR_IA32_VMX_PROCBASED_CTLS2);
-    uint32_t need2 = HYPE_VMX_PROCBASED2_VIRTUALIZE_APIC_ACCESSES |
-                     HYPE_VMX_PROCBASED2_APIC_REGISTER_VIRT |
-                     HYPE_VMX_PROCBASED2_VIRTUAL_INTERRUPT_DELIVERY;
-    if (((proc_cap >> 32) & HYPE_VMX_PROCBASED_USE_TPR_SHADOW) == 0u) return 0;
-    if (((proc2_cap >> 32) & need2) != need2) return 0;
-    return 1;
-#else
-    return 0;
-#endif
-}
 
 /* #248: did the CPU actually grant acknowledge-interrupt-on-exit? Set from the
  * ADJUSTED exit controls in hype_vmx_vcpu_create(), never from what was
@@ -539,6 +516,30 @@ static inline uint64_t rdmsr(uint32_t msr) {
     return ((uint64_t)hi << 32) | lo;
 }
 
+/*
+ * #599: can this machine run APICv at all? Pure capability read, no VMCS
+ * needed -- boot/main.c uses it to decide whether to split the LAPIC page out
+ * of the EPT hole BEFORE any vCPU exists (mapping the page without the
+ * controls would hand the guest a dead zero page instead of exits).
+ */
+int hype_vmx_apicv_supported(void) {
+#if HYPE_ENABLE_APICV
+    uint64_t basic = rdmsr(HYPE_MSR_IA32_VMX_BASIC);
+    int have_true_ctls = (basic & (1ull << 55)) != 0u;
+    uint64_t proc_cap = rdmsr(have_true_ctls ? HYPE_MSR_IA32_VMX_TRUE_PROCBASED_CTLS
+                                             : HYPE_MSR_IA32_VMX_PROCBASED_CTLS);
+    uint64_t proc2_cap = rdmsr(HYPE_MSR_IA32_VMX_PROCBASED_CTLS2);
+    uint32_t need2 = HYPE_VMX_PROCBASED2_VIRTUALIZE_APIC_ACCESSES |
+                     HYPE_VMX_PROCBASED2_APIC_REGISTER_VIRT |
+                     HYPE_VMX_PROCBASED2_VIRTUAL_INTERRUPT_DELIVERY;
+    if (((proc_cap >> 32) & HYPE_VMX_PROCBASED_USE_TPR_SHADOW) == 0u) return 0;
+    if (((proc2_cap >> 32) & need2) != need2) return 0;
+    return 1;
+#else
+    return 0;
+#endif
+}
+
 static inline uint64_t read_cr0(void) {
     uint64_t v;
     __asm__ volatile("mov %%cr0, %0" : "=r"(v));
@@ -869,7 +870,12 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
     uint64_t entry_cap = rdmsr(have_true_ctls ? HYPE_MSR_IA32_VMX_TRUE_ENTRY_CTLS
                                               : HYPE_MSR_IA32_VMX_ENTRY_CTLS);
 
-    uint32_t pin_ctls = hype_vmx_adjust_controls(0, pin_cap);
+    /* #599: VM-entry demands external-interrupt exiting = 1 while virtual-interrupt
+     * delivery is on (SDM consistency check). Requested explicitly rather than relying
+     * on the capability MSR forcing it -- adjust_controls() would mask a part where it
+     * is optional, and the failure would be a cryptic entry error, not a message. */
+    uint32_t pin_ctls = hype_vmx_adjust_controls(
+        hype_vmx_apicv_supported() ? HYPE_VMX_PINBASED_EXT_INTR_EXITING : 0u, pin_cap);
     /* M2-8: a launchable guest. Primary controls activate the secondary
      * controls (for EPT + unrestricted guest below) and enable HLT-exiting
      * (so a guest HLT returns to hype). The APICv secondary bits the M2-4
@@ -3957,6 +3963,65 @@ int hype_vmx_vcpu_handle_lapic_npf(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lap
         /* #307: a read-modify-write of this device register needs its CURRENT value, so the
          * instruction can combine with what is already there rather than storing the other
          * operand alone. Only read it back when the form actually needs it. */
+        if (m.decoded.mem_is_dst &&
+            hype_guest_lapic_read(lapic, m.offset, m.decoded.size_bytes, &cur) != 0) {
+            return -1;
+        }
+        uint32_t value = vmx_mmio_store_val(&m, cur);
+        if (hype_guest_lapic_write(lapic, m.offset, m.decoded.size_bytes, value) != 0) {
+            return -1;
+        }
+    } else {
+        uint32_t value = 0;
+        if (hype_guest_lapic_read(lapic, m.offset, m.decoded.size_bytes, &value) != 0) {
+            return -1;
+        }
+        vmx_mmio_finish_read(&m, value);
+    }
+    vmx_mmio_end(&m);
+    return 0;
+}
+
+/*
+ * #599: an APIC-access VM exit (reason 44) -- the offsets APICv will not
+ * virtualize (the live timer count at 390H chief among them) plus any access
+ * shape outside the register model. The exit qualification carries the page
+ * offset and access type; GUEST_PHYSICAL_ADDRESS is NOT valid on this reason,
+ * so this cannot reuse vmx_mmio_begin_insn(). Emulation itself is the same
+ * 4-byte model read/write the EPT-violation LAPIC handler does.
+ */
+int hype_vmx_vcpu_handle_lapic_access(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lapic,
+                                      const uint8_t *guest_insn_bytes) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    struct vmx_mmio_access m;
+    int ok = 0;
+    uint64_t qual = vmread(HYPE_VMCS_EXIT_QUALIFICATION, &ok);
+    uint32_t atype = (uint32_t)((qual >> 12) & 0xFu);
+
+    if (atype > 1u) {
+        return -1; /* only linear read (0) / linear write (1) are instruction-shaped */
+    }
+    m.offset = (uint32_t)(qual & 0xFFFu);
+    m.is_write = (atype == 1u);
+    m.rip = vmread(HYPE_VMCS_GUEST_RIP, &ok);
+    if (guest_insn_bytes == 0 ||
+        hype_mmio_decode(guest_insn_bytes, HYPE_VMX_MMIO_MAX_INSTR_BYTES, &m.decoded) != 0) {
+        return -1;
+    }
+    if (m.decoded.is_write != m.is_write) {
+        return -1;
+    }
+    m.reg = m.decoded.has_imm ? 0 : vmx_gpr_ptr(real, m.decoded.reg);
+    if (m.reg == 0 && !m.decoded.has_imm) {
+        return -1;
+    }
+    m.rflags = vmread(HYPE_VMCS_GUEST_RFLAGS, &ok);
+    if (m.decoded.size_bytes != 4u) {
+        return -1;
+    }
+    if (m.decoded.is_write) {
+        uint32_t cur = 0;
         if (m.decoded.mem_is_dst &&
             hype_guest_lapic_read(lapic, m.offset, m.decoded.size_bytes, &cur) != 0) {
             return -1;

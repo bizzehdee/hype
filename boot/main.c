@@ -829,6 +829,10 @@ typedef struct hype_fw_vm {
     hype_ept_pte_t ept_pml4[HYPE_EPT_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
     hype_ept_pte_t ept_pdpt[HYPE_EPT_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
     hype_ept_pte_t ept_pd[HYPE_FW_1_NPT_GB][HYPE_EPT_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
+    /* #599: the ONE 4 KiB-split page table in the EPT tree -- the 2 MiB region holding the LAPIC
+     * page, so GPA 0xFEE00000 can translate to the APIC-access page while its 511 siblings keep
+     * faulting. Only populated when APICv is actually running (see the build site). */
+    hype_ept_pte_t ept_lapic_pt[HYPE_EPT_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
     /*
      * INPUT-8 (#281): this VM's own scripted-input state -- the parsed script and the
      * runner driving it. PER-VM, never file-scope: a shared script buffer would type
@@ -11755,6 +11759,21 @@ wait_for_sipi:
                 }
                 g_ap_vcpu_unhandled[vm_idx][vi]++;
             }
+        } else if (kind == HYPE_VMM_KIND_VMX &&
+                   info.reason == HYPE_VMX_EXIT_REASON_APIC_WRITE) {
+            /* #599: trap-like -- see the run_fw_1_test twin for the reasoning. */
+            uint32_t aw_off = (uint32_t)(info.qualification & 0xFFFu);
+            (void)hype_guest_lapic_write(lapic, aw_off, 4u, hype_vmx_apicv_read32(ctx, aw_off));
+        } else if (kind == HYPE_VMM_KIND_VMX &&
+                   info.reason == HYPE_VMX_EXIT_REASON_VIRTUALIZED_EOI) {
+            hype_vmx_apicv_note_delivered(ctx, (uint8_t)(info.qualification & 0xFFu));
+            (void)hype_guest_lapic_write(lapic, HYPE_GUEST_LAPIC_REG_EOI, 4u, 0u);
+        } else if (kind == HYPE_VMM_KIND_VMX &&
+                   info.reason == HYPE_VMX_EXIT_REASON_APIC_ACCESS) {
+            const uint8_t *aa_insn = fw_1_insn_bytes_via_ptwalk(vm, ctx, info.guest_rip);
+            if (hype_vmx_vcpu_handle_lapic_access(ctx, lapic, aa_insn) != 0) {
+                g_ap_vcpu_unhandled[vm_idx][vi]++;
+            }
         } else if (vmm_reason_is_ioio(kind, info.reason)) {
             /*
              * SMP-7 (#191): shared-device port I/O, safe now because this core holds the VM's
@@ -13406,6 +13425,18 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     hype_ept_map_range(vm->ept_pd, 0, g_fw_1_ram_host_phys, vm->ram_bytes);
     hype_ept_mark_range_not_present(vm->ept_pd, vm->ram_bytes,
                                     (0x100000000ULL - g_fw_1_combined_size) - vm->ram_bytes);
+    /*
+     * #599 APICv: split the LAPIC page out of the not-present hole so guest accesses to
+     * 0xFEE00000 translate to the APIC-access page and take the virtualize-APIC-accesses
+     * treatment instead of plain EPT violations. Gated on the CAPABILITY, not the per-vCPU
+     * grant: the vCPU build (which runs later) refuses the launch if the grant then falls
+     * short of the full set, so the mapping can never outlive an APICv that failed to
+     * engage -- and mapping it without the controls would hand the guest a dead zero page.
+     */
+    if (g_fw_1_kind == HYPE_VMM_KIND_VMX && hype_vmx_apicv_supported()) {
+        hype_ept_split_map_4k(vm->ept_pd, vm->ept_lapic_pt, HYPE_LAPIC_DEFAULT_BASE,
+                              hype_vmx_apic_access_page_phys());
+    }
     if (g_fw_1_kind == HYPE_VMM_KIND_VMX) {
         npt_root_phys = (uint64_t)(uintptr_t)vm->ept_pml4;
     }
@@ -13459,6 +13490,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * Dispatching them is SMP-6.
      */
     vm->vcpu[0] = ctx;
+    /* #599: with APIC_REGISTER_VIRT the guest reads its APIC ID from the virtual-APIC page,
+     * so the model's per-vCPU assignment must be mirrored there. No-op when APICv is off. */
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_apicv_set_id(ctx, 0u);
+    }
     /*
      * #535: a kernel-boot VM's BSP enters in LONG mode, not at the reset vector. Done here, right
      * after create and before anything else writes this vCPU's VMCB/VMCS: the reset rebuilds the
@@ -13497,6 +13533,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 break;
             }
             vm->vcpu[vi] = ap;
+            if (kind == HYPE_VMM_KIND_VMX) {
+                hype_vmx_apicv_set_id(ap, vi); /* #599: mirror of the model's APIC ID */
+            }
         }
     }
     /*
@@ -17321,6 +17360,38 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             g_436_loop_section[(unsigned)(vm-g_vms)]=782;
             vmm_prune_masked_pic_pending(kind, ctx, &g_fw_1_pic); /* #455 */
             vmm_handle_intr_window(kind, ctx, &g_fw_1_lapic);
+            continue;
+        }
+
+        /*
+         * #599 APICv exits (VMX, only when APICv engaged -- these reasons cannot occur
+         * otherwise). APIC_WRITE is trap-like: the value already sits in the virtual-APIC page
+         * at the qualification offset and RIP has advanced, so only the model's side effects
+         * run (ICR sends, LVT/timer/divide bookkeeping). VIRTUALIZED_EOI names the completed
+         * vector; the model's EOI write carries the same IO-APIC level bookkeeping the trap
+         * path uses, and the delivered-vector note keeps #456's consumers working. APIC_ACCESS
+         * is the CPU declining to virtualize an offset (the live timer count, or a non-4-byte
+         * shape) -- emulate against the model exactly like an EPT-violation LAPIC fault.
+         */
+        if (kind == HYPE_VMM_KIND_VMX && info.reason == HYPE_VMX_EXIT_REASON_APIC_WRITE) {
+            uint32_t aw_off = (uint32_t)(info.qualification & 0xFFFu);
+            (void)hype_guest_lapic_write(&g_fw_1_lapic, aw_off, 4u,
+                                         hype_vmx_apicv_read32(ctx, aw_off));
+            continue;
+        }
+        if (kind == HYPE_VMM_KIND_VMX && info.reason == HYPE_VMX_EXIT_REASON_VIRTUALIZED_EOI) {
+            hype_vmx_apicv_note_delivered(ctx, (uint8_t)(info.qualification & 0xFFu));
+            (void)hype_guest_lapic_write(&g_fw_1_lapic, HYPE_GUEST_LAPIC_REG_EOI, 4u, 0u);
+            continue;
+        }
+        if (kind == HYPE_VMM_KIND_VMX && info.reason == HYPE_VMX_EXIT_REASON_APIC_ACCESS) {
+            const uint8_t *aa_insn = fw_1_insn_bytes_via_ptwalk(vm, ctx, info.guest_rip);
+            if (hype_vmx_vcpu_handle_lapic_access(ctx, &g_fw_1_lapic, aa_insn) != 0) {
+                hype_debug_print("fw-1: vm%u APIC-access exit not emulated (qual=0x%llx "
+                                 "rip=0x%llx) [#599]\n", (unsigned)(vm - g_vms),
+                                 (unsigned long long)info.qualification,
+                                 (unsigned long long)info.guest_rip);
+            }
             continue;
         }
 

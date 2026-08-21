@@ -239,6 +239,8 @@ int hype_vmx_apicv_active(hype_vcpu_ctx_t *ctx);
 void hype_vmx_apicv_set_id(hype_vcpu_ctx_t *ctx, uint32_t apic_id);
 uint32_t hype_vmx_apicv_read32(hype_vcpu_ctx_t *ctx, uint32_t offset);
 void hype_vmx_apicv_note_delivered(hype_vcpu_ctx_t *ctx, uint8_t vector);
+int hype_vmx_vcpu_handle_lapic_access(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lapic,
+                                      const uint8_t *guest_insn_bytes);
 void hype_vmx_vcpu_wake_hlt(hype_vcpu_ctx_t *ctx);
 void hype_vmx_vcpu_get_intr_state(hype_vcpu_ctx_t *ctx, hype_vmm_intr_state_t *out);
 int hype_vmx_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx);
