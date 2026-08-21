@@ -409,6 +409,7 @@ static hype_cfg_status_t apply_field(hype_cfg_vm_t *vm, unsigned int *seen, char
     if (hype_streq(key, "firmware")) {
         if (*seen & HYPE_CFG_F_FIRMWARE) return HYPE_CFG_ERR_DUPLICATE_KEY;
         if (hype_streq(val, "uefi")) vm->firmware = HYPE_CFG_FW_UEFI;
+        else if (hype_streq(val, "uefi-secboot")) vm->firmware = HYPE_CFG_FW_UEFI_SECBOOT; /* #432 */
         else if (hype_streq(val, "legacy")) vm->firmware = HYPE_CFG_FW_LEGACY;
         else return HYPE_CFG_ERR_BAD_VALUE;
         *seen |= HYPE_CFG_F_FIRMWARE;
@@ -2216,7 +2217,10 @@ static void serialize_vm(hype_cfg_w_t *w, const hype_cfg_vm_t *vm) {
     if (vm->boot_order_count > 0u) {
         w_kv_list(w, "boot_order", vm->boot_order, vm->boot_order_count);
     }
-    w_kv(w, "firmware", vm->firmware == HYPE_CFG_FW_LEGACY ? "legacy" : "uefi");
+    w_kv(w, "firmware", vm->firmware == HYPE_CFG_FW_LEGACY
+                            ? "legacy"
+                            : (vm->firmware == HYPE_CFG_FW_UEFI_SECBOOT ? "uefi-secboot"
+                                                                        : "uefi")); /* #432 */
     /* #565: emitted only when set, like every other non-default -- writing `display = none` into
      * every config would add a line the operator never wrote. */
     if (vm->display != HYPE_CFG_DISPLAY_NONE) {

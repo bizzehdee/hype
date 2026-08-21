@@ -2422,7 +2422,7 @@ static hype_fs_t *fw_1_boot_volume(void);
 /* #450: defined further down (needs the boot-volume locator and the cfg parser). */
 static void load_hype_cfg(void);
 /* #451: defined with the Phase 1 loaders; the VM-restart path re-reads through it. */
-static int fw_1_read_firmware_images(uint64_t dst_phys, uint64_t mapped_size);
+static int fw_1_read_firmware_images(unsigned int vi, uint64_t dst_phys, uint64_t mapped_size);
 /* #452: read in Phase 1 now; defined with the other config-fed loaders. */
 static void load_input_script(hype_fw_vm_t *vm, unsigned vm_index);
 
@@ -10112,7 +10112,8 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
      * runnable, so it is reported rather than fatal -- unlike the initial load, where there is
      * nothing to fall back to.
      */
-    if (fw_1_read_firmware_images(g_fw_1_combined_host_phys, g_fw_1_combined_size) != 0) {
+    if (fw_1_read_firmware_images((unsigned)(vm - g_vms), g_fw_1_combined_host_phys,
+                                  g_fw_1_combined_size) != 0) {
         HYPE_LOGF(HYPE_LOG_WARN, "fw-1 vm%u: could not re-read the pristine firmware for this Start -- the "
                          "buffer still holds the previous run's image [#451]\n",
                          (unsigned)(vm - g_vms));
@@ -11983,24 +11984,39 @@ wait_for_sipi:
  * flush against the END of the mapped region -- padding goes at the START so guest-physical
  * 4 GiB - 16 (the reset vector) keeps landing on CODE's own real last bytes.
  */
-static int fw_1_read_firmware_images(uint64_t dst_phys, uint64_t mapped_size) {
+/* #432: which blob pair a VM boots. Secure Boot is a PER-VM choice -- it rejects unsigned
+ * media by design, so turning it on globally would break every ordinary installer VM. */
+static int fw_1_vm_secboot(unsigned int vi) {
+    return vi < g_hype_cfg.vm_count &&
+           g_hype_cfg.vms[vi].firmware == HYPE_CFG_FW_UEFI_SECBOOT;
+}
+static const char *fw_1_code_path(unsigned int vi) {
+    return fw_1_vm_secboot(vi) ? "\\EFI\\hype\\OVMF_CODE.secboot.fd"
+                               : "\\EFI\\hype\\OVMF_CODE.fd";
+}
+static const char *fw_1_vars_path(unsigned int vi) {
+    return fw_1_vm_secboot(vi) ? "\\EFI\\hype\\OVMF_VARS.secboot.fd"
+                               : "\\EFI\\hype\\OVMF_VARS.fd";
+}
+
+static int fw_1_read_firmware_images(unsigned int vi, uint64_t dst_phys, uint64_t mapped_size) {
     hype_fs_t *bv = fw_1_boot_volume();
     hype_fs_file_t f;
-    uint64_t content_size = g_vms[0].code_size + g_vms[0].vars_size;
+    uint64_t content_size = g_vms[vi].code_size + g_vms[vi].vars_size;
     uint64_t content_start;
 
     if (bv == 0 || dst_phys == 0ull || content_size == 0ull || content_size > mapped_size) {
         return -1;
     }
     content_start = dst_phys + (mapped_size - content_size);
-    if (hype_fs_lookup(bv, "\\EFI\\hype\\OVMF_VARS.fd", &f) != 0 ||
+    if (hype_fs_lookup(bv, fw_1_vars_path(vi), &f) != 0 ||
         hype_fs_read_at(&f, 0ull, (void *)(uintptr_t)content_start,
-                        (unsigned int)g_vms[0].vars_size) != 0) {
+                        (unsigned int)g_vms[vi].vars_size) != 0) {
         return -1;
     }
-    if (hype_fs_lookup(bv, "\\EFI\\hype\\OVMF_CODE.fd", &f) != 0 ||
-        hype_fs_read_at(&f, 0ull, (void *)(uintptr_t)(content_start + g_vms[0].vars_size),
-                        (unsigned int)g_vms[0].code_size) != 0) {
+    if (hype_fs_lookup(bv, fw_1_code_path(vi), &f) != 0 ||
+        hype_fs_read_at(&f, 0ull, (void *)(uintptr_t)(content_start + g_vms[vi].vars_size),
+                        (unsigned int)g_vms[vi].code_size) != 0) {
         return -1;
     }
     return 0;
@@ -12020,12 +12036,12 @@ static void fw_1_phase1_firmware(void) {
         hype_fatal("fw-1: no boot volume -- the guest firmware images cannot be read, so no guest "
                    "can boot [#451]");
     }
-    if (hype_fs_lookup(bv, "\\EFI\\hype\\OVMF_CODE.fd", &f) != 0) {
-        hype_fatal("fw-1: \\EFI\\hype\\OVMF_CODE.fd not found on the boot volume [#451]");
+    if (hype_fs_lookup(bv, fw_1_code_path(0u), &f) != 0) {
+        hype_fatal("fw-1: %s not found on the boot volume [#451/#432]", fw_1_code_path(0u));
     }
     g_vms[0].code_size = f.size;
-    if (hype_fs_lookup(bv, "\\EFI\\hype\\OVMF_VARS.fd", &f) != 0) {
-        hype_fatal("fw-1: \\EFI\\hype\\OVMF_VARS.fd not found on the boot volume [#451]");
+    if (hype_fs_lookup(bv, fw_1_vars_path(0u), &f) != 0) {
+        hype_fatal("fw-1: %s not found on the boot volume [#451/#432]", fw_1_vars_path(0u));
     }
     g_vms[0].vars_size = f.size;
 
@@ -12042,7 +12058,7 @@ static void fw_1_phase1_firmware(void) {
 
     hz = g_vms[0].host_tsc_hz;
     t0 = hype_rdtsc();
-    if (fw_1_read_firmware_images(g_vms[0].combined_host_phys, mapped_size) != 0) {
+    if (fw_1_read_firmware_images(0u, g_vms[0].combined_host_phys, mapped_size) != 0) {
         hype_fatal("fw-1: the guest firmware images could not be READ from the boot volume -- no "
                    "guest can boot [#451]");
     }
@@ -12680,14 +12696,47 @@ static void fw_1_phase1_config(void) {
     for (unsigned vi = 1u; vi < g_vm_count; vi++) {
         hype_fw_vm_t *vmn = &g_vms[vi];
             hype_fw_vm_t *vm = &g_vms[0];
-        vmn->code_size = vm->code_size;
-        vmn->vars_size = vm->vars_size;
-        vmn->combined_size = vm->combined_size;
-        vmn->combined_host_phys = fw_1_pool_carve(0, vi,
-                                                  HYPE_POOL_KIND_FW, vmn->combined_size,
-                                                  "firmware");
-        hype_guest_ram_copy((void *)(uintptr_t)vmn->combined_host_phys,
-                            (const void *)(uintptr_t)vm->combined_host_phys, vmn->combined_size);
+        if (fw_1_vm_secboot(vi) == fw_1_vm_secboot(0u)) {
+            /* same blob pair as vm0: copy its pristine buffer, as before */
+            vmn->code_size = vm->code_size;
+            vmn->vars_size = vm->vars_size;
+            vmn->combined_size = vm->combined_size;
+            vmn->combined_host_phys = fw_1_pool_carve(0, vi,
+                                                      HYPE_POOL_KIND_FW, vmn->combined_size,
+                                                      "firmware");
+            hype_guest_ram_copy((void *)(uintptr_t)vmn->combined_host_phys,
+                                (const void *)(uintptr_t)vm->combined_host_phys,
+                                vmn->combined_size);
+        } else {
+            /* #432: a different firmware VARIANT -- size + read its own pair. Fatal when the
+             * blobs are missing, same as vm0's load: a VM that asked for Secure Boot must not
+             * silently boot without it. */
+            hype_fs_t *bv2 = fw_1_boot_volume();
+            hype_fs_file_t f2;
+            if (bv2 == 0 || hype_fs_lookup(bv2, fw_1_code_path(vi), &f2) != 0) {
+                hype_fatal("fw-1: vm%u asks for %s and it is not on the boot volume [#432]", vi,
+                           fw_1_code_path(vi));
+            }
+            vmn->code_size = f2.size;
+            if (hype_fs_lookup(bv2, fw_1_vars_path(vi), &f2) != 0) {
+                hype_fatal("fw-1: vm%u asks for %s and it is not on the boot volume [#432]", vi,
+                           fw_1_vars_path(vi));
+            }
+            vmn->vars_size = f2.size;
+            vmn->combined_size = ((vmn->code_size + vmn->vars_size) + HYPE_PAGING_2MB - 1) &
+                                 ~(HYPE_PAGING_2MB - 1);
+            vmn->combined_host_phys = fw_1_pool_carve(0, vi, HYPE_POOL_KIND_FW,
+                                                      vmn->combined_size, "firmware");
+            hype_guest_ram_zero((void *)(uintptr_t)vmn->combined_host_phys, vmn->combined_size);
+            if (fw_1_read_firmware_images(vi, vmn->combined_host_phys, vmn->combined_size) != 0) {
+                hype_fatal("fw-1: vm%u's %s firmware images could not be read [#432]", vi,
+                           fw_1_vm_secboot(vi) ? "Secure Boot" : "plain");
+            }
+            hype_debug_print("fw-1: vm%u boots the %s firmware pair (%llu+%llu bytes) [#432]\n",
+                             vi, fw_1_vm_secboot(vi) ? "SECURE BOOT" : "plain",
+                             (unsigned long long)vmn->code_size,
+                             (unsigned long long)vmn->vars_size);
+        }
         fw_1_resolve_guest_ram(vmn, &g_hype_cfg, vi);
         fw_1_resolve_os_hint(vmn, &g_hype_cfg, vi);
         vmn->ram_host_phys = fw_1_pool_carve(0, vi,

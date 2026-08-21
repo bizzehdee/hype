@@ -30,6 +30,14 @@ if [ "$FW_TARGET" != "RELEASE" ] && [ "$FW_TARGET" != "DEBUG" ]; then
     exit 1
 fi
 
+# #432: FW_SECBOOT=1 builds the Secure Boot variant -- SECURE_BOOT_ENABLE (SMM-free
+# authenticated variables; hype has no SMM, so SMM_REQUIRE stays FALSE) plus TPM-less
+# physical-presence. Written to *.secboot.fd beside the plain blobs, never over them:
+# Secure Boot rejects unsigned media by DESIGN, so it must stay an explicit per-VM choice.
+# The enrolled varstore (PK/KEK + the Microsoft CAs) is produced by tools/enroll-secboot.sh
+# from the EMPTY vars this build emits.
+FW_SECBOOT="${FW_SECBOOT:-0}"
+
 if [ ! -f "$EDK2_DIR/edksetup.sh" ]; then
     echo "build-fw.sh: $EDK2_DIR doesn't look like an edk2 checkout (no edksetup.sh)." >&2
     echo "Run 'git submodule update --init --recursive' first." >&2
@@ -64,6 +72,9 @@ if [ "$FW_TARGET" = "DEBUG" ]; then
     # (PlatformDebugLibIoPort, routed by FW-1g's hype-side handler).
     build -p OvmfPkg/OvmfPkgX64.dsc -a X64 -t CLANGDWARF -b DEBUG \
         --pcd gEfiMdePkgTokenSpaceGuid.PcdDebugPrintErrorLevel=0xFFFFFFFF
+elif [ "$FW_SECBOOT" = "1" ]; then
+    build -p OvmfPkg/OvmfPkgX64.dsc -a X64 -t CLANGDWARF -b RELEASE \
+        -D SECURE_BOOT_ENABLE=TRUE
 else
     build -p OvmfPkg/OvmfPkgX64.dsc -a X64 -t CLANGDWARF -b RELEASE
 fi
@@ -74,6 +85,11 @@ if [ "$FW_TARGET" = "DEBUG" ]; then
     cp "$OUT_DIR/OVMF_CODE.fd" "$FW_DIR/OVMF_CODE.debug.fd"
     cp "$OUT_DIR/OVMF_VARS.fd" "$FW_DIR/OVMF_VARS.debug.fd"
     echo "build-fw.sh: done -- $FW_DIR/OVMF_CODE.debug.fd and OVMF_VARS.debug.fd updated (DEBUG)."
+elif [ "$FW_SECBOOT" = "1" ]; then
+    cp "$OUT_DIR/OVMF_CODE.fd" "$FW_DIR/OVMF_CODE.secboot.fd"
+    cp "$OUT_DIR/OVMF_VARS.fd" "$FW_DIR/OVMF_VARS.secboot-empty.fd"
+    echo "build-fw.sh: done -- $FW_DIR/OVMF_CODE.secboot.fd + OVMF_VARS.secboot-empty.fd (#432)."
+    echo "build-fw.sh: now run tools/enroll-secboot.sh to produce the enrolled varstore."
 else
     cp "$OUT_DIR/OVMF_CODE.fd" "$FW_DIR/OVMF_CODE.fd"
     cp "$OUT_DIR/OVMF_VARS.fd" "$FW_DIR/OVMF_VARS.fd"

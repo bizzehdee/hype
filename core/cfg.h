@@ -128,7 +128,8 @@ typedef enum {
 
 typedef enum {
     HYPE_CFG_FW_UEFI,
-    HYPE_CFG_FW_LEGACY
+    HYPE_CFG_FW_LEGACY,
+    HYPE_CFG_FW_UEFI_SECBOOT /* #432: the SECURE_BOOT_ENABLE OVMF + enrolled varstore */
 } hype_cfg_firmware_t;
 
 /*
