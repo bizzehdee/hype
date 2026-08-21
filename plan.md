@@ -2851,7 +2851,8 @@ isn't lost.
     epic's close.
 
 56. **Write durability on a device with no cache-flush barrier -- decided
-    (2026-08-21), #596.** hype's on-medium FAT32/exFAT/ext writers keep the
+    (2026-08-21); revised (2026-08-21) after #596's real root cause landed as
+    decision 57.** hype's on-medium FAT32/exFAT/ext writers keep the
     filesystem crash-consistent by ORDERING: a metadata pointer that reaches a
     block (a FAT link before the directory size that spans it, #377; an exFAT
     DataLength; an ext journal commit) must be durable before the pointer is
@@ -2859,7 +2860,15 @@ isn't lost.
     (`SYNCHRONIZE CACHE` on USB MSC), invoked through the fs-agnostic
     `fs->sync` callback.
 
-    **The defect (#596, reproduced on real hardware).** Some cheap flash sticks
+    **Attribution correction (2026-08-21).** This decision originally claimed
+    the mechanism below explained #596. It does not: #596 reproduced with FUA
+    active, on a SATA-USB SSD whose `SYNCHRONIZE CACHE` works, and in QEMU. The
+    real cause was a cross-core race in the log drain (decision 57). FUA remains
+    correct and stays: a barrier no-op that reports success is still a lie, and
+    a flush-rejecting stick still needs per-command write-through for the #377
+    ordering. Only the "this fixes #596" claim is withdrawn.
+
+    **The defect this DOES fix (durability on flush-less media).** Some cheap flash sticks
     reject `SYNCHRONIZE CACHE` as an unknown opcode. #516 handled that by
     latching `sync_cache_unsupported` and treating the barrier as a no-op that
     RETURNS SUCCESS -- on the assumption "rejects the flush ⟹ cacheless ⟹
@@ -2867,10 +2876,9 @@ isn't lost.
     buffer/reorder/lose writes. So `flush_metadata` believed it had ordered the
     FAT link, published the larger size, and the device then lost the
     once-written tail FAT sectors while the repeatedly-rewritten directory entry
-    survived -- leaving a persistent `dirent size > cluster chain` (the exact
-    invariant #464 forbids), a leaked cluster, and a wrong free count, on the
-    real log writer's concurrently-grown per-VM logs. A no-op that reports
-    success is a lie the whole ordering rests on.
+    survived -- a window for exactly the `dirent size > cluster chain` state
+    #464 forbids. A no-op that reports success is a lie the whole ordering
+    rests on.
 
     **Decided.** When the device has no working flush barrier, hype sets the
     SCSI **FUA (Force Unit Access)** bit on every `WRITE(10)`. FUA is
@@ -2898,6 +2906,58 @@ isn't lost.
     operator should use `SYNCHRONIZE CACHE`- or FUA-honouring media for durable
     or `physical:` writes. Efficacy on a given controller is a
     hardware-validation item, not a claim the code can make on its own.
+
+57. **#596 root cause: the #239 single-owner rule must cover EVERY sink drain
+    -- decided (2026-08-21).** hype's logging is single-writer by design: every
+    core appends records to the in-RAM capture buffer (core/logbuf.c), and only
+    the BSP drains that buffer to the USB/FAT sinks (#239), because the FAT32
+    writer's shared state (the single-sector FAT cache, the allocation cursor,
+    each file's size/tail_cluster) has no lock -- ownership IS the lock.
+
+    **The defect.** `usb_log_flush()` enforced #239 only for its combined-sink
+    half (inside `usb_log_flush_limit()`). Its split-sink completion loop
+    called `hype_log_sink_flush_budget(&g_vm_log[vi], ...)` DIRECTLY, with no
+    ownership check -- and `usb_log_flush()` is called from every guest's
+    dispatch loop on that guest's own AP, where the author relied on the
+    internal guard making the call a no-op. Result: up to four cores ran
+    `hype_fat32_append` on the same file concurrently. Racing on `f->size`, a
+    32 KiB cluster-boundary extension was skipped (each core computed the
+    offset-in-cluster before the other advanced the size), the append wrapped
+    back into the tail cluster, and `flush_metadata` published a size the chain
+    does not reach: fsck's `file size > cluster chain length`, one leaked
+    cluster, wrong free count -- #596's exact signature. This is why only
+    `\VMn.LOG` files ever corrupted (`\HYPE.LOG` drains only through the
+    guarded path), why it was intermittent on hardware (the AP flush must race
+    the BSP at a cluster boundary), and why it was device-independent (SanDisk
+    stick, SATA-USB SSD, QEMU usb-storage alike -- FUA/decision 56 could not
+    fix it).
+
+    **Evidence.** A compile-gated in-RAM journal (`-DHYPE_596_JOURNAL`,
+    core/fat_write_fs.c) recording every allocation, FAT-entry set, sector
+    write and size publish, stamped with the executing core's APIC ID, plus a
+    publish-time chain audit that dumps the journal over raw serial on the
+    first divergence. In QEMU (tools/596/run-596-qemu.sh) the dump showed
+    cores 0, 1 and 2 interleaved in one file's append stream, the chain
+    skipping the racing core's cluster (`315 -> 317` with 316 leaked), and
+    return-address records placing the AP calls in `usb_log_flush()`'s split
+    loop. The guard itself never misfired (zero guard-pass records on APs):
+    the loop simply never consulted it.
+
+    **Decided.** `usb_log_flush()` now checks `usb_log_this_core_owns_usb()`
+    at entry, covering the split loop. The rule going forward: ANY code that
+    touches a sink or `g_hype_log.fs` -- append, drain, create, or FS-LEVEL
+    READ (`hype_fs_read_at` mutates the shared FAT cache and seek state, so
+    reads are not innocent) -- must either run under the #239 guard or post a
+    request to the BSP (the #454 vars-service mailbox pattern). Block-layer
+    reads may stay cross-core; they are serialized by blk_usb's ticket lock
+    and touch no FAT state.
+
+    **Alternatives considered.** (i) An fs-level lock so any core may write --
+    rejected: it converts guest dispatch latency into USB-transfer waits on
+    every log burst, and single-owner is already the working design; the bug
+    was a leak in the funnel, not the funnel. (ii) Per-sink core affinity --
+    rejected: all sinks share ONE `hype_fs_t` (decision behind #338), so
+    per-sink ownership still races the allocator and FAT cache.
 
 ## 11. Pre-M0 readiness checklist
 

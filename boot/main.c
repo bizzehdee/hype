@@ -23307,6 +23307,23 @@ static void fw_1_logbuf_reclaim(void) {
  * not live yet, or where preserving the final diagnostic tail is the priority. */
 static void usb_log_flush(void) {
     unsigned int before;
+    /*
+     * #596 ROOT CAUSE: the split-sink completion loop below drains g_vm_log[] DIRECTLY, so the
+     * #239 ownership rule must hold for this WHOLE function, not only inside
+     * usb_log_flush_limit(). Without this guard, every guest dispatch loop's usb_log_flush()
+     * call -- written to rely on the internal guard making it a no-op on an AP -- drained the
+     * per-VM sinks from its own AP, concurrently with the BSP's cadence and the other APs, on
+     * one shared FAT state with no lock. Three cores appending one file race on f->size, a
+     * 32 KiB cluster-boundary extension gets skipped, and flush_metadata publishes a size the
+     * chain does not reach: fsck's "file size > cluster chain length" plus one leaked cluster --
+     * the exact #596 signature, and why only \VMn.LOG files ever corrupted (\HYPE.LOG is drained
+     * only through the guarded path). Reproduced deterministically in QEMU (tools/596) and
+     * pinned by a per-core write journal: cores 1 and 2 calling hype_log_sink_flush_budget from
+     * this function's split loop.
+     */
+    if (!usb_log_this_core_owns_usb()) {
+        return;
+    }
     do {
         before = hype_log_sink_flushed(&g_hype_log);
         usb_log_flush_limit(~0u);

@@ -20,6 +20,123 @@ static void bzero(uint8_t *dst, unsigned int n) {
     for (i = 0; i < n; i++) dst[i] = 0u;
 }
 
+#ifndef HYPE_596_JOURNAL
+/* Production build: the write wrapper is a pure pass-through. */
+static int hype_596_wr(hype_fat32_fs_t *fs, uint64_t lba, uint32_t count, const void *src) {
+    return fs->write(fs->ctx, lba, count, src);
+}
+#else
+/*
+ * #596 diagnostic build (-DHYPE_596_JOURNAL): an in-RAM ring journal of every mutation this
+ * writer performs, plus a publish-time chain audit. On the FIRST publish whose FAT chain is
+ * shorter than the size being published, the journal and a cache-vs-medium comparison of the
+ * divergent FAT sector are dumped over RAW SERIAL (hype_serial_print -- deliberately NOT
+ * hype_debug_print: routing diagnostics through the logbuf perturbs the exact writer under
+ * observation, which is how two earlier probe rounds contaminated their own evidence).
+ */
+#include "serial.h"
+
+#define J_N 16384u
+typedef struct { uint8_t tag; uint32_t a, b, c; } hype_596_j_t;
+static hype_596_j_t g_j[J_N];
+static uint32_t g_jseq;
+static int g_jdumped;
+
+/* Which core produced each record: two different IDs interleaved on one file is the #239 guard
+ * failing; one ID with nested patterns is reentrancy on that core. CPUID.1:EBX[31:24]. */
+static uint32_t hype_596_apic_id(void) {
+    uint32_t ebx;
+    __asm__ volatile("cpuid" : "=b"(ebx) : "a"(1u) : "ecx", "edx");
+    return ebx >> 24;
+}
+
+static void jrec(uint8_t tag, uint32_t a, uint32_t b, uint32_t c) {
+    hype_596_j_t *e = &g_j[g_jseq % J_N];
+    (void)c;
+    e->tag = tag; e->a = a; e->b = b; e->c = hype_596_apic_id();
+    g_jseq++;
+}
+
+/* #596: generic journal note for other modules (log_sink) -- tag + two values, core-stamped. */
+void hype_596_note(uint32_t tag, uint32_t a, uint32_t b);
+void hype_596_note(uint32_t tag, uint32_t a, uint32_t b) { jrec((uint8_t)tag, a, b, 0); }
+
+static int hype_596_wr(hype_fat32_fs_t *fs, uint64_t lba, uint32_t count, const void *src) {
+    int rc = fs->write(fs->ctx, lba, count, src);
+    /* 'w' = any sector write (lba, count, ok). FAT-range detection scans these. */
+    jrec(rc == 0 ? 'w' : 'X', (uint32_t)lba, count, (uint32_t)(uintptr_t)fs);
+    return rc;
+}
+
+static void hype_596_dump_journal(void) {
+    uint32_t n = (g_jseq < J_N) ? g_jseq : J_N;
+    uint32_t first = g_jseq - n;
+    uint32_t s;
+    hype_serial_print("[596j] journal: %u total events, dumping last %u (seq %u..%u)\n",
+                      g_jseq, n, first, g_jseq - 1u);
+    for (s = first; s < g_jseq; s++) {
+        const hype_596_j_t *e = &g_j[s % J_N];
+        hype_serial_print("[596j] %u %c %u %u %u\n", s, e->tag, e->a, e->b, e->c);
+    }
+    hype_serial_print("[596j] journal end\n");
+}
+
+/* Publish-time audit: walk the chain the medium+cache actually hold and compare with the size
+ * about to be published. Runs on every flush_metadata; dumps once. */
+static int fat_get(hype_fat32_fs_t *fs, uint32_t cl, uint32_t *out); /* fwd */
+static void hype_596_check(hype_fat32_wfile_t *f, uint32_t sz) {
+    hype_fat32_fs_t *fs = f->fs;
+    uint64_t cb = (uint64_t)fs->spc * SECSZ;
+    uint64_t need = ((uint64_t)sz + cb - 1u) / cb;
+    uint32_t cl = f->first_cluster, count = 0, ent = 0;
+    uint32_t soff, i;
+    uint8_t raw[SECSZ];
+
+    if (g_jdumped || sz == 0u || cl < 2u) return;
+    for (;;) {
+        count++;
+        if (fat_get(fs, cl, &ent) != 0) return;
+        if (ent >= FAT32_EOC_MIN || count > need + 4u) break;
+        if (ent < 2u || ent > fs->max_cluster) break; /* free/reserved mid-chain: also broken */
+        cl = ent;
+    }
+    if ((uint64_t)count >= need && ent >= FAT32_EOC_MIN) return; /* healthy */
+
+    g_jdumped = 1;
+    hype_serial_print("[596j] SHORT CHAIN at publish: file '%c%c%c%c%c%c%c%c.%c%c%c' first=%u "
+                      "size=%u need=%llu walked=%u end_cl=%u end_entry=0x%x mem_tail=%u "
+                      "dirent_lba=%llu\n",
+                      f->name11[0], f->name11[1], f->name11[2], f->name11[3], f->name11[4],
+                      f->name11[5], f->name11[6], f->name11[7], f->name11[8], f->name11[9],
+                      f->name11[10], f->first_cluster, sz, (unsigned long long)need, count, cl,
+                      ent, f->tail_cluster, (unsigned long long)f->dirent_lba);
+
+    /* The walk parked the shared cache on end_cl's FAT sector. Re-read that sector RAW from the
+     * medium and print any entry where cache and medium disagree -- a nonempty list is a lost or
+     * reverted sector write; an empty list means cache==medium and the loss happened earlier. */
+    soff = cl / HYPE_FAT32_ENTRIES_PER_SECTOR;
+    if (fs->fat_cache_valid && fs->fat_cache_off == soff &&
+        fs->read(fs->ctx, (uint64_t)fs->reserved + soff, 1u, raw) == 0) {
+        int diffs = 0;
+        for (i = 0; i < HYPE_FAT32_ENTRIES_PER_SECTOR; i++) {
+            uint32_t cv = hype_fat32_entry_get(fs->fat_cache, i);
+            uint32_t mv = hype_fat32_entry_get(raw, i);
+            if (cv != mv) {
+                hype_serial_print("[596j] CACHE!=MEDIUM fatsec=%u entry=%u (cl=%u) cache=0x%x "
+                                  "medium=0x%x\n", soff, i,
+                                  soff * HYPE_FAT32_ENTRIES_PER_SECTOR + i, cv, mv);
+                diffs = 1;
+            }
+        }
+        if (!diffs) hype_serial_print("[596j] cache==medium for fatsec=%u\n", soff);
+    }
+    /* Any journalled write that landed inside FAT copy 0 but was NOT a fat_set ('S' precedes its
+     * own 'w' from inside fat_set, so an unpaired 'w' in FAT range is a stray writer). */
+    hype_serial_print("[596j] fat0 range: lba %u..%u\n", fs->reserved, fs->reserved + fs->fat_size);
+    hype_596_dump_journal();
+}
+#endif /* HYPE_596_JOURNAL */
+
 /* The first cluster is immutable after the first allocation. The guard binds
  * it to this file's directory slot and short name, so a stray assignment of a
  * neighbouring writer's first_cluster fails closed instead of cross-linking
@@ -111,10 +228,13 @@ static int fat_set(hype_fat32_fs_t *fs, uint32_t cl, uint32_t val) {
     uint32_t off = cl / HYPE_FAT32_ENTRIES_PER_SECTOR;
     unsigned int copy;
     if (fat_cache_load(fs, off) != 0) return -1;
+#ifdef HYPE_596_JOURNAL
+    jrec('S', cl, val, (uint32_t)(uintptr_t)fs);
+#endif
     hype_fat32_entry_set(fs->fat_cache, idx, val);
     for (copy = 0; copy < fs->num_fats; copy++) {
         uint64_t slba = (uint64_t)fs->reserved + (uint64_t)copy * fs->fat_size + off;
-        if (fs->write(fs->ctx, slba, 1u, fs->fat_cache) != 0) {
+        if (hype_596_wr(fs, slba, 1u, fs->fat_cache) != 0) {
             fs->fat_cache_valid = 0;
             return -1;
         }
@@ -129,7 +249,7 @@ static int cluster_zero(hype_fat32_fs_t *fs, uint32_t cl) {
     unsigned int s;
     bzero(sec, SECSZ);
     for (s = 0; s < fs->spc; s++) {
-        if (fs->write(fs->ctx, cluster_lba(fs, cl) + s, 1u, sec) != 0) return -1;
+        if (hype_596_wr(fs, cluster_lba(fs, cl) + s, 1u, sec) != 0) return -1;
     }
     return 0;
 }
@@ -154,6 +274,9 @@ static int alloc_cluster(hype_fat32_fs_t *fs, uint32_t *out) {
             if (fs->free_count != UNKNOWN && fs->free_count != 0u) fs->free_count--;
             fs->fsinfo_dirty = 1;
             fs->allocated_any = 1; /* #584: our cursor is authoritative from here on */
+#ifdef HYPE_596_JOURNAL
+            jrec('A', cl, fs->next_free, fs->free_count);
+#endif
             *out = cl;
             return 0;
         }
@@ -235,6 +358,12 @@ int hype_fat32_fs_mount(hype_blk_read_fn read, hype_blk_write_fn write, void *ct
             if (out->next_free < 2u || out->next_free > out->max_cluster) out->next_free = 2u;
         }
     }
+#ifdef HYPE_596_JOURNAL
+    /* Build-variant gate: this line on serial proves the journal build is the one running. */
+    hype_serial_print("[596j] JOURNAL BUILD: fat32 mount fs=%u reserved=%u fat_size=%u spc=%u "
+                      "anchor=0x%llx\n", (uint32_t)(uintptr_t)out, out->reserved, out->fat_size,
+                      out->spc, (unsigned long long)(uintptr_t)&hype_fat32_fs_mount);
+#endif
     return 0;
 }
 
@@ -245,7 +374,7 @@ static void fsinfo_flush(hype_fat32_fs_t *fs) {
         uint8_t fsi[SECSZ];
         if (fs->read(fs->ctx, fs->fsinfo_sector, 1u, fsi) == 0 &&
             hype_fat32_fsinfo_set(fsi, fs->free_count, fs->next_free) == 0) {
-            if (fs->write(fs->ctx, fs->fsinfo_sector, 1u, fsi) == 0) {
+            if (hype_596_wr(fs, fs->fsinfo_sector, 1u, fsi) == 0) {
                 fs->fsinfo_dirty = 0;
             }
         }
@@ -294,11 +423,15 @@ static int flush_metadata(hype_fat32_wfile_t *f, int durable, int truncate_root)
         f->last_error = HYPE_FAT32_WFILE_ERR_IDENTITY;
         return -1;
     }
+#ifdef HYPE_596_JOURNAL
+    jrec('P', f->first_cluster, sz, f->tail_cluster);
+    hype_596_check(f, sz);
+#endif
     hype_fat_dirent_build(ent, f->name11, HYPE_FAT_ATTR_ARCHIVE,
                           (!truncate_root && disk_first != 0u) ? disk_first : f->first_cluster, sz,
                           &f->fs->now);
     bcopy(sec + f->dirent_off, ent, DIRENT_SIZE);
-    if (fs->write(fs->ctx, f->dirent_lba, 1u, sec) != 0) return -1;
+    if (hype_596_wr(fs, f->dirent_lba, 1u, sec) != 0) return -1;
 
     fsinfo_flush(fs);
     /* Persist the directory entry too. Losing it leaves a safely shorter file;
@@ -385,7 +518,7 @@ static int dirent_write(hype_fat32_fs_t *fs, uint32_t dir_first, uint32_t ei,
     if (dirent_pos(fs, dir_first, ei, &lba, &off) != 0) return -1;
     if (fs->read(fs->ctx, lba, 1u, sec) != 0) return -1;
     bcopy(sec + off, ent, DIRENT_SIZE);
-    return fs->write(fs->ctx, lba, 1u, sec);
+    return hype_596_wr(fs, lba, 1u, sec);
 }
 
 /* ---- name matching ---- */
@@ -821,7 +954,7 @@ int hype_fat32_mkdir(hype_fat32_fs_t *fs, const char *path) {
     hype_fat_dirent_build(ent, dot11, HYPE_FAT_ATTR_DIRECTORY,
                           (parent == fs->root_cluster) ? 0u : parent, 0u, &fs->now);
     bcopy(sec + DIRENT_SIZE, ent, DIRENT_SIZE);
-    if (fs->write(fs->ctx, cluster_lba(fs, dcl), 1u, sec) != 0) return -1;
+    if (hype_596_wr(fs, cluster_lba(fs, dcl), 1u, sec) != 0) return -1;
 
     {
         uint8_t dummy11[11];
@@ -925,7 +1058,7 @@ int hype_fat32_rename(hype_fat32_fs_t *fs, const char *from, const char *to) {
         if (sec[DIRENT_SIZE] == '.' && sec[DIRENT_SIZE + 1u] == '.') {
             hype_fat_dirent_set_cluster(sec + DIRENT_SIZE,
                                         (tparent == fs->root_cluster) ? 0u : tparent);
-            if (fs->write(fs->ctx, cluster_lba(fs, dcl), 1u, sec) != 0) return -1;
+            if (hype_596_wr(fs, cluster_lba(fs, dcl), 1u, sec) != 0) return -1;
         }
     }
 
@@ -977,7 +1110,7 @@ int hype_fat32_append(hype_fat32_wfile_t *f, const void *data, unsigned int len)
             uint8_t sec[SECSZ];
             if (fs->read(fs->ctx, lba, 1u, sec) != 0) return -1;
             bcopy(sec + bis, src, n);
-            if (fs->write(fs->ctx, lba, 1u, sec) != 0) return -1;
+            if (hype_596_wr(fs, lba, 1u, sec) != 0) return -1;
         } else {
             /*
              * #374: the block callbacks accept a sector count, and the USB
@@ -992,7 +1125,7 @@ int hype_fat32_append(hype_fat32_wfile_t *f, const void *data, unsigned int len)
             if (sectors > in_cluster) sectors = in_cluster;
             if (sectors == 0u) sectors = 1u;
             n = sectors * SECSZ;
-            if (fs->write(fs->ctx, lba, sectors, src) != 0) return -1;
+            if (hype_596_wr(fs, lba, sectors, src) != 0) return -1;
         }
         src += n;
         len -= n;
@@ -1115,11 +1248,11 @@ static int span_io(hype_fat32_wfile_t *f, uint64_t off, uint8_t *rbuf, const uin
             if (rbuf != 0) {
                 if (fs->read(fs->ctx, lba, sectors, rbuf) != 0) return -1;
             } else if (wbuf != 0) {
-                if (fs->write(fs->ctx, lba, sectors, wbuf) != 0) return -1;
+                if (hype_596_wr(fs, lba, sectors, wbuf) != 0) return -1;
             } else {
                 unsigned int si;
                 for (si = 0; si < sectors; si++) {
-                    if (fs->write(fs->ctx, lba + si, 1u, zsec) != 0) return -1;
+                    if (hype_596_wr(fs, lba + si, 1u, zsec) != 0) return -1;
                 }
             }
         } else {
@@ -1137,7 +1270,7 @@ static int span_io(hype_fat32_wfile_t *f, uint64_t off, uint8_t *rbuf, const uin
                 } else {
                     bzero(sec + bis, n);
                 }
-                if (fs->write(fs->ctx, lba, 1u, sec) != 0) return -1;
+                if (hype_596_wr(fs, lba, 1u, sec) != 0) return -1;
             }
         }
         off += n;

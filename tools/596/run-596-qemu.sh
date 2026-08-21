@@ -59,5 +59,17 @@ done
 echo "=== verdicts ==="
 grep -aE 'FAT32-STICK SELFTEST|LOGTEST-STICK SELFTEST' "$S/serial.txt" || echo "(no verdict -- did the batteries run?)"
 echo "=== fsck.vfat -n on the USB log volume (the judge) ==="
-fsck.vfat -n "$S/usb.img" 2>&1 | grep -aiE 'chain length|beyond EOF|Reclaimed|lost|orphan|free cluster summary|Bad|allocation|clean|files,' || true
+fsck.vfat -n "$S/usb.img" > "$S/fsck.txt" 2>&1 || true
+grep -aiE 'chain length|beyond EOF|Reclaimed|lost|orphan|free cluster summary|Bad|allocation|clean|files,' "$S/fsck.txt" || true
 echo "--- files ---"; mdir -i "$S/usb.img" ::/ 2>/dev/null | head
+# #596 regression gate: dirent-beyond-chain, leaked clusters or a wrong free count on the log
+# volume is THE defect; a diagnostic build's own publish-time audit firing counts too.
+rc=0
+if grep -aqiE 'chain length|Reclaimed|free cluster summary wrong|orphan|lost cluster' "$S/fsck.txt"; then
+    echo "FAIL: fsck found the #596 corruption class on the log volume"; rc=1
+fi
+if grep -aq 'SHORT CHAIN' "$S/serial.txt"; then
+    echo "FAIL: the publish-time chain audit fired (build with -DHYPE_596_JOURNAL)"; rc=1
+fi
+[ "$rc" -eq 0 ] && echo "PASS: log volume structurally clean after 3 concurrent guests + batteries"
+exit "$rc"

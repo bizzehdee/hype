@@ -188,6 +188,13 @@ static int flush_filtered(hype_log_sink_t *s, const char *data, unsigned int len
 }
 
 int hype_log_sink_flush_budget(hype_log_sink_t *s, unsigned int max_source_bytes) {
+#ifdef HYPE_596_JOURNAL
+    {
+        void hype_596_note(uint32_t tag, uint32_t a, uint32_t b);
+        hype_596_note('F', (uint32_t)(uintptr_t)__builtin_return_address(0),
+                      (uint32_t)s->filter);
+    }
+#endif
     unsigned int len;
     if (!s->active) return -1;
     if (max_source_bytes == 0u) return 0;
