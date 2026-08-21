@@ -18618,24 +18618,92 @@ unsigned g_media_dev_count;
 
 static const char *g_media_dev_serial[HYPE_MEDIA_MAX_DEVS]; /* #323 */
 
+/*
+ * #589: a per-inventory-entry media reader. media_ahci_read/media_nvme_read were hardwired to the
+ * ONE selected disk (the g_hostdisk / g_hostnvme globals), so a file on any OTHER inventoried port was
+ * unreachable as media/backing even though #258 had recorded the port. The host read/write APIs
+ * already take the device address as a parameter, so one reader carrying (bus, bar, port) in its
+ * ctx serves every port. The ctx lives in a static pool alongside the media table so the pointer
+ * stays valid for the life of the run.
+ */
+typedef struct {
+    hype_disk_bus_t bus;
+    uint64_t bar;
+    unsigned int port;
+} hype_media_hostdisk_ctx_t;
+
+static hype_media_hostdisk_ctx_t g_media_hostdisk_ctx[HYPE_MEDIA_MAX_DEVS];
+
+static int media_hostdisk_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
+    hype_media_hostdisk_ctx_t *c = (hype_media_hostdisk_ctx_t *)ctx;
+    uint8_t *d = (uint8_t *)dst;
+    uint64_t t0 = hype_rdtsc();
+    int rc = 0;
+    if (c == 0) {
+        return -1;
+    }
+    while (count > 0u) {
+        uint32_t chunk = (count > 8192u) ? 8192u : count; /* uint16 FIS/PRP count, 4 MiB/cmd */
+        rc = (c->bus == HYPE_DISK_BUS_NVME)
+                 ? hype_nvme_host_read(c->bar, lba, (uint16_t)chunk, d)
+                 : hype_ahci_host_read(c->bar, c->port, lba, (uint16_t)chunk, d);
+        if (rc != 0) {
+            break;
+        }
+        lba += chunk;
+        d += (uint64_t)chunk * 512u;
+        count -= chunk;
+    }
+    g_media_io_tsc += hype_rdtsc() - t0;
+    g_media_io_calls++;
+    return rc;
+}
+
+static int media_hostdisk_write(void *ctx, uint64_t lba, uint32_t count, const void *src) {
+    hype_media_hostdisk_ctx_t *c = (hype_media_hostdisk_ctx_t *)ctx;
+    const uint8_t *s = (const uint8_t *)src;
+    int rc = 0;
+    if (c == 0) {
+        return -1;
+    }
+    while (count > 0u) {
+        uint32_t chunk = (count > 8192u) ? 8192u : count;
+        rc = (c->bus == HYPE_DISK_BUS_NVME)
+                 ? hype_nvme_host_write(c->bar, lba, (uint16_t)chunk, s)
+                 : hype_ahci_host_write(c->bar, c->port, lba, (uint16_t)chunk, s);
+        if (rc != 0) {
+            break;
+        }
+        lba += chunk;
+        s += (uint64_t)chunk * 512u;
+        count -= chunk;
+    }
+    return rc;
+}
+
 static void media_add_dev(int (*rd)(void *, uint64_t, uint32_t, void *),
                           int (*wr)(void *, uint64_t, uint32_t, const void *), const char *bus,
-                          const char *serial) {
+                          const char *serial, void *ctx) {
     unsigned i;
     if (g_media_dev_count >= HYPE_MEDIA_MAX_DEVS) {
         hype_debug_print("media: ignoring a %s device -- already tracking %u (cap)\n", bus,
                          g_media_dev_count);
         return;
     }
-    /* Same bus twice is fine (two AHCI ports); the same read fn twice is a double-register bug. */
+    /*
+     * Same read fn twice with the SAME ctx is a double-register bug. The same read fn with a
+     * DIFFERENT ctx is a distinct device -- #589 registers every inventoried AHCI/NVMe port
+     * through one media_hostdisk_read whose ctx names the (bar, port), so the ctx is part of a
+     * device's identity now, not always 0.
+     */
     for (i = 0; i < g_media_dev_count; i++) {
-        if (g_media_devs[i].read == rd) {
+        if (g_media_devs[i].read == rd && g_media_devs[i].ctx == ctx) {
             return;
         }
     }
     g_media_devs[g_media_dev_count].read = rd;
     g_media_devs[g_media_dev_count].write = wr;
-    g_media_devs[g_media_dev_count].ctx = 0;
+    g_media_devs[g_media_dev_count].ctx = ctx;
     g_media_devs[g_media_dev_count].bus = bus;
     g_media_devs[g_media_dev_count].part_base_lba = 0;
     g_media_dev_serial[g_media_dev_count] = serial; /* #323: static storage, stays valid */
@@ -18697,7 +18765,7 @@ static void iso_stream_bind_dev(hype_iso_stream_t *st, unsigned devidx) {
 
 /* Binds the media device to the AHCI port host discovery selected. */
 static void media_select_ahci(void) {
-    media_add_dev(media_ahci_read, media_ahci_write, "ahci", g_hostdisk_serial);
+    media_add_dev(media_ahci_read, media_ahci_write, "ahci", g_hostdisk_serial, 0);
     /* Keep AHCI as the ACTIVE device when it is found, so a machine that works today is
      * unchanged; the scan loops over all registered devices regardless. */
     g_media.read = media_ahci_read;
@@ -18810,7 +18878,7 @@ static void media_select_usb(const hype_blk_backend_t *be) {
      * auto-detected but never matched -- `media_disk` cannot name it, and it is never
      * silently selected under another drive's name either.
      */
-    media_add_dev(media_usb_read, media_usb_write, "usb", g_hostusb_serial);
+    media_add_dev(media_usb_read, media_usb_write, "usb", g_hostusb_serial, 0);
     if (!media_present()) {
         g_media.read = media_usb_read;
         g_media.write = media_usb_write;
@@ -18900,17 +18968,52 @@ static void media_select_atapi(uint64_t abar, unsigned port) {
     g_hostcd_abar = abar;
     g_hostcd_port = port;
     g_hostcd_present = 1;
-    media_add_dev(media_atapi_read, 0, "atapi", "");
+    media_add_dev(media_atapi_read, 0, "atapi", "", 0);
 }
 
 /* #324: same, for an enumerated NVMe controller. */
 static void media_select_nvme(void) {
-    media_add_dev(media_nvme_read, media_nvme_write, "nvme", g_hostnvme_serial);
+    media_add_dev(media_nvme_read, media_nvme_write, "nvme", g_hostnvme_serial, 0);
     if (!media_present()) {
         g_media.read = media_nvme_read;
         g_media.write = media_nvme_write;
         g_media.ctx = 0;
         g_media.bus = "nvme";
+    }
+}
+
+/*
+ * #589: register EVERY inventoried disk as a media device, not just the one port discovery
+ * selected. The selected disk (the g_hostdisk / g_hostnvme globals) is already device 0 through
+ * media_select_ahci or media_select_nvme; this adds the rest, each with a per-port ctx so a file
+ * on any port's
+ * filesystem is reachable and #323 by-serial selection has more than one candidate. Called once,
+ * after every controller has been walked and before media resolution.
+ */
+static void media_register_inventory(void) {
+    unsigned int i;
+    for (i = 0; i < g_disk_inv.count && g_media_dev_count < HYPE_MEDIA_MAX_DEVS; i++) {
+        const hype_disk_entry_t *e = hype_disk_inventory_get(&g_disk_inv, i);
+        hype_media_hostdisk_ctx_t *c;
+        int is_selected;
+        if (e == 0) {
+            continue;
+        }
+        /* Skip the disk already registered as device 0 by media_select_*: same read fn, but its
+         * ctx is 0, so the ctx-aware dedup in media_add_dev would not catch this second form. */
+        is_selected = (e->bus == HYPE_DISK_BUS_NVME)
+                          ? (g_hostnvme_present && e->bar_phys == g_hostnvme_bar)
+                          : (g_hostdisk_present && e->bar_phys == g_hostdisk_abar &&
+                             e->port == g_hostdisk_port);
+        if (is_selected) {
+            continue;
+        }
+        c = &g_media_hostdisk_ctx[g_media_dev_count];
+        c->bus = e->bus;
+        c->bar = e->bar_phys;
+        c->port = e->port;
+        media_add_dev(media_hostdisk_read, media_hostdisk_write,
+                      e->bus == HYPE_DISK_BUS_NVME ? "nvme" : "ahci", e->serial, c);
     }
 }
 
@@ -24594,7 +24697,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                               &g_musbx_xc[k], msc_slot, &g_musbx_eps[k], 512u,
                                               (uint64_t)xlast + 1u);
                             media_add_dev(g_musbx_rd[k], g_musbx_wr[k], "usb",
-                                          g_musbx_serial[k]);
+                                          g_musbx_serial[k], 0);
                             /* claimed: passthrough must never offer a device hype is using */
                             hype_usb_inventory_claim(&g_usb_inv,
                                                      hype_usb_inventory_find(&g_usb_inv,
@@ -25117,6 +25220,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             }
         }
     }
+
+    /* #589: with the inventory complete, register every remaining port as a media device before
+     * media resolution runs, so a file on any port -- not just the selected disk -- is reachable. */
+    media_register_inventory();
 
     fw_1_phase1_config();
 

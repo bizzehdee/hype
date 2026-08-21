@@ -1,0 +1,12 @@
+# #589: the guest disk is a file on the SECOND AHCI port. Reaching the shell and reading the
+# magic proves the media registry found ahci.1 and resolved the file there.
+timeout 300000
+fail-if Kernel panic
+fail-if Unable to mount root
+expect job control turned off
+send \n
+send echo KBOOT589-$((6*7))\n
+expect KBOOT589-42
+send test -b /dev/vda && dd if=/dev/vda bs=16 count=1 2>/dev/null; echo; echo VDA-DONE\n
+expect VDA-DONE
+pass file-on-second-ahci-port
