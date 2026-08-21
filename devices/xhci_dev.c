@@ -114,7 +114,18 @@ void hype_xhci_dev_reset(hype_xhci_dev_t *dev, int device_present) {
     dev->device_present = device_present ? 1 : 0;
     dev->events_posted = 0u;
     dev->commands_processed = 0u;
+    dev->transfers_processed = 0u;
     slots_reset(dev);
+    /* dev->usb is intentionally NOT cleared: the class device is attached once at present time and
+     * must survive a guest HCRST, which re-enters this function. */
+}
+
+void hype_xhci_dev_attach(hype_xhci_dev_t *dev, const hype_usb_device_t *usb) {
+    if (dev == 0) {
+        return;
+    }
+    dev->usb = usb;
+    dev->device_present = (usb != 0) ? 1 : 0;
 }
 
 /* ---- event ring -------------------------------------------------------------------------- */
@@ -381,15 +392,147 @@ static void process_command_ring(hype_xhci_dev_t *dev, const hype_gpa_map_t *m) 
     dev->crcr &= ~(uint64_t)HYPE_XHCI_CRCR_CRR;
 }
 
-void hype_xhci_dev_doorbell(hype_xhci_dev_t *dev, uint32_t target, const hype_gpa_map_t *dma_map) {
+/* #592: post a Transfer Event for a completed transfer TRB. `residual` is the untransferred byte
+ * count the guest reads out of status[23:0]. */
+static void post_transfer_event(hype_xhci_dev_t *dev, const hype_gpa_map_t *m, uint64_t trb_gpa,
+                                uint8_t slot, uint8_t dci, uint32_t cc, uint32_t residual) {
+    uint32_t status = (cc << 24) | (residual & 0x00FFFFFFu);
+    uint32_t control = ((uint32_t)HYPE_XHCI_TRB_TRANSFER_EVENT << HYPE_XHCI_TRB_TYPE_SHIFT) |
+                       ((uint32_t)dci << 16) | ((uint32_t)slot << HYPE_XHCI_TRB_SLOT_SHIFT);
+    (void)event_post(dev, m, trb_gpa, status, control);
+}
+
+/*
+ * #592: walk one endpoint's transfer ring on a slot doorbell and hand each transfer to the USB
+ * function. DCI 1 is the control endpoint (Setup/Data/Status stages); an even DCI is a bulk-OUT
+ * endpoint (host-to-device), an odd DCI >= 3 a bulk-IN endpoint (device-to-host). A Transfer Event
+ * is posted for every TRB that requested Interrupt On Completion.
+ */
+static void process_transfer_ring(hype_xhci_dev_t *dev, const hype_gpa_map_t *m, uint8_t slot,
+                                  uint8_t dci) {
+    unsigned int guard = 0u;
+    uint8_t setup[8];
+    int have_setup = 0;
+    int control_done = 0; /* the device->control call already happened for this TD */
+    hype_xhci_slot_t *sl;
+
+    if (slot == 0u || slot > HYPE_XHCI_MAX_SLOTS || dci == 0u || dci >= 32u) {
+        return;
+    }
+    sl = &dev->slots[slot];
+    if (sl->state < HYPE_XHCI_SLOT_ADDRESSED || !sl->ep_configured[dci] || sl->ep_ring[dci] == 0u) {
+        return;
+    }
+    if (dev->usb == 0 || dev->usb->ops == 0) {
+        return;
+    }
+
+    while (guard++ < 4096u) {
+        uint32_t p0lo, p0hi, status, control;
+        uint64_t trb_gpa = sl->ep_ring[dci];
+        uint8_t type, cycle;
+        uint32_t xfer_len, cc = HYPE_XHCI_CC_SUCCESS, residual = 0u;
+        int ioc;
+        if (gread32(m, trb_gpa + 0u, &p0lo) != 0 || gread32(m, trb_gpa + 4u, &p0hi) != 0 ||
+            gread32(m, trb_gpa + 8u, &status) != 0 || gread32(m, trb_gpa + 12u, &control) != 0) {
+            break;
+        }
+        cycle = (uint8_t)(control & HYPE_XHCI_TRB_CYCLE);
+        if (cycle != sl->ep_cycle[dci]) {
+            break; /* ring drained */
+        }
+        type = (uint8_t)((control >> HYPE_XHCI_TRB_TYPE_SHIFT) & 0x3Fu);
+        ioc = (control & HYPE_XHCI_TRB_IOC) != 0;
+        xfer_len = status & HYPE_XHCI_TRB_XFER_LEN_MASK;
+
+        if (type == HYPE_XHCI_TRB_LINK) {
+            uint64_t next = ((uint64_t)p0lo | ((uint64_t)p0hi << 32)) & ~0xFull;
+            if (control & HYPE_XHCI_TRB_LINK_TC) {
+                sl->ep_cycle[dci] ^= 1u;
+            }
+            sl->ep_ring[dci] = next;
+            continue;
+        }
+
+        if (type == HYPE_XHCI_TRB_SETUP_STAGE) {
+            /* Immediate 8-byte SETUP packet in the TRB parameter dwords. */
+            setup[0] = (uint8_t)p0lo;
+            setup[1] = (uint8_t)(p0lo >> 8);
+            setup[2] = (uint8_t)(p0lo >> 16);
+            setup[3] = (uint8_t)(p0lo >> 24);
+            setup[4] = (uint8_t)p0hi;
+            setup[5] = (uint8_t)(p0hi >> 8);
+            setup[6] = (uint8_t)(p0hi >> 16);
+            setup[7] = (uint8_t)(p0hi >> 24);
+            have_setup = 1;
+            control_done = 0;
+        } else if (type == HYPE_XHCI_TRB_DATA_STAGE) {
+            /* Control data phase: run the control transfer against this buffer. */
+            uint64_t buf = (uint64_t)p0lo | ((uint64_t)p0hi << 32);
+            uint64_t host = hype_gpa_to_host(m, buf, xfer_len);
+            uint32_t dlen = xfer_len;
+            if (host == 0 || !have_setup) {
+                cc = HYPE_XHCI_CC_TRB_ERROR;
+            } else if (dev->usb->ops->control(dev->usb->ctx, setup, (uint8_t *)(uintptr_t)host,
+                                              xfer_len, &dlen) != 0) {
+                cc = HYPE_XHCI_CC_TRB_ERROR;
+            } else {
+                residual = (dlen < xfer_len) ? (xfer_len - dlen) : 0u;
+            }
+            control_done = 1;
+        } else if (type == HYPE_XHCI_TRB_STATUS_STAGE) {
+            /* If there was no data phase, run a zero-length control transfer now. */
+            if (have_setup && !control_done) {
+                uint32_t dlen = 0;
+                if (dev->usb->ops->control(dev->usb->ctx, setup, 0, 0, &dlen) != 0) {
+                    cc = HYPE_XHCI_CC_TRB_ERROR;
+                }
+            }
+            have_setup = 0;
+            control_done = 0;
+        } else if (type == HYPE_XHCI_TRB_NORMAL) {
+            uint64_t buf = (uint64_t)p0lo | ((uint64_t)p0hi << 32);
+            uint64_t host = hype_gpa_to_host(m, buf, xfer_len);
+            if (host == 0) {
+                cc = HYPE_XHCI_CC_TRB_ERROR;
+            } else if ((dci & 1u) == 0u) {
+                /* even DCI = bulk OUT (host to device) */
+                if (dev->usb->ops->bulk_out(dev->usb->ctx, (const uint8_t *)(uintptr_t)host,
+                                            xfer_len) != 0) {
+                    cc = HYPE_XHCI_CC_TRB_ERROR;
+                }
+            } else {
+                /* odd DCI = bulk IN (device to host) */
+                uint32_t got = 0;
+                if (dev->usb->ops->bulk_in(dev->usb->ctx, (uint8_t *)(uintptr_t)host, xfer_len,
+                                           &got) != 0) {
+                    cc = HYPE_XHCI_CC_TRB_ERROR;
+                } else {
+                    residual = (got < xfer_len) ? (xfer_len - got) : 0u;
+                }
+            }
+        }
+        /* else: an unmodeled transfer TRB type -- accepted, no data moved. */
+
+        if (ioc) {
+            post_transfer_event(dev, m, trb_gpa, slot, dci, cc, residual);
+        }
+        dev->transfers_processed++;
+        sl->ep_ring[dci] += HYPE_XHCI_TRB_SIZE;
+    }
+}
+
+void hype_xhci_dev_doorbell(hype_xhci_dev_t *dev, uint32_t db_index, uint32_t db_value,
+                            const hype_gpa_map_t *dma_map) {
     if (dev == 0 || dma_map == 0) {
         return;
     }
-    if (target == HYPE_XHCI_DB_COMMAND) {
+    if (db_index == HYPE_XHCI_DB_COMMAND) {
         process_command_ring(dev, dma_map);
+        return;
     }
-    /* A slot doorbell (transfer-ring kick) is the class layer's job (#592); accepted and ignored
-     * here so a guest that rings it during bring-up is not stalled. */
+    /* A slot doorbell: db_value[7:0] is the endpoint DCI to service. */
+    process_transfer_ring(dev, dma_map, (uint8_t)db_index, (uint8_t)(db_value & 0xFFu));
 }
 
 /* ---- MMIO register access ---------------------------------------------------------------- */
@@ -643,8 +786,8 @@ int hype_xhci_dev_mmio_write(hype_xhci_dev_t *dev, uint32_t offset, uint8_t size
         return 0; /* capability registers are read-only */
     }
     if (offset >= HYPE_XHCI_DBOFF) {
-        uint32_t target = (offset - HYPE_XHCI_DBOFF) / 4u;
-        hype_xhci_dev_doorbell(dev, target, dma_map);
+        uint32_t db_index = (offset - HYPE_XHCI_DBOFF) / 4u;
+        hype_xhci_dev_doorbell(dev, db_index, (uint32_t)value, dma_map);
         return 0;
     }
     if (offset >= HYPE_XHCI_RTSOFF) {

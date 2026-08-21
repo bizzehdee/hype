@@ -172,7 +172,7 @@ static void test_enable_slot(void) {
     uint32_t status, control;
     rig_init(&r);
     push_cmd(&r, 0, 0, HYPE_XHCI_TRB_ENABLE_SLOT, 0);
-    hype_xhci_dev_doorbell(&r.dev, HYPE_XHCI_DB_COMMAND, &r.map);
+    hype_xhci_dev_doorbell(&r.dev, HYPE_XHCI_DB_COMMAND, 0u, &r.map);
     CHECK_INT("one command processed", 1, r.dev.commands_processed);
     CHECK_INT("one event posted", 1, r.dev.events_posted);
     read_event(&r, 0, &param, &status, &control);
@@ -201,7 +201,7 @@ static void test_bringup_sequence(void) {
     push_cmd(&r, 0, 0, HYPE_XHCI_TRB_ENABLE_SLOT, 0);
     /* 2. Address Device (slot 1, input context pointer). */
     push_cmd(&r, GBASE + OFF_INCTX, 0, HYPE_XHCI_TRB_ADDRESS_DEVICE, 1);
-    hype_xhci_dev_doorbell(&r.dev, HYPE_XHCI_DB_COMMAND, &r.map);
+    hype_xhci_dev_doorbell(&r.dev, HYPE_XHCI_DB_COMMAND, 0u, &r.map);
 
     CHECK_INT("two commands so far", 2, r.dev.commands_processed);
     read_event(&r, 1, &param, &status, &control);
@@ -216,7 +216,7 @@ static void test_bringup_sequence(void) {
     put32(&r, OFF_INCTX + 4u, (1u << 2)); /* add-flags: A2 */
     put64(&r, OFF_INCTX + 32u + 2u * 32u + 8u, (GBASE + 0x7000u) | 1u);
     push_cmd(&r, GBASE + OFF_INCTX, 0, HYPE_XHCI_TRB_CONFIGURE_ENDPOINT, 1);
-    hype_xhci_dev_doorbell(&r.dev, HYPE_XHCI_DB_COMMAND, &r.map);
+    hype_xhci_dev_doorbell(&r.dev, HYPE_XHCI_DB_COMMAND, 0u, &r.map);
 
     read_event(&r, 2, &param, &status, &control);
     CHECK_INT("configure endpoint success", HYPE_XHCI_CC_SUCCESS, (status >> 24) & 0xFFu);
@@ -244,7 +244,7 @@ static void test_link_trb_and_noop(void) {
         r.cmd_enqueue = 2; /* producer now at TRB 2 */
     }
     push_cmd(&r, 0, 0, HYPE_XHCI_TRB_NOOP_CMD, 0); /* TRB 2 */
-    hype_xhci_dev_doorbell(&r.dev, HYPE_XHCI_DB_COMMAND, &r.map);
+    hype_xhci_dev_doorbell(&r.dev, HYPE_XHCI_DB_COMMAND, 0u, &r.map);
     CHECK_INT("two no-ops executed across a link", 2, r.dev.commands_processed);
     read_event(&r, 0, &param, &status, &control);
     CHECK_INT("first no-op success", HYPE_XHCI_CC_SUCCESS, (status >> 24) & 0xFFu);
@@ -261,7 +261,7 @@ static void test_address_device_bad_slot(void) {
     rig_init(&r);
     /* Address Device on a slot that was never enabled -> Slot Not Enabled error. */
     push_cmd(&r, GBASE + OFF_INCTX, 0, HYPE_XHCI_TRB_ADDRESS_DEVICE, 3);
-    hype_xhci_dev_doorbell(&r.dev, HYPE_XHCI_DB_COMMAND, &r.map);
+    hype_xhci_dev_doorbell(&r.dev, HYPE_XHCI_DB_COMMAND, 0u, &r.map);
     read_event(&r, 0, &param, &status, &control);
     CHECK_INT("slot not enabled error", HYPE_XHCI_CC_SLOT_NOT_ENABLED, (status >> 24) & 0xFFu);
 }
@@ -270,7 +270,7 @@ static void test_hcreset_clears_state(void) {
     rig_t r;
     rig_init(&r);
     push_cmd(&r, 0, 0, HYPE_XHCI_TRB_ENABLE_SLOT, 0);
-    hype_xhci_dev_doorbell(&r.dev, HYPE_XHCI_DB_COMMAND, &r.map);
+    hype_xhci_dev_doorbell(&r.dev, HYPE_XHCI_DB_COMMAND, 0u, &r.map);
     CHECK_INT("slot enabled before reset", 1, r.dev.slots_enabled);
     wr32(&r, HYPE_XHCI_OP_USBCMD, HYPE_XHCI_USBCMD_HCRST);
     CHECK_INT("slots cleared by HCRST", 0, r.dev.slots_enabled);
@@ -307,7 +307,7 @@ static void test_usbsts_and_iman_rw1c(void) {
     rig_init(&r);
     /* Post an event (Enable Slot) -> EINT + IMAN.IP set, IRQ pending. */
     push_cmd(&r, 0, 0, HYPE_XHCI_TRB_ENABLE_SLOT, 0);
-    hype_xhci_dev_doorbell(&r.dev, HYPE_XHCI_DB_COMMAND, &r.map);
+    hype_xhci_dev_doorbell(&r.dev, HYPE_XHCI_DB_COMMAND, 0u, &r.map);
     CHECK_INT("EINT set", 1, (rd32(&r, HYPE_XHCI_OP_USBSTS) & HYPE_XHCI_USBSTS_EINT) ? 1 : 0);
     CHECK_INT("IP set", 1, (rd32(&r, HYPE_XHCI_RT_IMAN) & HYPE_XHCI_IMAN_IP) ? 1 : 0);
     CHECK_INT("irq pending", 1, hype_xhci_dev_irq_pending(&r.dev));
@@ -320,7 +320,7 @@ static void test_usbsts_and_iman_rw1c(void) {
     /* INTE gates the IRQ: clear it and even a pending IP does not assert. */
     wr32(&r, HYPE_XHCI_OP_USBCMD, HYPE_XHCI_USBCMD_RS); /* INTE clear */
     push_cmd(&r, 0, 0, HYPE_XHCI_TRB_NOOP_CMD, 0);
-    hype_xhci_dev_doorbell(&r.dev, HYPE_XHCI_DB_COMMAND, &r.map);
+    hype_xhci_dev_doorbell(&r.dev, HYPE_XHCI_DB_COMMAND, 0u, &r.map);
     CHECK_INT("no irq without INTE", 0, hype_xhci_dev_irq_pending(&r.dev));
 }
 
@@ -338,7 +338,7 @@ static void test_event_ring_wrap(void) {
     for (i = 0; i < 3; i++) {
         push_cmd(&r, 0, 0, HYPE_XHCI_TRB_NOOP_CMD, 0);
     }
-    hype_xhci_dev_doorbell(&r.dev, HYPE_XHCI_DB_COMMAND, &r.map);
+    hype_xhci_dev_doorbell(&r.dev, HYPE_XHCI_DB_COMMAND, 0u, &r.map);
     CHECK_INT("three events posted", 3, r.dev.events_posted);
     /* The third event overwrote slot 0; its cycle bit is 0 (toggled after the wrap). */
     read_event(&r, 0, &param, &status, &control);
@@ -353,14 +353,14 @@ static void test_disable_slot(void) {
     rig_init(&r);
     push_cmd(&r, 0, 0, HYPE_XHCI_TRB_ENABLE_SLOT, 0);
     push_cmd(&r, 0, 0, HYPE_XHCI_TRB_DISABLE_SLOT, 1);
-    hype_xhci_dev_doorbell(&r.dev, HYPE_XHCI_DB_COMMAND, &r.map);
+    hype_xhci_dev_doorbell(&r.dev, HYPE_XHCI_DB_COMMAND, 0u, &r.map);
     read_event(&r, 1, &param, &status, &control);
     CHECK_INT("disable slot success", HYPE_XHCI_CC_SUCCESS, (status >> 24) & 0xFFu);
     CHECK_INT("slot disabled", HYPE_XHCI_SLOT_DISABLED, r.dev.slots[1].state);
     CHECK_INT("count back to zero", 0, r.dev.slots_enabled);
     /* Disabling an already-disabled slot errors. */
     push_cmd(&r, 0, 0, HYPE_XHCI_TRB_DISABLE_SLOT, 2);
-    hype_xhci_dev_doorbell(&r.dev, HYPE_XHCI_DB_COMMAND, &r.map);
+    hype_xhci_dev_doorbell(&r.dev, HYPE_XHCI_DB_COMMAND, 0u, &r.map);
     read_event(&r, 2, &param, &status, &control);
     CHECK_INT("disable unenabled errors", HYPE_XHCI_CC_SLOT_NOT_ENABLED, (status >> 24) & 0xFFu);
 }

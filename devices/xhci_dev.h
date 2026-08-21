@@ -119,6 +119,9 @@
 
 /* TRB types (control dword bits [15:10]). */
 #define HYPE_XHCI_TRB_NORMAL 1u
+#define HYPE_XHCI_TRB_SETUP_STAGE 2u
+#define HYPE_XHCI_TRB_DATA_STAGE 3u
+#define HYPE_XHCI_TRB_STATUS_STAGE 4u
 #define HYPE_XHCI_TRB_LINK 6u
 #define HYPE_XHCI_TRB_ENABLE_SLOT 9u
 #define HYPE_XHCI_TRB_DISABLE_SLOT 10u
@@ -131,6 +134,17 @@
 #define HYPE_XHCI_TRB_PORT_STATUS_CHANGE 34u
 /* Link-TRB control bit 1: Toggle Cycle. */
 #define HYPE_XHCI_TRB_LINK_TC 0x2u
+/* Transfer-TRB control bits. */
+#define HYPE_XHCI_TRB_IOC 0x20u          /* bit 5: Interrupt On Completion */
+#define HYPE_XHCI_TRB_IDT 0x40u          /* bit 6: Immediate Data (Setup Stage) */
+#define HYPE_XHCI_TRB_CHAIN 0x10u        /* bit 4: Chain */
+#define HYPE_XHCI_TRB_DATA_DIR_IN 0x10000u /* Data/Status Stage control bit 16: 1 = device-to-host */
+/* Normal/Data TRB status: [16:0] TRB Transfer Length. */
+#define HYPE_XHCI_TRB_XFER_LEN_MASK 0x1FFFFu
+/* Endpoint DCIs the USB-MSC function uses: EP0 control, then bulk OUT/IN. */
+#define HYPE_XHCI_DCI_CONTROL 1u
+#define HYPE_XHCI_DCI_BULK_OUT 2u
+#define HYPE_XHCI_DCI_BULK_IN 3u
 
 /* Completion codes (event TRB status [31:24]). */
 #define HYPE_XHCI_CC_SUCCESS 1u
@@ -190,10 +204,41 @@ typedef struct {
 
     int device_present; /* 1 once a backing device is attached (set by the MSC layer, #592) */
 
+    /* #592: the USB function on the port. NULL until a class device (usb_msc) is attached. */
+    const struct hype_usb_device *usb;
+
     /* Counters for tests/diagnostics. */
     uint32_t events_posted;
     uint32_t commands_processed;
+    uint32_t transfers_processed;
 } hype_xhci_dev_t;
+
+/*
+ * #592: the USB function behind the controller's single port. The controller gathers a transfer
+ * off the endpoint ring and hands it here; the class device (a USB Mass Storage BOT/SCSI device in
+ * v1) answers. All three return 0 on success (ACK) and -1 to STALL the endpoint. Buffers are host
+ * pointers into already-translated guest memory -- the controller does the GPA translation.
+ *
+ *  control  - a control transfer on EP0. `setup` is the 8-byte SETUP packet; direction is its
+ *             bit 7. For IN, fill up to `data_max` and set *data_len; for OUT, `data` and
+ *             *data_len hold the received bytes.
+ *  bulk_out - host-to-device bulk data (the BOT CBW, or WRITE payload).
+ *  bulk_in  - device-to-host bulk data (READ payload, or the BOT CSW); fill up to `max`, set *len.
+ */
+typedef struct hype_usb_device_ops {
+    int (*control)(void *ctx, const uint8_t setup[8], uint8_t *data, uint32_t data_max,
+                   uint32_t *data_len);
+    int (*bulk_out)(void *ctx, const uint8_t *data, uint32_t len);
+    int (*bulk_in)(void *ctx, uint8_t *data, uint32_t max, uint32_t *len);
+} hype_usb_device_ops_t;
+
+typedef struct hype_usb_device {
+    const hype_usb_device_ops_t *ops;
+    void *ctx;
+} hype_usb_device_t;
+
+/* Attach (or detach, with NULL) the USB function. */
+void hype_xhci_dev_attach(hype_xhci_dev_t *dev, const hype_usb_device_t *usb);
 
 /* Reset to power-on: HCHalted set, CNR clear, one connected port, rings empty. `device_present`
  * declares the port has the emulated device on it (so PORTSC reports CCS=1). */
@@ -216,7 +261,8 @@ int hype_xhci_dev_mmio_write(hype_xhci_dev_t *dev, uint32_t offset, uint8_t size
  * (#592) -- in #591 a slot doorbell is accepted and ignored. Called from mmio_write when the
  * offset lands in the doorbell region; exposed for the unit test to drive directly.
  */
-void hype_xhci_dev_doorbell(hype_xhci_dev_t *dev, uint32_t target, const hype_gpa_map_t *dma_map);
+void hype_xhci_dev_doorbell(hype_xhci_dev_t *dev, uint32_t db_index, uint32_t db_value,
+                            const hype_gpa_map_t *dma_map);
 
 /* 1 if the controller has an interrupt asserted the guest has not yet acknowledged. The arch
  * dispatch raises the device's GSI/MSI while this is true. */
