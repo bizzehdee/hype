@@ -37,7 +37,7 @@ CORE_SRCS := core/format.c core/console.c core/halt.c core/memmap.c \
              core/gpt.c core/iso_stream.c core/fat.c core/file_range.c core/fs_ops.c core/ntfs.c core/ext2_alloc.c core/jbd2.c core/ext_jalloc.c core/ext.c core/ext_write.c core/blk_image.c core/blk_qcow2.c core/nvme_host.c core/nvme_host_hw.c core/blk_backend.c core/blk_phys.c core/blk_phys_hw.c core/phys_guard.c \
              core/kbd_decode.c core/vt_screen.c core/vt_render.c core/dashboard.c core/vm_lifecycle.c core/vm_isolation.c core/input_script.c core/input_runner.c core/vm_watchdog.c core/cmdparse.c \
              core/cfg.c core/phys_confirm.c core/scancode.c core/xhci.c core/xhci_hw.c core/usb_msc.c core/usb_hid.c core/blk_usb.c \
-             core/fat_write.c core/fat_write_fs.c core/fat_exfat.c core/fat_exfat_fs.c \
+             core/fat_write.c core/fat_write_fs.c core/fat_exfat.c core/fat_exfat_fs.c core/fat32_selftest.c \
              core/rtc.c core/rtc_hw.c \
              core/log_sink.c core/log_split.c core/disk_inventory.c core/cpu_topology.c core/smp_pack.c core/e1000.c core/e1000_hw.c core/arp.c core/virtio_net_ring.c core/nat.c core/e1000_dev_ring.c core/guest_nic.c core/pe_ident.c core/mtrr.c core/run_state.c
 ARCH_SRCS := arch/x86_64/cpu/gdt.c arch/x86_64/cpu/gdt_load.c arch/x86_64/cpu/idt.c \

@@ -57,6 +57,7 @@
 #include "../core/fat.h"
 #include "../core/fat_write_fs.h"
 #include "../core/log_sink.h"
+#include "../core/fat32_selftest.h"
 #include "../core/nvme_host.h"
 #include "../core/blk_backend.h"
 #include "../core/fw1_debug.h"
@@ -25603,6 +25604,35 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      */
     if (g_hype_log.active) {
         split_log_setup();
+    }
+
+    /*
+     * #597: on-medium FAT32 write battery. If the operator dropped \F32TEST.RUN on the boot
+     * volume, drive hype's own writer at that live volume across small/medium/large files and
+     * every write path, then read each back byte-exact. This reproduces the exact host-side
+     * writer path that corrupted a log on real hardware (#596) on the device that showed it.
+     * The files are left in \F32TEST for a host fsck.vfat + validate_stick pass after the stick
+     * is pulled -- that independent judgement is what catches a chain hype round-trips but Linux
+     * rejects. Gated on the marker file, so a normal stick is untouched.
+     */
+    if (g_hype_log.active && g_hype_log_ready) {
+        hype_fs_file_t f32_marker;
+        if (hype_fs_lookup(&g_hype_log.fs, HYPE_FAT32_SELFTEST_MARKER, &f32_marker) == 0) {
+            hype_fat32_selftest_result_t f32;
+            int f32_rc;
+            hype_debug_print("FAT32-STICK: marker \\%s found -- running the #597 write battery on "
+                             "the boot volume\n", HYPE_FAT32_SELFTEST_MARKER);
+            f32_rc = hype_fat32_selftest_run(&g_hype_log.fs,
+                                             g_host_time_valid ? &g_host_time : 0, &f32);
+            hype_debug_print("FAT32-STICK SELFTEST: %s -- written=%u refused=%u selfcheck_fail=%u%s%s "
+                             "[#597 #596]\n",
+                             (f32_rc == 0 && f32.files_refused == 0) ? "PASS" : "FAIL",
+                             f32.files_written, f32.files_refused, f32.selfcheck_fail,
+                             f32.first_fail[0] ? " first=" : "", f32.first_fail);
+            hype_debug_print("FAT32-STICK: files left in \\%s -- pull the stick and run "
+                             "tools/fat32-e2e/validate-stick.sh for the fsck.vfat verdict\n",
+                             HYPE_FAT32_SELFTEST_DIR);
+        }
     }
 
     /*
