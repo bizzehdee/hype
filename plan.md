@@ -282,6 +282,23 @@ explicit design:
   **any number of disks, each with its own bus** — see §6d and §10 decision
   26. `docs/hype-cfg-spec.md` is the authority for the config surface itself
   and already specifies these keys.
+- **Removable USB mass storage presented to guest** (a fourth front-end,
+  #446, plan.md §10 decision 55): a `.img` attached over an EMULATED,
+  guest-visible xHCI controller + USB Mass Storage (BOT/SCSI) class device,
+  so the guest sees *removable USB media* rather than a fixed disk. This is
+  what most real Windows/Linux installers are written for (Windows Setup's
+  partitioning, several Linux live-media detection paths, driver-injection
+  flows all key off "is this removable USB media"). It is a substantial new
+  device-emulation surface — a guest-facing xHCI (ring/TRB processing,
+  port/slot/endpoint state machines) plus the MSC class on top — comparable
+  to the AHCI/NVMe guest-facing work, and DISTINCT from `core/xhci.c`, which
+  is hype's HOST-side driver for real controllers. It is backed through the
+  same `hype_blk_backend_t` vtable the other front-ends share, so file- and
+  physical-backed both work for free, and selected by `bus = usb-msc` in a
+  `[disk.*]` entry. Decomposed into sub-tickets (controller bring-up, MSC
+  class layer, config wiring, real-guest validation) rather than one change;
+  the guest xHCI is default-absent, exactly as `tpm` and the SB firmware are,
+  so no VM pays for it unasked.
 - **Network**: virtio-net, optional; not required for offline installs.
 - **Video**: two phases. Pre-OS-driver, the hypervisor registers QEMU's
   `etc/ramfb` fw_cfg file for each VM. The vendored OVMF `QemuRamfbDxe`
@@ -2811,6 +2828,27 @@ isn't lost.
     unmapped. The TPM2 table (which carries the CRB control-area address) is
     what binds `tpm_crb` and what a compatibility probe reads; the DSDT node
     for Windows needs a per-VM SSDT overlay and is the follow-up's.
+
+55. **Guest-facing removable USB mass storage is a new emulated front-end,
+    decomposed rather than landed whole -- decided (2026-08-21), #446.** The
+    ask is a `.img` a guest sees as removable USB media, which needs an
+    EMULATED guest-visible xHCI controller plus a USB Mass Storage class
+    device on top -- a surface the size of the AHCI or NVMe guest-facing
+    work, not a config addition. It is deliberately separate from
+    `core/xhci.c` (hype's HOST-side driver for real controllers): the two
+    share the USB *protocol* structs but nothing else, and conflating them
+    would couple a guest-facing model to a host datapath the #343/#377
+    corruption work carefully serialised. Backed through the existing
+    `hype_blk_backend_t` vtable, so file/physical backends come for free, and
+    the guest xHCI is default-absent (a VM without a `bus = usb-msc` disk
+    gets no controller), the same posture `tpm` and Secure Boot take. The
+    breakdown, each its own board ticket: (a) the guest xHCI controller PCI
+    function + ring/TRB/port/slot/endpoint state machine; (b) the USB-MSC
+    (BOT/SCSI) class device over it, backed by `hype_blk_backend_t`; (c) the
+    `bus = usb-msc` config wiring + admission; (d) real-guest validation
+    (Windows Setup and a Linux live-media path both seeing removable USB).
+    Landing (a) before (b) before (c) is the natural order; (d) gates the
+    epic's close.
 
 ## 11. Pre-M0 readiness checklist
 
