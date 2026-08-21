@@ -56,6 +56,8 @@ static extj_slot_t g_cache[HYPE_EXTJ_CACHE];
 #define GD_FREE_BLOCKS 0x0Cu
 
 /* inode */
+#define IN_SIZE_LO 0x04u   /* #497 */
+#define IN_SIZE_HIGH 0x6Cu /* #497 */
 #define IN_MODE 0x00u
 #define IN_CTIME 0x0Cu
 #define IN_MTIME 0x10u
@@ -248,6 +250,51 @@ static void inode_add_blocks(hype_extj_wfile_t *f, uint32_t nblocks) {
         hype_wr32(s->data + off + IN_CTIME, f->mtime);
     }
     s->dirty = 1;
+}
+
+/*
+ * #497: write [from, to) inside allocated block `blk` -- `src` bytes, or zeros when src == 0.
+ * A plain data write to a published block, outside the journal (data is never journaled here);
+ * everything it touches sits at or past the OLD i_size, so an aborted transaction (i_size
+ * unmoved) leaves these bytes invisible.
+ */
+static int tail_span_write(hype_extj_wfile_t *f, uint64_t blk, uint64_t from, uint64_t to,
+                           const uint8_t *src) {
+    uint8_t sec[SECSZ];
+    uint64_t bs = f->block_size;
+    uint64_t pos = from;
+
+    while (pos < to) {
+        uint64_t in_blk = pos % bs;
+        uint64_t sec_idx = in_blk / SECSZ;
+        uint64_t sec_off = in_blk % SECSZ;
+        uint64_t n = SECSZ - sec_off;
+        uint64_t lba = blk * f->spb + sec_idx;
+        unsigned k;
+        if (n > to - pos) n = to - pos;
+        if (f->read(f->ctx, lba, 1u, sec) != 0) return -1;
+        for (k = 0; k < n; k++) {
+            sec[sec_off + k] = src ? src[pos - from + k] : 0u;
+        }
+        if (f->write(f->ctx, lba, 1u, sec) != 0) return -1;
+        pos += n;
+    }
+    return 0;
+}
+
+/* #497: publish the new i_size into the (journaled) inode image. */
+static int inode_set_size(hype_extj_wfile_t *f, uint64_t size) {
+    uint32_t off;
+    extj_slot_t *s = inode_slot(f, &off);
+    if (s == 0) return -1;
+    hype_wr32(s->data + off + IN_SIZE_LO, (uint32_t)size);
+    hype_wr32(s->data + off + IN_SIZE_HIGH, (uint32_t)(size >> 32));
+    if (f->mtime != 0u) {
+        hype_wr32(s->data + off + IN_MTIME, f->mtime);
+        hype_wr32(s->data + off + IN_CTIME, f->mtime);
+    }
+    s->dirty = 1;
+    return 0;
 }
 
 /* Zero a freshly claimed block on the MEDIUM (data-before-metadata). */
@@ -742,15 +789,37 @@ int hype_extj_write_at(hype_extj_wfile_t *f, uint64_t offset, const void *data,
                        unsigned int len) {
     const uint8_t *src = (const uint8_t *)data;
     uint64_t end = offset + len;
+    uint64_t old_size;
+    uint64_t inloop_end;
+    int grow;
     uint64_t bs;
 
     if (f->dead) return -1; /* an exposed transaction awaits replay */
     if (len == 0u) return 0;
-    if (end < offset || end > f->size_bytes) return -1;
+    if (end < offset) return -1;
+    old_size = f->size_bytes;
+    /* #497: a write past EOF GROWS the file -- same shape as the ext2 writer: the in-map walk
+     * covers [offset, old_size), the grown region follows, i_size rides the same journal
+     * commit, and an untouched gap stays a sparse hole. */
+    grow = (end > old_size) ? 1 : 0;
+    /*
+     * #497: refuse a grow BEFORE the map can outgrow what hype can read back. Growth in many
+     * small steps fragments (an indirection/extent boundary breaks a range every span), and a
+     * file whose range count passes HYPE_FILE_MAX_RANGES commits fine and then cannot be
+     * re-mapped -- readable by fsck, unreadable by hype, which is the ticket's named forbidden
+     * outcome. One bounded call adds only a handful of ranges, so an 8-range margin stops
+     * growth safely short of the cliff; the caller sees a clean refusal and a file that still
+     * reads back whole.
+     */
+    if (grow && f->map.count + 8u > HYPE_FILE_MAX_RANGES) {
+        return -1;
+    }
+    inloop_end = grow ? ((offset < old_size) ? old_size : offset) : end;
     bs = f->block_size;
 
-    /* the metadata-free fast path stays: a span wholly inside DATA */
-    {
+    /* the metadata-free fast path stays: a span wholly inside DATA (never on a grow -- growth
+     * always publishes a new i_size, which needs the transaction) */
+    if (!grow) {
         uint64_t probe = offset;
         int all_data = 1;
         while (probe < end) {
@@ -774,13 +843,13 @@ int hype_extj_write_at(hype_extj_wfile_t *f, uint64_t offset, const void *data,
 
     {
         uint64_t pos = offset;
-        while (pos < end) {
+        while (pos < inloop_end) {
             uint64_t lb = pos / bs;
             uint64_t n = bs - pos % bs;
             hype_range_kind_t kind;
             uint64_t lba, run;
             uint32_t head;
-            if (n > end - pos) n = end - pos;
+            if (n > inloop_end - pos) n = inloop_end - pos;
             if (hype_file_rmap_locate(&f->map, pos, &kind, &lba, &head, &run) != 0) return -1;
 
             if (kind == HYPE_RANGE_DATA) {
@@ -822,12 +891,95 @@ int hype_extj_write_at(hype_extj_wfile_t *f, uint64_t offset, const void *data,
                 }
             }
             pos = (lb + 1u) * bs;
-            if (pos > end) pos = end;
+            if (pos > inloop_end) pos = inloop_end;
             src = (const uint8_t *)data + (pos - offset);
         }
     }
 
+    /* #497: the grown region -- see the ext2 writer's twin for the case split. */
+    if (grow) {
+        uint64_t B = ((old_size + bs - 1u) / bs) * bs;
+        if ((old_size % bs) != 0u) {
+            hype_range_kind_t tk;
+            uint64_t tlba, trun;
+            uint32_t thead;
+            uint64_t tlb = old_size / bs;
+            if (hype_file_rmap_locate(&f->map, old_size - 1u, &tk, &tlba, &thead, &trun) != 0) {
+                return -1;
+            }
+            if (tk == HYPE_RANGE_DATA) {
+                uint64_t blk = (tlba - (((old_size - 1u) % bs) / SECSZ)) / f->spb;
+                uint64_t zto = (offset < B) ? offset : B;
+                uint64_t wfrom = (offset > old_size) ? offset : old_size;
+                uint64_t wto = (end < B) ? end : B;
+                if (old_size < zto && tail_span_write(f, blk, old_size, zto, 0) != 0) return -1;
+                if (wfrom < wto &&
+                    tail_span_write(f, blk, wfrom, wto,
+                                    (const uint8_t *)data + (wfrom - offset)) != 0) {
+                    return -1;
+                }
+            } else if (tk == HYPE_RANGE_UNWRITTEN) {
+                /* The whole block reads zero today; content (zeros outside the data slice --
+                 * including every byte below old_size) plus conversion preserves exactly that. */
+                uint64_t blk = (tlba - (((old_size - 1u) % bs) / SECSZ)) / f->spb;
+                if (!f->is_extents) return -1;
+                if (media_block_content(f, blk, tlb, offset, end, (const uint8_t *)data) != 0) {
+                    return -1;
+                }
+                if (extent_convert_block(f, tlb) != 0) return -1;
+            } else if (offset < B) {
+                /* a HOLE tail the write touches: the in-map walk already filled it whenever it
+                 * ran (offset < old_size); otherwise allocate it here. */
+                if (offset >= old_size) {
+                    uint64_t blk = 0;
+                    if (f->is_extents) {
+                        if (claim_block(f, f->inode_byte / SECSZ / f->spb, &blk) != 0) return -1;
+                        if (media_block_content(f, blk, tlb, offset, end,
+                                                (const uint8_t *)data) != 0) {
+                            return -1;
+                        }
+                        if (extent_insert_block(f, tlb, blk) != 0) return -1;
+                        inode_add_blocks(f, 1u);
+                    } else {
+                        int fresh = 0;
+                        if (classic_map_block(f, tlb, &blk, &fresh) != 0) return -1;
+                        if (media_block_content(f, blk, tlb, offset, end,
+                                                (const uint8_t *)data) != 0) {
+                            return -1;
+                        }
+                    }
+                }
+            }
+        }
+        {
+            uint64_t lb2 = (offset > B) ? offset / bs : B / bs;
+            for (; lb2 * bs < end; lb2++) {
+                uint64_t blk = 0;
+                if (f->is_extents) {
+                    if (claim_block(f, f->inode_byte / SECSZ / f->spb, &blk) != 0) return -1;
+                    if (media_block_content(f, blk, lb2, offset, end,
+                                            (const uint8_t *)data) != 0) {
+                        return -1;
+                    }
+                    if (extent_insert_block(f, lb2, blk) != 0) return -1;
+                    inode_add_blocks(f, 1u);
+                } else {
+                    int fresh = 0;
+                    if (classic_map_block(f, lb2, &blk, &fresh) != 0) return -1;
+                    if (media_block_content(f, blk, lb2, offset, end,
+                                            (const uint8_t *)data) != 0) {
+                        return -1;
+                    }
+                }
+            }
+        }
+        if (inode_set_size(f, end) != 0) return -1;
+    }
+
     if (txn_commit(f) != 0) return -1;
     cache_reset(f);
+    if (grow) {
+        f->size_bytes = end; /* #497: the committed inode now carries it */
+    }
     return hype_ext_map_ino_rmap(f->read, f->ctx, f->ino, &f->map);
 }

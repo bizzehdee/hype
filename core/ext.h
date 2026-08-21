@@ -173,12 +173,16 @@ int hype_ext2_read_at(hype_ext2_wfile_t *f, uint64_t offset, void *out, unsigned
 
 /*
  * Writes `len` bytes at `offset`, allocating blocks (and any missing
- * indirection blocks) where the span crosses holes. The range must lie
- * wholly inside the file -- this writer changes a file's SHAPE, never its
- * size. Newly allocated blocks are zero-filled around the written bytes
- * before the pointer publishing them lands. Returns 0, -1 on error, a full
- * volume (rolled back; file unchanged), or a span needing more than the
- * per-call allocation bound.
+ * indirection blocks) where the span crosses holes -- and, since #497, GROWING
+ * the file when the span ends past EOF: the final partially-used block is
+ * extended in place (with the stale bytes between the old size and the write
+ * zeroed before the new i_size can expose them), wholly-new blocks are
+ * allocated and filled, an untouched gap stays a sparse hole, and i_size is
+ * published with the same commit -- so a failure rolls back to a file whose
+ * size never moved. Newly allocated blocks are zero-filled around the written
+ * bytes before the pointer publishing them lands. Returns 0, -1 on error, a
+ * full volume (rolled back), or a span needing more than the per-call
+ * allocation bound (the fs_ops layer chunks large writes for this).
  */
 int hype_ext2_write_at(hype_ext2_wfile_t *f, uint64_t offset, const void *data,
                        unsigned int len);

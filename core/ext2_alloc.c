@@ -41,6 +41,8 @@
 #define IN_MTIME 0x10u
 #define IN_BLOCKS 0x1Cu /* 512-byte sectors, indirection blocks included */
 #define IN_FLAGS 0x20u
+#define IN_SIZE_LO 0x04u   /* #497 */
+#define IN_SIZE_HIGH 0x6Cu /* #497: i_size_high (i_dir_acl on directories; files only here) */
 #define IN_BLOCK 0x28u
 #define FL_EXTENTS 0x00080000u
 #define MODE_FMT 0xF000u
@@ -443,21 +445,122 @@ int hype_ext2_read_at(hype_ext2_wfile_t *f, uint64_t offset, void *out, unsigned
     return hype_file_rmap_read_at(&f->map, f->read, f->ctx, offset, out, len);
 }
 
+/*
+ * #497: write [from, to) inside allocated block `blk` -- `src` bytes, or zeros when src == 0.
+ * Sector-granular RMW, no transaction: this is a plain data write to an already-published block,
+ * and everything it touches sits at or past the OLD i_size, so a later rollback (which leaves
+ * i_size unchanged) leaves these bytes invisible rather than exposed.
+ */
+static int tail_span_write(hype_ext2_wfile_t *f, uint64_t blk, uint64_t from, uint64_t to,
+                           const uint8_t *src) {
+    uint8_t sec[SECSZ];
+    uint64_t bs = f->block_size;
+    uint64_t pos = from;
+
+    while (pos < to) {
+        uint64_t in_blk = pos % bs;
+        uint64_t sec_idx = in_blk / SECSZ;
+        uint64_t sec_off = in_blk % SECSZ;
+        uint64_t n = SECSZ - sec_off;
+        uint64_t lba = blk * f->spb + sec_idx;
+        unsigned k;
+        if (n > to - pos) n = to - pos;
+        if (f->read(f->ctx, lba, 1u, sec) != 0) return -1;
+        for (k = 0; k < n; k++) {
+            sec[sec_off + k] = src ? src[pos - from + k] : 0u;
+        }
+        if (f->write(f->ctx, lba, 1u, sec) != 0) return -1;
+        pos += n;
+    }
+    return 0;
+}
+
+/*
+ * #497 (extracted from the write loop, unchanged semantics): allocate block `lb`, write its
+ * content -- the [offset, end) slice of `data` where it intersects, zeros elsewhere -- and
+ * publish the leaf pointer only after the content is durable. Returns 0, -1 on error (the
+ * caller rolls the transaction back).
+ */
+static int alloc_and_fill(hype_ext2_wfile_t *f, txn_t *t, uint64_t lb, uint64_t offset,
+                          uint64_t end, const void *data) {
+    uint64_t bs = f->block_size;
+    uint64_t blk = 0;
+    uint64_t entry_byte = 0;
+    int rc = map_block(t, lb, &blk);
+
+    if (rc < 0) return -1;
+    if (rc == 1) {
+        entry_byte = t->undo[t->undo_count - 1u].parent_byte;
+        /* leaf pointer publish deferred until content lands */
+        t->undo[t->undo_count - 1u].parent_byte = 0;
+    }
+    {
+        uint8_t sec[SECSZ];
+        uint32_t s;
+        for (s = 0; s < f->spb; s++) {
+            uint64_t sec_start = (uint64_t)s * SECSZ;
+            uint64_t sec_end = sec_start + SECSZ;
+            uint64_t blk_off = lb * bs;
+            bzero8(sec, SECSZ);
+            if (blk_off + sec_end > offset && blk_off + sec_start < end) {
+                uint64_t from = (offset > blk_off + sec_start) ? offset - blk_off - sec_start : 0u;
+                uint64_t to = (end < blk_off + sec_end) ? end - blk_off - sec_start : SECSZ;
+                bcopy8(sec + from, (const uint8_t *)data + (blk_off + sec_start + from - offset),
+                       (unsigned)(to - from));
+            }
+            if (f->write(f->ctx, blk * f->spb + s, 1u, sec) != 0) return -1;
+        }
+    }
+    if (rc == 1 && entry_byte != 0u) {
+        uint8_t p4[4];
+        hype_wr32(p4, (uint32_t)blk);
+        if (media_rmw(f, entry_byte, p4, 4u) != 0) return -1;
+        t->undo[t->undo_count - 1u].parent_byte = entry_byte;
+    }
+    return 0;
+}
+
 int hype_ext2_write_at(hype_ext2_wfile_t *f, uint64_t offset, const void *data,
                        unsigned int len) {
     static txn_t t; /* >4 KiB (undo log + inode image): static per the
                      * __chkstk rule; the writer is BSP-serialized */
     const uint8_t *src = (const uint8_t *)data;
     uint64_t end = offset + len;
+    uint64_t old_size;
+    uint64_t inloop_end;
+    int grow;
     uint64_t bs;
     int allocated = 0;
 
     if (len == 0u) return 0;
-    if (end < offset || end > f->size_bytes) return -1;
+    if (end < offset) return -1;
+    old_size = f->size_bytes;
+    /*
+     * #497: a write past EOF GROWS the file. The in-map walk below covers [offset, old_size);
+     * the grown region is handled after it (tail-block writes in place, wholly-new blocks
+     * through the same allocation machinery), and i_size is published with the same commit.
+     * A write starting past EOF leaves [old_size, offset) as a SPARSE hole -- ext represents
+     * that natively and it reads back as zeros, per the #381 range contract.
+     */
+    grow = (end > old_size) ? 1 : 0;
+    /*
+     * #497: refuse a grow BEFORE the map can outgrow what hype can read back. Growth in many
+     * small steps fragments (an indirection/extent boundary breaks a range every span), and a
+     * file whose range count passes HYPE_FILE_MAX_RANGES commits fine and then cannot be
+     * re-mapped -- readable by fsck, unreadable by hype, which is the ticket's named forbidden
+     * outcome. One bounded call adds only a handful of ranges, so an 8-range margin stops
+     * growth safely short of the cliff; the caller sees a clean refusal and a file that still
+     * reads back whole.
+     */
+    if (grow && f->map.count + 8u > HYPE_FILE_MAX_RANGES) {
+        return -1;
+    }
+    inloop_end = grow ? ((offset < old_size) ? old_size : offset) : end;
     bs = f->block_size;
 
-    /* fast path: the whole span is DATA -- a pure in-place data write */
-    {
+    /* fast path: the whole span is DATA -- a pure in-place data write (never on a grow:
+     * growth always publishes a new i_size, which needs the transaction). */
+    if (!grow) {
         uint64_t probe = offset;
         int all_data = 1;
         while (probe < end) {
@@ -497,14 +600,14 @@ int hype_ext2_write_at(hype_ext2_wfile_t *f, uint64_t offset, const void *data,
 
     {
         uint64_t pos = offset;
-        while (pos < end) {
+        while (pos < inloop_end) {
             uint64_t lb = pos / bs;
             uint64_t in_blk = pos % bs;
             uint64_t n = bs - in_blk;
             hype_range_kind_t kind;
             uint64_t lba, run;
             uint32_t head;
-            if (n > end - pos) n = end - pos;
+            if (n > inloop_end - pos) n = inloop_end - pos;
 
             if (hype_file_rmap_locate(&f->map, pos, &kind, &lba, &head, &run) != 0) {
                 goto fail;
@@ -520,53 +623,70 @@ int hype_ext2_write_at(hype_ext2_wfile_t *f, uint64_t offset, const void *data,
             }
 
             /* a hole: allocate this block, write zeros+data, then publish */
-            {
-                uint64_t blk = 0;
-                uint64_t entry_byte = 0;
-                int rc = map_block(&t, lb, &blk);
-                if (rc < 0) goto fail;
-                if (rc == 1) {
-                    entry_byte = t.undo[t.undo_count - 1u].parent_byte;
-                    /* leaf pointer publish deferred until content lands */
-                    t.undo[t.undo_count - 1u].parent_byte = 0;
+            if (alloc_and_fill(f, &t, lb, offset, end, data) != 0) goto fail;
+            allocated = 1;
+            pos = (lb + 1u) * bs;
+            if (pos > inloop_end) pos = inloop_end;
+            src = (const uint8_t *)data + (pos - offset);
+        }
+    }
+
+    /*
+     * #497: the grown region. Three cases, split at B (the first block boundary at or past the
+     * old size):
+     *   - the final, partially-used block: written IN PLACE when it is DATA -- zeros over
+     *     [old_size, min(offset, B)) so stale on-media bytes never become readable when i_size
+     *     moves past them, then the data slice; when it is a HOLE the ordinary allocate-and-fill
+     *     covers it (a hole's bytes below old_size read zero before and after);
+     *   - wholly-new blocks intersecting the write: allocate-and-fill;
+     *   - gap blocks the write never touches stay SPARSE holes (they read back zeros).
+     * i_size is published with this same commit, so a failure anywhere rolls back to a file
+     * whose size never moved -- the in-place tail bytes it may have written sit past the old
+     * EOF and stay invisible.
+     */
+    if (grow) {
+        uint64_t B = ((old_size + bs - 1u) / bs) * bs;
+        if ((old_size % bs) != 0u) {
+            hype_range_kind_t tk;
+            uint64_t tlba, trun;
+            uint32_t thead;
+            if (hype_file_rmap_locate(&f->map, old_size - 1u, &tk, &tlba, &thead, &trun) != 0) {
+                goto fail;
+            }
+            if (tk == HYPE_RANGE_DATA) {
+                uint64_t blk = (tlba - (((old_size - 1u) % bs) / SECSZ)) / f->spb;
+                uint64_t zto = (offset < B) ? offset : B;
+                uint64_t wfrom = (offset > old_size) ? offset : old_size;
+                uint64_t wto = (end < B) ? end : B;
+                if (old_size < zto &&
+                    tail_span_write(f, blk, old_size, zto, 0) != 0) {
+                    goto fail;
+                }
+                if (wfrom < wto &&
+                    tail_span_write(f, blk, wfrom, wto,
+                                    (const uint8_t *)data + (wfrom - offset)) != 0) {
+                    goto fail;
+                }
+            } else if (offset < B && end > old_size) {
+                /* a HOLE tail the write touches: allocate it unless the in-map walk above
+                 * already did (it did whenever the walk ran, i.e. offset < old_size). */
+                if (offset >= old_size &&
+                    alloc_and_fill(f, &t, old_size / bs, offset, end, data) != 0) {
+                    goto fail;
                 }
                 allocated = 1;
-                /* content: zeros around the covered slice, one pass */
-                {
-                    uint8_t sec[SECSZ];
-                    uint32_t s;
-                    for (s = 0; s < f->spb; s++) {
-                        uint64_t sec_start = (uint64_t)s * SECSZ;
-                        uint64_t sec_end = sec_start + SECSZ;
-                        uint64_t blk_off = lb * bs;
-                        bzero8(sec, SECSZ);
-                        /* overlay the written slice where it intersects */
-                        if (blk_off + sec_end > offset && blk_off + sec_start < end) {
-                            uint64_t from = (offset > blk_off + sec_start)
-                                                ? offset - blk_off - sec_start
-                                                : 0u;
-                            uint64_t to = (end < blk_off + sec_end)
-                                              ? end - blk_off - sec_start
-                                              : SECSZ;
-                            bcopy8(sec + from,
-                                   (const uint8_t *)data + (blk_off + sec_start + from - offset),
-                                   (unsigned)(to - from));
-                        }
-                        if (f->write(f->ctx, blk * f->spb + s, 1u, sec) != 0) goto fail;
-                    }
-                }
-                if (rc == 1 && entry_byte != 0u) {
-                    /* content is durable in order; publish the leaf pointer */
-                    uint8_t p4[4];
-                    hype_wr32(p4, (uint32_t)blk);
-                    if (media_rmw(f, entry_byte, p4, 4u) != 0) goto fail;
-                    t.undo[t.undo_count - 1u].parent_byte = entry_byte;
-                }
-                pos = (lb + 1u) * bs;
-                if (pos > end) pos = end;
-                src = (const uint8_t *)data + (pos - offset);
             }
         }
+        {
+            uint64_t lb2 = (offset > B) ? offset / bs : B / bs;
+            for (; lb2 * bs < end; lb2++) {
+                if (alloc_and_fill(f, &t, lb2, offset, end, data) != 0) goto fail;
+                allocated = 1;
+            }
+        }
+        hype_wr32(t.inode + IN_SIZE_LO, (uint32_t)end);
+        hype_wr32(t.inode + IN_SIZE_HIGH, (uint32_t)(end >> 32));
+        t.inode_dirty = 1;
     }
 
     /* commit: inode (pointers, i_blocks, times), superblock counters + clean */
@@ -582,8 +702,12 @@ int hype_ext2_write_at(hype_ext2_wfile_t *f, uint64_t offset, const void *data,
     }
     if (sb_update(f, 0, -(int64_t)t.sb_free_delta) != 0) return -1;
 
-    /* refresh the map so subsequent calls see the new DATA ranges */
-    if (allocated) {
+    if (grow) {
+        f->size_bytes = end; /* #497: the commit above published the new i_size */
+    }
+    /* refresh the map so subsequent calls see the new DATA ranges (and, on a grow, the new
+     * size -- the map is rebuilt from the on-media inode, which now carries it) */
+    if (allocated || grow) {
         if (hype_ext_map_ino_rmap(f->read, f->ctx, f->ino, &f->map) != 0) return -1;
     }
     return 0;

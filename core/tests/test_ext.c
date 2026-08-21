@@ -919,9 +919,12 @@ static void test_fs_ops_ext(void) {
     /* writable mount: lookup produces the native in-place handle */
     CHECK_HEX("rw auto-mount", 0, hype_fs_mount_auto(&fs, vol_read, vol_write, 0));
     CHECK("rw caps: in-place write", (hype_fs_caps(&fs) & HYPE_FS_CAP_WRITE_INPLACE) != 0);
-    CHECK("rw caps: no append (ext allocation is #384)",
-          (hype_fs_caps(&fs) & HYPE_FS_CAP_APPEND) == 0);
+    CHECK("rw caps: append + grow (#497)",
+          (hype_fs_caps(&fs) & (HYPE_FS_CAP_APPEND | HYPE_FS_CAP_WRITE_GROW)) ==
+              (HYPE_FS_CAP_APPEND | HYPE_FS_CAP_WRITE_GROW));
     CHECK_HEX("rw lookup", 0, hype_fs_lookup(&fs, "/img.bin", &f));
+    /* #497: the legacy in-place handle cannot change a file's size -- append refuses. */
+    CHECK("append refused on the native handle", hype_fs_append(&f, "x", 1) != 0);
     CHECK_HEX("rw read_at (native arm)", 0, hype_fs_read_at(&f, 0, buf, 16));
     buf[0] = 0xEE;
     CHECK_HEX("rw write_at in place", 0, hype_fs_write_at(&f, 3, buf, 1));
@@ -1135,7 +1138,17 @@ static void test_ext2_alloc(void) {
     CHECK_HEX("mtime", 1765432100u, get32(inode(13u) + 0x10));
 
     /* bounds + bound refusals */
-    CHECK("write past EOF refused", hype_ext2_write_at(&w, w.size_bytes - 1u, "ab", 2) != 0);
+    /* #497: a write past EOF now GROWS. Straddling the boundary by one byte: the last old
+     * byte is overwritten in place and the size moves by exactly one. */
+    {
+        uint64_t before = w.size_bytes;
+        uint8_t rb[2];
+        CHECK_HEX("straddling write grows", 0,
+                  hype_ext2_write_at(&w, w.size_bytes - 1u, "ab", 2));
+        CHECK("size moved by one", w.size_bytes == before + 1u);
+        CHECK_HEX("straddle readback", 0, hype_ext2_read_at(&w, before - 1u, rb, 2));
+        CHECK("straddle bytes", rb[0] == 'a' && rb[1] == 'b');
+    }
     CHECK("overflow refused", hype_ext2_write_at(&w, ~0ull - 1u, "a", 1) != 0);
     CHECK_HEX("len 0 no-op", 0, hype_ext2_write_at(&w, 0, buf, 0));
     CHECK("reads past EOF refused", hype_ext2_read_at(&w, w.size_bytes, buf, 1) != 0);
@@ -1881,7 +1894,16 @@ static void test_extj_classic(void) {
     CHECK("indirect data", memcmp(buf, "JIND", 4) == 0);
 
     /* bounds */
-    CHECK("past EOF refused", hype_extj_write_at(&w, w.size_bytes - 1u, "ab", 2) != 0);
+    /* #497: a straddling write now GROWS by one byte. */
+    {
+        uint64_t before2 = w.size_bytes;
+        uint8_t rb2[2];
+        CHECK_HEX("straddling write grows (extj)", 0,
+                  hype_extj_write_at(&w, w.size_bytes - 1u, "ab", 2));
+        CHECK("extj size moved by one", w.size_bytes == before2 + 1u);
+        CHECK_HEX("extj straddle readback", 0, hype_extj_read_at(&w, before2 - 1u, rb2, 2));
+        CHECK("extj straddle bytes", rb2[0] == 'a' && rb2[1] == 'b');
+    }
     CHECK("overflow refused", hype_extj_write_at(&w, ~0ull - 1u, "a", 1) != 0);
     CHECK_HEX("len 0", 0, hype_extj_write_at(&w, 0, buf, 0));
 }
@@ -2736,6 +2758,547 @@ static void test_extj_last_mile(void) {
     CHECK("B byte", buf[0] == 'B');
 }
 
+
+/* --- #497: growth -- write_at past EOF and append, both writers --- */
+
+static void test_497_ext2_grow(void) {
+    static hype_ext2_wfile_t w;
+    static uint8_t big[3u * BS];
+    uint8_t rb[2u * BS];
+    uint64_t sz0;
+    unsigned i;
+
+    build_vol_ext2();
+    g_wfail_at = ~0u;
+    CHECK_HEX("open", 0, hype_ext2_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w));
+    sz0 = w.size_bytes;
+
+    /* Cross-block growth: 2.5 blocks of pattern appended right at EOF. */
+    for (i = 0; i < sizeof(big); i++) big[i] = pat(i);
+    CHECK_HEX("append-shaped grow", 0,
+              hype_ext2_write_at(&w, sz0, big, (unsigned)(2u * BS + BS / 2u)));
+    CHECK("size grew", w.size_bytes == sz0 + 2u * BS + BS / 2u);
+    CHECK_HEX("grow readback", 0, hype_ext2_read_at(&w, sz0, rb, BS));
+    for (i = 0; i < BS; i++) { if (rb[i] != pat(i)) break; }
+    CHECK("grow bytes", i == BS);
+
+    /* The size is now block-UNALIGNED. A further write leaving a gap INSIDE the tail block:
+     * the gap must read back zero, not stale bytes -- the gap-zeroing rule. */
+    {
+        uint64_t sz1 = w.size_bytes;             /* ...+BS/2: mid-block */
+        CHECK_HEX("gapped tail grow", 0, hype_ext2_write_at(&w, sz1 + 64u, "GAP", 3));
+        CHECK("size grew past gap", w.size_bytes == sz1 + 64u + 3u);
+        CHECK_HEX("gap readback", 0, hype_ext2_read_at(&w, sz1, rb, 67u));
+        for (i = 0; i < 64u; i++) { if (rb[i] != 0u) break; }
+        CHECK("tail gap reads zero", i == 64u);
+        CHECK("gapped data", rb[64] == 'G' && rb[65] == 'A' && rb[66] == 'P');
+    }
+
+    /* A far-past-EOF write leaves the untouched gap SPARSE: only the written block (plus any
+     * indirection) is allocated. */
+    {
+        uint64_t sz2 = w.size_bytes;
+        uint32_t used0 = bitmap_used_count();
+        uint64_t far = ((sz2 / BS) + 6u) * BS + 10u;
+        CHECK_HEX("sparse grow", 0, hype_ext2_write_at(&w, far, "FAR", 3));
+        CHECK("sparse size", w.size_bytes == far + 3u);
+        /* at most the data block + one indirection level went; 5+ gap blocks did NOT */
+        CHECK("gap stayed sparse", bitmap_used_count() <= used0 + 2u);
+        CHECK_HEX("sparse gap readback", 0, hype_ext2_read_at(&w, sz2 + BS, rb, 64u));
+        for (i = 0; i < 64u; i++) { if (rb[i] != 0u) break; }
+        CHECK("sparse gap zeros", i == 64u);
+        CHECK_HEX("far readback", 0, hype_ext2_read_at(&w, far, rb, 3u));
+        CHECK("far bytes", rb[0] == 'F' && rb[1] == 'A' && rb[2] == 'R');
+    }
+
+    /* Counters still consistent -- the local fsck invariant. */
+    {
+        uint32_t used = bitmap_used_count();
+        uint16_t gdfree = (uint16_t)(get32(blk(2) + 0x0C) & 0xFFFFu);
+        CHECK("counters consistent after growth", used + gdfree == VOL_BLOCKS - 1u);
+    }
+}
+
+static void test_497_ext2_grow_rollback(void) {
+    static hype_ext2_wfile_t w;
+    uint8_t rb[8];
+    uint64_t sz0;
+    uint32_t used0;
+
+    build_vol_ext2();
+    CHECK_HEX("open", 0, hype_ext2_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w));
+    sz0 = w.size_bytes;
+    used0 = bitmap_used_count();
+
+    /* Fail the medium partway into a growing write: the transaction must roll back and the
+     * SIZE must not move -- a half-grown file is the #464 class. */
+    g_wfail_at = g_writes_seen + 3u;
+    CHECK("mid-grow failure reported",
+          hype_ext2_write_at(&w, sz0 + 5u, "XYZXYZXY", 8) != 0);
+    g_wfail_at = ~0u;
+    CHECK("size unmoved after rollback", w.size_bytes == sz0);
+    CHECK("claims rolled back", bitmap_used_count() == used0);
+    /* And a read past the (unchanged) EOF still refuses. */
+    CHECK("EOF intact", hype_ext2_read_at(&w, sz0 + 1u, rb, 4) != 0);
+}
+
+static void test_497_extj_grow_extents(void) {
+    static hype_extj_wfile_t w;
+    static uint8_t big[2u * BS];
+    uint8_t rb[BS];
+    uint64_t sz0;
+    unsigned i;
+
+    g_wfail_at = ~0u;
+    build_vol_ext4j();
+    CHECK_HEX("open", 0, hype_extj_open_rw(vol_read, vol_write2, 0, "/esp.bin", &w));
+    sz0 = w.size_bytes;
+
+    for (i = 0; i < sizeof(big); i++) big[i] = pat(i + 7u);
+    /* Straddle EOF: in-place tail + one fresh extent block, one journaled commit. */
+    CHECK_HEX("straddling grow", 0,
+              hype_extj_write_at(&w, sz0 - 4u, big, (unsigned)(BS + 8u)));
+    CHECK("size grew", w.size_bytes == sz0 + BS + 4u);
+    CHECK_HEX("readback across old EOF", 0, hype_extj_read_at(&w, sz0 - 4u, rb, 16u));
+    for (i = 0; i < 16u; i++) { if (rb[i] != pat(i + 7u)) break; }
+    CHECK("straddle bytes", i == 16u);
+
+    /* Sparse far grow on extents, gap reads zero. */
+    {
+        uint64_t far = w.size_bytes + 5u * BS;
+        CHECK_HEX("far grow", 0, hype_extj_write_at(&w, far, "EXT4", 4));
+        CHECK("far size", w.size_bytes == far + 4u);
+        CHECK_HEX("gap zeros", 0, hype_extj_read_at(&w, far - 2u * BS, rb, 32u));
+        for (i = 0; i < 32u; i++) { if (rb[i] != 0u) break; }
+        CHECK("gap reads zero", i == 32u);
+    }
+
+    /* fsck-local invariant on the journaled volume too. */
+    {
+        uint32_t used = bitmap_used_count();
+        uint16_t gdfree = (uint16_t)(get32(blk(2) + 0x0C) & 0xFFFFu);
+        CHECK("counters consistent", used + gdfree == VOL_BLOCKS - 1u);
+    }
+}
+
+static void test_497_extj_grow_classic(void) {
+    static hype_extj_wfile_t w;
+    uint8_t rb[8];
+    uint64_t sz0;
+
+    g_wfail_at = ~0u;
+    build_vol_ext3();
+    CHECK_HEX("open classic", 0, hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w));
+    sz0 = w.size_bytes;
+    CHECK_HEX("classic grow", 0, hype_extj_write_at(&w, sz0, "JCLASSIC", 8));
+    CHECK("classic size", w.size_bytes == sz0 + 8u);
+    CHECK_HEX("classic readback", 0, hype_extj_read_at(&w, sz0, rb, 8));
+    CHECK("classic bytes", memcmp(rb, "JCLASSIC", 8) == 0);
+}
+
+
+/* #497 coverage: the tail-block cases that need an i_size ending inside a HOLE or UNWRITTEN
+ * block. Legitimate files have that shape (a sparse file truncated to size); the fixture's do
+ * not, so the on-media i_size is POKED directly (the writers re-read it at open). */
+static void poke_size(uint64_t inode_byte, uint64_t size) {
+    put32(g_vol + inode_byte + 0x04u, (uint32_t)size);
+    put32(g_vol + inode_byte + 0x6Cu, (uint32_t)(size >> 32));
+}
+
+static void test_497_extj_unwritten_and_hole_tails(void) {
+    static hype_extj_wfile_t w;
+    uint8_t rb[256];
+    unsigned i;
+
+    g_wfail_at = ~0u;
+    /* UNWRITTEN tail: i_size ends mid-block inside the unwritten region (block 5).
+     * Learn the inode's byte offset on a THROWAWAY build, then poke a FRESH build and open it
+     * exactly once -- the writers assume one open per volume instance. */
+    uint64_t ib;
+    build_vol_ext4j();
+    CHECK_HEX("open (learn inode)", 0, hype_extj_open_rw(vol_read, vol_write2, 0, "/esp.bin", &w));
+    ib = w.inode_byte;
+    /* Block 7 is the LAST unwritten block: after the grow-and-convert nothing in the tree
+     * lies wholly past EOF, so the post-commit re-map stays valid. (An unwritten extent
+     * ENTIRELY beyond i_size -- the fallocate shape -- is refused by hype's mapper at open,
+     * before and after #497; the leading-hole poke below asserts that refusal.) */
+    build_vol_ext4j();
+    poke_size(ib, 7u * BS + 100u);
+    CHECK_HEX("open with poked size", 0,
+              hype_extj_open_rw(vol_read, vol_write2, 0, "/esp.bin", &w));
+    CHECK("poked size took", w.size_bytes == 7u * BS + 100u);
+    {
+        int rc1 = hype_extj_write_at(&w, 7u * BS + 150u, "UWT", 3);
+        CHECK_HEX("grow across an UNWRITTEN tail", 0, rc1);
+    }
+    CHECK("unwritten-tail size", w.size_bytes == 7u * BS + 153u);
+    CHECK_HEX("tail readback", 0, hype_extj_read_at(&w, 7u * BS + 90u, rb, 63u));
+    for (i = 0; i < 60u; i++) { if (rb[i] != 0u) break; } /* 90..150 all zeros */
+    CHECK("unwritten tail + gap read zero", i == 60u);
+    CHECK("unwritten-tail data", rb[60] == 'U' && rb[61] == 'W' && rb[62] == 'T');
+
+    /* An i_size poked into the LEADING hole (extents starting past EOF) is an unopenable shape
+     * and open_rw correctly refuses it -- asserted so the refusal stays deliberate. */
+    build_vol_ext4j();
+    poke_size(ib, 1u * BS + 100u);
+    CHECK("extents past a poked EOF refuse to open",
+          hype_extj_open_rw(vol_read, vol_write2, 0, "/esp.bin", &w) != 0);
+}
+
+static void test_497_extj_classic_sparse_and_tails(void) {
+    static hype_extj_wfile_t w;
+    uint8_t rb[8];
+    uint64_t sz0;
+
+    g_wfail_at = ~0u;
+    /* classic map under a journal: a far sparse grow through wholly-new blocks */
+    build_vol_ext3();
+    CHECK_HEX("open", 0, hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w));
+    sz0 = w.size_bytes;
+    CHECK_HEX("classic far grow", 0,
+              hype_extj_write_at(&w, sz0 + 4u * BS + 9u, "CLSF", 4));
+    CHECK("classic far size", w.size_bytes == sz0 + 4u * BS + 13u);
+    CHECK_HEX("classic gap zero", 0, hype_extj_read_at(&w, sz0 + BS, rb, 8));
+    CHECK("classic gap zeros", rb[0] == 0 && rb[7] == 0);
+
+    /* classic HOLE tail via the poke (learn offset, rebuild, poke, single open) */
+    {
+        uint64_t ib2 = w.inode_byte;
+        build_vol_ext3();
+        poke_size(ib2, 1u * BS + 50u); /* logical block 1 is a hole in swiss.bin */
+        CHECK_HEX("re-open 2", 0, hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w));
+    }
+    CHECK_HEX("classic hole-tail grow", 0, hype_extj_write_at(&w, 1u * BS + 80u, "CH", 2));
+    CHECK("classic hole-tail size", w.size_bytes == 1u * BS + 82u);
+    CHECK_HEX("classic hole-tail readback", 0, hype_extj_read_at(&w, 1u * BS + 50u, rb, 8));
+    CHECK("classic hole-tail gap zeros", rb[0] == 0);
+}
+
+static void test_497_ext2_hole_tail(void) {
+    static hype_ext2_wfile_t w;
+    uint8_t rb[8];
+
+    uint64_t ib3;
+    build_vol_ext2();
+    g_wfail_at = ~0u;
+    CHECK_HEX("open", 0, hype_ext2_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w));
+    ib3 = w.inode_byte;
+    build_vol_ext2();
+    poke_size(ib3, 1u * BS + 40u);
+    CHECK_HEX("re-open", 0, hype_ext2_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w));
+    CHECK("poked took", w.size_bytes == 1u * BS + 40u);
+    CHECK_HEX("ext2 hole-tail grow", 0, hype_ext2_write_at(&w, 1u * BS + 60u, "E2", 2));
+    CHECK("ext2 hole-tail size", w.size_bytes == 1u * BS + 62u);
+    CHECK_HEX("ext2 hole-tail readback", 0, hype_ext2_read_at(&w, 1u * BS + 40u, rb, 8));
+    CHECK("ext2 hole-tail gap zeros", rb[0] == 0);
+}
+
+
+static void test_497_fs_ops_append(void) {
+    static hype_fs_t fs;
+    static hype_fs_file_t f;
+    static uint8_t big[80u * 1024u]; /* > EXT_GROW_CHUNK: exercises the chunk split */
+    uint8_t rb[64];
+    uint64_t sz0;
+    unsigned i;
+
+    g_wfail_at = ~0u;
+    build_vol_ext4j();
+    CHECK_HEX("mount rw", 0, hype_fs_mount_auto(&fs, vol_read, vol_write2, 0));
+    CHECK("caps carry append+grow",
+          (hype_fs_caps(&fs) & (HYPE_FS_CAP_APPEND | HYPE_FS_CAP_WRITE_GROW)) ==
+              (HYPE_FS_CAP_APPEND | HYPE_FS_CAP_WRITE_GROW));
+    CHECK_HEX("lookup", 0, hype_fs_lookup(&fs, "/esp.bin", &f));
+    sz0 = f.size;
+    for (i = 0; i < sizeof(big); i++) big[i] = pat(i + 11u);
+    CHECK_HEX("80 KiB append (chunked)", 0, hype_fs_append(&f, big, (unsigned)sizeof(big)));
+    CHECK("handle size advanced", f.size == sz0 + sizeof(big));
+    CHECK_HEX("readback at the old EOF", 0, hype_fs_read_at(&f, sz0, rb, 64u));
+    for (i = 0; i < 64u; i++) { if (rb[i] != pat(i + 11u)) break; }
+    CHECK("append bytes", i == 64u);
+    CHECK_HEX("readback at the very end", 0,
+              hype_fs_read_at(&f, sz0 + sizeof(big) - 8u, rb, 8u));
+    for (i = 0; i < 8u; i++) { if (rb[i] != pat((unsigned)(sizeof(big) - 8u + i + 11u))) break; }
+    CHECK("append tail bytes", i == 8u);
+    /* write_at grow through the fs layer too */
+    CHECK_HEX("write_at grow via fs_ops", 0,
+              hype_fs_write_at(&f, f.size + 100u, "FSGROW", 6u));
+    CHECK("write_at grew the handle", f.size == sz0 + sizeof(big) + 106u);
+}
+
+
+/* #497: fault sweep over the growth paths -- every write is failed in turn, and each failure
+ * must leave either a rolled-back file (size unmoved) or, for the journaled writer past its
+ * exposure point, a POISONED handle (dead) -- never a silently half-grown file. This is the
+ * #464 discipline: growth work carries a deliberate mid-growth failure test, not only success. */
+static void test_497_grow_fault_sweep(void) {
+    static uint8_t big[3u * BS];
+    unsigned k, i;
+    for (i = 0; i < sizeof(big); i++) big[i] = pat(i + 3u);
+
+    for (k = 1; k < 48u; k++) {
+        static hype_ext2_wfile_t w;
+        uint64_t sz0;
+        int rc;
+        build_vol_ext2();
+        g_wfail_at = ~0u;
+        if (hype_ext2_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w) != 0) { CHECK("sweep open2", 0); break; }
+        sz0 = w.size_bytes;
+        g_wfail_at = g_writes_seen + k;
+        rc = hype_ext2_write_at(&w, sz0 + 700u, big, (unsigned)(2u * BS));
+        g_wfail_at = ~0u;
+        if (rc != 0) {
+            CHECK("ext2 grow failure rolled back (size unmoved)", w.size_bytes == sz0);
+        } else {
+            CHECK("ext2 grow survived late fault -- size moved", w.size_bytes == sz0 + 700u + 2u * BS);
+        }
+    }
+
+    for (k = 1; k < 48u; k++) {
+        static hype_extj_wfile_t w;
+        uint64_t sz0;
+        int rc;
+        build_vol_ext4j();
+        g_wfail_at = ~0u;
+        if (hype_extj_open_rw(vol_read, vol_write2, 0, "/esp.bin", &w) != 0) { CHECK("sweep openj", 0); break; }
+        sz0 = w.size_bytes;
+        g_wfail_at = g_writes_seen + k;
+        rc = hype_extj_write_at(&w, sz0 + 700u, big, (unsigned)(2u * BS));
+        g_wfail_at = ~0u;
+        if (rc != 0) {
+            /* Unexposed failure: size unmoved. Exposed failure: the handle is poisoned and
+             * refuses everything -- both honest, a half-grown live file is neither. */
+            CHECK("extj grow failure honest", w.dead || w.size_bytes == sz0);
+            if (w.dead) {
+                CHECK("dead handle refuses writes",
+                      hype_extj_write_at(&w, 0u, "x", 1) != 0);
+            }
+        } else {
+            CHECK("extj grow survived late fault", w.size_bytes == sz0 + 700u + 2u * BS);
+        }
+    }
+
+    /* the same sweep through the poked TAIL shapes -- unwritten and pure-hole tails, so the
+     * convert/claim/insert error legs are exercised, not only the fresh-block ones */
+    {
+        static hype_extj_wfile_t w;
+        uint64_t ibp = 0;
+        build_vol_ext4j();
+        g_wfail_at = ~0u;
+        if (hype_extj_open_rw(vol_read, vol_write2, 0, "/esp.bin", &w) == 0) ibp = w.inode_byte;
+        for (k = 1; k < 28u && ibp != 0u; k++) {
+            int rc;
+            build_vol_ext4j();
+            poke_size(ibp, 7u * BS + 100u); /* unwritten tail */
+            g_wfail_at = ~0u;
+            if (hype_extj_open_rw(vol_read, vol_write2, 0, "/esp.bin", &w) != 0) { CHECK("sweep openu", 0); break; }
+            g_wfail_at = g_writes_seen + k;
+            rc = hype_extj_write_at(&w, 7u * BS + 150u, big, 64u);
+            g_wfail_at = ~0u;
+            if (rc != 0) {
+                CHECK("unwritten-tail fault honest", w.dead || w.size_bytes == 7u * BS + 100u);
+            }
+        }
+        for (k = 1; k < 28u && ibp != 0u; k++) {
+            int rc;
+            build_vol_ext4j();
+            poke_size(ibp, 12u * BS + 50u); /* pure-hole tail past every extent */
+            g_wfail_at = ~0u;
+            if (hype_extj_open_rw(vol_read, vol_write2, 0, "/esp.bin", &w) != 0) { CHECK("sweep openh", 0); break; }
+            g_wfail_at = g_writes_seen + k;
+            rc = hype_extj_write_at(&w, 12u * BS + 80u, big, 64u);
+            g_wfail_at = ~0u;
+            if (rc != 0) {
+                CHECK("hole-tail fault honest", w.dead || w.size_bytes == 12u * BS + 50u);
+            }
+        }
+        /* DATA-tail gap sweep: unalign first, then a gapped in-tail grow under fault -- the
+         * tail_span_write zero and data legs each get their turn to fail. */
+        for (k = 1; k < 24u; k++) {
+            static hype_extj_wfile_t w2;
+            uint64_t sz1;
+            int rc;
+            build_vol_ext4j();
+            g_wfail_at = ~0u;
+            if (hype_extj_open_rw(vol_read, vol_write2, 0, "/esp.bin", &w2) != 0) { CHECK("sweep openg", 0); break; }
+            if (hype_extj_write_at(&w2, w2.size_bytes, "unalign!", 8) != 0) { CHECK("sweep unalign", 0); break; }
+            sz1 = w2.size_bytes;
+            g_wfail_at = g_writes_seen + k;
+            rc = hype_extj_write_at(&w2, sz1 + 40u, big, 80u);
+            g_wfail_at = ~0u;
+            if (rc != 0) {
+                CHECK("gapped-tail fault honest", w2.dead || w2.size_bytes == sz1);
+            }
+        }
+        /* READ-failure legs of the in-place tail writes (tail_span_write RMWs each sector). */
+        {
+            static hype_extj_wfile_t w4;
+            uint64_t sz1;
+            long r;
+            build_vol_ext4j();
+            g_wfail_at = ~0u;
+            if (hype_extj_open_rw(vol_read, vol_write2, 0, "/esp.bin", &w4) == 0 &&
+                hype_extj_write_at(&w4, w4.size_bytes, "unalign!", 8) == 0) {
+                sz1 = w4.size_bytes;
+                for (r = 0; r < 12; r++) {
+                    int rc;
+                    g_read_countdown = r;
+                    rc = hype_extj_write_at(&w4, sz1 + 40u, big, 80u);
+                    g_read_countdown = -1;
+                    if (rc == 0) {
+                        break; /* reads exhausted past the fragile window: done */
+                    }
+                    CHECK("read-fault tail grow honest", w4.dead || w4.size_bytes == sz1);
+                    if (w4.dead) break;
+                }
+                g_read_countdown = -1;
+            }
+        }
+        /* classic-map (ext3-under-journal) grow sweep: the classic wholly-new and tail legs. */
+        for (k = 1; k < 24u; k++) {
+            static hype_extj_wfile_t w3;
+            uint64_t sz0c;
+            int rc;
+            build_vol_ext3();
+            g_wfail_at = ~0u;
+            if (hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w3) != 0) { CHECK("sweep openc", 0); break; }
+            sz0c = w3.size_bytes;
+            g_wfail_at = g_writes_seen + k;
+            rc = hype_extj_write_at(&w3, sz0c + 300u, big, (unsigned)(BS + 100u));
+            g_wfail_at = ~0u;
+            if (rc != 0) {
+                CHECK("classic grow fault honest", w3.dead || w3.size_bytes == sz0c);
+            }
+        }
+    }
+}
+
+/* #497: the extj DATA-tail gap-zero rule (the ext2 twin lives in test_497_ext2_grow). */
+static void test_497_extj_gapped_tail(void) {
+    static hype_extj_wfile_t w;
+    uint8_t rb[128];
+    uint64_t sz1;
+    unsigned i;
+
+    g_wfail_at = ~0u;
+    build_vol_ext4j();
+    CHECK_HEX("open", 0, hype_extj_open_rw(vol_read, vol_write2, 0, "/esp.bin", &w));
+    /* first grow: 100 bytes -> size unaligned, tail block DATA */
+    CHECK_HEX("unalign grow", 0, hype_extj_write_at(&w, w.size_bytes, "0123456789", 10));
+    sz1 = w.size_bytes;
+    CHECK_HEX("gapped tail grow", 0, hype_extj_write_at(&w, sz1 + 40u, "JGAP", 4));
+    CHECK("gapped size", w.size_bytes == sz1 + 44u);
+    CHECK_HEX("gap readback", 0, hype_extj_read_at(&w, sz1, rb, 44u));
+    for (i = 0; i < 40u; i++) { if (rb[i] != 0u) break; }
+    CHECK("extj tail gap reads zero", i == 40u);
+    CHECK("extj gapped data", rb[40] == 'J' && rb[41] == 'G' && rb[42] == 'A' && rb[43] == 'P');
+}
+
+
+/* #497: the remaining functional sides -- zeros-only tails, the extents HOLE tail, and the
+ * ext2-tagged fs_ops chunked append. */
+static void test_497_more_sides(void) {
+    unsigned i;
+    g_wfail_at = ~0u;
+
+    /* extj: a grow whose write starts BEYOND the tail block -- the tail gets zeros only. */
+    {
+        static hype_extj_wfile_t w;
+        uint8_t rb[64];
+        uint64_t sz1;
+        build_vol_ext4j();
+        CHECK_HEX("open", 0, hype_extj_open_rw(vol_read, vol_write2, 0, "/esp.bin", &w));
+        CHECK_HEX("unalign", 0, hype_extj_write_at(&w, w.size_bytes, "abc", 3));
+        sz1 = w.size_bytes;
+        CHECK_HEX("far grow past the tail", 0,
+                  hype_extj_write_at(&w, sz1 + 2u * BS, "BEYOND", 6));
+        CHECK("far size", w.size_bytes == sz1 + 2u * BS + 6u);
+        CHECK_HEX("tail zeros-only readback", 0, hype_extj_read_at(&w, sz1, rb, 32u));
+        for (i = 0; i < 32u; i++) { if (rb[i] != 0u) break; }
+        CHECK("tail zeroed to its end", i == 32u);
+    }
+
+    /* ext2 twin of the same shape. */
+    {
+        static hype_ext2_wfile_t w;
+        uint8_t rb[32];
+        uint64_t sz1;
+        build_vol_ext2();
+        CHECK_HEX("open2", 0, hype_ext2_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w));
+        CHECK_HEX("unalign2", 0, hype_ext2_write_at(&w, w.size_bytes, "xy", 2));
+        sz1 = w.size_bytes;
+        CHECK_HEX("far grow past the tail (ext2)", 0,
+                  hype_ext2_write_at(&w, sz1 + 3u * BS, "B2", 2));
+        CHECK("far size 2", w.size_bytes == sz1 + 3u * BS + 2u);
+        CHECK_HEX("tail zeros readback 2", 0, hype_ext2_read_at(&w, sz1, rb, 16u));
+        for (i = 0; i < 16u; i++) { if (rb[i] != 0u) break; }
+        CHECK("ext2 tail zeroed", i == 16u);
+    }
+
+    /* extents HOLE tail: i_size poked past every extent, tail block a pure hole. */
+    {
+        static hype_extj_wfile_t w;
+        uint8_t rb[16];
+        uint64_t ib;
+        build_vol_ext4j();
+        CHECK_HEX("open3", 0, hype_extj_open_rw(vol_read, vol_write2, 0, "/esp.bin", &w));
+        ib = w.inode_byte;
+        build_vol_ext4j();
+        poke_size(ib, 12u * BS + 50u); /* well past the last extent: tail is a hole */
+        CHECK_HEX("open poked-high", 0,
+                  hype_extj_open_rw(vol_read, vol_write2, 0, "/esp.bin", &w));
+        CHECK_HEX("extents hole-tail grow", 0,
+                  hype_extj_write_at(&w, 12u * BS + 80u, "EHT", 3));
+        CHECK("extents hole-tail size", w.size_bytes == 12u * BS + 83u);
+        CHECK_HEX("extents hole-tail readback", 0, hype_extj_read_at(&w, 12u * BS + 50u, rb, 16u));
+        for (i = 0; i < 16u; i++) { if (rb[i] != (uint8_t)((i >= 30u) ? 0u : 0u)) break; }
+        CHECK("extents hole gap zeros", rb[0] == 0u && rb[15] == 0u);
+    }
+
+    /* fs_ops chunked append through the TAG_EXT2 arm (no journal on this volume). */
+    {
+        static hype_fs_t fs;
+        static hype_fs_file_t f;
+        static uint8_t big2[70u * 1024u];
+        uint64_t sz0;
+        build_vol_ext2();
+        for (i = 0; i < sizeof(big2); i++) big2[i] = pat(i + 5u);
+        CHECK_HEX("mount ext2 rw", 0, hype_fs_mount_auto(&fs, vol_read, vol_write2, 0));
+        CHECK_HEX("lookup swiss", 0, hype_fs_lookup(&fs, "/swiss.bin", &f));
+        sz0 = f.size;
+        CHECK_HEX("70 KiB ext2 append (chunked)", 0,
+                  hype_fs_append(&f, big2, (unsigned)sizeof(big2)));
+        CHECK("ext2 append size", f.size == sz0 + sizeof(big2));
+    }
+}
+
+
+/* #497: the fragmentation margin -- a grow is refused BEFORE the map can outgrow
+ * HYPE_FILE_MAX_RANGES, leaving a file hype can still read whole. */
+static void test_497_margin_gate(void) {
+    g_wfail_at = ~0u;
+    {
+        static hype_ext2_wfile_t w;
+        uint64_t sz0;
+        build_vol_ext2();
+        CHECK_HEX("open", 0, hype_ext2_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w));
+        sz0 = w.size_bytes;
+        w.map.count = HYPE_FILE_MAX_RANGES - 4u; /* four from the cliff */
+        CHECK("ext2 grow refused at the margin", hype_ext2_write_at(&w, sz0, "m", 1) != 0);
+        w.map.count = HYPE_FILE_MAX_RANGES - 9u; /* just under the margin */
+        CHECK("non-grow writes unaffected", hype_ext2_write_at(&w, 10u, "m", 1) == 0);
+    }
+    {
+        static hype_extj_wfile_t w;
+        uint64_t sz0;
+        build_vol_ext4j();
+        CHECK_HEX("openj", 0, hype_extj_open_rw(vol_read, vol_write2, 0, "/esp.bin", &w));
+        sz0 = w.size_bytes;
+        w.map.count = HYPE_FILE_MAX_RANGES - 4u;
+        CHECK("extj grow refused at the margin", hype_extj_write_at(&w, sz0, "m", 1) != 0);
+    }
+}
+
 int main(void) {
     test_fs_ops_ext();
     test_resolve_rmap_sparse();
@@ -2766,6 +3329,19 @@ int main(void) {
     test_64bit_feature();
     test_triple_indirect();
     test_fault_sweep();
+
+    test_497_ext2_grow();
+    test_497_ext2_grow_rollback();
+    test_497_extj_grow_extents();
+    test_497_extj_grow_classic();
+    test_497_extj_unwritten_and_hole_tails();
+    test_497_extj_classic_sparse_and_tails();
+    test_497_ext2_hole_tail();
+    test_497_fs_ops_append();
+    test_497_grow_fault_sweep();
+    test_497_extj_gapped_tail();
+    test_497_more_sides();
+    test_497_margin_gate();
     if (failures == 0) { printf("all tests passed\n"); return 0; }
     printf("%d test(s) failed\n", failures);
     return 1;

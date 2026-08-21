@@ -444,14 +444,14 @@ static int ext_read_at(hype_fs_file_t *f, uint64_t offset, void *dst, unsigned i
     return -1;
 }
 
+static int ext_write_chunked(hype_fs_file_t *f, uint64_t offset, const void *src,
+                             unsigned int len);
+
 static int ext_write_at(hype_fs_file_t *f, uint64_t offset, const void *src, unsigned int len) {
-    if (f->tag == TAG_EXT2) {
-        /* allocates when the span crosses a hole (#384) */
-        return hype_ext2_write_at(&f->u.ext2, offset, src, len);
-    }
-    if (f->tag == TAG_EXTJ) {
-        /* journaled allocation + unwritten conversion (#385) */
-        return hype_extj_write_at(&f->u.extj, offset, src, len);
+    if (f->tag == TAG_EXT2 || f->tag == TAG_EXTJ) {
+        /* allocates across holes (#384/#385) and, since #497, GROWS past EOF -- chunked so a
+         * large span never trips the writers' per-transaction bounds */
+        return ext_write_chunked(f, offset, src, len);
     }
     if (f->tag != TAG_NATIVE) {
         return -1;
@@ -459,16 +459,53 @@ static int ext_write_at(hype_fs_file_t *f, uint64_t offset, const void *src, uns
     return hype_ext_write_at(&f->u.ext, offset, src, len);
 }
 
+/*
+ * #497: both allocating writers carry a per-call transaction bound (EXT2_ALLOC_MAX undo slots;
+ * HYPE_JBD2_MAX_BLOCKS journal credits), so a large write/append is CHUNKED here rather than
+ * refused -- each chunk is its own all-or-nothing transaction. 256 KiB keeps a chunk's metadata
+ * footprint (blocks + indirection/extent nodes) comfortably inside both bounds at every block
+ * size the writers accept -- the tightest is ext2's EXT2_ALLOC_MAX/2 blocks per call, which at a
+ * 1 KiB block size is 128 KiB -- and a failure mid-sequence leaves a shorter, CONSISTENT file:
+ * every committed chunk already published its own i_size.
+ */
+#define EXT_GROW_CHUNK (64u * 1024u)
+
+static int ext_write_chunked(hype_fs_file_t *f, uint64_t offset, const void *src,
+                             unsigned int len) {
+    const uint8_t *p = (const uint8_t *)src;
+    while (len > 0u) {
+        unsigned int n = (len > EXT_GROW_CHUNK) ? EXT_GROW_CHUNK : len;
+        int rc = (f->tag == TAG_EXT2) ? hype_ext2_write_at(&f->u.ext2, offset, p, n)
+                                      : hype_extj_write_at(&f->u.extj, offset, p, n);
+        if (rc != 0) {
+            return -1;
+        }
+        offset += n;
+        p += n;
+        len -= n;
+    }
+    f->size = (f->tag == TAG_EXT2) ? f->u.ext2.size_bytes : f->u.extj.size_bytes;
+    return 0;
+}
+
+static int ext_append(hype_fs_file_t *f, const void *src, unsigned int len) {
+    if (f->tag != TAG_EXT2 && f->tag != TAG_EXTJ) {
+        return -1; /* the legacy in-place handle cannot change a file's size */
+    }
+    return ext_write_chunked(f, f->size, src, len);
+}
+
 static const hype_fs_ops_t ext_ops = {
     "ext",
-    HYPE_FS_CAP_READ | HYPE_FS_CAP_WRITE_INPLACE | HYPE_FS_CAP_SPARSE,
+    HYPE_FS_CAP_READ | HYPE_FS_CAP_WRITE_INPLACE | HYPE_FS_CAP_SPARSE |
+        HYPE_FS_CAP_WRITE_GROW | HYPE_FS_CAP_APPEND, /* #497 */
     ext_probe,
     ext_mount,
     ext_lookup,
     ext_map_ranges,
     ext_read_at,
     ext_write_at,
-    0, /* append: ext allocation is #384/#385, not stubbed */
+    ext_append, /* #497 */
     0, /* create */
     0, /* unlink */
     0, /* mkdir */

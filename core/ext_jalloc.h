@@ -77,7 +77,10 @@ int hype_extj_read_at(hype_extj_wfile_t *f, uint64_t offset, void *out, unsigned
  * place with no transaction. Spans crossing HOLE ranges allocate through a
  * journaled transaction; spans crossing UNWRITTEN ranges zero the uncovered
  * bytes of the touched blocks and convert those blocks to written, likewise
- * journaled. Returns 0; -1 on error, a full volume (rolled back), or a span
+ * journaled. Since #497 a span ending past EOF GROWS the file (tail block
+ * extended in place with the stale gap zeroed, new blocks allocated, an
+ * untouched gap left sparse, i_size published in the same journal commit).
+ * Returns 0; -1 on error, a full volume (rolled back), or a span
  * whose metadata footprint exceeds the per-call journal credit bound.
  */
 int hype_extj_write_at(hype_extj_wfile_t *f, uint64_t offset, const void *data,
