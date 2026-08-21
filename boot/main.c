@@ -22,6 +22,7 @@
 #include "../core/mp.h"
 #include "../core/admission.h"
 #include "../core/cfg.h"
+#include "../core/avic.h" /* #193 (SMP-9): AVIC capability gate + tables */
 #include "../core/run_state.h"
 #include "../core/strutil.h"
 #include "../core/phys_guard.h"
@@ -10512,6 +10513,33 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
     if (hype_cpu_has_pause_filter(hype_cpu_svm_feature_edx())) {
         vmm_enable_pause_filter(kind, ctx, 65535u, 4096u);
     }
+    /*
+     * #193 (SMP-9): AMD AVIC (hardware-accelerated IPI delivery). Detected always and logged once;
+     * ACTIVATED only when explicitly opted in at build time (-DHYPE_ENABLE_AVIC=1) AND the host
+     * supports it. Default OFF is deliberate: turning AVIC on changes guest IPI delivery, and the
+     * proven trap-and-emulate path (SMP-3..5) must remain the default until AVIC is validated on
+     * real hardware -- a bare-metal SMP guest that works today must not regress on the next run.
+     */
+    if (kind == HYPE_VMM_KIND_SVM) {
+        static int avic_logged = 0;
+        int avic_hw = hype_avic_supported(hype_cpu_svm_feature_edx());
+        if (!avic_logged) {
+            const char *note;
+#if defined(HYPE_ENABLE_AVIC) && HYPE_ENABLE_AVIC
+            note = avic_hw ? " -- ENABLING (HYPE_ENABLE_AVIC set)" : " -- opted in but unsupported";
+#else
+            note = avic_hw ? " -- not enabled (build -DHYPE_ENABLE_AVIC=1 to use it)" : "";
+#endif
+            avic_logged = 1;
+            hype_debug_print("fw-1: AMD AVIC %s on this host%s [#193]\n",
+                             avic_hw ? "AVAILABLE" : "not available", note);
+        }
+#if defined(HYPE_ENABLE_AVIC) && HYPE_ENABLE_AVIC
+        if (avic_hw) {
+            hype_svm_vcpu_enable_apic_accel_ops(ctx);
+        }
+#endif
+    }
     vmm_enable_intr_intercept(kind, ctx);
     vm->shutdown_deadline_tsc = 0;
     vm->pm1a_cnt = 0;
@@ -14275,6 +14303,25 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         } else if (vmm_reason_is_intr(kind, info.reason)) {
             ex_intr++;
             prev_cost_bucket = 7;
+        } else if (kind == HYPE_VMM_KIND_SVM &&
+                   (info.reason == HYPE_SVM_EXITCODE_AVIC_INCOMPLETE_IPI ||
+                    info.reason == HYPE_SVM_EXITCODE_AVIC_NOACCEL)) {
+            /*
+             * #193 (SMP-9): an AVIC exit. Only reachable when AVIC was opted in and enabled.
+             * INCOMPLETE_IPI = the CPU could not deliver a guest IPI itself; the per-iteration
+             * guest-LAPIC drain below plus AVIC's own retry on re-entry carry it. NOACCEL = an
+             * APIC-register access AVIC does not virtualise. Both are re-entered rather than
+             * faulted; the backing-page-driven fast path is refined on AVIC hardware. Bounded log
+             * so an AVIC bring-up run is legible without flooding a working boot.
+             */
+            static unsigned avic_exit_logged;
+            if (avic_exit_logged < 8u) {
+                avic_exit_logged++;
+                hype_debug_print("fw-1: AVIC exit 0x%llx (guest_rip=0x%llx) -- re-entering [#193]\n",
+                                 (unsigned long long)info.reason,
+                                 (unsigned long long)info.guest_rip);
+            }
+            prev_cost_bucket = 8;
         } else {
             ex_other++;
             prev_cost_bucket = 8;

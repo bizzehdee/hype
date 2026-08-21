@@ -391,6 +391,12 @@ _Static_assert(__builtin_offsetof(hype_vmcb_t, control.exitintinfo) == 0x088, "c
 #define HYPE_SVM_EXITCODE_RDTSC 0x6EULL
 #define HYPE_SVM_EXITCODE_MSR 0x7CULL
 #define HYPE_SVM_EXITCODE_NPF 0x400ULL
+/* #193 (SMP-9): AVIC exits. INCOMPLETE_IPI = the CPU could not deliver a guest IPI itself (e.g. a
+ * target vCPU not running, or a broadcast) and hands it back for the emulated route. NOACCEL = a
+ * guest APIC-register access AVIC does not accelerate, to be emulated. Only ever seen when AVIC is
+ * enabled (which hype does only on AVIC-capable hardware). */
+#define HYPE_SVM_EXITCODE_AVIC_INCOMPLETE_IPI 0x401ULL
+#define HYPE_SVM_EXITCODE_AVIC_NOACCEL 0x402ULL
 /*
  * #317: the SVM-instruction #VMEXITs (APM Appendix C, exit-code table). Reached only because
  * hype now intercepts them; the handler injects #UD, which is precisely what the guest would
