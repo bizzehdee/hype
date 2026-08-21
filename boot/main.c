@@ -371,6 +371,8 @@ static unsigned long long g_ata_irq_pending, g_ata_irq_delivered;
  * (hype_ahci_t.irq_events); these hold the last count already sent. #512 replaced the old
  * sampled-level latches, which missed edges another vCPU consumed-and-rearmed between polls. */
 static unsigned long long g_cd_msi_seen, g_ata_msi_seen;
+static unsigned long long g_xhci_msi_seen; /* #594 */
+static unsigned g_xhci_irq_dbg;
 /* #440: how often the guest touches the ICH9 SATA target's ABAR at all --
  * distinguishes "Windows never drives the controller" from "Windows drives it
  * and the exchange goes wrong". */
@@ -16337,6 +16339,40 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * Models a level line going low; the guest's LAPIC EOI need not be
              * decoded (hype's minimal LAPIC doesn't track the ISR vector). */
             hype_ioapic_deassert(&g_fw_1_ioapic, HYPE_FW_1_AHCI_GSI);
+        }
+        /*
+         * #594: the guest xHCI's completion interrupt. The controller sets an interrupt-pending
+         * state (event ring wrote + IMAN.IP + INTE) that the guest clears by writing IMAN.IP. MSI
+         * is edge-triggered off the event counter; the legacy path raises the PCI interrupt line
+         * on the PIC (the direct-boot acpi=off case the USB-media guests use). No IO-APIC/_PRT
+         * entry yet: an ACPI guest would need a DSDT _PRT row for dev 9, tracked separately.
+         */
+        if (vm->xhci_present && hype_xhci_dev_irq_pending(&vm->xhci_dev)) {
+            if (hype_pci_msi_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_XHCI)) {
+                if (g_xhci_msi_seen != vm->xhci_dev.events_posted) {
+                    g_xhci_msi_seen = vm->xhci_dev.events_posted;
+                    fw_1_deliver_msi_vector(vm, HYPE_FW_1_PCI_DEV_XHCI, 0,
+                                            hype_pci_msi_vector(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_XHCI));
+                    if (g_xhci_irq_dbg < 6u) {
+                        g_xhci_irq_dbg++;
+                        hype_debug_print("fw-1[vm %u]: #594 xHCI MSI delivered (events=%u cmds=%u "
+                                         "xfers=%u vec=%u)\n", (unsigned)(vm - &g_vms[0]),
+                                         vm->xhci_dev.events_posted, vm->xhci_dev.commands_processed,
+                                         vm->xhci_dev.transfers_processed,
+                                         hype_pci_msi_vector(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_XHCI));
+                    }
+                }
+            } else {
+                uint8_t line = hype_pci_get_interrupt_line(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_XHCI);
+                if (line != 0u && line < 16u) {
+                    int in_service = (line < 8u)
+                        ? ((g_fw_1_pic.master.isr & (uint8_t)(1u << line)) != 0)
+                        : ((g_fw_1_pic.slave.isr & (uint8_t)(1u << (line - 8u))) != 0);
+                    if (!in_service) {
+                        hype_pic_emu_raise_global_irq(&g_fw_1_pic, line);
+                    }
+                }
+            }
         }
         /*
          * GSI 20, and it now carries THREE devices: virtio-blk (M5-7 #196), the slot-0 NVMe

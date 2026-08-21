@@ -242,7 +242,10 @@ static uint32_t cmd_address_device(hype_xhci_dev_t *dev, const hype_gpa_map_t *m
     if (gwrite32(m, dev_ctx + 12u, ((uint32_t)slot) | ((uint32_t)HYPE_GXHCI_SLOT_ADDRESSED << 27)) != 0) {
         return HYPE_GXHCI_CC_TRB_ERROR;
     }
-    /* EP0 output context: copy dword1 (EP type etc) and the TR dequeue pointer. */
+    /* EP0 output context (DCI 1, at device-context offset 32). Set EP State = Running (dword0
+     * [2:0] = 1) -- without it xhci-hcd reads the endpoint back as Disabled and refuses to submit
+     * URBs ("WARN urb submitted to disabled ep"). Copy dword1 (EP type etc) and the TR pointer. */
+    (void)gwrite32(m, dev_ctx + 32u + 0u, 1u);
     (void)gwrite32(m, dev_ctx + 32u + 4u, ep0_ctx1);
     (void)gwrite32(m, dev_ctx + 32u + 8u, (uint32_t)(ep0_tr & 0xFFFFFFFFu));
     (void)gwrite32(m, dev_ctx + 32u + 12u, (uint32_t)(ep0_tr >> 32));
@@ -288,8 +291,10 @@ static uint32_t cmd_configure_endpoint(hype_xhci_dev_t *dev, const hype_gpa_map_
         dev->slots[slot].ep_ring[dci] = ep_tr & ~0xFull;
         dev->slots[slot].ep_cycle[dci] = (uint8_t)(ep_tr & 0x1u);
         dev->slots[slot].ep_configured[dci] = 1u;
-        /* Mirror into the output device context so the guest reads back a configured EP. */
+        /* Mirror into the output device context so the guest reads back a configured, Running EP
+         * (dword0 [2:0] = 1). */
         if (dev_ctx != 0u) {
+            (void)gwrite32(m, dev_ctx + (uint64_t)dci * 32u + 0u, 1u);
             (void)gwrite32(m, dev_ctx + (uint64_t)dci * 32u + 4u, ep1);
             (void)gwrite32(m, dev_ctx + (uint64_t)dci * 32u + 8u, (uint32_t)(ep_tr & 0xFFFFFFFFu));
             (void)gwrite32(m, dev_ctx + (uint64_t)dci * 32u + 12u, (uint32_t)(ep_tr >> 32));
@@ -377,6 +382,42 @@ static void process_command_ring(hype_xhci_dev_t *dev, const hype_gpa_map_t *m) 
                 /* Accepted: v1 does not re-derive max-packet from a re-evaluated context. */
                 cc = HYPE_GXHCI_CC_SUCCESS;
                 break;
+            case HYPE_GXHCI_TRB_RESET_DEVICE:
+                /* Return the slot to the Default state: keep it enabled, drop its endpoint
+                 * configuration except the control endpoint. Linux resets the device mid-
+                 * enumeration; rejecting it (the old default: TRB_ERROR) stalled every probe. */
+                if (slot >= 1u && slot <= HYPE_GXHCI_MAX_SLOTS &&
+                    dev->slots[slot].state != HYPE_GXHCI_SLOT_DISABLED) {
+                    unsigned int e;
+                    for (e = 2u; e < 32u; e++) {
+                        dev->slots[slot].ep_configured[e] = 0u;
+                    }
+                    dev->slots[slot].state = HYPE_GXHCI_SLOT_ENABLED;
+                    cc = HYPE_GXHCI_CC_SUCCESS;
+                } else {
+                    cc = HYPE_GXHCI_CC_SLOT_NOT_ENABLED;
+                }
+                break;
+            case HYPE_GXHCI_TRB_RESET_ENDPOINT:
+            case HYPE_GXHCI_TRB_STOP_ENDPOINT:
+                /* Clear a halted/stopped condition. v1 never halts an endpoint, so there is nothing
+                 * to unwind -- accept it so the guest's error-recovery path completes. */
+                cc = HYPE_GXHCI_CC_SUCCESS;
+                break;
+            case HYPE_GXHCI_TRB_SET_TR_DEQUEUE: {
+                /* Repoint an endpoint's transfer ring. Endpoint ID (DCI) is control[20:16]; the new
+                 * dequeue pointer + DCS bit is the TRB parameter. */
+                uint8_t dci = (uint8_t)((control >> 16) & 0x1Fu);
+                if (slot >= 1u && slot <= HYPE_GXHCI_MAX_SLOTS && dci < 32u &&
+                    dev->slots[slot].state != HYPE_GXHCI_SLOT_DISABLED) {
+                    dev->slots[slot].ep_ring[dci] = param & ~0xFull;
+                    dev->slots[slot].ep_cycle[dci] = (uint8_t)(param & 0x1u);
+                    cc = HYPE_GXHCI_CC_SUCCESS;
+                } else {
+                    cc = HYPE_GXHCI_CC_SLOT_NOT_ENABLED;
+                }
+                break;
+            }
             case HYPE_GXHCI_TRB_NOOP_CMD:
                 cc = HYPE_GXHCI_CC_SUCCESS;
                 break;
@@ -559,6 +600,26 @@ static uint32_t cap_reg32(uint32_t off) {
     }
 }
 
+/* xHCI Extended Capabilities: one Supported Protocol Capability (USB 2.0) covering our single
+ * port. Without it Linux's xhci-hcd cannot classify the port and aborts roothub setup. */
+static uint32_t xecp_read32(uint32_t off) {
+    switch (off - HYPE_GXHCI_XECP_OFF) {
+    case 0x00u:
+        /* [7:0] Cap ID = 2 (Supported Protocol), [15:8] Next Ptr = 0 (last), [23:16] Minor Rev = 0,
+         * [31:24] Major Rev = 2 (USB 2.0). */
+        return 0x02000002u;
+    case 0x04u:
+        return 0x20425355u; /* Name String "USB " */
+    case 0x08u:
+        /* [7:0] Compatible Port Offset = 1, [15:8] Compatible Port Count = 1. */
+        return 0x00000101u;
+    case 0x0Cu:
+        return 0x00000000u; /* [4:0] Protocol Slot Type = 0 */
+    default:
+        return 0u;
+    }
+}
+
 static uint32_t op_read32(const hype_xhci_dev_t *dev, uint32_t off) {
     switch (off) {
     case HYPE_GXHCI_OP_USBCMD:
@@ -638,6 +699,8 @@ int hype_xhci_dev_mmio_read(const hype_xhci_dev_t *dev, uint32_t offset, uint8_t
     base = offset & ~0x3u;
     if (base < HYPE_GXHCI_CAPLENGTH) {
         v32 = cap_reg32(base);
+    } else if (base >= HYPE_GXHCI_XECP_OFF && base < HYPE_GXHCI_XECP_OFF + 0x10u) {
+        v32 = xecp_read32(base);
     } else if (base >= HYPE_GXHCI_RTSOFF && base < HYPE_GXHCI_DBOFF) {
         v32 = rt_read32(dev, base);
     } else if (base >= HYPE_GXHCI_DBOFF) {

@@ -1,0 +1,25 @@
+# #594: a real Linux enumerates hype's emulated xHCI + USB-MSC as REMOVABLE media, binds
+# usb-storage, and reads the on-disk magic byte-exact. Modules are in the initramfs.
+timeout 300000
+fail-if Kernel panic
+fail-if Unable to mount root
+expect job control turned off
+send \n
+send modprobe usb-storage 2>&1; echo MOD-STOR-$?\n
+expect MOD-STOR-
+send modprobe xhci-pci 2>&1; echo MOD-XHCI-$?\n
+expect MOD-XHCI-
+# give xhci-hcd time to reset the port, enumerate the device, and usb-storage to bind
+send sleep 4; echo SLEPT\n
+expect SLEPT
+send dmesg | grep -iE "xhci|usb-storage|usb 1|scsi|removable" | tail -20; echo DMESG-DONE\n
+expect DMESG-DONE
+send for d in /dev/sda /dev/sdb; do test -b $d && echo FOUND-$d; done; echo SCAN-DONE\n
+expect SCAN-DONE
+send cat /sys/block/sda/removable 2>/dev/null; echo RMB-DONE\n
+expect RMB-DONE
+send dd if=/dev/sda bs=16 count=1 2>/dev/null; echo; echo VDA-DONE\n
+expect VDA-DONE
+send echo USB594-$(dd if=/dev/sda bs=16 count=1 2>/dev/null | tr -d "\\0")\n
+expect USB594-HYPE594-USB-MSC!
+pass removable-usb-msc-read

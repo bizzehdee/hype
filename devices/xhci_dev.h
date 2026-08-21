@@ -43,8 +43,14 @@
 /* HCSPARAMS1: MaxSlots[7:0], MaxIntrs[18:8], MaxPorts[31:24]. */
 #define HYPE_GXHCI_HCSPARAMS1 \
     (((uint32_t)HYPE_GXHCI_MAX_PORTS << 24) | (1u << 8) | HYPE_GXHCI_MAX_SLOTS)
-/* HCCPARAMS1 = 0: 32-bit addressing (AC64=0), 32-byte contexts (CSZ=0), no xECP. */
-#define HYPE_GXHCI_HCCPARAMS1 0x00000000u
+/*
+ * HCCPARAMS1: 32-bit addressing (AC64=0), 32-byte contexts (CSZ=0). Bits [31:16] are the xHCI
+ * Extended Capabilities Pointer in DWORDS from the BAR base -- Linux's xhci-hcd REFUSES to set up
+ * the roothub without a Supported Protocol capability there ("No Extended Capability registers,
+ * unable to set up roothub", -EIO/-ENOMEM). Point it at HYPE_GXHCI_XECP_OFF.
+ */
+#define HYPE_GXHCI_XECP_OFF 0x500u /* byte offset of the extended-capability list in the BAR */
+#define HYPE_GXHCI_HCCPARAMS1 ((HYPE_GXHCI_XECP_OFF / 4u) << 16)
 #define HYPE_GXHCI_DBOFF 0x0800u  /* must be 4-byte aligned; low 2 bits reserved 0 */
 #define HYPE_GXHCI_RTSOFF 0x0600u /* must be 32-byte aligned; low 5 bits reserved 0 */
 
@@ -128,6 +134,10 @@
 #define HYPE_GXHCI_TRB_ADDRESS_DEVICE 11u
 #define HYPE_GXHCI_TRB_CONFIGURE_ENDPOINT 12u
 #define HYPE_GXHCI_TRB_EVALUATE_CONTEXT 13u
+#define HYPE_GXHCI_TRB_RESET_ENDPOINT 14u
+#define HYPE_GXHCI_TRB_STOP_ENDPOINT 15u
+#define HYPE_GXHCI_TRB_SET_TR_DEQUEUE 16u
+#define HYPE_GXHCI_TRB_RESET_DEVICE 17u
 #define HYPE_GXHCI_TRB_NOOP_CMD 23u
 #define HYPE_GXHCI_TRB_TRANSFER_EVENT 32u
 #define HYPE_GXHCI_TRB_CMD_COMPLETION 33u
