@@ -3105,3 +3105,254 @@ own "keeping plan.md and the board in sync" rule).
   A management VM privileged enough to control other VMs is itself a new
   trust tier and needs its own §10 decision when promoted; it must not
   silently become a hole in the §6g/§10 guest-isolation invariant.
+
+## 14. Gap analysis (2026-08-21)
+
+A structured review of fifteen virtualization areas against this plan, the
+board, and the code as it stands. Each subsection states what exists (with
+file or ticket citations), what is missing, and the disposition: an existing
+ticket, a new ticket raised from this review (#599–#604), or
+deliberately-not-planned with the reason. This section records findings; it
+changes no existing decision. Where a finding contradicts a §10 decision,
+that is said explicitly rather than silently absorbed.
+
+### 14.1 IOMMU / DMA remapping (AMD-Vi / VT-d)
+
+Current state: no IOMMU use anywhere in the tree. §4 already rules: "IOMMU
+required only if we ever add passthrough — out of scope for v1." No guest can
+program a real device (§6j hard rule; the no-direct-hw-access invariant), so
+there is no guest-controlled DMA to isolate. Host-driver DMA targets
+(AHCI/NVMe/xHCI/NIC rings, and guest-RAM buffers passed to
+`hype_blk_backend_*`) are validated in software against the VM's GPA map
+before any controller is programmed.
+
+Gap: hype's own memory has no hardware backstop against a misprogrammed or
+malicious device — software validation is the only line.
+
+Disposition: **deliberately not planned for v1.** The plan's own boundary is
+§6j software validation; an IOMMU adds hardware defense-in-depth only, at the
+cost of a full AMD-Vi/VT-d driver pair. If passthrough ever lands (#130,
+STRETCH), the IOMMU becomes mandatory and must ship with it — §6j already
+says so.
+
+### 14.2 Interrupt remapping and MSI/MSI-X virtualization
+
+Current state: interrupt remapping is an IOMMU facility and is absent for the
+same reason as 14.1. Guest-facing MSI/MSI-X is deliberately not modeled:
+every device answers NO_VECTOR (`devices/virtio_blk.c`,
+`devices/virtio_net.c`, `devices/e1000_dev.h`) and delivery is by shared
+IO-APIC line, per decision 51's explicit rejection of MSI-X "before something
+needs MSI for its own sake." #514 fixed the one MSI-adjacent defect (config
+cycles from AP vCPUs).
+
+Gap: none beyond what decision 51 already defers.
+
+Disposition: **deliberately deferred by decision 51.** No ticket; raising one
+now would contradict that decision. The trigger for revisiting is written in
+decision 51: a device that cannot share a line.
+
+### 14.3 APIC / x2APIC virtualization
+
+Current state: the trap-and-emulate xAPIC path is what runs everywhere.
+AMD AVIC landed as build-time opt-in, default OFF (#193;
+`-DHYPE_ENABLE_AVIC=1` in `boot/main.c`). On Intel, the APICv secondary
+controls M2-4 defined are **deliberately dropped** at VMCS build time
+(`arch/x86_64/vmx/vmcs_hw.c`: APIC_REGISTER_VIRT, VIRTUAL_INTERRUPT_DELIVERY
+and USE_TPR_SHADOW are not requested). x2APIC guest mode is masked (CPUID
+leaf 1 ECX bit 21 forced clear, `arch/x86_64/cpu/cpuid_emulate.c`); the
+x2APIC MSR range is unhandled.
+
+Gap: this contradicts decision 6 and §4, which require APICv/AVIC "from the
+start." M2-4 (#30) is closed against that decision, but only structures and
+the AMD opt-in exist; no accelerated path is active by default on either
+vendor, and Intel has none at all.
+
+Disposition: three tickets. **#599** wires VMX APICv (opt-in, the #193
+shape). **#600** validates AVIC on bare-metal AMD and discharges #193's
+default-OFF condition. **#601** (Low) models x2APIC guest mode. Decision 6
+stays as written; #599/#600 are the path back to it.
+
+### 14.4 NPT/EPT corner cases
+
+Current state: both backends use fixed 2 MiB leaf mappings, WB memory type,
+built once per VM (`arch/x86_64/svm/npt.c`, `arch/x86_64/vmx/ept.c`). There
+is no 4 KiB level and no split path — guest MMIO windows are 2 MiB-aligned
+not-present holes by design (`npt.h` states this; decision on device windows
+follows it). Not-present entries are L1TF-inverted per decision 48. A/D bits
+are not enabled. Guest PAT/MTRR are modeled (#481 fixed reset state; g_pat
+WB fixed the uncacheable-guest-RAM defect). Per-VM roots and ASID/VPID
+separation are fixed and tested (#244, #245, #272, #273).
+
+Gap: no dirty tracking and no page-granular permissions — but nothing in v1
+consumes them (no live snapshot §1, no ballooning §13). The 2 MiB constraint
+is a real design limit every new device window must respect; it is
+documented where it binds.
+
+Disposition: **covered by design.** No ticket. A 4 KiB/split mechanism gets
+built when a consumer exists (the no-premature-abstraction rule), and the
+first consumer must say so here first.
+
+### 14.5 VMX/SVM capability handling
+
+Current state: VMX control bits are negotiated against the capability MSRs,
+TRUE variants preferred, granted bits read back rather than assumed
+(`arch/x86_64/vmx/vmcs_hw.c`); VPID is gated on IA32_VMX_EPT_VPID_CAP
+(#273); CR0/CR4 fixed bits applied before VMXON
+(`arch/x86_64/vmx/vmx_enable_hw.c`). SVM features come from CPUID 0x8000000A
+with graceful nRIP/decode-assist fallback (`arch/x86_64/svm/svm_vcpu.c`).
+Nested honesty: guests never see VMX/SVM CPUID bits (#552, #316), and the
+SVM instruction set is intercepted (#317) — nested virtualization is a §1
+non-goal and is honestly absent rather than half-advertised.
+
+Gap: decision 48 already records the one known hole (IA32_ARCH_CAPABILITIES
+is never read; the L1TF mitigation is unconditional instead).
+
+Disposition: **covered.** No ticket.
+
+### 14.6 Guest SMP (INIT/SIPI, >1 vCPU)
+
+Current state: INIT-SIPI-SIPI AP bring-up is implemented and hardened on
+both backends (#188; #520 ported the SIPI CS fix to VMX). Cross-core VMCS
+ownership is a §10 hard invariant (decision 43, #523). Correctness work is
+live on the board: #526 (nested-VMX soft lockups), #527 (bare-metal Intel
+VMCS-ownership validation), #525, and the SMP-1x shared-tier series
+(#467–#478).
+
+Gap: none untracked.
+
+Disposition: **covered by existing tickets.** No new ticket.
+
+### 14.7 ACPI / UEFI table correctness
+
+Current state: per-VM synthesis of RSDP/XSDT/FADT+FACS/MADT/MCFG, a compiled
+DSDT with PCI host bridge + _PRT, optional HPET (default absent — #436
+found Windows bugchecks with it advertised), and TPM2+SSDT when a TPM is
+configured (`devices/acpi.c`, `devices/dsdt_aml.h`; #60, #62, #312, #433).
+Unit-tested (`core/tests/test_acpi.c`, `test_acpi_loader.c`). Guest UEFI is
+real vendored OVMF (decision 1), so Runtime Services are OVMF's own, backed
+by the pflash varstore hype persists (#457, #441) — hype does not synthesize
+runtime services.
+
+Gap: none found.
+
+Disposition: **covered.** No ticket.
+
+### 14.8 PCI device reset (FLR) and bus isolation
+
+Current state: no device is ever assigned to a guest (no-direct-hw-access
+invariant), so guest-side FLR has nothing to reset. Host-side, hype resets
+the controllers it takes over during bring-up (NVMe CC.EN toggle in
+`core/nvme_host_hw.c`; xHCI reset + settle in `core/xhci_hw.c`). Each VM has
+its own emulated bus and device instances; the shared-singleton class of
+defect was hunted and fixed (#245, #277, #563). Emulated devices reset per
+their own contracts (virtio device_status=0 path is modeled and tested).
+
+Gap: none — FLR is a passthrough concept.
+
+Disposition: **not applicable under the no-passthrough architecture.** If
+#130 ever promotes, FLR arrives with it, alongside 14.1's IOMMU.
+
+### 14.9 virtio completion and error paths
+
+Current state: `process_virtio_blk_queue()` surfaces backend failures,
+malformed chains, out-of-range LBAs and out-of-map segments as S_IOERR, and
+unknown request types as S_UNSUPP (`arch/x86_64/svm/svm_vcpu.c`,
+`devices/virtio_blk.c`); driver-initiated device reset re-runs negotiation
+without leaking identity state (#310). All of it is unit-tested, including
+the adversarial shapes (`core/tests/test_virtio_blk.c`, `test_virtio_net.c`).
+SEG_MAX is offered (the max_segments=1 defect is fixed).
+
+Gap: none directed; what remains is the undirected-input class.
+
+Disposition: **covered**; adversarial coverage folds into the fuzz ticket
+(**#602**).
+
+### 14.10 Migration / snapshotting
+
+Current state: live migration and VM memory snapshotting are §1 non-goals.
+What exists is deliberate and narrower: the varstore persists per VM (#441),
+and the §6h run-state record restarts the same VM set after a host power
+event — explicitly restart-to-run-state, not resume.
+
+Gap: none within scope.
+
+Disposition: **deliberately not planned.** A single-box hypervisor with no
+peer has no migration target, and RAM-state snapshotting buys little for
+install-and-run workloads at the cost of dirty tracking (14.4) and device
+state serialization for every model. Disk-image snapshotting stays #131
+(STRETCH).
+
+### 14.11 Fuzzing
+
+Current state: directed adversarial unit tests exist at the §6j boundary
+(malformed virtio chains, out-of-bounds LBAs); the only fuzz-style loops are
+`core/tests/test_vt_fuzz.c` (host VT parser) and #504's planned MGMT
+pre-auth fuzz. No guest-facing surface is fuzzed.
+
+Gap: the guest-writable surfaces — virtio descriptors, AHCI/NVMe command
+structures, MMIO/PIO register models, `hype.cfg` — get only inputs someone
+thought of. §6j says a missed check here is a compromise, not a crash.
+
+Disposition: new ticket **#602** — a host-side, sanitizer-backed fuzz
+harness over the real device-model code in the unit-test build.
+
+### 14.12 VM-exit testing
+
+Current state: exit coverage is incidental. Microtests exercise whatever
+exits their workloads take; `core/tests/test_vmexit.c` covers only the pure
+classify/decide helpers. The EXHIST counters bucket exits per reason at run
+time. History shows the cost of incidental coverage: #315, #291 and #317
+were all found late, by guests.
+
+Gap: nothing enumerates the intercept set and proves each reason is taken
+and handled on both backends.
+
+Disposition: new ticket **#603** — a systematic exit-reason coverage
+microtest, cross-checked against the EXHIST counters.
+
+### 14.13 Security hardening of hype itself
+
+Current state: the guest-facing boundary is §6j validation plus the §10
+decision 48 L1TF mitigation, and guests see no VMX/SVM (14.5). hype's own
+environment, however, is unhardened: the host identity map is
+PRESENT|WRITE with no NX anywhere (`arch/x86_64/cpu/paging.c`), so all host
+RAM — guest RAM included — is executable at CPL0; there is no W^X for the
+image, no SMEP/SMAP, and no stack canaries (`Makefile` CFLAGS; `chkstk.S`
+is probing, not smash detection).
+
+Gap: one missed bounds check currently escalates directly to code
+execution, because overwritten data and injected code share writable,
+executable memory.
+
+Disposition: new ticket **#604** (Low) — NX for everything outside `.text`
+(guest RAM first), W^X for the image, stack canaries, SMEP; each step
+independently landable and gated on real-hardware runs.
+
+### 14.14 NUMA and huge pages
+
+Current state: guest RAM is backed by 2 MiB nested-paging mappings by
+construction (14.4), carved from the one Phase-0 pool (§2). NUMA-aware
+vCPU/RAM placement is already a board item: #475 (SMP-19).
+
+Gap: none untracked. 1 GiB backing pages would shrink walk depth further but
+no measurement motivates them.
+
+Disposition: **covered by #475**; 1 GiB pages deliberately not planned until
+a measurement asks for them (the measure-before-optimizing rule).
+
+### 14.15 Observability and debugging
+
+Current state: broader than the board suggests — per-reason EXHIST exit
+buckets and per-VM AHCIREG/AHCIIRQ lines in the periodic log
+(`boot/main.c`), a bounded per-port I/O histogram (`core/io_histogram.c`),
+write-size histograms in `blk_backend`, deep guest-state dumps on faults and
+preemption anomalies (`fw_1_436_deep_dump`), a per-VM watchdog
+(`core/vm_watchdog.c`), per-core panic accounting, a panic flush hook that
+persists the console log to the USB stick (`core/fatal.h`, #513), the USB
+log split, and the dashboard's per-VM state.
+
+Gap: none large enough to carry a ticket. The known soft spot — several
+counters live as FW-1-era statics in `boot/main.c` — is a refactor-in-place
+concern (#539's pattern), not missing capability.
+
+Disposition: **covered.** No ticket.
