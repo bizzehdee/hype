@@ -1,0 +1,112 @@
+; hype bare-metal hardware-validation stick -- multi-ticket run.
+;
+; BUDGET. A vCPU IS A PHYSICAL CORE (#564, decision 47). `vcpus = N` costs exactly N cores on any
+; host, with the BSP's core reserved. SMT is a BONUS: a 2-thread core makes one vCPU that the
+; guest sees as two logical CPUs, and a non-SMT host costs the same and yields one.
+;
+;     max total vCPUs = physical cores - 1        (the BSP keeps console/log duty)
+;
+;   AMD laptop       4 cores / 8 threads  ->  3 vCPUs  (this file: 1+1+1, exactly)
+;   Intel i5-13420H  8 cores / 12 threads ->  7 vCPUs
+;   Ryzen 5950X     16 cores / 32 threads -> 15 vCPUs
+;
+; So each Alpine here asks for ONE core and its guest still reports 2 CPUs on the SMT laptop --
+; #527's bar (`Brought up 1 node, 2 CPUs`) is met at a third of the old cost. On a host with SMT
+; off it would report 1 CPU and the config would still fit, which is the whole point of pricing
+; in cores: this file cannot stop fitting because of someone's BIOS setting.
+;
+; Read the per-VM placement line to see which happened:
+;   fw-1 SMP: vm0 granted 1 whole physical core(s) -> 2 logical CPU(s), 2 thread(s)/core (SMT bonus)
+; and `siblings known` vs `siblings UNPROVEN` on the summary line (#378's all-zero
+; EFI_CPU_PHYSICAL_LOCATION table, repaired from CPUID 0x8000001E on AMD).
+;
+; Counting VMs instead of cores is what #559 was, and it silently started two VMs on one core.
+;
+; ORDER IS LOAD-BEARING. hype dispatches VMs in this order and admission caps from the END,
+; naming every VM it drops (#396). So the two Alpine guests come first: they carry the
+; highest-value ticket (#527) and need the full run length, while every microtest below finishes
+; in seconds. If this host cannot admit all of them, what is lost is the cheapest evidence and
+; the log says exactly which.
+;
+; NOTHING HERE WRITES TO A PHYSICAL DISK. Every target_disk is `file:` on this stick, and there is
+; no `physical:` target anywhere. That is deliberate and non-negotiable on this machine: the Intel
+; laptop's only internal NVMe is the operator's BitLocker Windows install.
+
+[hype]
+config_version = 1
+log_level = debug
+
+; ---------------------------------------------------------------------------
+; #527 / #526 / #461 -- two 2-vCPU Alpine guests, unchanged in shape from the run that
+; #523's fix was measured against, so the numbers are directly comparable.
+;   #527 wants: both APs live=1, AP exits in the millions, guest "Brought up 1 node, 2 CPUs",
+;               VMCSRELOAD steals=0, entry failures 0, sustained past 8 minutes.
+;   #526 wants: the soft-lockup count on BARE METAL, against 2 per 240 s on the nested rig.
+;   #461 is watch-only: a host #GP with RIP inside the AP trampoline, if it recurs.
+; ---------------------------------------------------------------------------
+[vm.vm0]
+label = alpine-smp8
+vcpus = 1                 ; one physical core; the guest sees 2 CPUs via SMT (#527's bar)
+mem_mb = 1536
+boot = installer
+install_media = \iso\test.iso
+firmware = uefi
+os_hint = linux
+target_disk = file:\hype\disks\vm0.img
+
+; #525 rides on this SECOND guest: the 0xCF9 reset arm fires from vm1's input script, so with no
+; vm1 there is no #525 evidence at all. #560 is what made this VM possible on this host.
+; vm1 boots its OWN DISK, with no install media attached at all -- #120 (M9-5), which asks for
+; "already-installed guest disks, not just fresh installers". Every other guest on this stick boots
+; from media, so without this VM the disk-boot path is never exercised on hardware, and #120 has
+; stalled for want of the artefact rather than for want of a run.
+;
+; The image is built and CONTROL-BOOTED by tools/make-guest-disk-from-iso.sh, which refuses to
+; produce one that bare QEMU cannot boot -- on a cold-boot-only laptop, "hype's disk model refused
+; it" and "the image was never bootable" must not look the same.
+;
+; NO install_media, deliberately: with media attached, "did it boot the disk or the media?" is
+; unanswerable, and that distinction is the entire ticket. It also means a MISSING target disk is
+; fatal for this VM rather than a warning -- stage.sh knows the difference now.
+[vm.vm1]
+label = alpine-disk-load-cf9
+vcpus = 1                 ; one physical core; the guest sees 2 CPUs via SMT
+mem_mb = 1536
+boot = disk
+firmware = uefi
+os_hint = linux
+target_disk = file:\hype\disks\vm1-alpine-disk.img
+
+; ---------------------------------------------------------------------------
+; ONE VM, running the SUITE KERNEL (#554), which runs the microtests in turn.
+;
+; This is the whole reason the stick fits. A vCPU is a whole physical core with the BSP's core
+; reserved, so a host runs at most (physical cores - 1) single-core VMs however much RAM it has:
+;
+;   AMD laptop       4 physical cores (8 threads), 12 GB  ->  3 VMs
+;   Intel i5-13420H  8 physical cores (12 threads), 8 GB  ->  7 VMs
+;
+; The first version of this file listed seven VMs and the AMD run dropped four of them, including
+; both High-priority reproductions it was built to carry -- RAM was never close (the pool was 7012
+; of 10165 MiB usable). Two Alpine guests plus one suite VM is exactly three VMs, so it fits the
+; SMALLER host, and a bigger one simply has cores to spare.
+;
+; ps2 is not in the list: it needs \input\vmN.txt and the two Alpine scripts already occupy vm0 and
+; vm1. faulter is not in the list either -- it triple-faults on purpose, which would take the suite
+; VM and every member after it down; it stays a standalone artifact where that IS the point (#538).
+;
+; Watch for, in order: MICRO RUN lines naming each member as it starts (so a member that faults is
+; identified), then MICRO SUITE: ran=/passed=/failed=/noverdict=. The SUMMARY LINE'S ABSENCE is how
+; a truncated sweep is recognised.
+;
+; Expected today: pflash FAILS (#556's reproduction) and intdeliver may FAIL on bare metal (#557 --
+; a kernel guest that programs the legacy PIT/8259 got no interrupts at all on the AMD run). Every
+; other member should PASS.
+[vm.suite]
+label = micro/suite
+vcpus = 1
+mem_mb = 512
+boot = kernel
+kernel = \EFI\hype\micro\suite.bin
+cmdline = tests=hello,ram1,cpumsr,fwcfg,pci,pflash,intdeliver,pausespin
+os_hint = none

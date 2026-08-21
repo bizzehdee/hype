@@ -21,17 +21,25 @@ for k in hello faulter ram1 cpumsr fwcfg intdeliver pausespin ps2 pflash pci; do
     [ -f "build/micro/$k.bin" ] || { echo "build/micro/$k.bin missing -- run 'make micro'"; exit 2; }
 done
 
-# 1. safety: no physical target, comments stripped first (';' begins a comment -- spec section 3)
-python3 - "$@" <<'PY'
-import re, sys, glob, os
+# 1. safety: a physical target is allowed ONLY for operator-authorized spare-disk serials, both as
+# `target_disk = physical:<serial>` and as a `[disk.*] backing=physical / id_match=<serial>`. Any
+# other serial aborts the stage -- the by-serial allowlist is the same one hype auto-confirms, so
+# staging and the hypervisor agree on exactly which drives may be written. Comments stripped first.
+python3 - <<'PY'
+import re, sys, glob
+AUTHORIZED = {"5ME3N005713803V2W", "2132E5BF4EAE"}  # AMD laptop spare NVMe + SATA SSD
 bad = []
-for f in sorted(glob.glob(os.path.join(os.path.dirname(__file__) if False else 'tools/hwstick', '*.cfg'))):
-    for n, line in enumerate(open(f), 1):
-        if re.search(r'target_disk\s*=\s*physical:', line.split(';', 1)[0]):
-            bad.append((f, n))
+for f in sorted(glob.glob('tools/hwstick/*.cfg')):
+    text = "".join(line.split(';', 1)[0] for line in open(f))
+    serials = re.findall(r'target_disk\s*=\s*physical:\s*(\S+)', text)
+    serials += re.findall(r'\bid_match\s*=\s*(\S+)', text)
+    for s in serials:
+        if s not in AUTHORIZED:
+            bad.append((f, s))
 if bad:
-    sys.exit("REFUSING TO STAGE: physical: target at %s" % bad)
-print("safety: no physical: target in any config -- OK")
+    sys.exit("REFUSING TO STAGE: unauthorized physical: target serial(s) %s "
+             "(authorized: %s)" % (bad, sorted(AUTHORIZED)))
+print("safety: physical targets limited to authorized spare-disk serials -- OK")
 PY
 
 # Clear the previous run's evidence and state. The glob was `vars-vm*.bin`, which missed
@@ -49,6 +57,14 @@ mkdir -p "$DST/EFI/BOOT" "$DST/EFI/hype/micro" "$DST/input" "$DST/input-micro" \
 cp build/hype.efi "$DST/EFI/BOOT/BOOTX64.EFI"
 cp fw/OVMF_CODE.fd fw/OVMF_VARS.fd "$DST/EFI/hype/"
 cp build/micro/*.bin "$DST/EFI/hype/micro/"
+# The physical-write NVMe VM direct-boots a real Linux kernel + initramfs (alpine-virt). These are
+# not build artefacts, so they live under disk-images/; a config that names them fails the
+# kernel-present check below if they are absent, which is the intended loud failure.
+for k in vmlinuz-virt initramfs-virt; do
+    if [ -f "disk-images/545/$k" ]; then
+        cp "disk-images/545/$k" "$DST/EFI/hype/micro/$k"
+    fi
+done
 cp tools/hwstick/hype.cfg tools/hwstick/hype-micro.cfg tools/hwstick/README.md "$DST/"
 cp tools/hwstick/input/*.txt "$DST/input/"
 cp tools/hwstick/input-micro/*.txt "$DST/input-micro/"

@@ -1,68 +1,23 @@
-# SMP-8 (#192) end-to-end bar, and the measurement run for #509's bar.
-#
-# Proves from INSIDE the guest: 2 CPUs online, both schedulable under load,
-# reschedule IPIs delivered in BOTH directions, and no lockup/stall over a
-# sustained run. The markers are quote-split ("O''K") so the tty echo of the
-# typed command cannot satisfy its own expect.
+# HW physical-write validation, vm0: Alpine live writes to the SPARE SATA SSD (2132E5BF4EAE) via
+# hype's physical AHCI backend, presented as /dev/vda. The 48 MiB dd drives the #295 vectored-write
+# path (watch hype's `BLK WRITE ... vec=` DIAG); the marker read-back proves the bytes landed on
+# the real disk byte-exact. Writes are operator-authorized for this serial (auto-confirmed).
 timeout 300000
-fail-if soft lockup
-fail-if detected stalls
-fail-if self-detected stall
-
+fail-if Kernel panic
 expect localhost login:
 send root\n
 expect ~#
-
-# 2 processors, both online.
-send echo NPROC-$(grep -c ^processor /proc/cpuinfo)\n
-expect NPROC-2
-send echo ONLINE-$(cat /sys/devices/system/cpu/online)\n
-expect ONLINE-0-1
-send grep -E '^processor|^apicid' /proc/cpuinfo\n
+send ls -l /dev/vda; echo DEVLIST-$?\n
+expect DEVLIST-0
+# a large sequential write -- gives the guest block layer every chance to merge, so what reaches
+# hype reflects a real workload (the #295 measurement).
+send dd if=/dev/zero of=/dev/vda bs=1M count=48 conv=fsync; echo DD-DONE\n
+expect DD-DONE
+# now a distinct marker at LBA0 and a byte-exact read-back -- proves the physical write path.
+send printf 'HYPE-PHYS-AHCI!!' | dd of=/dev/vda bs=512 conv=fsync 2>/dev/null; echo MARK-$?\n
+expect MARK-0
+send sync\n
 expect ~#
-
-# IPI counters before load, per CPU column.
-send grep -E 'RES|CAL|TLB' /proc/interrupts\n
-expect ~#
-send A=$(awk '/RES/{print $2}' /proc/interrupts)\n
-expect ~#
-send B=$(awk '/RES/{print $3}' /proc/interrupts)\n
-expect ~#
-
-# 3 spinners on 2 CPUs force migrations and preemption on both.
-send yes>/dev/null & yes>/dev/null & yes>/dev/null &\n
-expect ~#
-send sleep 5; killall yes; echo LOAD-DON''E\n
-expect LOAD-DONE
-
-# Both CPUs accumulated user time -> both schedulable.
-send awk '/^cpu[01] /{print $1"-user-"$2}' /proc/stat\n
-expect cpu1-user-
-
-# Reschedule IPIs increased on BOTH CPUs during the load.
-send A2=$(awk '/RES/{print $2}' /proc/interrupts)\n
-expect ~#
-send B2=$(awk '/RES/{print $3}' /proc/interrupts)\n
-expect ~#
-send [ $A2 -gt $A ] && [ $B2 -gt $B ] && echo RES-IPI-BOTH-O''K\n
-expect RES-IPI-BOTH-OK
-
-# Sustained segment: idle a minute, then a second load burst.
-delay 60000
-send yes>/dev/null & yes>/dev/null & yes>/dev/null &\n
-expect ~#
-send sleep 10; killall yes; echo LOAD2-DON''E\n
-expect LOAD2-DONE
-delay 30000
-
-# Final counters for the record, then the lockup/stall verdict from dmesg.
-# Two traps cost a passing run each: bare 'stall' substring-matches Alpine's own
-# "Installing packages" dmesg line, and typing the literal fail-if strings makes
-# the tty echo trip the fail-if. Regex '.' keeps the match while the typed text
-# never contains the armed patterns.
-send grep -E 'RES|CAL|TLB' /proc/interrupts\n
-expect ~#
-send echo SMP8-DMESG-$(dmesg | grep -icE 'soft.lockup|detected.stall|hung.task|blocked for more')\n
-expect SMP8-DMESG-0
-
-pass smp8-alpine-2vcpu
+send echo AHCI-$(dd if=/dev/vda bs=16 count=1 2>/dev/null)\n
+expect AHCI-HYPE-PHYS-AHCI!!
+pass physical-ahci-write-verified

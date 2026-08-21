@@ -1,3 +1,24 @@
+# ⚠ PHYSICAL-WRITE RUN (build a502863+) — reads the AMD laptop's spare disks
+
+**This stick is configured to WRITE to the AMD laptop's two spare disks, by serial:**
+- `vm0 phys-write-ahci` → SATA SSD **2132E5BF4EAE** (Crucial), via a `[disk.*] backing=physical`
+  section (validates #586) presented as virtio-blk; a 48 MiB `dd` drives #295 vectored writes and a
+  marker read-back proves the physical AHCI write path. Watch hype's `BLK WRITE ... vec=` DIAG.
+- `vm1 phys-write-nvme` → NVMe **5ME3N005713803V2W** (SKHynix); a direct-boot Linux writes a marker
+  and reads it back — physical NVMe write path + #588 kernel-VM PCI BARs.
+- `suite` → the micro test suite (regression baseline).
+
+Destructive writes to those two serials are **operator-authorized and auto-confirmed** (no `confirm`
+keystroke needed). By-serial targeting means this can only ever touch those two disks — on any other
+machine the serials do not match and nothing is armed. **AMD LAPTOP ONLY.**
+
+Verdicts per VM land in `VM0.LOG` / `VM1.LOG`:
+`SCRIPT vm0: PASS pass (physical-ahci-write-verified)` and `SCRIPT vm1: PASS (physical-nvme-write-verified)`.
+Also check `HYPE.LOG`: `AUTO-CONFIRMED (operator-authorized serial ...)`, the `vec=` counter in the
+`BLK WRITE` DIAG (#295), and `#586 ... PHYSICAL AHCI/SATA backend ... [writable]`.
+
+---
+
 # hype hardware-validation stick — multi-ticket run
 
 Build: **`make clean && make all && make micro`, default flags, no `EXTRA_CFLAGS`.** Every ticket

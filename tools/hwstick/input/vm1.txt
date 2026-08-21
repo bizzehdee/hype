@@ -1,144 +1,17 @@
-# #523 probe: drive vm1 under sustained load PAST t=230s.
-#
-# Both recorded wedges caught vm1 mid package-install, never idle, and the
-# 76b3fb7 run's AP went live=0 at t=230s. A run that stops at 180s with an idle
-# vm1 tests neither condition -- the 60fb26a run ended 50s early and vm1 was
-# still installing packages when power was cut.
-#
-# Every beat carries the GUEST's own uptime, so the log says when the guest
-# stopped rather than when hype last sampled it. Markers are quote-split
-# ("DON''E") so the tty echo of the typed command cannot satisfy its own expect.
-timeout 900000
-fail-if soft lockup
-fail-if detected stalls
-fail-if self-detected stall
-
-expect localhost login:
-send root\n
-expect ~#
-
-send echo VM1-NPROC-$(grep -c ^processor /proc/cpuinfo)\n
-expect VM1-NPROC-2
-
-# IPI counters before load, per CPU column -- the previous wedge left the
-# surviving vCPU idle in HLT, so RES in both columns is the thing to compare.
-send grep -E 'RES|CAL|LOC' /proc/interrupts\n
-expect ~#
-
-# Sustained CD reads from two concurrent jobs, so both vCPUs stay busy without
-# needing taskset (busybox may not carry it). Falls back to a RAM copy if the
-# guest has no /dev/sr0, so the beat never stops for want of a device.
-# The load loop, BUILT LINE BY LINE inside the guest rather than sent as one command.
-#
-# The single-line version of this was 358 bytes against HYPE_INPUT_SCRIPT_MAX_ARG's 128, so hype
-# refused to arm the whole script -- "PARSE ERROR line 31: argument too long" -- and it had been
-# doing so silently for every run that used this file. vm1's guest still booted and still logged,
-# which is why nobody noticed: a VM1.LOG existed, so the script looked like it had worked. The load
-# it was written to apply never ran once.
-#
-# Each send below is well under the limit. Two concurrent dd jobs plus `wait` keep BOTH vCPUs busy,
-# which is the point of the loop; the original used /dev/sr0 with a /dev/zero fallback, and plain
-# /dev/zero is enough for load and removes the dependency on the guest having an optical device.
-send printf '%s\\n' 'for i in $(seq 1 200); do' > /tmp/l.sh\n
-expect ~#
-send printf '%s\\n' ' echo VM1-BEAT-$i-up$(cut -d. -f1 /proc/uptime)' >> /tmp/l.sh\n
-expect ~#
-send printf '%s\\n' ' dd if=/dev/zero of=/dev/null bs=1M count=32 2>/dev/null &' >> /tmp/l.sh\n
-expect ~#
-send printf '%s\\n' ' dd if=/dev/zero of=/dev/null bs=1M count=32 2>/dev/null; wait' >> /tmp/l.sh\n
-expect ~#
-send printf '%s\\n' 'done; echo VM1-LOAD-DON''E' >> /tmp/l.sh\n
-expect ~#
-send sh /tmp/l.sh\n
-expect VM1-LOAD-DONE
-
-send grep -E 'RES|CAL|LOC' /proc/interrupts\n
-expect ~#
-send echo VM1-SCRIPT-EN''D\n
-expect VM1-SCRIPT-END
-
-# ---------------------------------------------------------------------------
-# #525: prove the 0xCF9 guest-reboot path from a NON-BSP vCPU.
-#
-# #482 moved the ACPI reset register into fw_1_shared_port_io() so any vCPU can reboot a guest,
-# and its own notes flag the VMX side as COMPILE-TESTED ONLY. The bare-metal run that closed #482
-# never rebooted anything, so grep for 0xcf9 in that log finds nothing.
-#
-# sysrq-b is the right trigger: it calls emergency_restart() on the CURRENT CPU with no
-# stop_machine and no migration, unlike `reboot`, which Linux may run on CPU 0 whatever asked for
-# it. Pinned with taskset to CPU 1, the reset write therefore comes from vCPU 1 -- exactly the
-# path #525 needs.
-#
-# The delay comes FIRST so #527's 8-minute window is banked before this kills the guest. Without
-# it, a reboot at t=90s would cost the ticket this stick mainly exists for.
-delay 600000
-
-# Say whether taskset exists before relying on it. Its guard earned its keep on the bare-metal AMD
-# run of f1a831f, which reported NO-TASKSET: this Alpine's busybox does not carry it. The old line
-# then sent `taskset -c 1 ...` anyway, which failed with "not found", so the sysrq write NEVER
-# HAPPENED -- and hype logged no 0xCF9, no restart and no 8042 pulse on both that run and the Intel
-# one before it. Two cold boots spent on a command that could not run.
-send command -v taskset >/dev/null && echo HAVE-TASK''SET || echo NO-TASK''SET\n
-expect ~#
-send echo 1 > /proc/sys/kernel/sysrq\n
-expect ~#
-
-# THE RESET, no longer conditional on taskset existing.
-#
-# Pinning was only ever a way to make the write come from a non-BSP vCPU. It is not the only way to
-# LEARN which vCPU served it: hype now names the vCPU in its own log line (#525, d4391ce), so
-# observing beats forcing. So try the pin, and fall back to an unpinned write when taskset is
-# absent -- Linux's sysrq-b calls emergency_restart() on the CURRENT CPU with no stop_machine and no
-# migration, so an unpinned write still comes from whichever vCPU the shell is on, and hype's line
-# says which. With two vCPUs that is a coin toss per boot rather than a guarantee, and a run that
-# lands on vCPU 0 is still a valid data point instead of no data at all.
-#
-# One line, because HYPE_INPUT_SCRIPT_MAX_ARG is 128 bytes and a 358-byte send once silently
-# refused this whole script.
-send taskset -c 1 sh -c 'echo b >/proc/sysrq-trigger' 2>/dev/null || echo b >/proc/sysrq-trigger\n
-
-# ---------------------------------------------------------------------------
-# #525 asks for three things and the script used to prove only the first: that the write was
-# ISSUED. "the guest actually restarts, exactly once, and reaches a login prompt again" is the rest
-# of the bar, and a verdict of `reboot-issued` passes whether or not any of it happened -- a guest
-# that took the reset and never came back would have produced the same PASS.
-#
-# So wait for the login prompt to come round again. This is the FRESH boot's prompt: hype's restart
-# zeroes the guest's RAM and re-enters at the reset vector (M8-4), so everything below runs against
-# a guest that has genuinely started over.
-# TIGHTEN THE TIMEOUT FIRST, because the 900s ceiling set at the top is now the difference between
-# a FAIL inside the run and no verdict at all. Each `expect` gets the whole timeout, so if the reset
-# does not restart the guest, this one would sit for 15 minutes -- pushing the script's verdict to
-# ~26 min, well past when an operator on a cold-boot-only machine would have cut power. A run that
-# ends with no verdict is indistinguishable from a run still in progress, which is the failure mode
-# this project keeps paying for.
-#
-# 3 minutes is generous for an Alpine boot off a local 63 MB disk on bare metal (the ISO-streamed
-# first boot is the slow one, and this is not that), so a genuine restart is never cut off, while a
-# reset that did nothing is reported at ~14 min instead of ~26.
-timeout 180000
-
-expect localhost login:
-send root\n
-expect ~#
-
-# UPTIME IS THE PROOF, not the prompt. A guest that ignored the reset and kept running would also
-# be sitting at a shell -- with an uptime near 700s, since the delay above banked ten minutes
-# before the write. A fresh boot reports single or double digits. The marker carries the number so
-# the log answers "did it restart" rather than "was something alive afterwards".
-send echo VM1-REBOOTED-up$(cut -d. -f1 /proc/uptime)\n
-expect VM1-REBOOTED-up
-
-# And the second vCPU has to come back with it. A restart that returns a 1-CPU guest would satisfy
-# every check above while quietly losing the AP -- which is #523's failure, arriving by a different
-# route.
-send echo VM1-RENPROC-$(grep -c ^processor /proc/cpuinfo)\n
-expect VM1-RENPROC-2
-
-pass vm1-cf9-reboot-from-vcpu1-restarted-and-back-to-login
-
-# EXACTLY ONCE is the one part of the bar a script cannot assert -- there is no counting directive,
-# and a second restart would simply replay these same expects. It is checked in the log instead:
-#   LC_ALL=C grep -ac "0xCF9" HYPE.LOG        -> must be 1
-#   LC_ALL=C grep -ac "vm1 restarted (M8-4)" HYPE.LOG -> must be 1
-# tools/hwstick/README.md carries both greps.
+# HW physical-write validation, vm1: a direct-boot Linux (initramfs shell) writes a marker to the
+# SPARE NVMe (5ME3N005713803V2W) via hype's physical NVMe backend (presented as virtio-blk /dev/vda,
+# BARs programmed by #588) and reads it back byte-exact. Writes auto-confirmed for this serial.
+timeout 300000
+fail-if Kernel panic
+fail-if Unable to mount root
+expect job control turned off
+send \n
+send test -b /dev/vda && echo HAVE-VDA-$?\n
+expect HAVE-VDA-0
+send printf 'HYPE-PHYS-NVME!!' | dd of=/dev/vda bs=512 conv=fsync 2>/dev/null; echo MARK-$?\n
+expect MARK-0
+send sync; echo SYNCED\n
+expect SYNCED
+send echo NVME-$(dd if=/dev/vda bs=16 count=1 2>/dev/null)\n
+expect NVME-HYPE-PHYS-NVME!!
+pass physical-nvme-write-verified

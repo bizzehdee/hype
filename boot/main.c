@@ -20429,6 +20429,30 @@ static void load_hype_cfg(void) {
  * logged and NEVER armed -- a config entry alone is never sufficient (§6d/§10).
  * Called from the host-AHCI enumeration path with the identity it already reads.
  */
+/*
+ * Spare disks the operator authorized for destructive physical writes without the #125 interactive
+ * confirm. Matched against the ENUMERATED drive serial, so it authorizes a disk only if it is
+ * physically present as one of these -- the same by-serial identity discipline that makes a
+ * `physical:` target safe across machines. The gate is dropped for these two serials now and will
+ * be removed entirely later.
+ */
+static const char *const g_write_authorized_serials[] = {
+    "5ME3N005713803V2W", /* AMD laptop spare NVMe (SKHynix HFS256GEJ4X112N) */
+    "2132E5BF4EAE",      /* AMD laptop spare SATA SSD (Crucial CT240BX500SSD1) */
+};
+static int fw_1_serial_write_authorized(const char *serial) {
+    unsigned int i;
+    if (serial == 0 || serial[0] == '\0') {
+        return 0;
+    }
+    for (i = 0; i < sizeof(g_write_authorized_serials) / sizeof(g_write_authorized_serials[0]);
+         i++) {
+        if (hype_streq(serial, g_write_authorized_serials[i])) {
+            return 1;
+        }
+    }
+    return 0;
+}
 static void arm_physical_write_confirm(const hype_cfg_t *cfg, const char *drive_serial,
                                        const char *drive_model, uint64_t total_sectors,
                                        const uint8_t *disk_guid, const uint8_t *sector0,
@@ -20498,6 +20522,18 @@ static void arm_physical_write_confirm(const hype_cfg_t *cfg, const char *drive_
             char pbuf[192];
             hype_debug_print("phys-write: %s\n",
                              hype_phys_confirm_prompt(&g_phys_confirm, pbuf, sizeof(pbuf)));
+        }
+        /*
+         * Operator-authorized spare disks skip the interactive confirm. The operator dropped the
+         * #125 gate for these specific serials (it will be removed entirely later); scoping it to
+         * the ENUMERATED serial keeps every OTHER drive behind the confirmation and can only ever
+         * authorize a disk physically present as one of these -- never the wrong machine's disk.
+         */
+        if (fw_1_serial_write_authorized(drive_serial)) {
+            (void)hype_phys_confirm_submit(&g_phys_confirm, drive_serial);
+            hype_debug_print("phys-write: AUTO-CONFIRMED (operator-authorized serial '%s') for "
+                             "vm '%s'\n", drive_serial, v->name);
+            return;
         }
 #if HYPE_M10_6_AUTOCONFIRM
         /* Headless QEMU-scratch validation only: skip the interactive keystroke
