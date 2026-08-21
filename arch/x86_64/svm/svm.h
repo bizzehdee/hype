@@ -22,6 +22,7 @@
 #include "../../../devices/ps2_keyboard.h"
 #include "../../../devices/ps2_mouse.h"
 #include "../../../devices/bochs_vbe.h"
+#include "../../../devices/xhci_dev.h"
 #include "../../../devices/guest_lapic.h"
 #include "../../../devices/ioapic.h"
 #include "../../../devices/guest_uart.h"
@@ -1317,6 +1318,11 @@ void hype_svm_set_msr_trace(int enabled);
 int hype_svm_vcpu_handle_virtio_blk_npf(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t *dev,
                                          const hype_blk_backend_t *be, const hype_gpa_map_t *dma_map,
                                          uint64_t mmio_base_phys, const uint8_t *insn);
+
+/* #591: guest-facing xHCI controller MMIO. dma_map drives the command/event ring DMA. */
+int hype_svm_vcpu_handle_xhci_npf(hype_vcpu_ctx_t *ctx, hype_xhci_dev_t *dev,
+                                  const hype_gpa_map_t *dma_map, uint64_t mmio_base_phys,
+                                  const uint8_t *insn);
 
 
 /*

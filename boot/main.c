@@ -913,6 +913,13 @@ typedef struct hype_fw_vm {
      */
     hype_e1000_dev_t e1000_net;
     /*
+     * #591: this VM's guest-facing xHCI USB controller. Default-absent, exactly like the VBE and
+     * NIC above -- `xhci_present` is set only when the VM configures a `bus = usb-msc` disk (#593),
+     * and until then the PCI function is never presented. Always allocated so no pointer churn.
+     */
+    hype_xhci_dev_t xhci_dev;
+    int xhci_present;
+    /*
      * WHICH one this VM has. The forwarding plane -- proxy ARP, address learning, the on-link check,
      * NAPT, the peer mailbox -- is identical for both, so it goes through this rather than branching
      * at every site. `nic_ops` being NULL means this VM has no NIC, which is the default.
@@ -1152,6 +1159,9 @@ typedef struct hype_fw_vm {
      */
     volatile uint64_t shared_vbe_bar;
     volatile unsigned shared_vbe_mapped;
+    /* #591: the guest xHCI controller's BAR0 window, same publish-on-VM latch convention. */
+    volatile uint64_t shared_xhci_bar;
+    volatile unsigned shared_xhci_mapped;
     /*
      * #520: the SIPI entry a vCPU must apply to ITSELF.
      *
@@ -3505,6 +3515,8 @@ static void fw_1_longvmrun_record(unsigned vm_idx, const hype_longvmrun_t *e) {
  * (fn2 = the SATA disk). Free: 1, 9-30.
  */
 #define HYPE_FW_1_PCI_DEV_BOCHS_VBE 8u
+/* #591: the guest-facing xHCI controller. Device 9 (was free), present only for a bus = usb-msc VM. */
+#define HYPE_FW_1_PCI_DEV_XHCI 9u
 /*
  * NET-2 (#81): the guest virtio-net adapter, present only when `net_mode = nat`. Device 4 -- the
  * lowest free slot, and clear of the device-6 aliasing between the VBE adapter and disk slot 1
@@ -6320,6 +6332,15 @@ static int vmm_handle_virtio_blk_npf_map(hype_vmm_kind_t kind, hype_vcpu_ctx_t *
     return kind == HYPE_VMM_KIND_VMX
                ? hype_vmx_vcpu_handle_virtio_blk_npf_map(ctx, dev, be, dma_map, mmio_base_phys, insn)
                : hype_svm_vcpu_handle_virtio_blk_npf(ctx, dev, be, dma_map, mmio_base_phys, insn);
+}
+
+/* #591: kind-dispatch for the guest-facing xHCI controller's MMIO. */
+static int vmm_handle_xhci_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_xhci_dev_t *dev,
+                               const hype_gpa_map_t *dma_map, uint64_t mmio_base_phys,
+                               const uint8_t *insn) {
+    return kind == HYPE_VMM_KIND_VMX
+               ? hype_vmx_vcpu_handle_xhci_npf(ctx, dev, dma_map, mmio_base_phys, insn)
+               : hype_svm_vcpu_handle_xhci_npf(ctx, dev, dma_map, mmio_base_phys, insn);
 }
 
 /*
@@ -9587,6 +9608,31 @@ static void fw_1_bochs_vbe_present(hype_fw_vm_t *vm) {
 }
 
 /*
+ * #591: present the guest-facing xHCI controller. Default-absent -- only a VM that set
+ * vm->xhci_present (a bus = usb-msc disk, #593) gets the PCI function. Class 0x0C/0x03/0x30
+ * (serial bus / USB / xHCI), one 4 KiB MMIO BAR0, a legacy interrupt line. The device model is
+ * reset here so its rings/slots start empty; the backing USB-MSC device is attached by #592.
+ */
+static void fw_1_xhci_present(hype_fw_vm_t *vm) {
+    unsigned int idx = (unsigned int)(vm - g_vms);
+    if (!vm->xhci_present) {
+        return;
+    }
+    if (fw_1_pci_add_device(&vm->pci, HYPE_FW_1_PCI_DEV_XHCI, HYPE_PCI_VENDOR_ID_HYPE, 0x000Au, 0x0Cu,
+                            0x03u, 0x30u, "guest xHCI USB controller") != 0) {
+        vm->xhci_present = 0;
+        return;
+    }
+    hype_pci_set_bar_size(&vm->pci, HYPE_FW_1_PCI_DEV_XHCI, 0, HYPE_XHCI_BAR_SIZE);
+    hype_pci_set_interrupt(&vm->pci, HYPE_FW_1_PCI_DEV_XHCI, 1, 11);
+    hype_pci_set_msi_capability(&vm->pci, HYPE_FW_1_PCI_DEV_XHCI);
+    hype_xhci_dev_reset(&vm->xhci_dev, 1 /* the emulated USB-MSC device is on the port */);
+    hype_debug_print("fw-1[vm %u]: guest xHCI controller presented at PCI dev %u, BAR0 %u bytes "
+                     "[#591]\n",
+                     idx, HYPE_FW_1_PCI_DEV_XHCI, HYPE_XHCI_BAR_SIZE);
+}
+
+/*
  * NET-2 (#81): the guest's virtio-net adapter, presented only when `net_mode = nat`.
  *
  * The MAC is DERIVED FROM THE VM INDEX and is stable for the life of the VM, because the NAT plane
@@ -10051,6 +10097,14 @@ static void fw_1_program_kernel_bars(hype_fw_vm_t *vm) {
             vm->shared_vbe_mapped = 1u;
         }
     }
+    if (vm->xhci_present &&
+        hype_pci_memory_space_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_XHCI)) {
+        uint64_t bar = hype_pci_get_bar_value(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_XHCI, 0);
+        if (bar != 0) {
+            vm->shared_xhci_bar = bar;
+            vm->shared_xhci_mapped = 1u;
+        }
+    }
     {
         unsigned int slot;
         for (slot = 1u; slot < HYPE_FW_1_MAX_DISKS; slot++) {
@@ -10140,6 +10194,7 @@ static void fw_1_attach_storage(hype_fw_vm_t *vm) {
      */
     fw_1_setup_virtio_blk(vm);
     fw_1_bochs_vbe_present(vm); /* #565: only when display = bochs */
+    fw_1_xhci_present(vm);      /* #591: only when a bus = usb-msc disk is configured */
     fw_1_guest_nic_present(vm); /* #81/#82: only when net_mode = nat */
     if (fw_1_target_bus(vm) == HYPE_CFG_BUS_AHCI_SATA) {
         /* AFTER fw_1_setup_virtio_blk: that is what fills in the capacity. Attaching before it
@@ -10616,7 +10671,8 @@ typedef enum {
     HYPE_FW_DEV_NVME,
     HYPE_FW_DEV_DISK_SLOT,
     HYPE_FW_DEV_FLASH,
-    HYPE_FW_DEV_TPM /* #433 */
+    HYPE_FW_DEV_TPM, /* #433 */
+    HYPE_FW_DEV_XHCI /* #591 */
 } hype_fw_dev_t;
 
 typedef struct {
@@ -10950,6 +11006,21 @@ static hype_fw_dev_t fw_1_shared_mmio_npf(hype_fw_vm_t *vm, hype_vmm_kind_t kind
         if (refusal != 0) {
             refusal->dev = HYPE_FW_DEV_VBE;
             refusal->base = (uint64_t)vm->shared_vbe_bar;
+        }
+        return HYPE_FW_DEV_NONE;
+    }
+
+    /* #591: the guest xHCI controller's BAR0. Served from this dispatch so a guest driving USB
+     * from any vCPU is answered rather than absorbed, the same as the other shared windows. */
+    if (vm->shared_xhci_mapped && npf.guest_phys_addr >= vm->shared_xhci_bar &&
+        npf.guest_phys_addr < vm->shared_xhci_bar + HYPE_XHCI_BAR_SIZE) {
+        if (vmm_handle_xhci_npf(kind, ctx, &vm->xhci_dev, &g_fw_1_dma_map,
+                                (uint64_t)vm->shared_xhci_bar, insn) == 0) {
+            return HYPE_FW_DEV_XHCI;
+        }
+        if (refusal != 0) {
+            refusal->dev = HYPE_FW_DEV_XHCI;
+            refusal->base = (uint64_t)vm->shared_xhci_bar;
         }
         return HYPE_FW_DEV_NONE;
     }
@@ -17330,6 +17401,18 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                             vm->shared_vbe_mapped = 1u;
                             hype_debug_print("fw-1: Bochs VBE BAR2 enabled at guest-physical 0x%llx -- "
                                              "routing its MMIO to the VBE model now [#565]\n",
+                                             (unsigned long long)bar);
+                        }
+                    }
+                    /* #591: the same latch for the guest xHCI controller's BAR0, when present. */
+                    if (vm->xhci_present && !vm->shared_xhci_mapped &&
+                        hype_pci_memory_space_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_XHCI)) {
+                        uint64_t bar = hype_pci_get_bar_value(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_XHCI, 0);
+                        if (bar != 0) {
+                            vm->shared_xhci_bar = bar;
+                            vm->shared_xhci_mapped = 1u;
+                            hype_debug_print("fw-1: guest xHCI BAR0 enabled at guest-physical 0x%llx "
+                                             "-- routing its MMIO to the xHCI model now [#591]\n",
                                              (unsigned long long)bar);
                         }
                     }

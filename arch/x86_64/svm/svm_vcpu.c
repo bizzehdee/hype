@@ -3936,6 +3936,68 @@ int hype_svm_vcpu_handle_bochs_vbe_npf(hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *d
     return 0;
 }
 
+/*
+ * #591: guest-facing xHCI controller MMIO. Same decode/RIP-advance skeleton as the virtio-blk
+ * handler; the model's own mmio_read/write take the width and drive the ring DMA through dma_map
+ * (a doorbell write processes the command ring and posts events into guest memory).
+ */
+int hype_svm_vcpu_handle_xhci_npf(hype_vcpu_ctx_t *ctx, hype_xhci_dev_t *dev,
+                                  const hype_gpa_map_t *dma_map, uint64_t mmio_base_phys,
+                                  const uint8_t *insn) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_svm_npf_t npf;
+    hype_mmio_decode_t decoded;
+    uint64_t *reg;
+    uint32_t offset;
+    const uint8_t *guest_bytes;
+
+    hype_svm_decode_npf_info(real->vmcb->control.exitinfo1, real->vmcb->control.exitinfo2, &npf);
+
+    if (npf.guest_phys_addr < mmio_base_phys ||
+        npf.guest_phys_addr >= mmio_base_phys + HYPE_XHCI_BAR_SIZE) {
+        return -1;
+    }
+    offset = (uint32_t)(npf.guest_phys_addr - mmio_base_phys);
+
+    guest_bytes = (insn != 0) ? insn : (const uint8_t *)(uintptr_t)real->vmcb->save.rip;
+    if (hype_mmio_decode(guest_bytes, HYPE_MMIO_MAX_INSTR_BYTES, &decoded) != 0) {
+        return -1;
+    }
+    if (decoded.is_write != npf.is_write) {
+        return -1;
+    }
+    reg = decoded.has_imm ? 0 : gpr_ptr(real, decoded.reg);
+    if (reg == 0 && !decoded.has_imm) {
+        return -1;
+    }
+
+    if (decoded.is_write) {
+        uint64_t value;
+        if (decoded.mem_is_dst) {
+            uint64_t cur = 0;
+            if (hype_xhci_dev_mmio_read(dev, offset, decoded.size_bytes, &cur) != 0) {
+                return -1;
+            }
+            value = hype_mmio_rmw_value(&decoded, reg ? *reg : 0u, (uint32_t)cur,
+                                        &real->vmcb->save.rflags);
+        } else {
+            value = hype_mmio_store_value(&decoded, reg ? *reg : 0u);
+        }
+        if (hype_xhci_dev_mmio_write(dev, offset, decoded.size_bytes, value, dma_map) != 0) {
+            return -1;
+        }
+    } else {
+        uint64_t value = 0;
+        if (hype_xhci_dev_mmio_read(dev, offset, decoded.size_bytes, &value) != 0) {
+            return -1;
+        }
+        hype_mmio_complete_read(&decoded, reg, value, &real->vmcb->save.rflags);
+    }
+
+    real->vmcb->save.rip += decoded.instr_len;
+    return 0;
+}
+
 /* GLADDER-1: absorb an MMIO NPF to an UNMODELED guest-physical region. Real
  * hardware returns all-ones for reads of absent MMIO and drops writes; hype
  * previously PANICked on any unhandled NPF, so a fuller kernel probing a chipset

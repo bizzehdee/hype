@@ -2798,6 +2798,43 @@ int hype_vmx_vcpu_handle_bochs_vbe_npf(hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *d
     return 0;
 }
 
+/*
+ * #591: VMX MMIO handler for the guest-facing xHCI BAR. Mirror of the bochs/virtio VMX handlers;
+ * the model's mmio_read/write take the width and drive ring DMA through dma_map.
+ */
+int hype_vmx_vcpu_handle_xhci_npf(hype_vcpu_ctx_t *ctx, hype_xhci_dev_t *dev,
+                                  const hype_gpa_map_t *dma_map, uint64_t mmio_base_phys,
+                                  const uint8_t *insn) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    struct vmx_mmio_access m;
+    if (vmx_mmio_begin_insn(real, mmio_base_phys, HYPE_XHCI_BAR_SIZE, insn, &m) != 0) {
+        return -1;
+    }
+    if (m.decoded.is_write) {
+        uint32_t cur = 0;
+        if (m.decoded.mem_is_dst) {
+            uint64_t cur64 = 0;
+            if (hype_xhci_dev_mmio_read(dev, m.offset, m.decoded.size_bytes, &cur64) != 0) {
+                return -1;
+            }
+            cur = (uint32_t)cur64;
+        }
+        uint32_t value = vmx_mmio_store_val(&m, cur);
+        if (hype_xhci_dev_mmio_write(dev, m.offset, m.decoded.size_bytes, value, dma_map) != 0) {
+            return -1;
+        }
+    } else {
+        uint64_t value = 0;
+        if (hype_xhci_dev_mmio_read(dev, m.offset, m.decoded.size_bytes, &value) != 0) {
+            return -1;
+        }
+        vmx_mmio_finish_read(&m, value);
+    }
+    vmx_mmio_end(&m);
+    return 0;
+}
+
 /* VMX MMIO handler for the virtio-blk BAR (VMX-2): mirror of
  * hype_svm_vcpu_handle_virtio_blk_npf. Routes the BAR offset to the virtio
  * common/notify/ISR/device-config regions; a notify write kicks the queue,

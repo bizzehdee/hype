@@ -64,7 +64,8 @@ DEVICE_SRCS := devices/pic.c devices/pit.c devices/hpet.c devices/smbios.c devic
                devices/cmos.c devices/ps2_keyboard.c devices/ps2_mouse.c devices/bochs_vbe.c \
                devices/fb_blit.c devices/virtio_blk.c devices/ata_disk.c devices/e820.c \
                devices/guest_lapic.c devices/guest_uart.c devices/vt_filter.c devices/pvclock.c \
-               devices/ioapic.c devices/nvme.c devices/virtio_net.c devices/e1000_dev.c
+               devices/ioapic.c devices/nvme.c devices/virtio_net.c devices/e1000_dev.c \
+               devices/xhci_dev.c
 BOOT_SRCS := boot/main.c
 SRCS      := $(BOOT_SRCS) $(CORE_SRCS) $(ARCH_SRCS) $(DEVICE_SRCS)
 OBJS      := $(patsubst %.c,$(BUILD_DIR)/%.o,$(SRCS)) \
