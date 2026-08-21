@@ -9,6 +9,33 @@ Add a learning when an incident teaches something a future agent would
 otherwise re-learn the hard way. Keep each file to one finding. Cite the ticket
 number and the observable evidence, not just the conclusion.
 
+## Invariants — the hard rules, one per doc
+
+These are not war-stories; they are the project's non-negotiable rules, above
+performance, features, and convenience. **Do not weaken any of them without
+updating `plan.md` §10 first.** `AGENTS.md` lists them as one-liners and points
+here for the full text and rationale.
+
+- [invariant-security-boundaries.md](invariant-security-boundaries.md) — the
+  host↔guest and guest↔guest boundaries are paramount; no unintentional leakage.
+- [invariant-guest-isolation.md](invariant-guest-isolation.md) — validate every
+  guest-supplied address/length against the VM's own mapped range; no colliding
+  cpu_set/target_disk/varstore; default-deny guest networking; fault one guest
+  alone.
+- [invariant-cpu-time-isolation.md](invariant-cpu-time-isolation.md) — a vCPU
+  never loses CPU-time isolation; `dedicated` holds by construction, `shared`
+  only because preemption is mandatory.
+- [invariant-core-allocation.md](invariant-core-allocation.md) — a physical core
+  is the unit of allocation and a vCPU IS a physical core; SMT is a bonus, never
+  idle a sibling or disable SMT.
+- [invariant-guest-ram-zeroed.md](invariant-guest-ram-zeroed.md) — guest RAM is
+  zeroed before first execution, every (re)start.
+- [invariant-no-direct-hw-access.md](invariant-no-direct-hw-access.md) — no
+  guest gets direct hardware access; always host-driver + emulated frontend.
+- [invariant-physical-write-guard.md](invariant-physical-write-guard.md) —
+  destructive `physical:` writes are triple-guarded (serial match, confirm,
+  non-empty-PT guard).
+
 ## Index
 
 - [milestone-by-subject.md](milestone-by-subject.md) — a ticket's milestone
