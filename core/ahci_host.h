@@ -337,4 +337,20 @@ int hype_ahci_host_build_write_dma_ext_sg(uint8_t *cmd_table, uint64_t lba, uint
                                           const hype_ahci_host_sg_t *segs, unsigned int nsegs,
                                           unsigned int max_prdt);
 
+/*
+ * #295: most PRDT entries one command table carries -- the vectored write path's per-command
+ * segment cap. 32 matches HYPE_VIRTIO_BLK_SEG_MAX, so a whole guest request that honours the
+ * advertised seg_max always fits one command. g_cmd_table in ahci_host_hw.c is sized from this.
+ */
+#define HYPE_AHCI_HOST_SG_MAX_PRDT 32u
+
+/*
+ * #295: issue ONE WRITE DMA EXT whose data comes from `nsegs` scattered host buffers (`count` =
+ * total sectors, must equal the segment sum -- the builder refuses a mismatch). Serialised per
+ * port like the scalar read/write. Hardware-touching shim; the batching decisions live in
+ * blk_phys.c and the command construction in hype_ahci_host_build_write_dma_ext_sg, both tested.
+ */
+int hype_ahci_host_writev(uint64_t abar_phys, unsigned port, uint64_t lba,
+                          const hype_ahci_host_sg_t *sg, unsigned int nsegs, uint16_t count);
+
 #endif /* HYPE_CORE_AHCI_HOST_H */

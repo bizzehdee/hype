@@ -31,9 +31,28 @@
  * through a read-only backend is rejected. Return 0 on success, -1 on a
  * backing-store error.
  */
+/*
+ * #295: one segment of a vectored write -- `count` sectors taken from `buf`. The segments of one
+ * hype_blk_backend_writev() call land CONTIGUOUSLY on the medium starting at its `lba`; only the
+ * host-side buffers are scattered. That is the virtio-blk multi-segment request shape: the guest's
+ * pages are scattered, the disk range is one run.
+ */
+typedef struct {
+    const void *buf;
+    uint32_t count; /* sectors; never 0 in a valid call */
+} hype_blk_seg_t;
+
 typedef struct hype_blk_backend {
     int (*read)(void *ctx, uint64_t lba, uint32_t count, void *buf);
     int (*write)(void *ctx, uint64_t lba, uint32_t count, const void *buf);
+    /*
+     * #295: OPTIONAL vectored write -- the whole segment list as ONE backend operation (for the
+     * physical AHCI backend, one multi-PRDT command instead of one command per segment). NULL is
+     * normal and means the dispatcher falls back to `write` per segment; a backend only implements
+     * this when one call is genuinely cheaper than N. Impls receive an already-validated total
+     * range, same contract as `read`/`write`.
+     */
+    int (*writev)(void *ctx, uint64_t lba, const hype_blk_seg_t *segs, uint32_t nsegs);
     void *ctx;
     uint64_t total_sectors; /* backend capacity, in 512-byte sectors */
 } hype_blk_backend_t;
@@ -79,6 +98,14 @@ typedef struct {
     uint64_t first_tsc; /* clock reading at the FIRST write; 0 if no clock installed */
     uint32_t max_count; /* largest single request, in sectors */
     uint32_t hist[HYPE_BLK_WSTATS_BUCKETS];
+    /*
+     * #295: the merge counters the ticket requires, so the benefit is measured rather than
+     * assumed. Counted only when a vectored write actually went down a backend's `writev` impl --
+     * the fallback loop is N ordinary writes and is already visible as N entries above.
+     */
+    uint64_t vec_writes;  /* writev calls served by a vectored impl (one command each) */
+    uint64_t vec_segs;    /* segments those calls carried in total */
+    uint32_t vec_max_segs; /* largest single merge, in segments */
 } hype_blk_wstats_t;
 
 /*
@@ -115,6 +142,23 @@ hype_blk_wstats_t *hype_blk_wstats(void);
 int hype_blk_backend_read(const hype_blk_backend_t *be, uint64_t lba, uint32_t count, void *buf);
 int hype_blk_backend_write(const hype_blk_backend_t *be, uint64_t lba, uint32_t count,
                            const void *buf);
+
+/*
+ * #295: bounds-check + dispatch a vectored write of `nsegs` scattered host buffers to ONE
+ * contiguous [lba, lba+total) run, where total is the sum of the segment counts. The whole range
+ * is validated (with 64-bit, overflow-guarded summation) before ANY byte moves, so a list whose
+ * tail is out of bounds is refused having written nothing -- never partially applied.
+ *
+ * With a `writev` impl the list is one backend operation and is recorded in wstats as one write of
+ * `total` sectors (plus the vec_* merge counters). Without one, each segment goes through the
+ * `write` impl in order and is recorded individually -- so the wstats histogram always reflects
+ * the commands the backend actually saw, and a before/after comparison of the merge is honest.
+ * Returns 0, or -1 on a NULL/read-only backend, an empty or invalid list, an out-of-bounds total,
+ * or a backend error (fallback segments already written stay written, exactly as a mid-request
+ * device error behaves -- the caller reports the whole request failed).
+ */
+int hype_blk_backend_writev(const hype_blk_backend_t *be, uint64_t lba,
+                            const hype_blk_seg_t *segs, uint32_t nsegs);
 
 /*
  * File-backed implementation: a raw disk image resident in a host buffer

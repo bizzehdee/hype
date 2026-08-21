@@ -232,6 +232,170 @@ static void test_backend_write_records_only_on_success(void) {
     }
 }
 
+
+/* --- #295: the vectored write dispatcher --- */
+
+/* A recording fake: logs every writev/write call so tests can assert WHICH path served it. */
+#define VLOG_MAX 16
+typedef struct {
+    int vec_calls;
+    int scalar_calls;
+    uint64_t last_lba;
+    uint32_t last_nsegs;
+    uint64_t scalar_lbas[VLOG_MAX];
+    uint32_t scalar_counts[VLOG_MAX];
+    int fail_on_call; /* 1-based call number to fail on; 0 = never */
+    uint8_t sink[64 * HYPE_BLK_SECTOR_SIZE];
+} vfake_t;
+
+static int vfake_write(void *ctx, uint64_t lba, uint32_t count, const void *buf) {
+    vfake_t *f = (vfake_t *)ctx;
+    f->scalar_calls++;
+    if (f->fail_on_call != 0 && f->scalar_calls == f->fail_on_call) {
+        return -1;
+    }
+    if (f->scalar_calls <= VLOG_MAX) {
+        f->scalar_lbas[f->scalar_calls - 1] = lba;
+        f->scalar_counts[f->scalar_calls - 1] = count;
+    }
+    memcpy(f->sink + lba * HYPE_BLK_SECTOR_SIZE, buf, (size_t)count * HYPE_BLK_SECTOR_SIZE);
+    return 0;
+}
+
+static int vfake_writev(void *ctx, uint64_t lba, const hype_blk_seg_t *segs, uint32_t nsegs) {
+    vfake_t *f = (vfake_t *)ctx;
+    uint32_t i;
+    f->vec_calls++;
+    f->last_lba = lba;
+    f->last_nsegs = nsegs;
+    for (i = 0; i < nsegs; i++) {
+        memcpy(f->sink + lba * HYPE_BLK_SECTOR_SIZE, segs[i].buf,
+               (size_t)segs[i].count * HYPE_BLK_SECTOR_SIZE);
+        lba += segs[i].count;
+    }
+    return 0;
+}
+
+static void vfake_backend(vfake_t *f, hype_blk_backend_t *be, int with_vec) {
+    memset(f, 0, sizeof(*f));
+    be->read = 0;
+    be->write = vfake_write;
+    be->writev = with_vec ? vfake_writev : 0;
+    be->ctx = f;
+    be->total_sectors = 64u;
+}
+
+static void test_writev_vectored_path_and_stats(void) {
+    vfake_t f;
+    hype_blk_backend_t be;
+    uint8_t a[2 * HYPE_BLK_SECTOR_SIZE], b[HYPE_BLK_SECTOR_SIZE], c[3 * HYPE_BLK_SECTOR_SIZE];
+    hype_blk_seg_t segs[3] = {{a, 2u}, {b, 1u}, {c, 3u}};
+    hype_blk_wstats_t *g = hype_blk_wstats();
+    uint64_t w0, v0, s0;
+
+    memset(a, 0xA1, sizeof(a));
+    memset(b, 0xB2, sizeof(b));
+    memset(c, 0xC3, sizeof(c));
+    vfake_backend(&f, &be, 1);
+    w0 = g->writes; v0 = g->vec_writes; s0 = g->vec_segs;
+
+    CHECK_HEX("vectored writev accepted", 0, hype_blk_backend_writev(&be, 10u, segs, 3u));
+    CHECK_HEX("one vectored impl call", 1, f.vec_calls);
+    CHECK_HEX("no scalar calls", 0, f.scalar_calls);
+    CHECK_HEX("impl saw the start lba", 10u, f.last_lba);
+    CHECK_HEX("impl saw all 3 segments", 3u, f.last_nsegs);
+    CHECK_HEX("recorded as ONE write", w0 + 1u, g->writes);
+    CHECK_HEX("vec_writes counted", v0 + 1u, g->vec_writes);
+    CHECK_HEX("vec_segs counted", s0 + 3u, g->vec_segs);
+    /* Data landed contiguously: [10,12)=A1, [12,13)=B2, [13,16)=C3. */
+    CHECK_HEX("seg 0 first byte", 0xA1, f.sink[10u * HYPE_BLK_SECTOR_SIZE]);
+    CHECK_HEX("seg 1 first byte", 0xB2, f.sink[12u * HYPE_BLK_SECTOR_SIZE]);
+    CHECK_HEX("seg 2 last byte", 0xC3, f.sink[16u * HYPE_BLK_SECTOR_SIZE - 1u]);
+}
+
+static void test_writev_fallback_loops_scalar_writes(void) {
+    vfake_t f;
+    hype_blk_backend_t be;
+    uint8_t a[HYPE_BLK_SECTOR_SIZE], b[2 * HYPE_BLK_SECTOR_SIZE];
+    hype_blk_seg_t segs[2] = {{a, 1u}, {b, 2u}};
+    hype_blk_wstats_t *g = hype_blk_wstats();
+    uint64_t w0, v0;
+
+    memset(a, 0x11, sizeof(a));
+    memset(b, 0x22, sizeof(b));
+    vfake_backend(&f, &be, 0); /* no writev impl */
+    w0 = g->writes; v0 = g->vec_writes;
+
+    CHECK_HEX("fallback writev accepted", 0, hype_blk_backend_writev(&be, 5u, segs, 2u));
+    CHECK_HEX("no vectored calls", 0, f.vec_calls);
+    CHECK_HEX("two scalar calls", 2, f.scalar_calls);
+    CHECK_HEX("scalar call 0 lba", 5u, f.scalar_lbas[0]);
+    CHECK_HEX("scalar call 1 lba advanced", 6u, f.scalar_lbas[1]);
+    CHECK_HEX("scalar call 1 count", 2u, f.scalar_counts[1]);
+    CHECK_HEX("recorded as TWO writes (honest histogram)", w0 + 2u, g->writes);
+    CHECK_HEX("vec counters untouched by the fallback", v0, g->vec_writes);
+    CHECK_HEX("fallback data seg 1", 0x22, f.sink[6u * HYPE_BLK_SECTOR_SIZE]);
+}
+
+static void test_writev_validates_whole_list_before_any_byte(void) {
+    vfake_t f;
+    hype_blk_backend_t be;
+    uint8_t a[HYPE_BLK_SECTOR_SIZE];
+    /* Total = 1 + 63 = 64 sectors starting at lba 1 -> [1,65) exceeds the 64-sector backend. */
+    hype_blk_seg_t oob[2] = {{a, 1u}, {a, 63u}};
+    hype_blk_seg_t zero[2] = {{a, 1u}, {a, 0u}};
+
+    vfake_backend(&f, &be, 0);
+    CHECK_HEX("out-of-bounds tail refused", -1, hype_blk_backend_writev(&be, 1u, oob, 2u));
+    CHECK_HEX("NOTHING was written for the oob list", 0, f.scalar_calls);
+    CHECK_HEX("zero-count segment refused", -1, hype_blk_backend_writev(&be, 0u, zero, 2u));
+    CHECK_HEX("NOTHING was written for the zero-seg list", 0, f.scalar_calls);
+    CHECK_HEX("empty list refused", -1, hype_blk_backend_writev(&be, 0u, oob, 0u));
+    CHECK_HEX("NULL segs refused", -1, hype_blk_backend_writev(&be, 0u, 0, 1u));
+    CHECK_HEX("NULL backend refused", -1, hype_blk_backend_writev(0, 0u, oob, 1u));
+}
+
+static void test_writev_read_only_backend_refused(void) {
+    hype_blk_backend_t ro;
+    uint8_t a[HYPE_BLK_SECTOR_SIZE];
+    hype_blk_seg_t segs[1] = {{a, 1u}};
+    ro.read = 0;
+    ro.write = 0;
+    ro.writev = 0;
+    ro.ctx = 0;
+    ro.total_sectors = 16u;
+    CHECK_HEX("read-only backend refuses writev", -1, hype_blk_backend_writev(&ro, 0u, segs, 1u));
+}
+
+static void test_writev_fallback_failure_stops_and_reports(void) {
+    vfake_t f;
+    hype_blk_backend_t be;
+    uint8_t a[HYPE_BLK_SECTOR_SIZE];
+    hype_blk_seg_t segs[3] = {{a, 1u}, {a, 1u}, {a, 1u}};
+    hype_blk_wstats_t *g = hype_blk_wstats();
+    uint64_t w0;
+
+    vfake_backend(&f, &be, 0);
+    f.fail_on_call = 2;
+    w0 = g->writes;
+    CHECK_HEX("mid-list failure reported", -1, hype_blk_backend_writev(&be, 0u, segs, 3u));
+    CHECK_HEX("stopped at the failing segment", 2, f.scalar_calls);
+    CHECK_HEX("only the SUCCESSFUL segment was counted", w0 + 1u, g->writes);
+}
+
+static void test_writev_32bit_total_overflow_refused(void) {
+    vfake_t f;
+    hype_blk_backend_t be;
+    uint8_t a[HYPE_BLK_SECTOR_SIZE];
+    /* Two segments summing past 2^32 sectors must be refused by arithmetic, not by luck. */
+    hype_blk_seg_t big[2] = {{a, 0xFFFFFFFFu}, {a, 2u}};
+
+    vfake_backend(&f, &be, 0);
+    be.total_sectors = 0xFFFFFFFFFFFFFFFFull; /* capacity is NOT the guard under test */
+    CHECK_HEX("total > 32 bits refused", -1, hype_blk_backend_writev(&be, 0u, big, 2u));
+    CHECK_HEX("nothing written", 0, f.scalar_calls);
+}
+
 int main(void) {
     test_range_in_bounds();
     test_file_read();
@@ -245,6 +409,13 @@ int main(void) {
     test_wstats_first_tsc_is_the_first_write();
     test_wstats_kbps();
     test_backend_write_records_only_on_success();
+
+    test_writev_vectored_path_and_stats();
+    test_writev_fallback_loops_scalar_writes();
+    test_writev_validates_whole_list_before_any_byte();
+    test_writev_read_only_backend_refused();
+    test_writev_fallback_failure_stops_and_reports();
+    test_writev_32bit_total_overflow_refused();
 
     if (failures == 0) {
         printf("all tests passed\n");

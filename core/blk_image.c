@@ -125,6 +125,7 @@ int hype_blk_image_init(hype_blk_image_t *img, hype_blk_backend_t *be, const hyp
 
     be->read = image_read;
     be->write = (write_sectors != 0) ? image_write : 0;
+    be->writev = 0; /* #295: no vectored impl -- N scalar writes cost the same here */
     be->ctx = img;
     be->total_sectors = capacity;
     return 0;

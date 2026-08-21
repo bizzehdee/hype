@@ -29,7 +29,17 @@
 #define AHCI_HOST_MAX_PORTS 32u
 static uint8_t g_cmd_list[AHCI_HOST_MAX_PORTS][1024] __attribute__((aligned(1024)));
 static uint8_t g_recv_fis[AHCI_HOST_MAX_PORTS][256] __attribute__((aligned(256)));
-static uint8_t g_cmd_table[AHCI_HOST_MAX_PORTS][256] __attribute__((aligned(128)));
+/*
+ * #295: sized for the vectored write path -- 0x80 bytes of CFIS/ACMD ahead of the PRDT, then one
+ * 16-byte entry per segment up to HYPE_AHCI_HOST_SG_MAX_PRDT (32, matching the seg_max hype's
+ * virtio-blk advertises, so a whole multi-segment guest request rides one command). The old 256
+ * held 8 entries, which silently bounded any merge at a quarter of what the guest is told it may
+ * send. 128-byte alignment is the AHCI requirement; 32 ports * 640 B rounds to 20 KiB of .bss.
+ */
+static uint8_t g_cmd_table[AHCI_HOST_MAX_PORTS]
+                          [HYPE_AHCI_HOST_CT_PRDT_OFF +
+                           HYPE_AHCI_HOST_SG_MAX_PRDT * HYPE_AHCI_HOST_PRDT_ENTRY_SIZE]
+    __attribute__((aligned(128)));
 
 /*
  * #343: serialise commands per port.
@@ -491,6 +501,53 @@ static int ahci_write_locked(uint64_t abar_phys, unsigned port, uint64_t lba, ui
     } else if ((rd32(pb, HYPE_AHCI_PREG_TFD) & TFD_STS_ERR) != 0u) {
         rc = -1;
     }
+    return rc;
+}
+
+/*
+ * #295: one WRITE DMA EXT carrying the whole segment list -- one PRDT entry per segment, one
+ * command completion instead of nsegs of them. The caller (blk_phys's batching loop) guarantees
+ * nsegs <= HYPE_AHCI_HOST_SG_MAX_PRDT and the total <= one command's ceiling; both are re-checked
+ * by the builder anyway, because this is the destructive path and "the caller promised" is not a
+ * bounds check.
+ */
+static int ahci_writev_locked(uint64_t abar_phys, unsigned port, uint64_t lba,
+                              const hype_ahci_host_sg_t *sg, unsigned int nsegs, uint16_t count) {
+    if (port >= AHCI_HOST_MAX_PORTS) {
+        return -1;
+    }
+    volatile uint8_t *abar = (volatile uint8_t *)(uintptr_t)abar_phys;
+    volatile uint8_t *pb = port_base(abar, port);
+    int rc = 0;
+
+    if (hype_ahci_host_build_write_dma_ext_sg(g_cmd_table[port], lba, count, sg, nsegs,
+                                              HYPE_AHCI_HOST_SG_MAX_PRDT) != 0) {
+        return -1;
+    }
+    hype_ahci_host_build_cmd_header(g_cmd_list[port], /*is_write=*/1, /*prdtl=*/(uint16_t)nsegs,
+                                    (uint64_t)(uintptr_t)g_cmd_table[port]);
+
+    if (wait_clear(pb, HYPE_AHCI_PREG_TFD, TFD_STS_BSY | TFD_STS_DRQ, SPIN_READY) != 0) {
+        return -1;
+    }
+    wr32(pb, HYPE_AHCI_PREG_CI, 1u);
+    if (wait_clear(pb, HYPE_AHCI_PREG_CI, 1u, SPIN_CMD) != 0) {
+        rc = -1;
+    } else if ((rd32(pb, HYPE_AHCI_PREG_TFD) & TFD_STS_ERR) != 0u) {
+        rc = -1;
+    }
+    return rc;
+}
+
+int hype_ahci_host_writev(uint64_t abar_phys, unsigned port, uint64_t lba,
+                          const hype_ahci_host_sg_t *sg, unsigned int nsegs, uint16_t count) {
+    int rc;
+    if (port >= AHCI_HOST_MAX_PORTS) {
+        return -1;
+    }
+    ahci_port_lock(port);
+    rc = ahci_writev_locked(abar_phys, port, lba, sg, nsegs, count);
+    ahci_port_unlock(port);
     return rc;
 }
 

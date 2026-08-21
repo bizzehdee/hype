@@ -27,10 +27,26 @@
 
 typedef int (*hype_blk_phys_read_fn)(void *hw, uint64_t lba, uint32_t count, void *buf);
 typedef int (*hype_blk_phys_write_fn)(void *hw, uint64_t lba, uint32_t count, const void *buf);
+/*
+ * #295: one hw call carrying a whole segment list as ONE device command (multi-PRDT on AHCI). The
+ * caller (phys_writev) has already ensured the batch fits the limits the hw layer declared at init
+ * (writev_max_segs / writev_max_sectors), so an impl may build the command without re-deciding.
+ */
+typedef int (*hype_blk_phys_writev_fn)(void *hw, uint64_t lba, const hype_blk_seg_t *segs,
+                                       uint32_t nsegs);
 
 typedef struct {
     hype_blk_phys_read_fn read_sectors;
     hype_blk_phys_write_fn write_sectors; /* NULL => read-only backend */
+    /*
+     * #295: optional vectored write, with the limits ONE hw command can carry. Both limits are
+     * plain numbers so this module stays bus-agnostic: AHCI's are its PRDT slot count and its
+     * 4 MiB total-per-command ceiling; a bus with no vectored win leaves the fn NULL and the
+     * backend's writev slot stays NULL too (the dispatcher then falls back to scalar writes).
+     */
+    hype_blk_phys_writev_fn writev_sectors;
+    uint32_t writev_max_segs;    /* most segments one hw command carries */
+    uint32_t writev_max_sectors; /* most total sectors one hw command carries */
     void *hw;                             /* opaque, passed to the callbacks */
     /*
      * #332: disk-absolute LBA of sector 0 of the SCOPE. 0 for a whole-disk target; the partition's
@@ -103,5 +119,16 @@ typedef struct {
  */
 void hype_blk_phys_nvme_init(hype_blk_phys_t *p, hype_blk_phys_nvme_t *hw, hype_blk_backend_t *be,
                              uint64_t abar_phys, uint64_t total_sectors);
+
+/*
+ * #295: arm the vectored write path. Call AFTER hype_blk_phys_init(_scoped); sets be->writev so
+ * hype_blk_backend_writev() reaches phys_writev, which batches the segment list into hw commands
+ * of at most `max_segs` segments and `max_sectors` total sectors each (a single segment larger
+ * than `max_sectors` goes through the ordinary chunked scalar path instead). No-op when
+ * `writev_sectors` is NULL or the backend is read-only.
+ */
+void hype_blk_phys_enable_writev(hype_blk_phys_t *p, hype_blk_backend_t *be,
+                                 hype_blk_phys_writev_fn writev_sectors, uint32_t max_segs,
+                                 uint32_t max_sectors);
 
 #endif /* HYPE_CORE_BLK_PHYS_H */

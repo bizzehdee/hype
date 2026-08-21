@@ -4574,12 +4574,26 @@ int process_virtio_blk_queue(hype_virtio_blk_t *dev, const hype_blk_backend_t *b
             uint64_t xfer_bytes = 0;
             uint32_t nsegs = 0;
             const char *err = 0;
+            /*
+             * #295: a WRITE chain's segments are gathered and issued as ONE vectored backend call
+             * per batch instead of one call per segment. Within a request the segments are
+             * contiguous on disk BY CONSTRUCTION (one virtio_blk_req has one start sector and its
+             * data runs from there), so the batch needs no adjacency decision -- only a size cap.
+             * The cap matches the seg_max hype advertises: a driver that honours it always fits
+             * one batch; one that never negotiated SEG_MAX may exceed it, and then each full batch
+             * flushes as its own (still contiguous) vectored call.
+             *
+             * Reads stay per-segment: the measured cost was the write path's one-command-per-4KiB
+             * round trip (#265/#295), and the read path's throughput has never been the complaint.
+             */
+            hype_blk_seg_t wsegs[HYPE_VIRTIO_BLK_SEG_MAX];
+            uint32_t nw = 0;
+            uint64_t wbatch_lba = sector;
 
             for (;;) {
                 hype_virtq_desc_t seg;
                 uint32_t nsec;
                 void *gbuf;
-                int rc;
 
                 /* Cannot fail: virtq_validate_chain() already walked this exact
                  * list. Checked anyway rather than assuming, since a failure here
@@ -4611,10 +4625,19 @@ int process_virtio_blk_queue(hype_virtio_blk_t *dev, const hype_blk_backend_t *b
                     err = "data segment failed bounds check";
                     break;
                 }
-                rc = (req_type == HYPE_VIRTIO_BLK_T_OUT)
-                         ? hype_blk_backend_write(be, seg_lba, nsec, gbuf)
-                         : hype_blk_backend_read(be, seg_lba, nsec, gbuf);
-                if (rc != 0) {
+                if (req_type == HYPE_VIRTIO_BLK_T_OUT) {
+                    if (nw == HYPE_VIRTIO_BLK_SEG_MAX) {
+                        if (hype_blk_backend_writev(be, wbatch_lba, wsegs, nw) != 0) {
+                            err = "backend rejected the transfer";
+                            break;
+                        }
+                        wbatch_lba = seg_lba;
+                        nw = 0;
+                    }
+                    wsegs[nw].buf = gbuf;
+                    wsegs[nw].count = nsec;
+                    nw++;
+                } else if (hype_blk_backend_read(be, seg_lba, nsec, gbuf) != 0) {
                     err = "backend rejected the transfer";
                     break;
                 }
@@ -4622,6 +4645,10 @@ int process_virtio_blk_queue(hype_virtio_blk_t *dev, const hype_blk_backend_t *b
                 xfer_bytes += seg.len;
                 nsegs++;
                 cur = seg.next;
+            }
+            if (err == 0 && nw != 0u &&
+                hype_blk_backend_writev(be, wbatch_lba, wsegs, nw) != 0) {
+                err = "backend rejected the transfer";
             }
 
             if (err == 0 && nsegs == 0u) {

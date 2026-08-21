@@ -544,6 +544,7 @@ int hype_qcow2_init(hype_qcow2_t *q, hype_blk_backend_t *be, hype_blk_backend_t 
 
     be->read = qcow2_read;
     be->write = (file->write != 0) ? qcow2_write : 0;
+    be->writev = 0; /* #295: cluster mapping splits runs anyway; vectoring is future work */
     be->ctx = q;
     be->total_sectors = q->virtual_size / SECSZ;
     return 0;

@@ -14087,14 +14087,22 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         if (ws->first_tsc != 0 && g_fw_1_host_tsc_hz != 0) {
                             w_ms = ((hype_rdtsc() - ws->first_tsc) * 1000ULL) / g_fw_1_host_tsc_hz;
                         }
+                        /* #295: vec= is the merge report -- vectored commands issued, segments
+                         * they carried, and the largest single merge. All zero on a backend with
+                         * no vectored impl (file/qcow2/NVMe/USB), so the line also says WHICH
+                         * path served the writes. */
                         hype_debug_print("fw-1 DIAG: BLK WRITE count=%llu sectors=%llu max=%u "
-                                         "hist=%u/%u/%u/%u/%u/%u elapsed=%llums thru=%lluKB/s\n",
+                                         "hist=%u/%u/%u/%u/%u/%u vec=%llu/%llu/%u "
+                                         "elapsed=%llums thru=%lluKB/s\n",
                                          (unsigned long long)ws->writes,
                                          (unsigned long long)ws->sectors,
                                          (unsigned)ws->max_count, (unsigned)ws->hist[0],
                                          (unsigned)ws->hist[1], (unsigned)ws->hist[2],
                                          (unsigned)ws->hist[3], (unsigned)ws->hist[4],
-                                         (unsigned)ws->hist[5], (unsigned long long)w_ms,
+                                         (unsigned)ws->hist[5],
+                                         (unsigned long long)ws->vec_writes,
+                                         (unsigned long long)ws->vec_segs,
+                                         (unsigned)ws->vec_max_segs, (unsigned long long)w_ms,
                                          (unsigned long long)hype_blk_wstats_kbps(ws, w_ms));
                     }
                 }

@@ -577,6 +577,140 @@ static void tq_chain(tq_t *q, const uint32_t *seg_len, unsigned nsegs, uint16_t 
     tq_desc(q, 1u + nsegs, &q->status, 1u, 0, 0);
 }
 
+static int tqb_scalar_write(void *ctx, uint64_t lba, uint32_t count, const void *buf) {
+    memcpy((uint8_t *)ctx + lba * 512u, buf, (size_t)count * 512u);
+    return 0;
+}
+
+/* --- #295: the drain batches a write chain into vectored backend calls --- */
+
+/* Recording writev shim: logs each call, then lands the data in the img the ctx points at --
+ * so the same byte-exact assertions the fallback tests make hold on the vectored path too. */
+#define TQV_MAXCALLS 4
+static struct { uint64_t lba; uint32_t nsegs; } g_tqv_calls[TQV_MAXCALLS];
+static unsigned g_tqv_ncalls;
+
+static int tqv_writev(void *ctx, uint64_t lba, const hype_blk_seg_t *segs, uint32_t nsegs) {
+    uint8_t *img = (uint8_t *)ctx;
+    uint32_t i;
+    if (g_tqv_ncalls < TQV_MAXCALLS) {
+        g_tqv_calls[g_tqv_ncalls].lba = lba;
+        g_tqv_calls[g_tqv_ncalls].nsegs = nsegs;
+    }
+    g_tqv_ncalls++;
+    for (i = 0; i < nsegs; i++) {
+        memcpy(img + lba * 512u, segs[i].buf, (size_t)segs[i].count * 512u);
+        lba += segs[i].count;
+    }
+    return 0;
+}
+
+static void test_chain_write_is_one_vectored_backend_call(void) {
+    tq_t q;
+    uint32_t len[3] = {512u, 1024u, 512u};
+
+    tq_init(&q, HYPE_VIRTIO_BLK_T_OUT, 1);
+    /* Arm a vectored impl on the otherwise file-backed tq backend. */
+    q.be.writev = tqv_writev;
+    q.be.ctx = q.img; /* the shim writes straight into the image */
+    g_tqv_ncalls = 0;
+
+    memset(q.gbuf + 0, 0xC1, 512u);
+    memset(q.gbuf + 512, 0xC2, 1024u);
+    memset(q.gbuf + 1536, 0xC3, 512u);
+    tq_chain(&q, len, 3, 0);
+    tq_submit(&q, 0);
+
+    CHECK_HEX("vectored write accepted", 0, tq_run(&q));
+    CHECK_HEX("status OK", HYPE_VIRTIO_BLK_S_OK, q.status);
+    CHECK_HEX("the WHOLE chain was ONE backend call", 1u, g_tqv_ncalls);
+    CHECK_HEX("call started at the request sector", 1u, g_tqv_calls[0].lba);
+    CHECK_HEX("call carried all 3 segments", 3u, g_tqv_calls[0].nsegs);
+    CHECK_HEX("segment 0 -> sector 1", 0xC1u, q.img[1u * 512u]);
+    CHECK_HEX("segment 1 -> sector 3", 0xC2u, q.img[3u * 512u]);
+    CHECK_HEX("segment 2 -> sector 4", 0xC3u, q.img[4u * 512u]);
+    CHECK_HEX("sector 5 untouched", 0x15u, q.img[5u * 512u]);
+}
+
+/*
+ * A chain LONGER than HYPE_VIRTIO_BLK_SEG_MAX (legal from a driver that never negotiated
+ * SEG_MAX): the drain must flush a full batch mid-chain and continue, each batch contiguous.
+ * Needs its own fixture -- tq_t's queue holds 8 descriptors and this takes 35.
+ */
+#define TQB_QSZ 40u
+#define TQB_NSEG (HYPE_VIRTIO_BLK_SEG_MAX + 1u)
+static void test_chain_longer_than_seg_max_flushes_in_batches(void) {
+    static uint8_t desc[TQB_QSZ * 16u];
+    static uint8_t avail[4u + 2u * TQB_QSZ + 2u];
+    static uint8_t used[4u + 8u * TQB_QSZ + 2u];
+    static uint8_t hdr[16];
+    static uint8_t status;
+    static uint8_t img[64u * 512u];
+    static uint8_t gbuf[TQB_NSEG * 512u];
+    hype_virtio_blk_t dev;
+    hype_blk_backend_t be;
+    unsigned i;
+
+    hype_virtio_blk_set_reject_sink(tq_reject_sink);
+    memset(img, 0xEE, sizeof(img));
+    for (i = 0; i < TQB_NSEG; i++) {
+        memset(gbuf + i * 512u, (int)(1u + i), 512u); /* sector i+? carries i+1 */
+    }
+    status = 0xEE;
+    tq_put32(hdr, HYPE_VIRTIO_BLK_T_OUT);
+    tq_put64(hdr + 8, 2u);
+
+    hype_virtio_blk_reset(&dev, 64u);
+    dev.queue_size = (uint16_t)TQB_QSZ;
+    dev.queue_desc = (uint64_t)(uintptr_t)desc;
+    dev.queue_driver = (uint64_t)(uintptr_t)avail;
+    dev.queue_device = (uint64_t)(uintptr_t)used;
+
+    /* header -> 33 one-sector segments -> status */
+    tq_put64(desc + 0, (uint64_t)(uintptr_t)hdr);
+    tq_put32(desc + 8, 16u);
+    tq_put16(desc + 12, HYPE_VIRTQ_DESC_F_NEXT);
+    tq_put16(desc + 14, 1u);
+    for (i = 0; i < TQB_NSEG; i++) {
+        uint8_t *d = desc + (1u + i) * 16u;
+        tq_put64(d, (uint64_t)(uintptr_t)(gbuf + i * 512u));
+        tq_put32(d + 8, 512u);
+        tq_put16(d + 12, HYPE_VIRTQ_DESC_F_NEXT);
+        tq_put16(d + 14, (uint16_t)(2u + i));
+    }
+    {
+        uint8_t *d = desc + (1u + TQB_NSEG) * 16u;
+        tq_put64(d, (uint64_t)(uintptr_t)&status);
+        tq_put32(d + 8, 1u);
+        tq_put16(d + 12, 0);
+        tq_put16(d + 14, 0);
+    }
+    tq_put16(avail + 4, 0u); /* ring[0] = chain head 0 */
+    tq_put16(avail + 2, 1u); /* avail idx = 1 */
+
+    be.read = 0;
+    /* A scalar impl must be present: the dispatcher reads write == NULL as "read-only". */
+    be.write = tqb_scalar_write;
+    be.writev = tqv_writev;
+    be.ctx = img;
+    be.total_sectors = 64u;
+    g_tqv_ncalls = 0;
+
+    CHECK_HEX("33-segment chain accepted", 0, process_virtio_blk_queue(&dev, &be, 0));
+    CHECK_HEX("status OK", HYPE_VIRTIO_BLK_S_OK, status);
+    CHECK_HEX("TWO vectored calls", 2u, g_tqv_ncalls);
+    CHECK_HEX("batch 0 at sector 2", 2u, g_tqv_calls[0].lba);
+    CHECK_HEX("batch 0 carries SEG_MAX segments", (unsigned long long)HYPE_VIRTIO_BLK_SEG_MAX,
+              g_tqv_calls[0].nsegs);
+    CHECK_HEX("batch 1 continues where batch 0 ended", 2u + HYPE_VIRTIO_BLK_SEG_MAX,
+              g_tqv_calls[1].lba);
+    CHECK_HEX("batch 1 carries the leftover", 1u, g_tqv_calls[1].nsegs);
+    CHECK_HEX("first sector landed", 1u, img[2u * 512u]);
+    CHECK_HEX("last sector landed", (unsigned long long)TQB_NSEG,
+              img[(2u + TQB_NSEG - 1u) * 512u]);
+    CHECK_HEX("sector past the run untouched", 0xEEu, img[(2u + TQB_NSEG) * 512u]);
+}
+
 static void test_chain_single_segment_write_still_works(void) {
     tq_t q;
     uint32_t len[1] = {512u};
@@ -1262,6 +1396,8 @@ int main(void) {
     test_isr_read_clears_pending_status();
     test_is_queue_ready();
     test_virtq_decode_desc();
+    test_chain_write_is_one_vectored_backend_call();
+    test_chain_longer_than_seg_max_flushes_in_batches();
     test_chain_single_segment_write_still_works();
     test_chain_multi_segment_write();
     test_chain_multi_segment_read();

@@ -55,6 +55,9 @@ void hype_blk_wstats_reset(hype_blk_wstats_t *s) {
     for (i = 0; i < HYPE_BLK_WSTATS_BUCKETS; i++) {
         s->hist[i] = 0;
     }
+    s->vec_writes = 0;
+    s->vec_segs = 0;
+    s->vec_max_segs = 0;
 }
 
 void hype_blk_wstats_record(hype_blk_wstats_t *s, uint32_t count) {
@@ -108,6 +111,58 @@ int hype_blk_backend_write(const hype_blk_backend_t *be, uint64_t lba, uint32_t 
     }
 }
 
+int hype_blk_backend_writev(const hype_blk_backend_t *be, uint64_t lba,
+                            const hype_blk_seg_t *segs, uint32_t nsegs) {
+    uint64_t total = 0;
+    uint32_t i;
+
+    if (be == (const hype_blk_backend_t *)0 ||
+        be->write == (int (*)(void *, uint64_t, uint32_t, const void *))0 ||
+        segs == (const hype_blk_seg_t *)0 || nsegs == 0u) {
+        return -1; /* NULL write => read-only backend, even for the vectored path */
+    }
+    /*
+     * Validate the WHOLE list before any byte moves. The sum is 64-bit and each segment is
+     * re-checked against it, so a list built to wrap 32 bits cannot read as small: 2^32 sectors is
+     * 2 TiB, and total_sectors bounds it far earlier for any real backend, but the guard is
+     * arithmetic rather than an assumption about capacities.
+     */
+    for (i = 0; i < nsegs; i++) {
+        if (segs[i].count == 0u) {
+            return -1; /* a real transfer is always >= 1 sector (same rule as the scalar path) */
+        }
+        total += (uint64_t)segs[i].count;
+    }
+    if (total > 0xFFFFFFFFu || !hype_blk_range_in_bounds(be->total_sectors, lba, (uint32_t)total)) {
+        return -1;
+    }
+
+    if (be->writev != (int (*)(void *, uint64_t, const hype_blk_seg_t *, uint32_t))0) {
+        int rc = be->writev(be->ctx, lba, segs, nsegs);
+        if (rc == 0) {
+            hype_blk_wstats_record(&g_wstats, (uint32_t)total);
+            g_wstats.vec_writes++;
+            g_wstats.vec_segs += (uint64_t)nsegs;
+            if (nsegs > g_wstats.vec_max_segs) {
+                g_wstats.vec_max_segs = nsegs;
+            }
+        }
+        return rc;
+    }
+
+    /* Fallback: N ordinary writes, recorded individually so the histogram reflects the commands
+     * the backend actually saw. A failure mid-list leaves earlier segments written, exactly as a
+     * device error mid-transfer does -- the caller fails the whole request. */
+    for (i = 0; i < nsegs; i++) {
+        if (be->write(be->ctx, lba, segs[i].count, segs[i].buf) != 0) {
+            return -1;
+        }
+        hype_blk_wstats_record(&g_wstats, segs[i].count);
+        lba += (uint64_t)segs[i].count;
+    }
+    return 0;
+}
+
 /* --- file-backed implementation (a raw disk image in a host buffer) --- */
 
 /* Both impls run only on ranges the dispatcher already validated against
@@ -145,6 +200,7 @@ void hype_blk_file_init(hype_blk_file_t *f, hype_blk_backend_t *be, uint8_t *bas
 
     be->read = file_read;
     be->write = file_write;
+    be->writev = 0; /* #295: a memcpy backend gains nothing from vectoring */
     be->ctx = f;
     be->total_sectors = f->total_sectors;
 }
