@@ -3030,8 +3030,60 @@ static void test_bus_usb_msc(void) {
     CHECK_INT("usb-msc emitted", 1, strstr(text, "bus = usb-msc") != 0);
 }
 
+static void test_attach_detach_disk(void) {
+    /* #488: attach a usb-msc image and a sata disk to a VM, then detach one. The VM uses the
+     * disks= model (target_disk and disks= are mutually exclusive per §7), which is the model
+     * attach/detach manage. */
+    const char *base =
+        "[vm.k]\nvcpus=1\nmem_mb=512\nboot=disk\ndisks=boot\nfirmware=uefi\nos_hint=linux\n"
+        "[disk.boot]\ntype=disk\nbacking=file\npath=\\boot.img\nbus=virtio-blk\n";
+    hype_cfg_t out;
+    static char text[4096];
+    hype_cfg_serialize_result_t sr;
+    CHECK_INT("base parses", HYPE_CFG_OK, parse_copy(base, &out).status);
+    /* attach an image as removable USB media */
+    CHECK_INT("attach usb-msc", 0,
+              hype_cfg_attach_disk(&out, "k", "stick", HYPE_CFG_DISK_TYPE_DISK,
+                                   HYPE_CFG_BACKING_FILE, "\\u.img", HYPE_CFG_BUS_USB_MSC));
+    /* attach a SATA disk */
+    CHECK_INT("attach sata", 0,
+              hype_cfg_attach_disk(&out, "k", "data", HYPE_CFG_DISK_TYPE_DISK,
+                                   HYPE_CFG_BACKING_FILE, "\\d.img", HYPE_CFG_BUS_AHCI_SATA));
+    CHECK_INT("three disks now", 3, out.disk_count);
+    CHECK_INT("vm has three devices", 3, out.vms[0].disks_count);
+    /* it serializes with both sections + the disks= list */
+    sr = hype_cfg_serialize(&out, text, sizeof(text));
+    CHECK_INT("serializes", 0, sr.refused_overflow || sr.truncated);
+    CHECK_INT("usb-msc section emitted", 1, strstr(text, "[disk.stick]") != 0);
+    CHECK_INT("usb-msc bus emitted", 1, strstr(text, "bus = usb-msc") != 0);
+    CHECK_INT("sata section emitted", 1, strstr(text, "[disk.data]") != 0);
+    /* re-parsing the serialized text yields a valid config with both devices on the VM */
+    {
+        hype_cfg_t rt;
+        CHECK_INT("round-trip parses", HYPE_CFG_OK, parse_copy(text, &rt).status);
+        CHECK_INT("round-trip three vm devices", 3, rt.vms[0].disks_count);
+    }
+    /* duplicate id refused */
+    CHECK_INT("duplicate id refused", -1,
+              hype_cfg_attach_disk(&out, "k", "stick", HYPE_CFG_DISK_TYPE_DISK,
+                                   HYPE_CFG_BACKING_FILE, "\\x.img", HYPE_CFG_BUS_USB_MSC));
+    /* unknown VM refused */
+    CHECK_INT("unknown vm refused", -1,
+              hype_cfg_attach_disk(&out, "nope", "z", HYPE_CFG_DISK_TYPE_DISK,
+                                   HYPE_CFG_BACKING_FILE, "\\z.img", HYPE_CFG_BUS_USB_MSC));
+    /* detach the usb stick */
+    CHECK_INT("detach stick", 0, hype_cfg_detach_disk(&out, "k", "stick"));
+    CHECK_INT("vm back to two devices", 2, out.vms[0].disks_count);
+    sr = hype_cfg_serialize(&out, text, sizeof(text));
+    CHECK_INT("detached section gone", 0, strstr(text, "[disk.stick]") != 0);
+    CHECK_INT("kept section remains", 1, strstr(text, "[disk.data]") != 0);
+    /* detach a device the VM does not have */
+    CHECK_INT("detach missing refused", -1, hype_cfg_detach_disk(&out, "k", "stick"));
+}
+
 int main(void) {
     test_bus_usb_msc();
+    test_attach_detach_disk();
     test_label_from_the_spec_example_is_accepted();
     test_label_absent_leaves_an_empty_string();
     test_label_rejects_empty_and_duplicate();

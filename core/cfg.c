@@ -1574,6 +1574,182 @@ int hype_cfg_delete_vm(hype_cfg_t *cfg, unsigned int vm_index) {
     return 0;
 }
 
+
+/*
+ * #488 (TERM-12): attach a device to a VM at runtime, writing a [disk.<id>] section and adding it
+ * to the VM's device list. The change persists through hype_cfg_serialize() (which emits the disk
+ * from the struct) and takes effect at the VM's next start. `backing == PHYSICAL` uses
+ * `path_or_serial` as id_match (the host device's identity); otherwise as the image path. Returns
+ * 0 on success, -1 on a bad argument, an unknown VM, a duplicate id, or a full table.
+ */
+int hype_cfg_attach_disk(hype_cfg_t *cfg, const char *vm_name, const char *id,
+                         hype_cfg_disk_type_t type, hype_cfg_backing_t backing,
+                         const char *path_or_serial, hype_cfg_bus_t bus) {
+    unsigned int i;
+    int vmi = -1, di;
+    char raw[HYPE_CFG_LINE_MAX];
+    hype_cfg_disk_t *d;
+    hype_cfg_vm_t *vm;
+
+    if (cfg == 0 || vm_name == 0 || id == 0 || id[0] == '\0' || path_or_serial == 0) {
+        return -1;
+    }
+    for (i = 0; i < cfg->vm_count; i++) {
+        if (!cfg->vms[i].deleted && hype_streq(cfg->vms[i].name, vm_name)) {
+            vmi = (int)i;
+            break;
+        }
+    }
+    if (vmi < 0) {
+        return -1;
+    }
+    for (i = 0; i < cfg->disk_count; i++) {
+        if (hype_streq(cfg->disks[i].id, id)) {
+            return -1; /* id already exists */
+        }
+    }
+    if (cfg->disk_count >= HYPE_CFG_MAX_DISKS) {
+        return -1;
+    }
+    vm = &cfg->vms[vmi];
+    if (vm->disks_count >= HYPE_CFG_MAX_VM_DISKS) {
+        return -1;
+    }
+    di = (int)cfg->disk_count;
+    d = &cfg->disks[di];
+    zero_disk(d);
+    if (hype_strlcpy(d->id, id, HYPE_CFG_NAME_MAX) >= HYPE_CFG_NAME_MAX) {
+        return -1;
+    }
+    d->type = type;
+    d->backing = backing;
+    d->has_backing = 1;
+    d->bus = bus;
+    if (backing == HYPE_CFG_BACKING_PHYSICAL) {
+        if (hype_strlcpy(d->id_match, path_or_serial, HYPE_CFG_PATH_MAX) >= HYPE_CFG_PATH_MAX) {
+            return -1;
+        }
+        d->has_id_match = 1;
+    } else {
+        if (hype_strlcpy(d->path, path_or_serial, HYPE_CFG_PATH_MAX) >= HYPE_CFG_PATH_MAX) {
+            return -1;
+        }
+        d->has_path = 1;
+    }
+    /* Section header line, as it would be written: "[disk.<id>]". Built by hand -- no strlcat in
+     * this freestanding build. */
+    {
+        unsigned int n = 0;
+        const char *pfx = "[disk.";
+        while (pfx[n] != '\0' && n + 1u < sizeof(raw)) {
+            raw[n] = pfx[n];
+            n++;
+        }
+        {
+            unsigned int j = 0;
+            while (id[j] != '\0' && n + 1u < sizeof(raw)) {
+                raw[n++] = id[j++];
+            }
+        }
+        if (n + 1u < sizeof(raw)) {
+            raw[n++] = ']';
+        }
+        raw[n] = '\0';
+    }
+    if (add_section(cfg, HYPE_CFG_SECTION_DISK, id, raw, di) < 0) {
+        return -1;
+    }
+    cfg->disk_count++;
+    (void)hype_strlcpy(vm->disks[vm->disks_count], id, HYPE_CFG_NAME_MAX);
+    vm->disks_count++;
+    return 0;
+}
+
+/*
+ * #488: detach device `id` from VM `vm_name`. Removes the [disk.<id>] section (compacting
+ * sections[] and remapping retained lines, exactly as hype_cfg_delete_vm does) and drops the id
+ * from the VM's device list. The disk entry stays in disks[] uncompacted -- nothing references it,
+ * so it is never re-emitted -- matching the delete_vm convention. Returns 0, or -1 if the VM or
+ * the device is not found.
+ */
+int hype_cfg_detach_disk(hype_cfg_t *cfg, const char *vm_name, const char *id) {
+    unsigned int si, ri, di_i;
+    unsigned int w, rw;
+    int vmi = -1, di = -1;
+    int remap[HYPE_CFG_MAX_SECTIONS];
+    hype_cfg_vm_t *vm;
+
+    if (cfg == 0 || vm_name == 0 || id == 0) {
+        return -1;
+    }
+    for (di_i = 0; di_i < cfg->vm_count; di_i++) {
+        if (!cfg->vms[di_i].deleted && hype_streq(cfg->vms[di_i].name, vm_name)) {
+            vmi = (int)di_i;
+            break;
+        }
+    }
+    if (vmi < 0) {
+        return -1;
+    }
+    vm = &cfg->vms[vmi];
+    /* The id must currently be on THIS VM's list. */
+    {
+        unsigned int k;
+        int on_list = -1;
+        for (k = 0; k < vm->disks_count; k++) {
+            if (hype_streq(vm->disks[k], id)) {
+                on_list = (int)k;
+                break;
+            }
+        }
+        if (on_list < 0) {
+            return -1;
+        }
+        /* Drop it from the list (compact the small fixed array). */
+        for (k = (unsigned int)on_list; k + 1u < vm->disks_count; k++) {
+            (void)hype_strlcpy(vm->disks[k], vm->disks[k + 1u], HYPE_CFG_NAME_MAX);
+        }
+        vm->disks_count--;
+    }
+    for (di_i = 0; di_i < cfg->disk_count; di_i++) {
+        if (hype_streq(cfg->disks[di_i].id, id)) {
+            di = (int)di_i;
+            break;
+        }
+    }
+    /* Remove the disk's section (compact + remap retained), mirroring hype_cfg_delete_vm. */
+    w = 0;
+    for (si = 0; si < cfg->section_count; si++) {
+        if (cfg->sections[si].kind == HYPE_CFG_SECTION_DISK && di >= 0 &&
+            cfg->sections[si].index == di) {
+            remap[si] = -1;
+            continue;
+        }
+        remap[si] = (int)w;
+        if (w != si) {
+            cfg_byte_copy(&cfg->sections[w], &cfg->sections[si], sizeof(cfg->sections[w]));
+        }
+        w++;
+    }
+    cfg->section_count = w;
+    rw = 0;
+    for (ri = 0; ri < cfg->retained_count; ri++) {
+        int sec = cfg->retained[ri].section;
+        if (sec >= 0) {
+            if (remap[sec] < 0) {
+                continue;
+            }
+            cfg->retained[ri].section = remap[sec];
+        }
+        if (rw != ri) {
+            cfg_byte_copy(&cfg->retained[rw], &cfg->retained[ri], sizeof(cfg->retained[rw]));
+        }
+        rw++;
+    }
+    cfg->retained_count = rw;
+    return 0;
+}
+
 unsigned int hype_cfg_count_vms(const char *text) {
     unsigned int n = 0;
     const char *p = text;

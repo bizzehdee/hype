@@ -2449,6 +2449,8 @@ static void load_input_script(hype_fw_vm_t *vm, unsigned vm_index);
 static void term_config_cmd(int idx, const char *nm);
 /* TERM-14 (#490): same placement reason -- needs g_hype_cfg + the serializer + #447. */
 static void term_set_cmd(int idx, const char *nm, const char *key, const char *value);
+static void term_attach_cmd(int idx, const char *nm, const char *spec); /* TERM-12 (#488) */
+static void term_detach_cmd(int idx, const char *nm, const char *id);   /* TERM-12 (#488) */
 /* TERM-10 (#486): the create wizard owns the command line while it is active. */
 static void term_create_begin(const char *name_arg);
 static void term_create_feed(const char *line);
@@ -2605,6 +2607,24 @@ static void term_run_cmdline(void) {
                 term_resultf("set: usage: set <vm> <key> <value>");
             } else {
                 term_set_cmd(idx, nm, c.arg2, c.arg3);
+            }
+            break;
+        case HYPE_CMD_ATTACH:
+            if (idx < 0) {
+                term_resultf("attach: unknown vm '%s'", nm);
+            } else if (!c.has_arg2) {
+                term_resultf("attach: usage: attach <vm> <usb-msc|sata|usb-phys>:<path-or-serial>");
+            } else {
+                term_attach_cmd(idx, nm, c.arg2);
+            }
+            break;
+        case HYPE_CMD_DETACH:
+            if (idx < 0) {
+                term_resultf("detach: unknown vm '%s'", nm);
+            } else if (!c.has_arg2) {
+                term_resultf("detach: usage: detach <vm> <device-id>");
+            } else {
+                term_detach_cmd(idx, nm, c.arg2);
             }
             break;
         case HYPE_CMD_HOST: {
@@ -21583,6 +21603,128 @@ static int term_write_cfg(const hype_cfg_t *cand, const char *verb) {
     (void)hype_fs_sync(bv);
     return 0;
 }
+/*
+ * TERM-12 (#488): attach a device to a VM from the terminal. `spec` is `<kind>:<value>`:
+ *   usb-msc:<path>    -- an image file as removable USB mass storage (#446)
+ *   sata:<path>       -- an image file as a SATA/AHCI disk
+ *   usb-phys:<serial> -- a physical host USB device, by its serial, as removable media
+ * The device id is auto-generated (attN) and reported so `detach` can name it. The change is
+ * written to hype.cfg and adopted; for a running VM it applies at the next boot.
+ */
+static void term_attach_cmd(int idx, const char *nm, const char *spec) {
+    static hype_cfg_t cand;
+    char kind[16];
+    const char *colon, *value;
+    unsigned i, kn;
+    hype_cfg_backing_t backing;
+    hype_cfg_bus_t bus;
+    char id[HYPE_CFG_NAME_MAX];
+    hype_cfg_disk_type_t type = HYPE_CFG_DISK_TYPE_DISK;
+
+    if (idx < 0 || idx >= (int)g_hype_cfg.vm_count) {
+        term_resultf("attach: '%s' has no [vm.*] section -- only configured VMs can be edited", nm);
+        return;
+    }
+    if (spec == 0 || spec[0] == '\0') {
+        term_resultf("attach: usage: attach <vm> <usb-msc|sata|usb-phys>:<path-or-serial>");
+        return;
+    }
+    colon = spec;
+    while (*colon != '\0' && *colon != ':') colon++;
+    if (*colon != ':' || colon == spec || colon[1] == '\0') {
+        term_resultf("attach: spec must be <kind>:<value> -- got '%s'", spec);
+        return;
+    }
+    kn = (unsigned)(colon - spec);
+    if (kn >= sizeof(kind)) kn = sizeof(kind) - 1u;
+    for (i = 0; i < kn; i++) kind[i] = spec[i];
+    kind[kn] = '\0';
+    value = colon + 1;
+
+    if (term_streq(kind, "usb-msc")) {
+        backing = HYPE_CFG_BACKING_FILE;
+        bus = HYPE_CFG_BUS_USB_MSC;
+    } else if (term_streq(kind, "sata")) {
+        backing = HYPE_CFG_BACKING_FILE;
+        bus = HYPE_CFG_BUS_AHCI_SATA;
+    } else if (term_streq(kind, "usb-phys")) {
+        backing = HYPE_CFG_BACKING_PHYSICAL;
+        bus = HYPE_CFG_BUS_USB_MSC;
+    } else {
+        term_resultf("attach: unknown kind '%s' (usb-msc, sata, usb-phys)", kind);
+        return;
+    }
+
+    /* Pick the first free "attN" id across the whole config. */
+    id[0] = '\0';
+    {
+        unsigned n;
+        for (n = 1u; n < 100u; n++) {
+            unsigned di;
+            int taken = 0;
+            char cand_id[HYPE_CFG_NAME_MAX];
+            (void)hype_snprintf(cand_id, sizeof(cand_id), "att%u", n);
+            for (di = 0; di < g_hype_cfg.disk_count; di++) {
+                if (term_streq(g_hype_cfg.disks[di].id, cand_id)) { taken = 1; break; }
+            }
+            if (!taken) { (void)hype_strlcpy(id, cand_id, sizeof(id)); break; }
+        }
+    }
+    if (id[0] == '\0') {
+        term_resultf("attach: no free device id (att1..att99 all used)");
+        return;
+    }
+
+    hype_guest_ram_copy(&cand, &g_hype_cfg, sizeof(hype_cfg_t));
+    if (hype_cfg_attach_disk(&cand, g_hype_cfg.vms[idx].name, id, type, backing, value, bus) != 0) {
+        term_resultf("attach: could not add the device (table full, or the VM already has the "
+                     "maximum devices)");
+        return;
+    }
+    if (term_write_cfg(&cand, "attach") != 0) {
+        return; /* term_write_cfg reported why; nothing adopted */
+    }
+    hype_guest_ram_copy(&g_hype_cfg, &cand, sizeof(hype_cfg_t));
+    hype_debug_print("fw-1 ATTACH vm%d: %s = %s:%s -> [disk.%s] [#488]\n", idx, nm, kind, value, id);
+    if (idx < (int)g_vm_count && g_vms[idx].lifecycle != HYPE_VM_OFF) {
+        g_vms[idx].cfg_pending_bits |= 1u; /* a change is queued; consumed at restart (#490) */
+        term_resultf("%s: attached %s '%s' as [disk.%s] -- QUEUED, applies when %s next boots",
+                     nm, kind, value, id, nm);
+    } else {
+        term_resultf("%s: attached %s '%s' as [disk.%s] -- present at next start", nm, kind, value,
+                     id);
+    }
+}
+
+/* TERM-12 (#488): detach device `id` from VM `nm`. */
+static void term_detach_cmd(int idx, const char *nm, const char *id) {
+    static hype_cfg_t cand;
+    if (idx < 0 || idx >= (int)g_hype_cfg.vm_count) {
+        term_resultf("detach: '%s' has no [vm.*] section", nm);
+        return;
+    }
+    if (id == 0 || id[0] == '\0') {
+        term_resultf("detach: usage: detach <vm> <device-id>");
+        return;
+    }
+    hype_guest_ram_copy(&cand, &g_hype_cfg, sizeof(hype_cfg_t));
+    if (hype_cfg_detach_disk(&cand, g_hype_cfg.vms[idx].name, id) != 0) {
+        term_resultf("detach: '%s' has no device '%s'", nm, id);
+        return;
+    }
+    if (term_write_cfg(&cand, "detach") != 0) {
+        return;
+    }
+    hype_guest_ram_copy(&g_hype_cfg, &cand, sizeof(hype_cfg_t));
+    hype_debug_print("fw-1 DETACH vm%d: %s [disk.%s] [#488]\n", idx, nm, id);
+    if (idx < (int)g_vm_count && g_vms[idx].lifecycle != HYPE_VM_OFF) {
+        g_vms[idx].cfg_pending_bits |= 1u;
+        term_resultf("%s: detached [disk.%s] -- QUEUED, applies when %s next boots", nm, id, nm);
+    } else {
+        term_resultf("%s: detached [disk.%s] -- gone at next start", nm, id);
+    }
+}
+
 
 static void term_create_finish(void) {
     static hype_cfg_t cand;

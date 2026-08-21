@@ -30,6 +30,8 @@ typedef enum {
     HYPE_CMD_CREATE, /* TERM-10 (#486): interactive VM-creation wizard */
     HYPE_CMD_DELETE, /* TERM-15 (#491): two-step-confirmed VM removal */
     HYPE_CMD_MKDISK, /* TERM-11 (#487): create a preallocated qcow2 on a host disk */
+    HYPE_CMD_ATTACH, /* TERM-12 (#488): attach a device (usb-msc/sata/usb-phys) to a VM */
+    HYPE_CMD_DETACH, /* TERM-12 (#488): detach a device from a VM by id */
     /* TERM-6 (#444): arg = a VM name/index (the same addressing every other per-VM verb uses).
      * Prints that VM's full effective hype.cfg -- every field, tagged (default) or (set) --
      * into the dashboard's multi-line result panel (#460). */

@@ -772,6 +772,18 @@ int hype_cfg_append_vm(hype_cfg_t *cfg, const hype_cfg_vm_t *vm);
 int hype_cfg_delete_vm(hype_cfg_t *cfg, unsigned int vm_index);
 
 /*
+ * #488 (TERM-12): attach/detach a device to/from a VM at runtime. attach writes a [disk.<id>]
+ * section (backing=physical uses path_or_serial as id_match, else as the image path) and adds the
+ * id to the VM's device list; detach removes the section and the list entry. Both persist through
+ * hype_cfg_serialize() and take effect at the VM's next start. Return 0, or -1 on a bad argument,
+ * unknown VM, duplicate/missing id, or a full table.
+ */
+int hype_cfg_attach_disk(hype_cfg_t *cfg, const char *vm_name, const char *id,
+                         hype_cfg_disk_type_t type, hype_cfg_backing_t backing,
+                         const char *path_or_serial, hype_cfg_bus_t bus);
+int hype_cfg_detach_disk(hype_cfg_t *cfg, const char *vm_name, const char *id);
+
+/*
  * CONFIG-3 (#221): serialize `cfg` back into `hype.cfg` text, for the GUI/TUI
  * dashboard to persist a runtime edit (mem, vcpus, net, boot=installer->disk,
  * attach/detach a disk, ...) across a host reboot.
