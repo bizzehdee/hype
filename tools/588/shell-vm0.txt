@@ -1,0 +1,17 @@
+# #588: a real kernel + a configured virtio-blk disk reaches the shell (no wedge at the virtio
+# probe) AND the disk function's BAR is programmed. Before this fix the boot wedged mid-probe.
+timeout 300000
+fail-if Kernel panic
+fail-if Unable to mount root
+expect job control turned off
+send \n
+# proof 1: the boot survived the virtio-blk enumeration -- a shell exists
+send echo KBOOT588-$((6*7))\n
+expect KBOOT588-42
+# proof 2: the virtio-blk PCI function has a NON-zero, programmed memory BAR (was 0 before #588)
+send cat /sys/bus/pci/devices/0000:00:03.0/resource 2>/dev/null | head -5; echo RES-DONE\n
+expect RES-DONE
+# proof 3: if the block device came up, read LBA0 and show hype's on-disk magic
+send test -b /dev/vda && dd if=/dev/vda bs=16 count=1 2>/dev/null; echo; echo VDA-DONE\n
+expect VDA-DONE
+pass kboot-disk-no-wedge

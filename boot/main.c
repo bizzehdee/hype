@@ -9903,6 +9903,175 @@ static void fw_1_262_id_diff(hype_ata_disk_t *disk) {
  * So this is not tidying. It is removing a defect generator: the failure mode is that the code
  * compiles, the tests pass, the feature appears not to work, and the evidence points at the feature.
  */
+/*
+ * #588: a `boot = kernel` VM has NO guest firmware in the path, so nothing performs the PCI BAR
+ * assignment that OVMF would. A real kernel probes what it enumerates, reads an unprogrammed BAR
+ * as zero, and follows it into nowhere (the #545 alpine-virt boot wedge). hype does the firmware's
+ * job here: it assigns each presented function's memory BARs to fixed windows in the not-present
+ * 32-bit PCI aperture below the ECAM (0xE0000000), then sets memory-space + bus-master enable.
+ *
+ * The assignment goes through hype_pci_config_write() -- the SAME path a config-space BAR write
+ * from OVMF takes -- so the stored value is masked to ~(size-1) identically, and the dispatch's
+ * BAR-window latch (which reads hype_pci_get_bar_value) sees exactly what it sees on the firmware
+ * path. One set of window constants serves both. Only kernel-boot VMs reach this; a firmware VM's
+ * BARs are still assigned by its firmware.
+ */
+static void fw_1_program_kernel_bars(hype_fw_vm_t *vm) {
+    uint64_t cursor = HYPE_FW_1_ECAM_GPA; /* allocate downward from just below the ECAM */
+    unsigned int d;
+
+    if (!vm->kernel_boot) {
+        return;
+    }
+    for (d = 0u; d < HYPE_PCI_MAX_DEVICES; d++) {
+        unsigned int f;
+        for (f = 0u; f < HYPE_PCI_MAX_FUNCTIONS; f++) {
+            hype_pci_device_t *dev = (f == 0u) ? &vm->pci.devices[d]
+                                               : &vm->pci.functions[d][f - 1u];
+            unsigned int bar;
+            uint16_t command;
+            int placed_any = 0;
+            int io_present = 0;
+            if (!dev->in_use) {
+                continue;
+            }
+            for (bar = 0u; bar < 6u; bar++) {
+                hype_pci_ecam_addr_t addr;
+                uint32_t size = dev->bar_size[bar];
+                uint64_t base;
+                if (size == 0u) {
+                    continue;
+                }
+                if (dev->bar_is_io[bar]) {
+                    /* An I/O BAR's live PIO block is routed separately (the model owns it); the
+                     * config-space value only needs the I/O type bit and a non-zero placeholder.
+                     * hype's guest device models use memory BARs, so this path is defensive. */
+                    io_present = 1;
+                    continue;
+                }
+                /* Align the window DOWN to its own size; a memory BAR is naturally aligned. */
+                base = (cursor - (uint64_t)size) & ~((uint64_t)size - 1u);
+                if (base < vm->ram_bytes || base >= HYPE_FW_1_ECAM_GPA) {
+                    HYPE_LOGF(HYPE_LOG_WARN,
+                              "fw-1[vm %u]: #588 no PCI aperture left for dev %u func %u BAR%u "
+                              "(size 0x%x, RAM top 0x%llx) -- left unprogrammed\n",
+                              (unsigned)(vm - &g_vms[0]), d, f, bar, size,
+                              (unsigned long long)vm->ram_bytes);
+                    continue;
+                }
+                cursor = base;
+                addr.bus = 0u;
+                addr.device = d;
+                addr.function = f;
+                addr.register_offset = 0x10u + bar * 4u;
+                hype_pci_config_write(&vm->pci, &addr, 4u, (uint32_t)base);
+                placed_any = 1;
+                hype_debug_print("fw-1[vm %u]: #588 programmed dev %u func %u BAR%u -> "
+                                 "guest-physical 0x%llx (size 0x%x)\n",
+                                 (unsigned)(vm - &g_vms[0]), d, f, bar,
+                                 (unsigned long long)base, size);
+            }
+            if (placed_any || io_present) {
+                hype_pci_ecam_addr_t caddr;
+                command = (uint16_t)dev->config[0x04] | ((uint16_t)dev->config[0x05] << 8);
+                if (placed_any) command |= 0x0002u; /* memory space enable */
+                if (io_present) command |= 0x0001u; /* I/O space enable */
+                command |= 0x0004u;                 /* bus master enable */
+                caddr.bus = 0u;
+                caddr.device = d;
+                caddr.function = f;
+                caddr.register_offset = 0x04u;
+                hype_pci_config_write(&vm->pci, &caddr, 2u, command);
+            }
+        }
+    }
+
+    /*
+     * #588: the shared-window dispatch latches (vm->shared_*_mapped) normally fire in the
+     * DEV_ECAM branch -- the moment the guest's ECAM config write enables memory space. A kernel
+     * VM never makes that write, because hype enabled the functions just above. So latch the
+     * windows here, using the SAME sources the dispatch reads, or the first MMIO fault to a device
+     * window falls through unrouted and the guest hangs on it. NVMe is not latched: its dispatch
+     * derives the window from the live BAR value and needs no flag.
+     */
+    if (hype_pci_memory_space_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI)) {
+        uint64_t bar5 = hype_pci_get_bar_value(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI, 5);
+        if (bar5 != 0) {
+            vm->shared_ahci_abar = bar5;
+            vm->shared_ahci_mapped = 1u;
+            hype_ahci_set_bus_master(&g_fw_1_ahci,
+                                     hype_pci_bus_master_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI));
+        }
+    }
+    if (hype_pci_function_memory_space_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA,
+                                               HYPE_FW_1_PCI_FUNC_ATA)) {
+        uint64_t abar = hype_pci_get_function_bar_value(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA,
+                                                        HYPE_FW_1_PCI_FUNC_ATA, 5);
+        if (abar != 0) {
+            vm->shared_ata_abar = abar;
+            vm->shared_ata_mapped = 1u;
+            hype_ahci_set_bus_master(&g_fw_1_ata_ahci,
+                                     hype_pci_function_bus_master_enabled(&g_fw_1_pci,
+                                                                          HYPE_FW_1_PCI_DEV_ATA,
+                                                                          HYPE_FW_1_PCI_FUNC_ATA));
+        }
+    }
+    if (hype_pci_memory_space_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_VIRTIO_BLK)) {
+        uint64_t bar = hype_pci_get_bar_value(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_VIRTIO_BLK,
+                                              HYPE_FW_1_VIRTIO_BAR_INDEX);
+        if (bar != 0) {
+            vm->shared_vblk_bar = bar;
+            vm->shared_vblk_mapped = 1u;
+            hype_virtio_blk_set_bus_master(
+                &g_fw_1_vblk, hype_pci_bus_master_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_VIRTIO_BLK));
+            hype_debug_print("fw-1[vm %u]: #588 virtio-blk window latched at guest-physical 0x%llx\n",
+                             (unsigned)(vm - &g_vms[0]), (unsigned long long)bar);
+        }
+    }
+    if (vm->pci.devices[HYPE_FW_1_PCI_DEV_VIRTIO_NET].in_use &&
+        hype_pci_memory_space_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_VIRTIO_NET)) {
+        unsigned int bar_idx =
+            (vm->nic_ops == &hype_guest_nic_e1000) ? 0u : HYPE_FW_1_VIRTIO_BAR_INDEX;
+        uint64_t nbar = hype_pci_get_bar_value(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_VIRTIO_NET, bar_idx);
+        if (nbar != 0) {
+            int bm = hype_pci_bus_master_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_VIRTIO_NET);
+            vm->shared_vnet_bar = nbar;
+            vm->shared_vnet_mapped = 1u;
+            if (vm->nic_ops == &hype_guest_nic_e1000) {
+                hype_e1000_dev_set_bus_master(&vm->e1000_net, bm);
+            } else {
+                hype_virtio_net_set_bus_master(&vm->virtio_net, bm);
+            }
+        }
+    }
+    if (hype_pci_memory_space_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_BOCHS_VBE)) {
+        uint64_t bar = hype_pci_get_bar_value(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_BOCHS_VBE, 2);
+        if (bar != 0) {
+            vm->shared_vbe_bar = bar;
+            vm->shared_vbe_mapped = 1u;
+        }
+    }
+    {
+        unsigned int slot;
+        for (slot = 1u; slot < HYPE_FW_1_MAX_DISKS; slot++) {
+            hype_cfg_bus_t sbus = fw_1_slot_bus(vm, slot);
+            unsigned int sdev = fw_1_slot_pci_dev(slot, sbus);
+            unsigned int sbar = (sbus == HYPE_CFG_BUS_AHCI_SATA) ? 5u
+                                : (sbus == HYPE_CFG_BUS_NVME) ? 0u
+                                                              : (unsigned)HYPE_FW_1_VIRTIO_BAR_INDEX;
+            uint64_t bar;
+            if (fw_1_slot_cfg(vm, slot) == 0 || !hype_pci_memory_space_enabled(&g_fw_1_pci, sdev)) {
+                continue;
+            }
+            bar = hype_pci_get_bar_value(&g_fw_1_pci, sdev, sbar);
+            if (bar != 0) {
+                vm->shared_disk_bar[slot] = bar;
+                vm->shared_disk_mapped[slot] = 1u;
+            }
+        }
+    }
+}
+
 static void fw_1_attach_storage(hype_fw_vm_t *vm) {
     /* #262 slice 2: the SATA-disk HBA, same class/prog-IF and same 4KB BAR5 as the
      * optical one, so the firmware's existing AHCI driver binds it unchanged.
@@ -10076,6 +10245,10 @@ static void fw_1_attach_storage(hype_fw_vm_t *vm) {
      * commands and each line is GOP-rendered, so this must not survive into a normal build. */
     hype_svm_set_ahci_trace(1);
 #endif
+    /* #588: with all functions now presented, a kernel-boot VM gets its BARs assigned here (a
+     * firmware VM's firmware does it). Placed last so every function -- disk, NIC, display, and
+     * the #329 extra slots -- is already in_use and gets a window. */
+    fw_1_program_kernel_bars(vm);
 }
 
 static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind_t kind) {
