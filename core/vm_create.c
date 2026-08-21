@@ -71,6 +71,41 @@ const char *hype_vm_wizard_prompt(const hype_vm_wizard_t *w) {
     return "";
 }
 
+/* #570: see the header. Bounded copy helper -- no libc in a freestanding build. */
+static unsigned wiz_cat(char *out, unsigned pos, unsigned cap, const char *s) {
+    while (*s != '\0' && pos + 1u < cap) {
+        out[pos++] = *s++;
+    }
+    out[pos] = '\0';
+    return pos;
+}
+
+const char *hype_vm_wizard_render(const hype_vm_wizard_t *w, char *out, unsigned cap) {
+    unsigned pos = 0;
+
+    if (out == 0 || cap == 0u) {
+        return "";
+    }
+    out[0] = '\0';
+    if (w == 0) {
+        return out;
+    }
+    if (w->step == HYPE_VMW_DONE || w->step == HYPE_VMW_CANCELLED) {
+        pos = wiz_cat(out, pos, cap, "create: ");
+        (void)wiz_cat(out, pos, cap, hype_vm_wizard_prompt(w));
+        return out;
+    }
+    if (w->have_error) {
+        pos = wiz_cat(out, pos, cap, "INVALID -- ");
+        pos = wiz_cat(out, pos, cap, w->error);
+        pos = wiz_cat(out, pos, cap, "\n");
+    }
+    pos = wiz_cat(out, pos, cap, "create> ");
+    pos = wiz_cat(out, pos, cap, hype_vm_wizard_prompt(w));
+    (void)wiz_cat(out, pos, cap, "  ('cancel' abandons)");
+    return out;
+}
+
 /* The config parser accepts a section name of letters, digits, '-' and '_'. Same rule here. */
 static int name_is_valid(const char *s) {
     unsigned int i;

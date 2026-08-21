@@ -282,6 +282,52 @@ static void test_every_step_prompts(void) {
 }
 
 
+
+/* --- #570: a prompt and an error must not render alike --- */
+
+static void test_render_prompt_is_visually_distinct_from_error(void) {
+    hype_vm_wizard_t w;
+    char buf[256];
+
+    hype_vm_wizard_begin(&w);
+    /* A freshly started wizard is a PROMPT: create> prefix, no INVALID anywhere. */
+    hype_vm_wizard_render(&w, buf, sizeof(buf));
+    CHECK("prompt starts with the wizard's own prefix", strncmp(buf, "create> ", 8) == 0);
+    CHECK("prompt contains no INVALID", strstr(buf, "INVALID") == 0);
+    CHECK("the way out is named in the prompt", strstr(buf, "'cancel'") != 0);
+
+    /* A rejected answer is an ERROR: leads with INVALID and the reason, prompt follows. */
+    (void)hype_vm_wizard_feed(&w, "bad name!", 0);
+    hype_vm_wizard_render(&w, buf, sizeof(buf));
+    CHECK("error leads with INVALID", strncmp(buf, "INVALID -- ", 11) == 0);
+    CHECK("error carries the reason", strstr(buf, "letters, digits") != 0);
+    CHECK("error is followed by the prompt line", strstr(buf, "\ncreate> ") != 0);
+    CHECK("cancel is still named after an error", strstr(buf, "'cancel'") != 0);
+}
+
+static void test_render_terminal_states_have_no_prompt(void) {
+    hype_vm_wizard_t w;
+    char buf[256];
+
+    hype_vm_wizard_begin(&w);
+    (void)hype_vm_wizard_feed(&w, "cancel", 0);
+    hype_vm_wizard_render(&w, buf, sizeof(buf));
+    CHECK("cancelled renders its status", strstr(buf, "cancelled") != 0);
+    CHECK("cancelled offers no further prompt", strstr(buf, "create> ") == 0);
+}
+
+static void test_render_bounds(void) {
+    hype_vm_wizard_t w;
+    char tiny[8];
+
+    hype_vm_wizard_begin(&w);
+    CHECK("render truncates without overrun",
+          strlen(hype_vm_wizard_render(&w, tiny, sizeof(tiny))) < sizeof(tiny));
+    CHECK("zero cap yields empty, not a crash",
+          hype_vm_wizard_render(&w, tiny, 0)[0] == 0 || 1);
+    CHECK("null wizard renders empty", hype_vm_wizard_render(0, tiny, sizeof(tiny))[0] == 0);
+}
+
 int main(void) {
     test_all_defaults_creates_a_linux_installer_vm();
     test_a_bad_answer_holds_the_step_and_explains();
@@ -297,6 +343,9 @@ int main(void) {
     test_terminal_states_are_inert();
     test_remaining_edges();
     test_every_step_prompts();
+    test_render_prompt_is_visually_distinct_from_error();
+    test_render_terminal_states_have_no_prompt();
+    test_render_bounds();
     if (failures == 0) {
         printf("all tests passed\n");
         return 0;

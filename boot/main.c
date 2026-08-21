@@ -2368,7 +2368,7 @@ static void term_config_cmd(int idx, const char *nm);
 /* TERM-14 (#490): same placement reason -- needs g_hype_cfg + the serializer + #447. */
 static void term_set_cmd(int idx, const char *nm, const char *key, const char *value);
 /* TERM-10 (#486): the create wizard owns the command line while it is active. */
-static void term_create_begin(void);
+static void term_create_begin(const char *name_arg);
 static void term_create_feed(const char *line);
 static int g_wizard_active;
 
@@ -2531,7 +2531,7 @@ static void term_run_cmdline(void) {
             break;
         }
         case HYPE_CMD_CREATE:
-            term_create_begin();
+            term_create_begin(c.has_arg ? c.arg : 0);
             break;
         case HYPE_CMD_SCREENSHOT:
             /* #568: the same capture the hotkey performs. term_take_screenshot() reports its own
@@ -20170,14 +20170,14 @@ static int fw_1_start_new_vm(unsigned vi) {
 static hype_vm_wizard_t g_wizard;
 
 static void term_create_show(void) {
-    if (g_wizard.have_error) {
-        term_resultf("create: %s\n%s", g_wizard.error, hype_vm_wizard_prompt(&g_wizard));
-    } else {
-        term_resultf("create: %s", hype_vm_wizard_prompt(&g_wizard));
-    }
+    /* #570: the render is core's (hype_vm_wizard_render), where a unit test can hold the two
+     * states apart -- a prompt is `create> ...` with the cancel hint, a rejection leads with
+     * INVALID. The old "create: <prompt>" here is the exact text an operator read as an error. */
+    char line[256];
+    term_resultf("%s", hype_vm_wizard_render(&g_wizard, line, sizeof(line)));
 }
 
-static void term_create_begin(void) {
+static void term_create_begin(const char *name_arg) {
     if (g_hype_cfg.vm_count >= g_hype_cfg.vm_cap) {
         term_resultf("create: the config already holds %u VM(s), its storage limit -- nothing "
                      "created", g_hype_cfg.vm_count);
@@ -20201,6 +20201,14 @@ static void term_create_begin(void) {
     g_wizard_active = 1;
     HYPE_LOGF(HYPE_LOG_INFO, "fw-1 CREATE: wizard started (%u VM(s) now, %u slot(s) available) [#486]\n",
                      g_vm_count, g_max_vms - g_vm_count);
+    /*
+     * #570: `create <name>` uses the argument as the NAME answer instead of silently discarding
+     * it -- the third small surprise in the operator report. An invalid argument gets the same
+     * INVALID line an interactively typed bad name would, at the same step.
+     */
+    if (name_arg != 0 && name_arg[0] != '\0') {
+        (void)hype_vm_wizard_feed(&g_wizard, name_arg, &g_hype_cfg);
+    }
     term_create_show();
 }
 
@@ -20387,7 +20395,7 @@ static void fw_1_autocreate_probe(void) {
     }
     done = 1;
     hype_debug_print("fw-1 CREATE-PROBE: driving the wizard with fixed answers [#486]\n");
-    term_create_begin();
+    term_create_begin(0);
     if (!g_wizard_active) {
         hype_debug_print("fw-1 CREATE-PROBE: wizard refused to start [#486]\n");
         return;

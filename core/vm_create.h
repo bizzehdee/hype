@@ -51,6 +51,21 @@ void hype_vm_wizard_begin(hype_vm_wizard_t *w);
 const char *hype_vm_wizard_prompt(const hype_vm_wizard_t *w);
 
 /*
+ * #570: render the wizard's current state as the exact text the terminal shows. This is where a
+ * prompt and an error stop looking alike -- the operator report behind #570 read a correct prompt
+ * as a rejection, and that was the correct reading of the old text.
+ *
+ *   - a live prompt renders as   "create> <prompt>  ('cancel' abandons)"
+ *   - a rejected answer renders as "INVALID -- <why>" on its own line, THEN the prompt line
+ *   - DONE / CANCELLED render as their status text alone (no prompt -- the wizard is over)
+ *
+ * The `create>` prefix says the wizard owns the command line; the cancel hint names the way out on
+ * EVERY step (the other half of the operator report: no stated escape). Pure string building, so a
+ * test can assert the two states are distinguishable. Truncates safely at `cap`; returns `out`.
+ */
+const char *hype_vm_wizard_render(const hype_vm_wizard_t *w, char *out, unsigned cap);
+
+/*
  * Feed one answer. Returns the step the wizard is NOW on -- unchanged if the answer was rejected,
  * in which case w->error says why in terms an operator can act on.
  *
