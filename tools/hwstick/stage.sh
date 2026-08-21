@@ -14,8 +14,15 @@
 # indistinguishable from a run that produced nothing.
 set -eu
 cd "$(dirname "$0")/../.."
-DST="${1:-}"
-[ -n "$DST" ] && [ -d "$DST" ] || { echo "usage: $0 <mounted-stick-path>"; exit 2; }
+DST=""
+FAT32=0
+for a in "$@"; do
+    case "$a" in
+        --fat32) FAT32=1 ;;   # #597: stage the FAT32 on-medium self-test instead of the default run
+        *) DST="$a" ;;
+    esac
+done
+[ -n "$DST" ] && [ -d "$DST" ] || { echo "usage: $0 [--fat32] <mounted-stick-path>"; exit 2; }
 [ -f build/hype.efi ] || { echo "build/hype.efi missing -- run 'make all'"; exit 2; }
 for k in hello faulter ram1 cpumsr fwcfg intdeliver pausespin ps2 pflash pci; do
     [ -f "build/micro/$k.bin" ] || { echo "build/micro/$k.bin missing -- run 'make micro'"; exit 2; }
@@ -65,8 +72,20 @@ for k in vmlinuz-virt initramfs-virt; do
         cp "disk-images/545/$k" "$DST/EFI/hype/micro/$k"
     fi
 done
-cp tools/hwstick/hype.cfg tools/hwstick/hype-micro.cfg tools/hwstick/README.md "$DST/"
-cp tools/hwstick/input/*.txt "$DST/input/"
+if [ "$FAT32" -eq 1 ]; then
+    # #597: the active \hype.cfg is the FAT32 self-test config, and the marker file that arms the
+    # on-medium battery is present. The probe VM takes no input, so \input is left empty (no stale
+    # physical-write script is fed to it).
+    cp tools/hwstick/hype-fat32.cfg "$DST/hype.cfg"
+    cp tools/hwstick/hype-micro.cfg tools/hwstick/README.md "$DST/"
+    printf '%s\n' "#597 marker -- its presence makes hype run the FAT32 write battery on this volume." \
+        > "$DST/F32TEST.RUN"
+    echo "fat32: staged \\hype.cfg = hype-fat32.cfg and dropped the \\F32TEST.RUN marker"
+else
+    cp tools/hwstick/hype.cfg tools/hwstick/hype-micro.cfg tools/hwstick/README.md "$DST/"
+    cp tools/hwstick/input/*.txt "$DST/input/"
+    rm -f "$DST/F32TEST.RUN" # a normal run must not accidentally trigger the battery
+fi
 cp tools/hwstick/input-micro/*.txt "$DST/input-micro/"
 sync
 
