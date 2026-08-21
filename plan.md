@@ -2980,6 +2980,53 @@ isn't lost.
     was rejected -- it silently makes the trap path the de-facto product,
     which decision 6 already ruled out.
 
+    **Boot-D finding (2026-08-22), and what it changes.** The AMD gate did not
+    move. A flag-on build ran 26 minutes on bare metal and logged no AVIC line
+    at all -- the enable and the banner both sit in `fw_1_vm_reinit()`, whose
+    only caller is the VM-restart path, so a normal boot never reaches them,
+    and the state they point at is one 4 KiB backing page shared by every vCPU
+    of every VM with `max_physical_id = 0`. #193 delivered detection and a
+    VMCB field write, not a working AVIC. #640 carries the implementation
+    (per-vCPU backing pages, populated physical/logical ID tables, real
+    handling for the incomplete-IPI and no-accel exits, and one stated owner
+    of guest APIC state -- the software LAPIC model or the AVIC page, not
+    both). #600 is blocked on it. Nothing about the ruling changes: the target
+    is still ON by default per vendor. The correction is that "flip the
+    default after one validation run" presumed a feature that was ready to
+    validate, and on AMD it is not.
+
+59. **A guest's console must not be silently lossy -- decided (2026-08-22).**
+    Boot D read as a wedged guest: Alpine reached its login, took the scripted
+    `root`, printed the motd as far as "You may" and then said nothing for 17
+    minutes. The guest was healthy and idle at a live shell the whole time
+    (`GUESTPC ... lastreason=0x78` at the idle RIP). hype had dropped 5941 of
+    41199 console characters (`UARTTX: COM1 written=35258 dropped=5941`), and
+    the shell prompt was inside the dropped burst.
+
+    The cost is not cosmetic. `fw_1_drain_uart_console()` is what feeds
+    `fw_1_script_feed()`, so a dropped byte is a byte no expect pattern can
+    ever match: the input script stalled, #211's marker was never written, and
+    the whole 26-minute run yielded nothing on its own bar. Any past run
+    judged "guest wedged after login" is now suspect -- #637 first among them.
+
+    **Decided.** The guest UART model applies BACK-PRESSURE and never claims a
+    byte it did not queue (#639): LSR reports the transmitter ready only while
+    the TX ring has room, a THR write to a full ring raises no THRE, and the
+    dequeue that first makes room raises THRE as a counted 0->1 edge (#512's
+    mechanism) to wake an interrupt-driven writer. The ring is 4 KiB so the
+    common burst never reaches back-pressure. `UARTTX` now separates
+    `stalled` (the guest waited, nothing lost) from `dropped` (loss), and
+    after this a nonzero `dropped` means output is missing from the log.
+
+    **The general rule.** A model that reports a resource permanently ready
+    over a buffer that can fill will lose data, and the loss is invisible to
+    both the guest and the log reader. Where hype models a device the guest
+    can outrun -- and the drain is the BSP's alone, by the #239 rule --
+    readiness must be reported from the buffer's real state, not asserted.
+    Silent truncation of a diagnostic channel is worse than a stalled guest:
+    a stall is visible in one counter, a gap is indistinguishable from the
+    guest having nothing to say.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what
