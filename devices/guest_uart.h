@@ -28,7 +28,17 @@
  */
 
 #define HYPE_GUEST_UART_NREGS 8u
-#define HYPE_GUEST_UART_TX_RING 256u
+/*
+ * #639: 4 KiB, not 256 bytes, and the ring applies BACK-PRESSURE rather than dropping.
+ * Only the BSP loop drains this ring (one pass per vCPU-loop iteration, by the #239
+ * single-owner rule), so a guest writing from an AP -- or writing during one of the BSP's
+ * long housekeeping windows (#484 measured a 0.37 s worst-case device-lock hold) -- can
+ * queue thousands of bytes between two drains. Measured on the AMD boot-D run: 5941 of
+ * 41199 characters of a guest's console output were dropped in one burst at login, and the
+ * shell prompt was inside it, so the input script's `expect ~#` never matched and a healthy
+ * guest looked wedged for the remaining 17 minutes of the run.
+ */
+#define HYPE_GUEST_UART_TX_RING 4096u
 #define HYPE_GUEST_UART_RX_RING 64u
 
 /* Register offsets from the base port. */
@@ -77,6 +87,10 @@ typedef struct {
      * without these a lost console line looks exactly like a guest that stopped printing. */
     unsigned long long tx_written;
     unsigned long long tx_dropped;
+    /* #639: THR writes refused because the ring was full. Distinct from tx_dropped, which
+     * now only counts a guest that wrote THR anyway after LSR reported the transmitter
+     * busy -- real-hardware overrun, and the guest's own doing. */
+    unsigned long long tx_stalled;
 
     uint8_t rx[HYPE_GUEST_UART_RX_RING];
     uint32_t rx_head;
@@ -103,7 +117,7 @@ int hype_guest_uart_tx_dequeue(hype_guest_uart_t *u, uint8_t *out);
 
 /* Returns 1 if the UART currently has an enabled interrupt condition
  * asserted -- THRE (transmit always ready, when ETBEI is set) or RX data
- * available (when ERBFI is set). The 8250 driver's interrupt-driven TX
+ * available (when ERBFI is set, or -- #639 -- when a full TX ring drains again). The 8250 driver's interrupt-driven TX
  * (used by userspace tty writes, unlike the kernel's polled printk path)
  * sleeps until this fires, so a guest that enables ETBEI blocks forever
  * on a write if the serial IRQ is never delivered. The vCPU loop turns

@@ -13,6 +13,7 @@ void hype_guest_uart_reset(hype_guest_uart_t *u) {
     u->tx_head = 0;
     u->tx_tail = 0;
     u->tx_dropped = 0;
+    u->tx_stalled = 0;
     u->tx_written = 0;
     u->rx_head = 0;
     u->rx_tail = 0;
@@ -35,6 +36,13 @@ static void note_irq_edge(hype_guest_uart_t *u, int was_pending) {
 
 static int rx_available(const hype_guest_uart_t *u) {
     return u->rx_head != u->rx_tail;
+}
+
+/* #639: the transmitter is "busy" exactly while the ring has no room, and LSR.THRE has to
+ * say so. Reporting a permanently-ready transmitter over a ring that can fill is what turned
+ * a slow drain into silent data loss. */
+static int tx_full(const hype_guest_uart_t *u) {
+    return ((u->tx_tail + 1u) % HYPE_GUEST_UART_TX_RING) == u->tx_head;
 }
 
 uint8_t hype_guest_uart_read(hype_guest_uart_t *u, uint32_t offset) {
@@ -81,8 +89,11 @@ uint8_t hype_guest_uart_read(hype_guest_uart_t *u, uint32_t offset) {
         case HYPE_UART_REG_MCR:
             return u->mcr;
         case HYPE_UART_REG_LSR:
-            /* Transmitter always ready; DR set iff an RX byte waits. */
-            return (uint8_t)(HYPE_UART_LSR_THRE_TEMT | (rx_available(u) ? HYPE_UART_LSR_DR : 0u));
+            /* #639: THRE/TEMT while the ring has room, clear while it is full (a polled
+             * writer then spins on LSR, as it would on real hardware at 115200 baud, instead
+             * of handing hype bytes it has nowhere to put). DR set iff an RX byte waits. */
+            return (uint8_t)((tx_full(u) ? 0u : HYPE_UART_LSR_THRE_TEMT) |
+                             (rx_available(u) ? HYPE_UART_LSR_DR : 0u));
         case HYPE_UART_REG_MSR:
             /* Benign "carrier/CTS/DSR present" -- flow control is off, so
              * OVMF's default config never gates transmit on these. */
@@ -111,14 +122,24 @@ static void uart_write_reg(hype_guest_uart_t *u, uint32_t offset, uint8_t value)
                 if (next != u->tx_head) {
                     u->tx[u->tx_tail] = value;
                     u->tx_tail = next;
+                    u->tx_written++;
+                    /* The holding register empties into the ring immediately, so THRE rises
+                     * again: that 0->1 edge is what re-arms the interrupt for the next byte.
+                     * Writing THR also clears any THRE interrupt already pending, as on real
+                     * hardware. */
+                    u->thre_int = 1;
                 } else {
+                    /*
+                     * #639: full ring. LSR already reported the transmitter busy, so a driver
+                     * that respects THRE is not here; one that wrote anyway overruns, exactly
+                     * as it would on hardware. Do NOT raise THRE -- claiming the byte was sent
+                     * is what let a slow drain eat 14% of a guest's console. The dequeue side
+                     * raises the edge when room appears.
+                     */
+                    u->tx_stalled++;
                     u->tx_dropped++;
+                    u->thre_int = 0;
                 }
-                u->tx_written++;
-                /* Transmit is infinite-speed here, so the holding register empties immediately:
-                 * that 0->1 edge on THRE is what re-arms the interrupt for the next byte. Writing
-                 * THR also clears any THRE interrupt already pending, as on real hardware. */
-                u->thre_int = 1;
             }
             return;
         case HYPE_UART_REG_IER:
@@ -164,11 +185,22 @@ unsigned long long hype_guest_uart_irq_events(const hype_guest_uart_t *u) {
 }
 
 int hype_guest_uart_tx_dequeue(hype_guest_uart_t *u, uint8_t *out) {
+    int was_full;
+    int was_pending;
     if (u->tx_head == u->tx_tail) {
         return 0;
     }
+    was_full = tx_full(u);
+    was_pending = hype_guest_uart_irq_pending(u);
     *out = u->tx[u->tx_head];
     u->tx_head = (u->tx_head + 1u) % HYPE_GUEST_UART_TX_RING;
+    /* #639: a full->has-room transition is the transmitter becoming ready again. An
+     * ETBEI-driven writer is asleep waiting for precisely that edge, and nothing else in the
+     * model produces it once THR writes have stopped raising THRE on a full ring. */
+    if (was_full) {
+        u->thre_int = 1;
+        note_irq_edge(u, was_pending);
+    }
     return 1;
 }
 

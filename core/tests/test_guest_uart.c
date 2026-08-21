@@ -22,7 +22,7 @@ static void test_scratch_register_roundtrips(void) {
     CHECK_HEX("SCR returns 0x55", 0x55, hype_guest_uart_read(&u, HYPE_UART_REG_SCR));
 }
 
-static void test_lsr_always_transmit_ready(void) {
+static void test_lsr_transmit_ready_while_ring_has_room(void) {
     hype_guest_uart_t u;
     hype_guest_uart_reset(&u);
     /* THRE|TEMT set, DR clear when no input. */
@@ -209,9 +209,52 @@ static void test_rx_ring_full_rejects(void) {
     CHECK_HEX("rx enqueue eventually rejects when full", 0, last);
 }
 
+/*
+ * #639: a full TX ring must apply back-pressure, not swallow bytes.
+ *
+ * Measured on the AMD boot-D run: only the BSP loop drains this ring, and a guest writing
+ * from another vCPU queued 41199 characters between drains against a 256-byte ring. 5941 of
+ * them were dropped, the shell prompt was among them, and the input script waiting on that
+ * prompt hung for the rest of the run while the guest sat healthy at a live shell.
+ *
+ * The contract this pins: while the ring is full LSR reports the transmitter BUSY (so a
+ * polled writer waits) and THR writes raise no THRE (so an interrupt-driven writer is not
+ * told a byte it never queued was sent); the first dequeue that makes room raises THRE again
+ * as a counted 0->1 edge, which is what wakes that writer.
+ */
+static void test_tx_ring_full_applies_backpressure(void) {
+    hype_guest_uart_t u;
+    unsigned int i;
+    unsigned long long edges_before;
+    uint8_t b = 0;
+    hype_guest_uart_reset(&u);
+    hype_guest_uart_write(&u, HYPE_UART_REG_IER, HYPE_UART_IER_ETBEI);
+
+    for (i = 0; i < HYPE_GUEST_UART_TX_RING - 1u; i++) {
+        hype_guest_uart_write(&u, HYPE_UART_REG_DATA, (uint8_t)('a' + (i % 26u)));
+    }
+    CHECK_HEX("ring holds capacity-1 bytes with none lost", 0, (int)u.tx_dropped);
+    CHECK_HEX("LSR reports transmitter busy when full", 0x00,
+              hype_guest_uart_read(&u, HYPE_UART_REG_LSR));
+
+    /* A guest that writes anyway overruns -- hardware behaviour -- and must not be told THRE. */
+    hype_guest_uart_write(&u, HYPE_UART_REG_DATA, 'X');
+    CHECK_HEX("write to a full ring is counted as stalled", 1, (int)u.tx_stalled);
+    CHECK_HEX("no THRE interrupt while the ring is full", 0, hype_guest_uart_irq_pending(&u));
+
+    edges_before = hype_guest_uart_irq_events(&u);
+    CHECK_HEX("dequeue from a full ring succeeds", 1, hype_guest_uart_tx_dequeue(&u, &b));
+    CHECK_HEX("first queued byte survives the overrun", 'a', b);
+    CHECK_HEX("room again raises THRE", 1, hype_guest_uart_irq_pending(&u));
+    CHECK_HEX("room again counts one model edge", 1,
+              (int)(hype_guest_uart_irq_events(&u) - edges_before));
+    CHECK_HEX("LSR ready again once there is room", 0x60,
+              hype_guest_uart_read(&u, HYPE_UART_REG_LSR));
+}
+
 int main(void) {
     test_scratch_register_roundtrips();
-    test_lsr_always_transmit_ready();
+    test_lsr_transmit_ready_while_ring_has_room();
     test_thr_write_transmits();
     test_rx_read_and_dr();
     test_dlab_aliases_divisor();
@@ -221,6 +264,7 @@ int main(void) {
     test_irq_events_counts_model_edges();
     test_rx_interrupt_and_priority();
     test_rx_ring_full_rejects();
+    test_tx_ring_full_applies_backpressure();
 
     if (failures == 0) {
         printf("all tests passed\n");

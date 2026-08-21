@@ -15640,10 +15640,15 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * output; tx_dropped == 0 with tx_written far above what reached the log means
                  * the shortfall is escape-sequence stripping in the line sink and the guest
                  * really did stop. */
-                hype_debug_print("fw-1 UARTTX: COM1 written=%llu dropped=%llu | COM2 written=%llu "
-                                 "dropped=%llu\n",
-                                 g_fw_1_uart.tx_written, g_fw_1_uart.tx_dropped,
-                                 g_fw_1_uart2.tx_written, g_fw_1_uart2.tx_dropped);
+                /* #639: stalled is back-pressure (the guest waited, nothing lost); dropped is
+                 * loss, and after #639 it can only happen when a guest writes THR after LSR
+                 * said busy. A nonzero dropped means console output -- and any prompt an input
+                 * script is waiting for -- is missing from this log. */
+                hype_debug_print("fw-1 UARTTX: COM1 written=%llu stalled=%llu dropped=%llu | "
+                                 "COM2 written=%llu stalled=%llu dropped=%llu\n",
+                                 g_fw_1_uart.tx_written, g_fw_1_uart.tx_stalled,
+                                 g_fw_1_uart.tx_dropped, g_fw_1_uart2.tx_written,
+                                 g_fw_1_uart2.tx_stalled, g_fw_1_uart2.tx_dropped);
                 {
                     /*
                      * #557: defer/overwrite belong on this line.
