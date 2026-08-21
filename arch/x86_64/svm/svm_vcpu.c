@@ -3954,7 +3954,7 @@ int hype_svm_vcpu_handle_xhci_npf(hype_vcpu_ctx_t *ctx, hype_xhci_dev_t *dev,
     hype_svm_decode_npf_info(real->vmcb->control.exitinfo1, real->vmcb->control.exitinfo2, &npf);
 
     if (npf.guest_phys_addr < mmio_base_phys ||
-        npf.guest_phys_addr >= mmio_base_phys + HYPE_XHCI_BAR_SIZE) {
+        npf.guest_phys_addr >= mmio_base_phys + HYPE_GXHCI_BAR_SIZE) {
         return -1;
     }
     offset = (uint32_t)(npf.guest_phys_addr - mmio_base_phys);

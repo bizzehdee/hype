@@ -2808,7 +2808,7 @@ int hype_vmx_vcpu_handle_xhci_npf(hype_vcpu_ctx_t *ctx, hype_xhci_dev_t *dev,
     vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     struct vmx_mmio_access m;
-    if (vmx_mmio_begin_insn(real, mmio_base_phys, HYPE_XHCI_BAR_SIZE, insn, &m) != 0) {
+    if (vmx_mmio_begin_insn(real, mmio_base_phys, HYPE_GXHCI_BAR_SIZE, insn, &m) != 0) {
         return -1;
     }
     if (m.decoded.is_write) {

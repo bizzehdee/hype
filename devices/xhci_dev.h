@@ -23,141 +23,141 @@
  */
 
 /* ---- BAR layout (all offsets from BAR0 base) --------------------------------------------- */
-#define HYPE_XHCI_BAR_SIZE 0x1000u
+#define HYPE_GXHCI_BAR_SIZE 0x1000u
 
 /* Capability registers (read-only), 0x00..0x1F. */
-#define HYPE_XHCI_CAP_CAPLENGTH 0x00u /* byte: operational-register offset */
-#define HYPE_XHCI_CAP_HCIVERSION 0x02u
-#define HYPE_XHCI_CAP_HCSPARAMS1 0x04u
-#define HYPE_XHCI_CAP_HCSPARAMS2 0x08u
-#define HYPE_XHCI_CAP_HCSPARAMS3 0x0Cu
-#define HYPE_XHCI_CAP_HCCPARAMS1 0x10u
-#define HYPE_XHCI_CAP_DBOFF 0x14u
-#define HYPE_XHCI_CAP_RTSOFF 0x18u
-#define HYPE_XHCI_CAP_HCCPARAMS2 0x1Cu
+#define HYPE_GXHCI_CAP_CAPLENGTH 0x00u /* byte: operational-register offset */
+#define HYPE_GXHCI_CAP_HCIVERSION 0x02u
+#define HYPE_GXHCI_CAP_HCSPARAMS1 0x04u
+#define HYPE_GXHCI_CAP_HCSPARAMS2 0x08u
+#define HYPE_GXHCI_CAP_HCSPARAMS3 0x0Cu
+#define HYPE_GXHCI_CAP_HCCPARAMS1 0x10u
+#define HYPE_GXHCI_CAP_DBOFF 0x14u
+#define HYPE_GXHCI_CAP_RTSOFF 0x18u
+#define HYPE_GXHCI_CAP_HCCPARAMS2 0x1Cu
 
-#define HYPE_XHCI_CAPLENGTH 0x20u  /* operational registers begin here */
-#define HYPE_XHCI_HCIVERSION 0x0100u
-#define HYPE_XHCI_MAX_SLOTS 8u
-#define HYPE_XHCI_MAX_PORTS 1u
+#define HYPE_GXHCI_CAPLENGTH 0x20u  /* operational registers begin here */
+#define HYPE_GXHCI_HCIVERSION 0x0100u
+#define HYPE_GXHCI_MAX_SLOTS 8u
+#define HYPE_GXHCI_MAX_PORTS 1u
 /* HCSPARAMS1: MaxSlots[7:0], MaxIntrs[18:8], MaxPorts[31:24]. */
-#define HYPE_XHCI_HCSPARAMS1 \
-    (((uint32_t)HYPE_XHCI_MAX_PORTS << 24) | (1u << 8) | HYPE_XHCI_MAX_SLOTS)
+#define HYPE_GXHCI_HCSPARAMS1 \
+    (((uint32_t)HYPE_GXHCI_MAX_PORTS << 24) | (1u << 8) | HYPE_GXHCI_MAX_SLOTS)
 /* HCCPARAMS1 = 0: 32-bit addressing (AC64=0), 32-byte contexts (CSZ=0), no xECP. */
-#define HYPE_XHCI_HCCPARAMS1 0x00000000u
-#define HYPE_XHCI_DBOFF 0x0800u  /* must be 4-byte aligned; low 2 bits reserved 0 */
-#define HYPE_XHCI_RTSOFF 0x0600u /* must be 32-byte aligned; low 5 bits reserved 0 */
+#define HYPE_GXHCI_HCCPARAMS1 0x00000000u
+#define HYPE_GXHCI_DBOFF 0x0800u  /* must be 4-byte aligned; low 2 bits reserved 0 */
+#define HYPE_GXHCI_RTSOFF 0x0600u /* must be 32-byte aligned; low 5 bits reserved 0 */
 
 /* Operational registers (absolute offsets = CAPLENGTH + reg). */
-#define HYPE_XHCI_OP_USBCMD (HYPE_XHCI_CAPLENGTH + 0x00u)
-#define HYPE_XHCI_OP_USBSTS (HYPE_XHCI_CAPLENGTH + 0x04u)
-#define HYPE_XHCI_OP_PAGESIZE (HYPE_XHCI_CAPLENGTH + 0x08u)
-#define HYPE_XHCI_OP_DNCTRL (HYPE_XHCI_CAPLENGTH + 0x14u)
-#define HYPE_XHCI_OP_CRCR_LO (HYPE_XHCI_CAPLENGTH + 0x18u)
-#define HYPE_XHCI_OP_CRCR_HI (HYPE_XHCI_CAPLENGTH + 0x1Cu)
-#define HYPE_XHCI_OP_DCBAAP_LO (HYPE_XHCI_CAPLENGTH + 0x30u)
-#define HYPE_XHCI_OP_DCBAAP_HI (HYPE_XHCI_CAPLENGTH + 0x34u)
-#define HYPE_XHCI_OP_CONFIG (HYPE_XHCI_CAPLENGTH + 0x38u)
+#define HYPE_GXHCI_OP_USBCMD (HYPE_GXHCI_CAPLENGTH + 0x00u)
+#define HYPE_GXHCI_OP_USBSTS (HYPE_GXHCI_CAPLENGTH + 0x04u)
+#define HYPE_GXHCI_OP_PAGESIZE (HYPE_GXHCI_CAPLENGTH + 0x08u)
+#define HYPE_GXHCI_OP_DNCTRL (HYPE_GXHCI_CAPLENGTH + 0x14u)
+#define HYPE_GXHCI_OP_CRCR_LO (HYPE_GXHCI_CAPLENGTH + 0x18u)
+#define HYPE_GXHCI_OP_CRCR_HI (HYPE_GXHCI_CAPLENGTH + 0x1Cu)
+#define HYPE_GXHCI_OP_DCBAAP_LO (HYPE_GXHCI_CAPLENGTH + 0x30u)
+#define HYPE_GXHCI_OP_DCBAAP_HI (HYPE_GXHCI_CAPLENGTH + 0x34u)
+#define HYPE_GXHCI_OP_CONFIG (HYPE_GXHCI_CAPLENGTH + 0x38u)
 /* Port register set: operational base + 0x400 + 0x10 * (port-1). One port. */
-#define HYPE_XHCI_OP_PORTSC (HYPE_XHCI_CAPLENGTH + 0x400u)
+#define HYPE_GXHCI_OP_PORTSC (HYPE_GXHCI_CAPLENGTH + 0x400u)
 
 /* USBCMD bits. */
-#define HYPE_XHCI_USBCMD_RS 0x0001u    /* Run/Stop */
-#define HYPE_XHCI_USBCMD_HCRST 0x0002u /* Host Controller Reset */
-#define HYPE_XHCI_USBCMD_INTE 0x0004u  /* Interrupter Enable */
+#define HYPE_GXHCI_USBCMD_RS 0x0001u    /* Run/Stop */
+#define HYPE_GXHCI_USBCMD_HCRST 0x0002u /* Host Controller Reset */
+#define HYPE_GXHCI_USBCMD_INTE 0x0004u  /* Interrupter Enable */
 /* USBSTS bits. */
-#define HYPE_XHCI_USBSTS_HCH 0x0001u   /* HCHalted */
-#define HYPE_XHCI_USBSTS_EINT 0x0008u  /* Event Interrupt */
-#define HYPE_XHCI_USBSTS_PCD 0x0010u   /* Port Change Detect */
-#define HYPE_XHCI_USBSTS_CNR 0x0800u   /* Controller Not Ready */
+#define HYPE_GXHCI_USBSTS_HCH 0x0001u   /* HCHalted */
+#define HYPE_GXHCI_USBSTS_EINT 0x0008u  /* Event Interrupt */
+#define HYPE_GXHCI_USBSTS_PCD 0x0010u   /* Port Change Detect */
+#define HYPE_GXHCI_USBSTS_CNR 0x0800u   /* Controller Not Ready */
 /* CRCR bits (in the low dword). */
-#define HYPE_XHCI_CRCR_RCS 0x1u  /* Ring Cycle State */
-#define HYPE_XHCI_CRCR_CS 0x2u   /* Command Stop */
-#define HYPE_XHCI_CRCR_CA 0x4u   /* Command Abort */
-#define HYPE_XHCI_CRCR_CRR 0x8u  /* Command Ring Running */
-#define HYPE_XHCI_CRCR_PTR_MASK 0xFFFFFFFFFFFFFFC0ull /* [63:6] command ring pointer */
+#define HYPE_GXHCI_CRCR_RCS 0x1u  /* Ring Cycle State */
+#define HYPE_GXHCI_CRCR_CS 0x2u   /* Command Stop */
+#define HYPE_GXHCI_CRCR_CA 0x4u   /* Command Abort */
+#define HYPE_GXHCI_CRCR_CRR 0x8u  /* Command Ring Running */
+#define HYPE_GXHCI_CRCR_PTR_MASK 0xFFFFFFFFFFFFFFC0ull /* [63:6] command ring pointer */
 
 /* PORTSC bits. */
-#define HYPE_XHCI_PORTSC_CCS 0x00000001u  /* Current Connect Status */
-#define HYPE_XHCI_PORTSC_PED 0x00000002u  /* Port Enabled/Disabled */
-#define HYPE_XHCI_PORTSC_PR 0x00000010u   /* Port Reset */
-#define HYPE_XHCI_PORTSC_PP 0x00000200u   /* Port Power */
-#define HYPE_XHCI_PORTSC_CSC 0x00020000u  /* Connect Status Change */
-#define HYPE_XHCI_PORTSC_PRC 0x00200000u  /* Port Reset Change */
-#define HYPE_XHCI_PORTSC_SPEED_SHIFT 10u  /* Port Speed [13:10] */
-#define HYPE_XHCI_PORTSC_SPEED_HS 3u      /* High-Speed (USB 2.0) */
+#define HYPE_GXHCI_PORTSC_CCS 0x00000001u  /* Current Connect Status */
+#define HYPE_GXHCI_PORTSC_PED 0x00000002u  /* Port Enabled/Disabled */
+#define HYPE_GXHCI_PORTSC_PR 0x00000010u   /* Port Reset */
+#define HYPE_GXHCI_PORTSC_PP 0x00000200u   /* Port Power */
+#define HYPE_GXHCI_PORTSC_CSC 0x00020000u  /* Connect Status Change */
+#define HYPE_GXHCI_PORTSC_PRC 0x00200000u  /* Port Reset Change */
+#define HYPE_GXHCI_PORTSC_SPEED_SHIFT 10u  /* Port Speed [13:10] */
+#define HYPE_GXHCI_PORTSC_SPEED_HS 3u      /* High-Speed (USB 2.0) */
 /* Write-1-to-clear change bits the guest acknowledges. */
-#define HYPE_XHCI_PORTSC_RW1C (HYPE_XHCI_PORTSC_CSC | HYPE_XHCI_PORTSC_PRC)
+#define HYPE_GXHCI_PORTSC_RW1C (HYPE_GXHCI_PORTSC_CSC | HYPE_GXHCI_PORTSC_PRC)
 
 /* Runtime registers (absolute = RTSOFF + reg). Interrupter 0 only. */
-#define HYPE_XHCI_RT_MFINDEX (HYPE_XHCI_RTSOFF + 0x00u)
-#define HYPE_XHCI_RT_IMAN (HYPE_XHCI_RTSOFF + 0x20u)
-#define HYPE_XHCI_RT_IMOD (HYPE_XHCI_RTSOFF + 0x24u)
-#define HYPE_XHCI_RT_ERSTSZ (HYPE_XHCI_RTSOFF + 0x28u)
-#define HYPE_XHCI_RT_ERSTBA_LO (HYPE_XHCI_RTSOFF + 0x30u)
-#define HYPE_XHCI_RT_ERSTBA_HI (HYPE_XHCI_RTSOFF + 0x34u)
-#define HYPE_XHCI_RT_ERDP_LO (HYPE_XHCI_RTSOFF + 0x38u)
-#define HYPE_XHCI_RT_ERDP_HI (HYPE_XHCI_RTSOFF + 0x3Cu)
+#define HYPE_GXHCI_RT_MFINDEX (HYPE_GXHCI_RTSOFF + 0x00u)
+#define HYPE_GXHCI_RT_IMAN (HYPE_GXHCI_RTSOFF + 0x20u)
+#define HYPE_GXHCI_RT_IMOD (HYPE_GXHCI_RTSOFF + 0x24u)
+#define HYPE_GXHCI_RT_ERSTSZ (HYPE_GXHCI_RTSOFF + 0x28u)
+#define HYPE_GXHCI_RT_ERSTBA_LO (HYPE_GXHCI_RTSOFF + 0x30u)
+#define HYPE_GXHCI_RT_ERSTBA_HI (HYPE_GXHCI_RTSOFF + 0x34u)
+#define HYPE_GXHCI_RT_ERDP_LO (HYPE_GXHCI_RTSOFF + 0x38u)
+#define HYPE_GXHCI_RT_ERDP_HI (HYPE_GXHCI_RTSOFF + 0x3Cu)
 /* IMAN bits. */
-#define HYPE_XHCI_IMAN_IP 0x1u /* Interrupt Pending (write-1-to-clear) */
-#define HYPE_XHCI_IMAN_IE 0x2u /* Interrupt Enable */
+#define HYPE_GXHCI_IMAN_IP 0x1u /* Interrupt Pending (write-1-to-clear) */
+#define HYPE_GXHCI_IMAN_IE 0x2u /* Interrupt Enable */
 /* ERDP bit 3: Event Handler Busy (write-1-to-clear). */
-#define HYPE_XHCI_ERDP_EHB 0x8u
-#define HYPE_XHCI_ERDP_PTR_MASK 0xFFFFFFFFFFFFFFF0ull
+#define HYPE_GXHCI_ERDP_EHB 0x8u
+#define HYPE_GXHCI_ERDP_PTR_MASK 0xFFFFFFFFFFFFFFF0ull
 
 /* Doorbell registers (absolute = DBOFF + 4 * target). Target 0 = command ring. */
-#define HYPE_XHCI_DB_COMMAND 0u
+#define HYPE_GXHCI_DB_COMMAND 0u
 
 /* ---- TRB (Transfer Request Block) -------------------------------------------------------- */
 /* A TRB is 16 bytes: two dwords of parameter, one status dword, one control dword. Bit 0 of the
  * control dword is the Cycle bit; bits [15:10] are the TRB Type; bits [31:24] the Slot ID. */
-#define HYPE_XHCI_TRB_SIZE 16u
-#define HYPE_XHCI_TRB_CYCLE 0x1u
-#define HYPE_XHCI_TRB_TYPE_SHIFT 10u
-#define HYPE_XHCI_TRB_TYPE_MASK 0xFC00u /* [15:10] within the control dword's low 16 bits */
-#define HYPE_XHCI_TRB_SLOT_SHIFT 24u
+#define HYPE_GXHCI_TRB_SIZE 16u
+#define HYPE_GXHCI_TRB_CYCLE 0x1u
+#define HYPE_GXHCI_TRB_TYPE_SHIFT 10u
+#define HYPE_GXHCI_TRB_TYPE_MASK 0xFC00u /* [15:10] within the control dword's low 16 bits */
+#define HYPE_GXHCI_TRB_SLOT_SHIFT 24u
 
 /* TRB types (control dword bits [15:10]). */
-#define HYPE_XHCI_TRB_NORMAL 1u
-#define HYPE_XHCI_TRB_SETUP_STAGE 2u
-#define HYPE_XHCI_TRB_DATA_STAGE 3u
-#define HYPE_XHCI_TRB_STATUS_STAGE 4u
-#define HYPE_XHCI_TRB_LINK 6u
-#define HYPE_XHCI_TRB_ENABLE_SLOT 9u
-#define HYPE_XHCI_TRB_DISABLE_SLOT 10u
-#define HYPE_XHCI_TRB_ADDRESS_DEVICE 11u
-#define HYPE_XHCI_TRB_CONFIGURE_ENDPOINT 12u
-#define HYPE_XHCI_TRB_EVALUATE_CONTEXT 13u
-#define HYPE_XHCI_TRB_NOOP_CMD 23u
-#define HYPE_XHCI_TRB_TRANSFER_EVENT 32u
-#define HYPE_XHCI_TRB_CMD_COMPLETION 33u
-#define HYPE_XHCI_TRB_PORT_STATUS_CHANGE 34u
+#define HYPE_GXHCI_TRB_NORMAL 1u
+#define HYPE_GXHCI_TRB_SETUP_STAGE 2u
+#define HYPE_GXHCI_TRB_DATA_STAGE 3u
+#define HYPE_GXHCI_TRB_STATUS_STAGE 4u
+#define HYPE_GXHCI_TRB_LINK 6u
+#define HYPE_GXHCI_TRB_ENABLE_SLOT 9u
+#define HYPE_GXHCI_TRB_DISABLE_SLOT 10u
+#define HYPE_GXHCI_TRB_ADDRESS_DEVICE 11u
+#define HYPE_GXHCI_TRB_CONFIGURE_ENDPOINT 12u
+#define HYPE_GXHCI_TRB_EVALUATE_CONTEXT 13u
+#define HYPE_GXHCI_TRB_NOOP_CMD 23u
+#define HYPE_GXHCI_TRB_TRANSFER_EVENT 32u
+#define HYPE_GXHCI_TRB_CMD_COMPLETION 33u
+#define HYPE_GXHCI_TRB_PORT_STATUS_CHANGE 34u
 /* Link-TRB control bit 1: Toggle Cycle. */
-#define HYPE_XHCI_TRB_LINK_TC 0x2u
+#define HYPE_GXHCI_TRB_LINK_TC 0x2u
 /* Transfer-TRB control bits. */
-#define HYPE_XHCI_TRB_IOC 0x20u          /* bit 5: Interrupt On Completion */
-#define HYPE_XHCI_TRB_IDT 0x40u          /* bit 6: Immediate Data (Setup Stage) */
-#define HYPE_XHCI_TRB_CHAIN 0x10u        /* bit 4: Chain */
-#define HYPE_XHCI_TRB_DATA_DIR_IN 0x10000u /* Data/Status Stage control bit 16: 1 = device-to-host */
+#define HYPE_GXHCI_TRB_IOC 0x20u          /* bit 5: Interrupt On Completion */
+#define HYPE_GXHCI_TRB_IDT 0x40u          /* bit 6: Immediate Data (Setup Stage) */
+#define HYPE_GXHCI_TRB_CHAIN 0x10u        /* bit 4: Chain */
+#define HYPE_GXHCI_TRB_DATA_DIR_IN 0x10000u /* Data/Status Stage control bit 16: 1 = device-to-host */
 /* Normal/Data TRB status: [16:0] TRB Transfer Length. */
-#define HYPE_XHCI_TRB_XFER_LEN_MASK 0x1FFFFu
+#define HYPE_GXHCI_TRB_XFER_LEN_MASK 0x1FFFFu
 /* Endpoint DCIs the USB-MSC function uses: EP0 control, then bulk OUT/IN. */
-#define HYPE_XHCI_DCI_CONTROL 1u
-#define HYPE_XHCI_DCI_BULK_OUT 2u
-#define HYPE_XHCI_DCI_BULK_IN 3u
+#define HYPE_GXHCI_DCI_CONTROL 1u
+#define HYPE_GXHCI_DCI_BULK_OUT 2u
+#define HYPE_GXHCI_DCI_BULK_IN 3u
 
 /* Completion codes (event TRB status [31:24]). */
-#define HYPE_XHCI_CC_SUCCESS 1u
-#define HYPE_XHCI_CC_TRB_ERROR 5u
-#define HYPE_XHCI_CC_SLOT_NOT_ENABLED 11u
-#define HYPE_XHCI_CC_PARAMETER_ERROR 17u
+#define HYPE_GXHCI_CC_SUCCESS 1u
+#define HYPE_GXHCI_CC_TRB_ERROR 5u
+#define HYPE_GXHCI_CC_SLOT_NOT_ENABLED 11u
+#define HYPE_GXHCI_CC_PARAMETER_ERROR 17u
 
 /* Slot state (device-context slot-context byte, and our own tracking). */
 typedef enum {
-    HYPE_XHCI_SLOT_DISABLED = 0,
-    HYPE_XHCI_SLOT_ENABLED = 1,
-    HYPE_XHCI_SLOT_ADDRESSED = 2,
-    HYPE_XHCI_SLOT_CONFIGURED = 3
+    HYPE_GXHCI_SLOT_DISABLED = 0,
+    HYPE_GXHCI_SLOT_ENABLED = 1,
+    HYPE_GXHCI_SLOT_ADDRESSED = 2,
+    HYPE_GXHCI_SLOT_CONFIGURED = 3
 } hype_xhci_slot_state_t;
 
 /* Per-slot tracking (one device per controller in v1, but the array keeps slot IDs honest). */
@@ -199,7 +199,7 @@ typedef struct {
     uint8_t event_pcs;        /* producer cycle state for the event ring */
     int erst_latched;         /* event ring segment loaded from the ERST */
 
-    hype_xhci_slot_t slots[HYPE_XHCI_MAX_SLOTS + 1]; /* [0] unused; slot IDs are 1-based */
+    hype_xhci_slot_t slots[HYPE_GXHCI_MAX_SLOTS + 1]; /* [0] unused; slot IDs are 1-based */
     unsigned int slots_enabled;
 
     int device_present; /* 1 once a backing device is attached (set by the MSC layer, #592) */

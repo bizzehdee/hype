@@ -68,8 +68,8 @@ static int gwrite32(const hype_gpa_map_t *m, uint64_t gpa, uint32_t v) {
 /* ---- reset ------------------------------------------------------------------------------- */
 static void slots_reset(hype_xhci_dev_t *dev) {
     unsigned int s, e;
-    for (s = 0; s <= HYPE_XHCI_MAX_SLOTS; s++) {
-        dev->slots[s].state = HYPE_XHCI_SLOT_DISABLED;
+    for (s = 0; s <= HYPE_GXHCI_MAX_SLOTS; s++) {
+        dev->slots[s].state = HYPE_GXHCI_SLOT_DISABLED;
         dev->slots[s].device_ctx_gpa = 0;
         for (e = 0; e < 32u; e++) {
             dev->slots[s].ep_ring[e] = 0;
@@ -85,17 +85,17 @@ void hype_xhci_dev_reset(hype_xhci_dev_t *dev, int device_present) {
         return;
     }
     dev->usbcmd = 0u;
-    dev->usbsts = HYPE_XHCI_USBSTS_HCH; /* halted at reset; CNR clear (we are always ready) */
+    dev->usbsts = HYPE_GXHCI_USBSTS_HCH; /* halted at reset; CNR clear (we are always ready) */
     dev->dnctrl = 0u;
     dev->config = 0u;
     dev->crcr = 0u;
     dev->dcbaap = 0u;
     /* One port. If the device is present it reads as connected from reset (the cable is soldered
      * in for an emulated stick), with a Connect Status Change the guest will service. */
-    dev->portsc = HYPE_XHCI_PORTSC_PP;
+    dev->portsc = HYPE_GXHCI_PORTSC_PP;
     if (device_present) {
-        dev->portsc |= HYPE_XHCI_PORTSC_CCS | HYPE_XHCI_PORTSC_CSC |
-                       ((uint32_t)HYPE_XHCI_PORTSC_SPEED_HS << HYPE_XHCI_PORTSC_SPEED_SHIFT);
+        dev->portsc |= HYPE_GXHCI_PORTSC_CCS | HYPE_GXHCI_PORTSC_CSC |
+                       ((uint32_t)HYPE_GXHCI_PORTSC_SPEED_HS << HYPE_GXHCI_PORTSC_SPEED_SHIFT);
     }
     dev->iman = 0u;
     dev->imod = 0u;
@@ -165,14 +165,14 @@ static int event_post(hype_xhci_dev_t *dev, const hype_gpa_map_t *m, uint64_t pa
     if (!dev->erst_latched && event_ring_latch(dev, m) != 0) {
         return -1;
     }
-    control = control_no_cycle | (dev->event_pcs ? HYPE_XHCI_TRB_CYCLE : 0u);
+    control = control_no_cycle | (dev->event_pcs ? HYPE_GXHCI_TRB_CYCLE : 0u);
     if (gwrite32(m, dev->event_ring_ptr + 0u, (uint32_t)param) != 0 ||
         gwrite32(m, dev->event_ring_ptr + 4u, (uint32_t)(param >> 32)) != 0 ||
         gwrite32(m, dev->event_ring_ptr + 8u, status) != 0 ||
         gwrite32(m, dev->event_ring_ptr + 12u, control) != 0) {
         return -1;
     }
-    dev->event_ring_ptr += HYPE_XHCI_TRB_SIZE;
+    dev->event_ring_ptr += HYPE_GXHCI_TRB_SIZE;
     dev->event_trbs_left--;
     if (dev->event_trbs_left == 0u) {
         dev->event_ring_ptr = dev->event_seg_base;
@@ -181,24 +181,24 @@ static int event_post(hype_xhci_dev_t *dev, const hype_gpa_map_t *m, uint64_t pa
     }
     dev->events_posted++;
     /* Raise the interrupt: EINT in USBSTS, IP in the interrupter. The guest clears both. */
-    dev->usbsts |= HYPE_XHCI_USBSTS_EINT;
-    dev->iman |= HYPE_XHCI_IMAN_IP;
+    dev->usbsts |= HYPE_GXHCI_USBSTS_EINT;
+    dev->iman |= HYPE_GXHCI_IMAN_IP;
     return 0;
 }
 
 static void post_cmd_completion(hype_xhci_dev_t *dev, const hype_gpa_map_t *m, uint64_t cmd_trb_gpa,
                                 uint32_t completion_code, uint8_t slot_id) {
     uint32_t status = completion_code << 24;
-    uint32_t control = ((uint32_t)HYPE_XHCI_TRB_CMD_COMPLETION << HYPE_XHCI_TRB_TYPE_SHIFT) |
-                       ((uint32_t)slot_id << HYPE_XHCI_TRB_SLOT_SHIFT);
+    uint32_t control = ((uint32_t)HYPE_GXHCI_TRB_CMD_COMPLETION << HYPE_GXHCI_TRB_TYPE_SHIFT) |
+                       ((uint32_t)slot_id << HYPE_GXHCI_TRB_SLOT_SHIFT);
     (void)event_post(dev, m, cmd_trb_gpa, status, control);
 }
 
 /* ---- command execution ------------------------------------------------------------------- */
 static uint8_t first_free_slot(hype_xhci_dev_t *dev) {
     unsigned int s;
-    for (s = 1u; s <= HYPE_XHCI_MAX_SLOTS; s++) {
-        if (dev->slots[s].state == HYPE_XHCI_SLOT_DISABLED) {
+    for (s = 1u; s <= HYPE_GXHCI_MAX_SLOTS; s++) {
+        if (dev->slots[s].state == HYPE_GXHCI_SLOT_DISABLED) {
             return (uint8_t)s;
         }
     }
@@ -213,15 +213,15 @@ static uint32_t cmd_address_device(hype_xhci_dev_t *dev, const hype_gpa_map_t *m
     uint64_t dev_ctx, ep0_tr;
     uint32_t slot_ctx0, ep0_ctx1;
     uint32_t in_slot_off, in_ep0_off;
-    if (slot == 0u || slot > HYPE_XHCI_MAX_SLOTS ||
-        dev->slots[slot].state == HYPE_XHCI_SLOT_DISABLED) {
-        return HYPE_XHCI_CC_SLOT_NOT_ENABLED;
+    if (slot == 0u || slot > HYPE_GXHCI_MAX_SLOTS ||
+        dev->slots[slot].state == HYPE_GXHCI_SLOT_DISABLED) {
+        return HYPE_GXHCI_CC_SLOT_NOT_ENABLED;
     }
     if (dev->dcbaap == 0u || (input_ctx & 0xFu) != 0u) {
-        return HYPE_XHCI_CC_PARAMETER_ERROR;
+        return HYPE_GXHCI_CC_PARAMETER_ERROR;
     }
     if (gread64(m, dev->dcbaap + 8u * (uint64_t)slot, &dev_ctx) != 0 || dev_ctx == 0u) {
-        return HYPE_XHCI_CC_PARAMETER_ERROR;
+        return HYPE_GXHCI_CC_PARAMETER_ERROR;
     }
     dev_ctx &= ~0x3Full;
     /* Input Context = Input Control Context (32B) + Slot Context (32B) + EP contexts (32B each,
@@ -231,16 +231,16 @@ static uint32_t cmd_address_device(hype_xhci_dev_t *dev, const hype_gpa_map_t *m
     if (gread32(m, input_ctx + in_slot_off, &slot_ctx0) != 0 ||
         gread32(m, input_ctx + in_ep0_off + 4u, &ep0_ctx1) != 0 ||
         gread64(m, input_ctx + in_ep0_off + 8u, &ep0_tr) != 0) {
-        return HYPE_XHCI_CC_PARAMETER_ERROR;
+        return HYPE_GXHCI_CC_PARAMETER_ERROR;
     }
     /* Output device context: copy the slot context, force slot state = Addressed (bits [31:27] of
      * slot-context dword 3) and give the device USB address = slot id. */
     if (gwrite32(m, dev_ctx + 0u, slot_ctx0) != 0) {
-        return HYPE_XHCI_CC_TRB_ERROR;
+        return HYPE_GXHCI_CC_TRB_ERROR;
     }
     /* Slot-context dword 3: [7:0] USB Device Address, [31:27] Slot State (2 = Addressed). */
-    if (gwrite32(m, dev_ctx + 12u, ((uint32_t)slot) | ((uint32_t)HYPE_XHCI_SLOT_ADDRESSED << 27)) != 0) {
-        return HYPE_XHCI_CC_TRB_ERROR;
+    if (gwrite32(m, dev_ctx + 12u, ((uint32_t)slot) | ((uint32_t)HYPE_GXHCI_SLOT_ADDRESSED << 27)) != 0) {
+        return HYPE_GXHCI_CC_TRB_ERROR;
     }
     /* EP0 output context: copy dword1 (EP type etc) and the TR dequeue pointer. */
     (void)gwrite32(m, dev_ctx + 32u + 4u, ep0_ctx1);
@@ -251,8 +251,8 @@ static uint32_t cmd_address_device(hype_xhci_dev_t *dev, const hype_gpa_map_t *m
     dev->slots[slot].ep_ring[1] = ep0_tr & ~0xFull;
     dev->slots[slot].ep_cycle[1] = (uint8_t)(ep0_tr & 0x1u);
     dev->slots[slot].ep_configured[1] = 1u;
-    dev->slots[slot].state = HYPE_XHCI_SLOT_ADDRESSED;
-    return HYPE_XHCI_CC_SUCCESS;
+    dev->slots[slot].state = HYPE_GXHCI_SLOT_ADDRESSED;
+    return HYPE_GXHCI_CC_SUCCESS;
 }
 
 /* Configure Endpoint: read the Input Control Context add-flags; for each added endpoint DCI, read
@@ -262,16 +262,16 @@ static uint32_t cmd_configure_endpoint(hype_xhci_dev_t *dev, const hype_gpa_map_
     uint32_t add_flags;
     uint64_t dev_ctx;
     unsigned int dci;
-    if (slot == 0u || slot > HYPE_XHCI_MAX_SLOTS ||
-        dev->slots[slot].state < HYPE_XHCI_SLOT_ADDRESSED) {
-        return HYPE_XHCI_CC_SLOT_NOT_ENABLED;
+    if (slot == 0u || slot > HYPE_GXHCI_MAX_SLOTS ||
+        dev->slots[slot].state < HYPE_GXHCI_SLOT_ADDRESSED) {
+        return HYPE_GXHCI_CC_SLOT_NOT_ENABLED;
     }
     if ((input_ctx & 0xFu) != 0u) {
-        return HYPE_XHCI_CC_PARAMETER_ERROR;
+        return HYPE_GXHCI_CC_PARAMETER_ERROR;
     }
     /* Input Control Context dword 1 = Add Context flags (A0..A31); bit DCI set = add that EP. */
     if (gread32(m, input_ctx + 4u, &add_flags) != 0) {
-        return HYPE_XHCI_CC_PARAMETER_ERROR;
+        return HYPE_GXHCI_CC_PARAMETER_ERROR;
     }
     dev_ctx = dev->slots[slot].device_ctx_gpa;
     for (dci = 2u; dci < 32u; dci++) {
@@ -283,7 +283,7 @@ static uint32_t cmd_configure_endpoint(hype_xhci_dev_t *dev, const hype_gpa_map_
         }
         if (gread32(m, input_ctx + in_ep_off + 4u, &ep1) != 0 ||
             gread64(m, input_ctx + in_ep_off + 8u, &ep_tr) != 0) {
-            return HYPE_XHCI_CC_PARAMETER_ERROR;
+            return HYPE_GXHCI_CC_PARAMETER_ERROR;
         }
         dev->slots[slot].ep_ring[dci] = ep_tr & ~0xFull;
         dev->slots[slot].ep_cycle[dci] = (uint8_t)(ep_tr & 0x1u);
@@ -298,24 +298,24 @@ static uint32_t cmd_configure_endpoint(hype_xhci_dev_t *dev, const hype_gpa_map_
     /* Slot state -> Configured in the output device context. */
     if (dev_ctx != 0u) {
         (void)gwrite32(m, dev_ctx + 12u,
-                       ((uint32_t)slot) | ((uint32_t)HYPE_XHCI_SLOT_CONFIGURED << 27));
+                       ((uint32_t)slot) | ((uint32_t)HYPE_GXHCI_SLOT_CONFIGURED << 27));
     }
-    dev->slots[slot].state = HYPE_XHCI_SLOT_CONFIGURED;
-    return HYPE_XHCI_CC_SUCCESS;
+    dev->slots[slot].state = HYPE_GXHCI_SLOT_CONFIGURED;
+    return HYPE_GXHCI_CC_SUCCESS;
 }
 
 /* Process the command ring until a TRB with the wrong cycle bit (ring empty). */
 static void process_command_ring(hype_xhci_dev_t *dev, const hype_gpa_map_t *m) {
     unsigned int guard = 0u;
     if (!dev->crcr_latched) {
-        dev->cmd_ring_ptr = dev->crcr & HYPE_XHCI_CRCR_PTR_MASK;
-        dev->cmd_ccs = (uint8_t)(dev->crcr & HYPE_XHCI_CRCR_RCS);
+        dev->cmd_ring_ptr = dev->crcr & HYPE_GXHCI_CRCR_PTR_MASK;
+        dev->cmd_ccs = (uint8_t)(dev->crcr & HYPE_GXHCI_CRCR_RCS);
         if (dev->cmd_ring_ptr == 0u) {
             return;
         }
         dev->crcr_latched = 1;
     }
-    dev->crcr |= HYPE_XHCI_CRCR_CRR; /* Command Ring Running */
+    dev->crcr |= HYPE_GXHCI_CRCR_CRR; /* Command Ring Running */
     /* Bounded so a malformed self-linking ring cannot spin the host forever. */
     while (guard++ < 4096u) {
         uint32_t p0lo, p0hi, status, control;
@@ -326,15 +326,15 @@ static void process_command_ring(hype_xhci_dev_t *dev, const hype_gpa_map_t *m) 
             break;
         }
         (void)status;
-        cycle = (uint8_t)(control & HYPE_XHCI_TRB_CYCLE);
+        cycle = (uint8_t)(control & HYPE_GXHCI_TRB_CYCLE);
         if (cycle != dev->cmd_ccs) {
             break; /* producer has not written this slot yet -- ring drained */
         }
-        type = (uint8_t)((control >> HYPE_XHCI_TRB_TYPE_SHIFT) & 0x3Fu);
-        slot = (uint8_t)((control >> HYPE_XHCI_TRB_SLOT_SHIFT) & 0xFFu);
-        if (type == HYPE_XHCI_TRB_LINK) {
+        type = (uint8_t)((control >> HYPE_GXHCI_TRB_TYPE_SHIFT) & 0x3Fu);
+        slot = (uint8_t)((control >> HYPE_GXHCI_TRB_SLOT_SHIFT) & 0xFFu);
+        if (type == HYPE_GXHCI_TRB_LINK) {
             uint64_t next = ((uint64_t)p0lo | ((uint64_t)p0hi << 32)) & ~0xFull;
-            if (control & HYPE_XHCI_TRB_LINK_TC) {
+            if (control & HYPE_GXHCI_TRB_LINK_TC) {
                 dev->cmd_ccs ^= 1u;
             }
             dev->cmd_ring_ptr = next;
@@ -342,54 +342,54 @@ static void process_command_ring(hype_xhci_dev_t *dev, const hype_gpa_map_t *m) 
         }
         {
             uint64_t param = (uint64_t)p0lo | ((uint64_t)p0hi << 32);
-            uint32_t cc = HYPE_XHCI_CC_TRB_ERROR;
+            uint32_t cc = HYPE_GXHCI_CC_TRB_ERROR;
             uint8_t ev_slot = slot;
             switch (type) {
-            case HYPE_XHCI_TRB_ENABLE_SLOT: {
+            case HYPE_GXHCI_TRB_ENABLE_SLOT: {
                 uint8_t ns = first_free_slot(dev);
                 if (ns == 0u) {
-                    cc = HYPE_XHCI_CC_TRB_ERROR;
+                    cc = HYPE_GXHCI_CC_TRB_ERROR;
                 } else {
-                    dev->slots[ns].state = HYPE_XHCI_SLOT_ENABLED;
+                    dev->slots[ns].state = HYPE_GXHCI_SLOT_ENABLED;
                     dev->slots_enabled++;
                     ev_slot = ns; /* the allocated slot is reported in the completion event */
-                    cc = HYPE_XHCI_CC_SUCCESS;
+                    cc = HYPE_GXHCI_CC_SUCCESS;
                 }
                 break;
             }
-            case HYPE_XHCI_TRB_DISABLE_SLOT:
-                if (slot >= 1u && slot <= HYPE_XHCI_MAX_SLOTS &&
-                    dev->slots[slot].state != HYPE_XHCI_SLOT_DISABLED) {
-                    dev->slots[slot].state = HYPE_XHCI_SLOT_DISABLED;
+            case HYPE_GXHCI_TRB_DISABLE_SLOT:
+                if (slot >= 1u && slot <= HYPE_GXHCI_MAX_SLOTS &&
+                    dev->slots[slot].state != HYPE_GXHCI_SLOT_DISABLED) {
+                    dev->slots[slot].state = HYPE_GXHCI_SLOT_DISABLED;
                     if (dev->slots_enabled > 0u) dev->slots_enabled--;
-                    cc = HYPE_XHCI_CC_SUCCESS;
+                    cc = HYPE_GXHCI_CC_SUCCESS;
                 } else {
-                    cc = HYPE_XHCI_CC_SLOT_NOT_ENABLED;
+                    cc = HYPE_GXHCI_CC_SLOT_NOT_ENABLED;
                 }
                 break;
-            case HYPE_XHCI_TRB_ADDRESS_DEVICE:
+            case HYPE_GXHCI_TRB_ADDRESS_DEVICE:
                 cc = cmd_address_device(dev, m, slot, param & ~0xFull);
                 break;
-            case HYPE_XHCI_TRB_CONFIGURE_ENDPOINT:
+            case HYPE_GXHCI_TRB_CONFIGURE_ENDPOINT:
                 cc = cmd_configure_endpoint(dev, m, slot, param & ~0xFull);
                 break;
-            case HYPE_XHCI_TRB_EVALUATE_CONTEXT:
+            case HYPE_GXHCI_TRB_EVALUATE_CONTEXT:
                 /* Accepted: v1 does not re-derive max-packet from a re-evaluated context. */
-                cc = HYPE_XHCI_CC_SUCCESS;
+                cc = HYPE_GXHCI_CC_SUCCESS;
                 break;
-            case HYPE_XHCI_TRB_NOOP_CMD:
-                cc = HYPE_XHCI_CC_SUCCESS;
+            case HYPE_GXHCI_TRB_NOOP_CMD:
+                cc = HYPE_GXHCI_CC_SUCCESS;
                 break;
             default:
-                cc = HYPE_XHCI_CC_TRB_ERROR;
+                cc = HYPE_GXHCI_CC_TRB_ERROR;
                 break;
             }
             post_cmd_completion(dev, m, trb_gpa, cc, ev_slot);
             dev->commands_processed++;
         }
-        dev->cmd_ring_ptr += HYPE_XHCI_TRB_SIZE;
+        dev->cmd_ring_ptr += HYPE_GXHCI_TRB_SIZE;
     }
-    dev->crcr &= ~(uint64_t)HYPE_XHCI_CRCR_CRR;
+    dev->crcr &= ~(uint64_t)HYPE_GXHCI_CRCR_CRR;
 }
 
 /* #592: post a Transfer Event for a completed transfer TRB. `residual` is the untransferred byte
@@ -397,8 +397,8 @@ static void process_command_ring(hype_xhci_dev_t *dev, const hype_gpa_map_t *m) 
 static void post_transfer_event(hype_xhci_dev_t *dev, const hype_gpa_map_t *m, uint64_t trb_gpa,
                                 uint8_t slot, uint8_t dci, uint32_t cc, uint32_t residual) {
     uint32_t status = (cc << 24) | (residual & 0x00FFFFFFu);
-    uint32_t control = ((uint32_t)HYPE_XHCI_TRB_TRANSFER_EVENT << HYPE_XHCI_TRB_TYPE_SHIFT) |
-                       ((uint32_t)dci << 16) | ((uint32_t)slot << HYPE_XHCI_TRB_SLOT_SHIFT);
+    uint32_t control = ((uint32_t)HYPE_GXHCI_TRB_TRANSFER_EVENT << HYPE_GXHCI_TRB_TYPE_SHIFT) |
+                       ((uint32_t)dci << 16) | ((uint32_t)slot << HYPE_GXHCI_TRB_SLOT_SHIFT);
     (void)event_post(dev, m, trb_gpa, status, control);
 }
 
@@ -416,11 +416,11 @@ static void process_transfer_ring(hype_xhci_dev_t *dev, const hype_gpa_map_t *m,
     int control_done = 0; /* the device->control call already happened for this TD */
     hype_xhci_slot_t *sl;
 
-    if (slot == 0u || slot > HYPE_XHCI_MAX_SLOTS || dci == 0u || dci >= 32u) {
+    if (slot == 0u || slot > HYPE_GXHCI_MAX_SLOTS || dci == 0u || dci >= 32u) {
         return;
     }
     sl = &dev->slots[slot];
-    if (sl->state < HYPE_XHCI_SLOT_ADDRESSED || !sl->ep_configured[dci] || sl->ep_ring[dci] == 0u) {
+    if (sl->state < HYPE_GXHCI_SLOT_ADDRESSED || !sl->ep_configured[dci] || sl->ep_ring[dci] == 0u) {
         return;
     }
     if (dev->usb == 0 || dev->usb->ops == 0) {
@@ -431,30 +431,30 @@ static void process_transfer_ring(hype_xhci_dev_t *dev, const hype_gpa_map_t *m,
         uint32_t p0lo, p0hi, status, control;
         uint64_t trb_gpa = sl->ep_ring[dci];
         uint8_t type, cycle;
-        uint32_t xfer_len, cc = HYPE_XHCI_CC_SUCCESS, residual = 0u;
+        uint32_t xfer_len, cc = HYPE_GXHCI_CC_SUCCESS, residual = 0u;
         int ioc;
         if (gread32(m, trb_gpa + 0u, &p0lo) != 0 || gread32(m, trb_gpa + 4u, &p0hi) != 0 ||
             gread32(m, trb_gpa + 8u, &status) != 0 || gread32(m, trb_gpa + 12u, &control) != 0) {
             break;
         }
-        cycle = (uint8_t)(control & HYPE_XHCI_TRB_CYCLE);
+        cycle = (uint8_t)(control & HYPE_GXHCI_TRB_CYCLE);
         if (cycle != sl->ep_cycle[dci]) {
             break; /* ring drained */
         }
-        type = (uint8_t)((control >> HYPE_XHCI_TRB_TYPE_SHIFT) & 0x3Fu);
-        ioc = (control & HYPE_XHCI_TRB_IOC) != 0;
-        xfer_len = status & HYPE_XHCI_TRB_XFER_LEN_MASK;
+        type = (uint8_t)((control >> HYPE_GXHCI_TRB_TYPE_SHIFT) & 0x3Fu);
+        ioc = (control & HYPE_GXHCI_TRB_IOC) != 0;
+        xfer_len = status & HYPE_GXHCI_TRB_XFER_LEN_MASK;
 
-        if (type == HYPE_XHCI_TRB_LINK) {
+        if (type == HYPE_GXHCI_TRB_LINK) {
             uint64_t next = ((uint64_t)p0lo | ((uint64_t)p0hi << 32)) & ~0xFull;
-            if (control & HYPE_XHCI_TRB_LINK_TC) {
+            if (control & HYPE_GXHCI_TRB_LINK_TC) {
                 sl->ep_cycle[dci] ^= 1u;
             }
             sl->ep_ring[dci] = next;
             continue;
         }
 
-        if (type == HYPE_XHCI_TRB_SETUP_STAGE) {
+        if (type == HYPE_GXHCI_TRB_SETUP_STAGE) {
             /* Immediate 8-byte SETUP packet in the TRB parameter dwords. */
             setup[0] = (uint8_t)p0lo;
             setup[1] = (uint8_t)(p0lo >> 8);
@@ -466,47 +466,47 @@ static void process_transfer_ring(hype_xhci_dev_t *dev, const hype_gpa_map_t *m,
             setup[7] = (uint8_t)(p0hi >> 24);
             have_setup = 1;
             control_done = 0;
-        } else if (type == HYPE_XHCI_TRB_DATA_STAGE) {
+        } else if (type == HYPE_GXHCI_TRB_DATA_STAGE) {
             /* Control data phase: run the control transfer against this buffer. */
             uint64_t buf = (uint64_t)p0lo | ((uint64_t)p0hi << 32);
             uint64_t host = hype_gpa_to_host(m, buf, xfer_len);
             uint32_t dlen = xfer_len;
             if (host == 0 || !have_setup) {
-                cc = HYPE_XHCI_CC_TRB_ERROR;
+                cc = HYPE_GXHCI_CC_TRB_ERROR;
             } else if (dev->usb->ops->control(dev->usb->ctx, setup, (uint8_t *)(uintptr_t)host,
                                               xfer_len, &dlen) != 0) {
-                cc = HYPE_XHCI_CC_TRB_ERROR;
+                cc = HYPE_GXHCI_CC_TRB_ERROR;
             } else {
                 residual = (dlen < xfer_len) ? (xfer_len - dlen) : 0u;
             }
             control_done = 1;
-        } else if (type == HYPE_XHCI_TRB_STATUS_STAGE) {
+        } else if (type == HYPE_GXHCI_TRB_STATUS_STAGE) {
             /* If there was no data phase, run a zero-length control transfer now. */
             if (have_setup && !control_done) {
                 uint32_t dlen = 0;
                 if (dev->usb->ops->control(dev->usb->ctx, setup, 0, 0, &dlen) != 0) {
-                    cc = HYPE_XHCI_CC_TRB_ERROR;
+                    cc = HYPE_GXHCI_CC_TRB_ERROR;
                 }
             }
             have_setup = 0;
             control_done = 0;
-        } else if (type == HYPE_XHCI_TRB_NORMAL) {
+        } else if (type == HYPE_GXHCI_TRB_NORMAL) {
             uint64_t buf = (uint64_t)p0lo | ((uint64_t)p0hi << 32);
             uint64_t host = hype_gpa_to_host(m, buf, xfer_len);
             if (host == 0) {
-                cc = HYPE_XHCI_CC_TRB_ERROR;
+                cc = HYPE_GXHCI_CC_TRB_ERROR;
             } else if ((dci & 1u) == 0u) {
                 /* even DCI = bulk OUT (host to device) */
                 if (dev->usb->ops->bulk_out(dev->usb->ctx, (const uint8_t *)(uintptr_t)host,
                                             xfer_len) != 0) {
-                    cc = HYPE_XHCI_CC_TRB_ERROR;
+                    cc = HYPE_GXHCI_CC_TRB_ERROR;
                 }
             } else {
                 /* odd DCI = bulk IN (device to host) */
                 uint32_t got = 0;
                 if (dev->usb->ops->bulk_in(dev->usb->ctx, (uint8_t *)(uintptr_t)host, xfer_len,
                                            &got) != 0) {
-                    cc = HYPE_XHCI_CC_TRB_ERROR;
+                    cc = HYPE_GXHCI_CC_TRB_ERROR;
                 } else {
                     residual = (got < xfer_len) ? (xfer_len - got) : 0u;
                 }
@@ -518,7 +518,7 @@ static void process_transfer_ring(hype_xhci_dev_t *dev, const hype_gpa_map_t *m,
             post_transfer_event(dev, m, trb_gpa, slot, dci, cc, residual);
         }
         dev->transfers_processed++;
-        sl->ep_ring[dci] += HYPE_XHCI_TRB_SIZE;
+        sl->ep_ring[dci] += HYPE_GXHCI_TRB_SIZE;
     }
 }
 
@@ -527,7 +527,7 @@ void hype_xhci_dev_doorbell(hype_xhci_dev_t *dev, uint32_t db_index, uint32_t db
     if (dev == 0 || dma_map == 0) {
         return;
     }
-    if (db_index == HYPE_XHCI_DB_COMMAND) {
+    if (db_index == HYPE_GXHCI_DB_COMMAND) {
         process_command_ring(dev, dma_map);
         return;
     }
@@ -538,21 +538,21 @@ void hype_xhci_dev_doorbell(hype_xhci_dev_t *dev, uint32_t db_index, uint32_t db
 /* ---- MMIO register access ---------------------------------------------------------------- */
 static uint32_t cap_reg32(uint32_t off) {
     switch (off) {
-    case HYPE_XHCI_CAP_CAPLENGTH: /* CAPLENGTH byte + HCIVERSION word in the same dword */
-        return HYPE_XHCI_CAPLENGTH | ((uint32_t)HYPE_XHCI_HCIVERSION << 16);
-    case HYPE_XHCI_CAP_HCSPARAMS1:
-        return HYPE_XHCI_HCSPARAMS1;
-    case HYPE_XHCI_CAP_HCSPARAMS2:
+    case HYPE_GXHCI_CAP_CAPLENGTH: /* CAPLENGTH byte + HCIVERSION word in the same dword */
+        return HYPE_GXHCI_CAPLENGTH | ((uint32_t)HYPE_GXHCI_HCIVERSION << 16);
+    case HYPE_GXHCI_CAP_HCSPARAMS1:
+        return HYPE_GXHCI_HCSPARAMS1;
+    case HYPE_GXHCI_CAP_HCSPARAMS2:
         return 0u;
-    case HYPE_XHCI_CAP_HCSPARAMS3:
+    case HYPE_GXHCI_CAP_HCSPARAMS3:
         return 0u;
-    case HYPE_XHCI_CAP_HCCPARAMS1:
-        return HYPE_XHCI_HCCPARAMS1;
-    case HYPE_XHCI_CAP_DBOFF:
-        return HYPE_XHCI_DBOFF;
-    case HYPE_XHCI_CAP_RTSOFF:
-        return HYPE_XHCI_RTSOFF;
-    case HYPE_XHCI_CAP_HCCPARAMS2:
+    case HYPE_GXHCI_CAP_HCCPARAMS1:
+        return HYPE_GXHCI_HCCPARAMS1;
+    case HYPE_GXHCI_CAP_DBOFF:
+        return HYPE_GXHCI_DBOFF;
+    case HYPE_GXHCI_CAP_RTSOFF:
+        return HYPE_GXHCI_RTSOFF;
+    case HYPE_GXHCI_CAP_HCCPARAMS2:
         return 0u;
     default:
         return 0u;
@@ -561,27 +561,27 @@ static uint32_t cap_reg32(uint32_t off) {
 
 static uint32_t op_read32(const hype_xhci_dev_t *dev, uint32_t off) {
     switch (off) {
-    case HYPE_XHCI_OP_USBCMD:
+    case HYPE_GXHCI_OP_USBCMD:
         return dev->usbcmd;
-    case HYPE_XHCI_OP_USBSTS:
+    case HYPE_GXHCI_OP_USBSTS:
         return dev->usbsts;
-    case HYPE_XHCI_OP_PAGESIZE:
+    case HYPE_GXHCI_OP_PAGESIZE:
         return 0x1u; /* 4 KiB pages supported (bit 0) */
-    case HYPE_XHCI_OP_DNCTRL:
+    case HYPE_GXHCI_OP_DNCTRL:
         return dev->dnctrl;
-    case HYPE_XHCI_OP_CRCR_LO:
+    case HYPE_GXHCI_OP_CRCR_LO:
         /* CRCR reads back 0 in the pointer/flag bits except CRR; the command ring pointer is not
          * host-readable per spec (RsvdZ on read). */
-        return (uint32_t)(dev->crcr & HYPE_XHCI_CRCR_CRR);
-    case HYPE_XHCI_OP_CRCR_HI:
+        return (uint32_t)(dev->crcr & HYPE_GXHCI_CRCR_CRR);
+    case HYPE_GXHCI_OP_CRCR_HI:
         return 0u;
-    case HYPE_XHCI_OP_DCBAAP_LO:
+    case HYPE_GXHCI_OP_DCBAAP_LO:
         return (uint32_t)dev->dcbaap;
-    case HYPE_XHCI_OP_DCBAAP_HI:
+    case HYPE_GXHCI_OP_DCBAAP_HI:
         return (uint32_t)(dev->dcbaap >> 32);
-    case HYPE_XHCI_OP_CONFIG:
+    case HYPE_GXHCI_OP_CONFIG:
         return dev->config;
-    case HYPE_XHCI_OP_PORTSC:
+    case HYPE_GXHCI_OP_PORTSC:
         return dev->portsc;
     default:
         return 0u;
@@ -590,21 +590,21 @@ static uint32_t op_read32(const hype_xhci_dev_t *dev, uint32_t off) {
 
 static uint32_t rt_read32(const hype_xhci_dev_t *dev, uint32_t off) {
     switch (off) {
-    case HYPE_XHCI_RT_MFINDEX:
+    case HYPE_GXHCI_RT_MFINDEX:
         return 0u;
-    case HYPE_XHCI_RT_IMAN:
+    case HYPE_GXHCI_RT_IMAN:
         return dev->iman;
-    case HYPE_XHCI_RT_IMOD:
+    case HYPE_GXHCI_RT_IMOD:
         return dev->imod;
-    case HYPE_XHCI_RT_ERSTSZ:
+    case HYPE_GXHCI_RT_ERSTSZ:
         return dev->erstsz;
-    case HYPE_XHCI_RT_ERSTBA_LO:
+    case HYPE_GXHCI_RT_ERSTBA_LO:
         return (uint32_t)dev->erstba;
-    case HYPE_XHCI_RT_ERSTBA_HI:
+    case HYPE_GXHCI_RT_ERSTBA_HI:
         return (uint32_t)(dev->erstba >> 32);
-    case HYPE_XHCI_RT_ERDP_LO:
+    case HYPE_GXHCI_RT_ERDP_LO:
         return (uint32_t)dev->erdp;
-    case HYPE_XHCI_RT_ERDP_HI:
+    case HYPE_GXHCI_RT_ERDP_HI:
         return (uint32_t)(dev->erdp >> 32);
     default:
         return 0u;
@@ -621,7 +621,7 @@ int hype_xhci_dev_mmio_read(const hype_xhci_dev_t *dev, uint32_t offset, uint8_t
     if (size_bytes != 1u && size_bytes != 2u && size_bytes != 4u && size_bytes != 8u) {
         return -1;
     }
-    if (offset + size_bytes > HYPE_XHCI_BAR_SIZE) {
+    if (offset + size_bytes > HYPE_GXHCI_BAR_SIZE) {
         return -1;
     }
     if (size_bytes == 8u) {
@@ -636,11 +636,11 @@ int hype_xhci_dev_mmio_read(const hype_xhci_dev_t *dev, uint32_t offset, uint8_t
     /* Reads are dword-granular in the register file; sub-dword reads take the aligned dword and
      * shift. The guest's xhci-hcd reads registers at their natural width, so this is exact. */
     base = offset & ~0x3u;
-    if (base < HYPE_XHCI_CAPLENGTH) {
+    if (base < HYPE_GXHCI_CAPLENGTH) {
         v32 = cap_reg32(base);
-    } else if (base >= HYPE_XHCI_RTSOFF && base < HYPE_XHCI_DBOFF) {
+    } else if (base >= HYPE_GXHCI_RTSOFF && base < HYPE_GXHCI_DBOFF) {
         v32 = rt_read32(dev, base);
-    } else if (base >= HYPE_XHCI_DBOFF) {
+    } else if (base >= HYPE_GXHCI_DBOFF) {
         v32 = 0u; /* doorbells read as 0 */
     } else {
         v32 = op_read32(dev, base);
@@ -661,51 +661,51 @@ int hype_xhci_dev_mmio_read(const hype_xhci_dev_t *dev, uint32_t offset, uint8_t
 static void op_write32(hype_xhci_dev_t *dev, uint32_t off, uint32_t value,
                        const hype_gpa_map_t *m) {
     switch (off) {
-    case HYPE_XHCI_OP_USBCMD:
-        if (value & HYPE_XHCI_USBCMD_HCRST) {
+    case HYPE_GXHCI_OP_USBCMD:
+        if (value & HYPE_GXHCI_USBCMD_HCRST) {
             /* Host Controller Reset: back to power-on, but the port stays connected. */
             int present = dev->device_present;
             hype_xhci_dev_reset(dev, present);
             return;
         }
-        dev->usbcmd = value & (HYPE_XHCI_USBCMD_RS | HYPE_XHCI_USBCMD_INTE);
-        if (value & HYPE_XHCI_USBCMD_RS) {
-            dev->usbsts &= ~(uint32_t)HYPE_XHCI_USBSTS_HCH; /* running */
+        dev->usbcmd = value & (HYPE_GXHCI_USBCMD_RS | HYPE_GXHCI_USBCMD_INTE);
+        if (value & HYPE_GXHCI_USBCMD_RS) {
+            dev->usbsts &= ~(uint32_t)HYPE_GXHCI_USBSTS_HCH; /* running */
         } else {
-            dev->usbsts |= HYPE_XHCI_USBSTS_HCH;
+            dev->usbsts |= HYPE_GXHCI_USBSTS_HCH;
         }
         break;
-    case HYPE_XHCI_OP_USBSTS:
+    case HYPE_GXHCI_OP_USBSTS:
         /* RW1C bits: EINT, PCD. */
-        dev->usbsts &= ~(value & (HYPE_XHCI_USBSTS_EINT | HYPE_XHCI_USBSTS_PCD));
+        dev->usbsts &= ~(value & (HYPE_GXHCI_USBSTS_EINT | HYPE_GXHCI_USBSTS_PCD));
         break;
-    case HYPE_XHCI_OP_DNCTRL:
+    case HYPE_GXHCI_OP_DNCTRL:
         dev->dnctrl = value & 0xFFFFu;
         break;
-    case HYPE_XHCI_OP_CRCR_LO:
+    case HYPE_GXHCI_OP_CRCR_LO:
         dev->crcr = (dev->crcr & 0xFFFFFFFF00000000ull) | value;
         dev->crcr_latched = 0; /* a new ring pointer -- re-latch on the next doorbell */
         break;
-    case HYPE_XHCI_OP_CRCR_HI:
+    case HYPE_GXHCI_OP_CRCR_HI:
         dev->crcr = (dev->crcr & 0x00000000FFFFFFFFull) | ((uint64_t)value << 32);
         dev->crcr_latched = 0;
         break;
-    case HYPE_XHCI_OP_DCBAAP_LO:
+    case HYPE_GXHCI_OP_DCBAAP_LO:
         dev->dcbaap = (dev->dcbaap & 0xFFFFFFFF00000000ull) | (value & ~0x3Fu);
         break;
-    case HYPE_XHCI_OP_DCBAAP_HI:
+    case HYPE_GXHCI_OP_DCBAAP_HI:
         dev->dcbaap = (dev->dcbaap & 0x00000000FFFFFFFFull) | ((uint64_t)value << 32);
         break;
-    case HYPE_XHCI_OP_CONFIG:
+    case HYPE_GXHCI_OP_CONFIG:
         dev->config = value;
         break;
-    case HYPE_XHCI_OP_PORTSC: {
+    case HYPE_GXHCI_OP_PORTSC: {
         /* Preserve status bits; apply RW1C acknowledgements; act on a port reset. */
-        uint32_t cleared = dev->portsc & ~(value & HYPE_XHCI_PORTSC_RW1C);
-        if ((value & HYPE_XHCI_PORTSC_PR) && dev->device_present) {
+        uint32_t cleared = dev->portsc & ~(value & HYPE_GXHCI_PORTSC_RW1C);
+        if ((value & HYPE_GXHCI_PORTSC_PR) && dev->device_present) {
             /* Reset completes immediately for an emulated device: enable the port, flag PRC. */
-            cleared |= HYPE_XHCI_PORTSC_PED | HYPE_XHCI_PORTSC_PRC;
-            cleared &= ~(uint32_t)HYPE_XHCI_PORTSC_PR;
+            cleared |= HYPE_GXHCI_PORTSC_PED | HYPE_GXHCI_PORTSC_PRC;
+            cleared &= ~(uint32_t)HYPE_GXHCI_PORTSC_PR;
             (void)m;
         }
         dev->portsc = cleared;
@@ -718,33 +718,33 @@ static void op_write32(hype_xhci_dev_t *dev, uint32_t off, uint32_t value,
 
 static void rt_write32(hype_xhci_dev_t *dev, uint32_t off, uint32_t value) {
     switch (off) {
-    case HYPE_XHCI_RT_IMAN:
+    case HYPE_GXHCI_RT_IMAN:
         /* IP is RW1C; IE is RW. */
-        if (value & HYPE_XHCI_IMAN_IP) {
-            dev->iman &= ~(uint32_t)HYPE_XHCI_IMAN_IP;
+        if (value & HYPE_GXHCI_IMAN_IP) {
+            dev->iman &= ~(uint32_t)HYPE_GXHCI_IMAN_IP;
         }
-        dev->iman = (dev->iman & ~(uint32_t)HYPE_XHCI_IMAN_IE) | (value & HYPE_XHCI_IMAN_IE);
+        dev->iman = (dev->iman & ~(uint32_t)HYPE_GXHCI_IMAN_IE) | (value & HYPE_GXHCI_IMAN_IE);
         break;
-    case HYPE_XHCI_RT_IMOD:
+    case HYPE_GXHCI_RT_IMOD:
         dev->imod = value;
         break;
-    case HYPE_XHCI_RT_ERSTSZ:
+    case HYPE_GXHCI_RT_ERSTSZ:
         dev->erstsz = value & 0xFFFFu;
         dev->erst_latched = 0;
         break;
-    case HYPE_XHCI_RT_ERSTBA_LO:
+    case HYPE_GXHCI_RT_ERSTBA_LO:
         dev->erstba = (dev->erstba & 0xFFFFFFFF00000000ull) | (value & ~0x3Fu);
         dev->erst_latched = 0;
         break;
-    case HYPE_XHCI_RT_ERSTBA_HI:
+    case HYPE_GXHCI_RT_ERSTBA_HI:
         dev->erstba = (dev->erstba & 0x00000000FFFFFFFFull) | ((uint64_t)value << 32);
         dev->erst_latched = 0;
         break;
-    case HYPE_XHCI_RT_ERDP_LO:
+    case HYPE_GXHCI_RT_ERDP_LO:
         /* Guest advances the dequeue pointer and clears EHB. */
         dev->erdp = (dev->erdp & 0xFFFFFFFF00000000ull) | value;
         break;
-    case HYPE_XHCI_RT_ERDP_HI:
+    case HYPE_GXHCI_RT_ERDP_HI:
         dev->erdp = (dev->erdp & 0x00000000FFFFFFFFull) | ((uint64_t)value << 32);
         break;
     default:
@@ -760,7 +760,7 @@ int hype_xhci_dev_mmio_write(hype_xhci_dev_t *dev, uint32_t offset, uint8_t size
     if (size_bytes != 1u && size_bytes != 2u && size_bytes != 4u && size_bytes != 8u) {
         return -1;
     }
-    if (offset + size_bytes > HYPE_XHCI_BAR_SIZE) {
+    if (offset + size_bytes > HYPE_GXHCI_BAR_SIZE) {
         return -1;
     }
     if (size_bytes == 8u) {
@@ -782,15 +782,15 @@ int hype_xhci_dev_mmio_write(hype_xhci_dev_t *dev, uint32_t offset, uint8_t size
                 (((uint32_t)value & width_mask) << shift);
         offset = base;
     }
-    if (offset < HYPE_XHCI_CAPLENGTH) {
+    if (offset < HYPE_GXHCI_CAPLENGTH) {
         return 0; /* capability registers are read-only */
     }
-    if (offset >= HYPE_XHCI_DBOFF) {
-        uint32_t db_index = (offset - HYPE_XHCI_DBOFF) / 4u;
+    if (offset >= HYPE_GXHCI_DBOFF) {
+        uint32_t db_index = (offset - HYPE_GXHCI_DBOFF) / 4u;
         hype_xhci_dev_doorbell(dev, db_index, (uint32_t)value, dma_map);
         return 0;
     }
-    if (offset >= HYPE_XHCI_RTSOFF) {
+    if (offset >= HYPE_GXHCI_RTSOFF) {
         rt_write32(dev, offset, (uint32_t)value);
         return 0;
     }
@@ -802,6 +802,6 @@ int hype_xhci_dev_irq_pending(const hype_xhci_dev_t *dev) {
     if (dev == 0) {
         return 0;
     }
-    return (dev->iman & HYPE_XHCI_IMAN_IP) && (dev->iman & HYPE_XHCI_IMAN_IE) &&
-           (dev->usbcmd & HYPE_XHCI_USBCMD_INTE);
+    return (dev->iman & HYPE_GXHCI_IMAN_IP) && (dev->iman & HYPE_GXHCI_IMAN_IE) &&
+           (dev->usbcmd & HYPE_GXHCI_USBCMD_INTE);
 }

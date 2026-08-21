@@ -492,7 +492,8 @@ typedef enum {
     HYPE_CFG_BUS_VIRTIO_BLK,
     HYPE_CFG_BUS_AHCI_SATA,
     HYPE_CFG_BUS_NVME,
-    HYPE_CFG_BUS_AHCI_ATAPI
+    HYPE_CFG_BUS_AHCI_ATAPI,
+    HYPE_CFG_BUS_USB_MSC /* #593: removable USB mass storage over the guest xHCI (#446) */
 } hype_cfg_bus_t;
 
 typedef struct {

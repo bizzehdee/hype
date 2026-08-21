@@ -223,10 +223,10 @@ static uint32_t xget32(xrig_t *r, uint32_t off) {
 /* Put a Normal transfer TRB at ring offset `off`, buffer at bufgpa, length len, cycle 1, IOC. */
 static void put_normal(xrig_t *r, uint32_t off, uint64_t bufgpa, uint32_t len) {
     xput64(r, off, bufgpa);
-    xput32(r, off + 8, len & HYPE_XHCI_TRB_XFER_LEN_MASK);
+    xput32(r, off + 8, len & HYPE_GXHCI_TRB_XFER_LEN_MASK);
     xput32(r, off + 12,
-           ((uint32_t)HYPE_XHCI_TRB_NORMAL << HYPE_XHCI_TRB_TYPE_SHIFT) | HYPE_XHCI_TRB_IOC |
-               HYPE_XHCI_TRB_CYCLE);
+           ((uint32_t)HYPE_GXHCI_TRB_NORMAL << HYPE_GXHCI_TRB_TYPE_SHIFT) | HYPE_GXHCI_TRB_IOC |
+               HYPE_GXHCI_TRB_CYCLE);
 }
 
 static void test_end_to_end_via_xhci(void) {
@@ -254,35 +254,35 @@ static void test_end_to_end_via_xhci(void) {
     /* Program the event ring. */
     xput64(r, OFF_ERST, GBASE + OFF_EVT);
     xput32(r, OFF_ERST + 8, 64u);
-    hype_xhci_dev_mmio_write(&r->xh, HYPE_XHCI_RT_ERSTSZ, 4u, 1u, &r->map);
-    hype_xhci_dev_mmio_write(&r->xh, HYPE_XHCI_RT_ERSTBA_LO, 4u, (uint32_t)(GBASE + OFF_ERST),
+    hype_xhci_dev_mmio_write(&r->xh, HYPE_GXHCI_RT_ERSTSZ, 4u, 1u, &r->map);
+    hype_xhci_dev_mmio_write(&r->xh, HYPE_GXHCI_RT_ERSTBA_LO, 4u, (uint32_t)(GBASE + OFF_ERST),
                              &r->map);
-    hype_xhci_dev_mmio_write(&r->xh, HYPE_XHCI_OP_USBCMD, 4u,
-                             HYPE_XHCI_USBCMD_RS | HYPE_XHCI_USBCMD_INTE, &r->map);
+    hype_xhci_dev_mmio_write(&r->xh, HYPE_GXHCI_OP_USBCMD, 4u,
+                             HYPE_GXHCI_USBCMD_RS | HYPE_GXHCI_USBCMD_INTE, &r->map);
 
     /* Manually bring slot 1 up to CONFIGURED with bulk endpoints, bypassing the command ring
      * (that path is covered by test_xhci_dev). Point EP rings at our transfer rings. */
-    r->xh.slots[1].state = HYPE_XHCI_SLOT_CONFIGURED;
-    r->xh.slots[1].ep_configured[HYPE_XHCI_DCI_BULK_OUT] = 1u;
-    r->xh.slots[1].ep_ring[HYPE_XHCI_DCI_BULK_OUT] = GBASE + OFF_BULK_OUT;
-    r->xh.slots[1].ep_cycle[HYPE_XHCI_DCI_BULK_OUT] = 1u;
-    r->xh.slots[1].ep_configured[HYPE_XHCI_DCI_BULK_IN] = 1u;
-    r->xh.slots[1].ep_ring[HYPE_XHCI_DCI_BULK_IN] = GBASE + OFF_BULK_IN;
-    r->xh.slots[1].ep_cycle[HYPE_XHCI_DCI_BULK_IN] = 1u;
+    r->xh.slots[1].state = HYPE_GXHCI_SLOT_CONFIGURED;
+    r->xh.slots[1].ep_configured[HYPE_GXHCI_DCI_BULK_OUT] = 1u;
+    r->xh.slots[1].ep_ring[HYPE_GXHCI_DCI_BULK_OUT] = GBASE + OFF_BULK_OUT;
+    r->xh.slots[1].ep_cycle[HYPE_GXHCI_DCI_BULK_OUT] = 1u;
+    r->xh.slots[1].ep_configured[HYPE_GXHCI_DCI_BULK_IN] = 1u;
+    r->xh.slots[1].ep_ring[HYPE_GXHCI_DCI_BULK_IN] = GBASE + OFF_BULK_IN;
+    r->xh.slots[1].ep_cycle[HYPE_GXHCI_DCI_BULK_IN] = 1u;
 
     /* Build the CBW in guest memory and a Normal TRB on the bulk-OUT ring pointing at it. */
     build_cbw(&r->img[OFF_CBW], 0x77, 512, 1, cdb, 10);
     put_normal(r, OFF_BULK_OUT, GBASE + OFF_CBW, 31u);
     /* Bulk-IN ring: one TRB for the 512-byte data, one for the 13-byte CSW. */
     put_normal(r, OFF_BULK_IN, GBASE + OFF_DATA, 512u);
-    put_normal(r, OFF_BULK_IN + HYPE_XHCI_TRB_SIZE, GBASE + OFF_CSW, 13u);
+    put_normal(r, OFF_BULK_IN + HYPE_GXHCI_TRB_SIZE, GBASE + OFF_CSW, 13u);
 
     /* Ring the bulk-OUT doorbell (slot 1, DCI 2) -> CBW consumed, READ dispatched. */
-    hype_xhci_dev_doorbell(&r->xh, 1u, HYPE_XHCI_DCI_BULK_OUT, &r->map);
+    hype_xhci_dev_doorbell(&r->xh, 1u, HYPE_GXHCI_DCI_BULK_OUT, &r->map);
     CHECK_INT("cbw consumed", 1, r->msc.cbws);
     CHECK_INT("phase data-in after cbw", HYPE_MSC_PHASE_DATA_IN, r->msc.phase);
     /* Ring the bulk-IN doorbell -> data TRB then CSW TRB both processed. */
-    hype_xhci_dev_doorbell(&r->xh, 1u, HYPE_XHCI_DCI_BULK_IN, &r->map);
+    hype_xhci_dev_doorbell(&r->xh, 1u, HYPE_GXHCI_DCI_BULK_IN, &r->map);
 
     /* The disk sector landed in the guest data buffer. */
     CHECK_INT("read data matches disk", 0, memcmp(&r->img[OFF_DATA], &g_disk[3 * 512], 512));
@@ -293,8 +293,8 @@ static void test_end_to_end_via_xhci(void) {
     CHECK_INT("at least 3 transfer events", 1, r->xh.events_posted >= 3u ? 1 : 0);
     /* First event is a Transfer Event type for the bulk-OUT CBW TRB. */
     evctrl = xget32(r, OFF_EVT + 12);
-    CHECK_INT("event is transfer event", HYPE_XHCI_TRB_TRANSFER_EVENT,
-              (evctrl >> HYPE_XHCI_TRB_TYPE_SHIFT) & 0x3Fu);
+    CHECK_INT("event is transfer event", HYPE_GXHCI_TRB_TRANSFER_EVENT,
+              (evctrl >> HYPE_GXHCI_TRB_TYPE_SHIFT) & 0x3Fu);
     free(r);
 }
 

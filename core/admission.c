@@ -476,15 +476,16 @@ hype_adm_result_t hype_adm_check_disk_bus(const hype_cfg_t *cfg) {
             }
             bus = hype_cfg_resolve_bus(&cfg->disks[d], cfg->vms[vi].os_hint);
             /*
-             * The front-ends hype can actually present: virtio-blk, ahci-sata (#333) and, since #202
-             * slice 6, nvme. Anything else must fail LOUDLY here rather than producing a VM with no
-             * disk, which from inside the guest is indistinguishable from a hype bug.
+             * The front-ends hype can actually present: virtio-blk, ahci-sata (#333), nvme (#202
+             * slice 6) and, since #593, usb-msc (removable USB mass storage over the guest xHCI).
+             * Anything else must fail LOUDLY here rather than producing a VM with no disk, which
+             * from inside the guest is indistinguishable from a hype bug.
              *
              * This list is the thing to update when a front-end lands -- it was `nvme` that was
              * refused here until the controller existed.
              */
             if (bus != HYPE_CFG_BUS_VIRTIO_BLK && bus != HYPE_CFG_BUS_AHCI_SATA &&
-                bus != HYPE_CFG_BUS_NVME) {
+                bus != HYPE_CFG_BUS_NVME && bus != HYPE_CFG_BUS_USB_MSC) {
                 return adm_err(HYPE_ADM_ERR_DISK_BUS_UNSUPPORTED, vi, HYPE_ADM_NO_VM);
             }
         }

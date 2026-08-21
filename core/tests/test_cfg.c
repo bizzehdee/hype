@@ -3016,7 +3016,22 @@ static void test_tpm_key(void) {
     CHECK_INT("duplicate tpm refused", HYPE_CFG_ERR_DUPLICATE_KEY, parse_copy(dup, &out).status);
 }
 
+static void test_bus_usb_msc(void) {
+    /* #593: bus = usb-msc parses to the new enum and round-trips. */
+    const char *cfg =
+        "[disk.stick]\ntype = disk\nbacking = file\npath = \\u.img\nbus = usb-msc\n";
+    hype_cfg_t out;
+    static char text[2048];
+    hype_cfg_serialize_result_t sr;
+    CHECK_INT("usb-msc parses", HYPE_CFG_OK, parse_copy(cfg, &out).status);
+    CHECK_INT("bus usb-msc", (int)HYPE_CFG_BUS_USB_MSC, (int)out.disks[0].bus);
+    sr = hype_cfg_serialize(&out, text, sizeof(text));
+    CHECK_INT("serializes", 0, sr.refused_overflow || sr.truncated);
+    CHECK_INT("usb-msc emitted", 1, strstr(text, "bus = usb-msc") != 0);
+}
+
 int main(void) {
+    test_bus_usb_msc();
     test_label_from_the_spec_example_is_accepted();
     test_label_absent_leaves_an_empty_string();
     test_label_rejects_empty_and_duplicate();

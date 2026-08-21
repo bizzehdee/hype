@@ -1018,6 +1018,8 @@ static hype_cfg_status_t apply_disk_field(hype_cfg_disk_t *d, unsigned int *seen
             d->bus = HYPE_CFG_BUS_NVME;
         } else if (hype_streq(val, "ahci-atapi")) {
             d->bus = HYPE_CFG_BUS_AHCI_ATAPI;
+        } else if (hype_streq(val, "usb-msc")) {
+            d->bus = HYPE_CFG_BUS_USB_MSC;
         } else {
             return HYPE_CFG_ERR_BAD_VALUE;
         }
@@ -2273,6 +2275,7 @@ static const char *disk_bus_str(hype_cfg_bus_t bus) {
         case HYPE_CFG_BUS_AHCI_SATA: return "ahci-sata";
         case HYPE_CFG_BUS_NVME: return "nvme";
         case HYPE_CFG_BUS_AHCI_ATAPI: return "ahci-atapi";
+        case HYPE_CFG_BUS_USB_MSC: return "usb-msc";
         default: return 0;
     }
 }

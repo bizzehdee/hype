@@ -30,6 +30,7 @@
 #include "../core/l2switch.h" /* NET-6 (#223) */
 #include "../core/qcow2_create.h" /* TERM-11 (#487) */
 #include "../devices/tpm_crb.h" /* #433 */
+#include "../devices/usb_msc.h" /* #593: removable USB-MSC over the guest xHCI */
 #include "../core/file_io.h"
 #include "../core/host_pci.h"
 #include "../core/e1000.h"
@@ -919,6 +920,7 @@ typedef struct hype_fw_vm {
      */
     hype_xhci_dev_t xhci_dev;
     int xhci_present;
+    hype_usb_msc_t usb_msc; /* #593: the removable USB-MSC function behind the xHCI, when bus=usb-msc */
     /*
      * WHICH one this VM has. The forwarding plane -- proxy ARP, address learning, the on-link check,
      * NAPT, the peer mailbox -- is identical for both, so it goes through this rather than branching
@@ -9623,13 +9625,13 @@ static void fw_1_xhci_present(hype_fw_vm_t *vm) {
         vm->xhci_present = 0;
         return;
     }
-    hype_pci_set_bar_size(&vm->pci, HYPE_FW_1_PCI_DEV_XHCI, 0, HYPE_XHCI_BAR_SIZE);
+    hype_pci_set_bar_size(&vm->pci, HYPE_FW_1_PCI_DEV_XHCI, 0, HYPE_GXHCI_BAR_SIZE);
     hype_pci_set_interrupt(&vm->pci, HYPE_FW_1_PCI_DEV_XHCI, 1, 11);
     hype_pci_set_msi_capability(&vm->pci, HYPE_FW_1_PCI_DEV_XHCI);
     hype_xhci_dev_reset(&vm->xhci_dev, 1 /* the emulated USB-MSC device is on the port */);
     hype_debug_print("fw-1[vm %u]: guest xHCI controller presented at PCI dev %u, BAR0 %u bytes "
                      "[#591]\n",
-                     idx, HYPE_FW_1_PCI_DEV_XHCI, HYPE_XHCI_BAR_SIZE);
+                     idx, HYPE_FW_1_PCI_DEV_XHCI, HYPE_GXHCI_BAR_SIZE);
 }
 
 /*
@@ -10192,9 +10194,22 @@ static void fw_1_attach_storage(hype_fw_vm_t *vm) {
      * storage is chosen -- so the backend is resolved once and whichever front-end was selected
      * consumes it.
      */
+    /* #593: a bus = usb-msc first disk asks for the guest xHCI + removable USB-MSC front-end. */
+    vm->xhci_present = (fw_1_target_bus(vm) == HYPE_CFG_BUS_USB_MSC) ? 1 : 0;
     fw_1_setup_virtio_blk(vm);
     fw_1_bochs_vbe_present(vm); /* #565: only when display = bochs */
     fw_1_xhci_present(vm);      /* #591: only when a bus = usb-msc disk is configured */
+    if (vm->xhci_present) {
+        /* Attach the USB Mass Storage function over the backend fw_1_setup_virtio_blk resolved,
+         * so file- and physical-backed both work. The controller was reset by fw_1_xhci_present;
+         * the attach persists across a guest HCRST (#592). */
+        hype_usb_device_t *u = hype_usb_msc_init(&vm->usb_msc, &vm->disk[0].be);
+        hype_xhci_dev_attach(&vm->xhci_dev, u);
+        hype_debug_print("fw-1[vm %u]: removable USB-MSC attached over the guest xHCI -- %llu "
+                         "sectors (bus = usb-msc) [#593]\n",
+                         (unsigned)(vm - &g_vms[0]),
+                         (unsigned long long)vm->disk[0].be.total_sectors);
+    }
     fw_1_guest_nic_present(vm); /* #81/#82: only when net_mode = nat */
     if (fw_1_target_bus(vm) == HYPE_CFG_BUS_AHCI_SATA) {
         /* AFTER fw_1_setup_virtio_blk: that is what fills in the capacity. Attaching before it
@@ -10216,7 +10231,9 @@ static void fw_1_attach_storage(hype_fw_vm_t *vm) {
          * and "front-end = virtio-blk".
          */
         hype_debug_print("fw-1: disk front-end = %s -- no SATA disk attached (#333)\n",
-                         (fw_1_target_bus(vm) == HYPE_CFG_BUS_NVME) ? "nvme" : "virtio-blk");
+                         (fw_1_target_bus(vm) == HYPE_CFG_BUS_NVME)      ? "nvme"
+                         : (fw_1_target_bus(vm) == HYPE_CFG_BUS_USB_MSC) ? "usb-msc"
+                                                                        : "virtio-blk");
     }
     /*
      * #329 2b(ii): the EXTRA disk slots. Each exists only because the config's disks= list names a
@@ -10248,6 +10265,15 @@ static void fw_1_attach_storage(hype_fw_vm_t *vm) {
                 continue;
             }
             bus = fw_1_slot_bus(vm, slot);
+            if (bus == HYPE_CFG_BUS_USB_MSC) {
+                /* #593: usb-msc is a first-disk-only front-end (one guest xHCI + MSC per VM). An
+                 * extra slot asking for it is NOT presented rather than silently downgraded to
+                 * virtio-blk -- the #285 shape. Admission should already have refused this. */
+                hype_serial_print("fw-1[vm %d]: disk slot %u ([disk.%s]) bus = usb-msc is only "
+                                  "supported on the first disk -- NOT presented\n",
+                                  (int)(vm - &g_vms[0]), slot, cd->id);
+                continue;
+            }
             dev = fw_1_slot_pci_dev(slot, bus);
             switch (bus) {
             case HYPE_CFG_BUS_AHCI_SATA:
@@ -11013,7 +11039,7 @@ static hype_fw_dev_t fw_1_shared_mmio_npf(hype_fw_vm_t *vm, hype_vmm_kind_t kind
     /* #591: the guest xHCI controller's BAR0. Served from this dispatch so a guest driving USB
      * from any vCPU is answered rather than absorbed, the same as the other shared windows. */
     if (vm->shared_xhci_mapped && npf.guest_phys_addr >= vm->shared_xhci_bar &&
-        npf.guest_phys_addr < vm->shared_xhci_bar + HYPE_XHCI_BAR_SIZE) {
+        npf.guest_phys_addr < vm->shared_xhci_bar + HYPE_GXHCI_BAR_SIZE) {
         if (vmm_handle_xhci_npf(kind, ctx, &vm->xhci_dev, &g_fw_1_dma_map,
                                 (uint64_t)vm->shared_xhci_bar, insn) == 0) {
             return HYPE_FW_DEV_XHCI;
