@@ -78,9 +78,13 @@ if [ "$FAT32" -eq 1 ]; then
     # physical-write script is fed to it).
     cp tools/hwstick/hype-fat32.cfg "$DST/hype.cfg"
     cp tools/hwstick/hype-micro.cfg tools/hwstick/README.md "$DST/"
-    printf '%s\n' "#597 marker -- its presence makes hype run the FAT32 write battery on this volume." \
+    # Leading number = how many times to repeat that battery this boot (more = better odds of
+    # catching an intermittent leak). Edit it on the stick to change intensity without a rebuild.
+    printf '%s\n%s\n' "${F32_ITERS:-10}" \
+        "#597 marker -- leading number = repeat count for the FAT32 write battery this boot." \
         > "$DST/F32TEST.RUN"
-    printf '%s\n' "#596 marker -- its presence makes hype run the log-shaped write battery too." \
+    printf '%s\n%s\n' "${LOG_ITERS:-10}" \
+        "#596 marker -- leading number = repeat count for the log-shaped write battery this boot." \
         > "$DST/LOGTEST.RUN"
     rm -rf "$DST/F32TEST" "$DST/LOGTEST" # empty dirs so a stale file can't mask a failure
     echo "fat32: staged \\hype.cfg = hype-fat32.cfg and dropped the \\F32TEST.RUN marker"

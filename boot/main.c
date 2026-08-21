@@ -22528,6 +22528,60 @@ static void fw_1_fat32_selftest_log(void *ctx, const hype_fat32_selftest_event_t
                      ev->refused ? "REFUSED" : (ev->selfcheck_ok ? "OK" : "SELFCHECK-FAIL"));
 }
 
+/* #596: the marker file may carry a leading decimal = how many times to repeat the battery this
+ * boot. An intermittent single-cluster leak is a coin flip per run, so many alloc/free cycles per
+ * boot raise the odds of hitting it (the post-run fsck.vfat is what sees the leak -- hype's own
+ * byte-exact self-check cannot, a leaked cluster belongs to no file). Non-numeric / empty -> 1. */
+static unsigned int fw_1_read_marker_count(hype_fs_t *fs, const char *marker, unsigned int def,
+                                           unsigned int cap) {
+    hype_fs_file_t f;
+    char b[16];
+    unsigned int n, i, v = 0u;
+    int any = 0;
+    if (hype_fs_lookup(fs, marker, &f) != 0) return def;
+    n = (f.size < (uint64_t)(sizeof b - 1u)) ? (unsigned int)f.size : (unsigned int)(sizeof b - 1u);
+    if (n == 0u || hype_fs_read_at(&f, 0, b, n) != 0) return def;
+    for (i = 0; i < n; i++) {
+        if (b[i] >= '0' && b[i] <= '9') { v = v * 10u + (unsigned int)(b[i] - '0'); any = 1; if (v > cap) break; }
+        else break;
+    }
+    if (!any || v == 0u) return def;
+    return (v > cap) ? cap : v;
+}
+
+typedef int (*fw_1_fat_battery_fn)(hype_fs_t *, const hype_rtc_time_t *,
+                                   hype_fat32_selftest_result_t *, hype_fat32_selftest_log_fn, void *);
+
+/* Run one marker-gated FAT battery, repeated per the marker's count. Per-file boundaries are logged
+ * on the first iteration only (and on any failing one); every iteration prints a one-line summary
+ * only when it is the first or it failed, so a long loop stays legible. */
+static void fw_1_run_fat_battery(const char *marker, const char *dir, const char *label,
+                                 fw_1_fat_battery_fn run) {
+    hype_fs_file_t mk;
+    unsigned int iters, k, failing = 0u;
+    if (!(g_hype_log.active && g_hype_log_ready)) return;
+    if (hype_fs_lookup(&g_hype_log.fs, marker, &mk) != 0) return; /* marker absent -> skip */
+    iters = fw_1_read_marker_count(&g_hype_log.fs, marker, 1u, 1000u);
+    hype_debug_print("%s: marker \\%s found -- running the #596/#597 battery x%u on the boot "
+                     "volume\n", label, marker, iters);
+    for (k = 0; k < iters; k++) {
+        hype_fat32_selftest_result_t r;
+        int rc = run(&g_hype_log.fs, g_host_time_valid ? &g_host_time : 0, &r,
+                     (k == 0u) ? fw_1_fat32_selftest_log : (hype_fat32_selftest_log_fn)0, 0);
+        int failed = (rc != 0 || r.files_refused != 0);
+        if (failed) failing++;
+        if (k == 0u || failed) {
+            hype_debug_print("%s iter %u/%u: %s written=%u refused=%u selfcheck_fail=%u%s%s\n", label,
+                             k + 1u, iters, failed ? "FAIL" : "PASS", r.files_written, r.files_refused,
+                             r.selfcheck_fail, r.first_fail[0] ? " first=" : "", r.first_fail);
+        }
+    }
+    hype_debug_print("%s SELFTEST: %s -- %u iteration(s), %u failing. A LEAKED CLUSTER IS INVISIBLE "
+                     "to this self-check; run `sudo fsck.vfat -nv` after this boot -- that is the "
+                     "judge. Files in \\%s [#596 #597]\n",
+                     label, failing ? "FAIL" : "PASS", iters, failing, dir);
+}
+
 static void split_log_setup(void) {
     char name[16];
     unsigned int i;
@@ -25625,53 +25679,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * is pulled -- that independent judgement is what catches a chain hype round-trips but Linux
      * rejects. Gated on the marker file, so a normal stick is untouched.
      */
-    if (g_hype_log.active && g_hype_log_ready) {
-        hype_fs_file_t f32_marker;
-        if (hype_fs_lookup(&g_hype_log.fs, HYPE_FAT32_SELFTEST_MARKER, &f32_marker) == 0) {
-            hype_fat32_selftest_result_t f32;
-            int f32_rc;
-            hype_debug_print("FAT32-STICK: marker \\%s found -- running the #597 write battery on "
-                             "the boot volume\n", HYPE_FAT32_SELFTEST_MARKER);
-            f32_rc = hype_fat32_selftest_run(&g_hype_log.fs,
-                                             g_host_time_valid ? &g_host_time : 0, &f32,
-                                             fw_1_fat32_selftest_log, 0);
-            hype_debug_print("FAT32-STICK SELFTEST: %s -- written=%u refused=%u selfcheck_fail=%u%s%s "
-                             "[#597 #596]\n",
-                             (f32_rc == 0 && f32.files_refused == 0) ? "PASS" : "FAIL",
-                             f32.files_written, f32.files_refused, f32.selfcheck_fail,
-                             f32.first_fail[0] ? " first=" : "", f32.first_fail);
-            hype_debug_print("FAT32-STICK: files left in \\%s -- pull the stick and run "
-                             "tools/fat32-e2e/validate-stick.sh for the fsck.vfat verdict\n",
-                             HYPE_FAT32_SELFTEST_DIR);
-        }
-    }
-
-    /*
-     * #596: log-shaped write battery. If \LOGTEST.RUN is present, grow several files concurrently
-     * in ~4 KiB batches -- the FS-level output shape of hype's log writer -- against the live
-     * volume with the real device barrier. This targets the leaked-cluster class fsck found on the
-     * interleaved-run stick, which the raw-writer batteries do not exercise. Leaves \LOGTEST for
-     * the same validate-stick.sh + fsck.vfat pass. Gated on its own marker.
-     */
-    if (g_hype_log.active && g_hype_log_ready) {
-        hype_fs_file_t log_marker;
-        if (hype_fs_lookup(&g_hype_log.fs, HYPE_FAT32_LOGTEST_MARKER, &log_marker) == 0) {
-            hype_fat32_selftest_result_t lt;
-            int lt_rc;
-            hype_debug_print("LOGTEST-STICK: marker \\%s found -- running the #596 log-shaped write "
-                             "battery on the boot volume\n", HYPE_FAT32_LOGTEST_MARKER);
-            lt_rc = hype_fat32_logtest_run(&g_hype_log.fs, g_host_time_valid ? &g_host_time : 0, &lt,
-                                           fw_1_fat32_selftest_log, 0);
-            hype_debug_print("LOGTEST-STICK SELFTEST: %s -- written=%u refused=%u selfcheck_fail=%u%s%s "
-                             "[#596 #597]\n",
-                             (lt_rc == 0 && lt.files_refused == 0) ? "PASS" : "FAIL",
-                             lt.files_written, lt.files_refused, lt.selfcheck_fail,
-                             lt.first_fail[0] ? " first=" : "", lt.first_fail);
-            hype_debug_print("LOGTEST-STICK: files left in \\%s -- the fsck.vfat verdict is the one "
-                             "that matters (a leaked cluster is invisible to a file read-back)\n",
-                             HYPE_FAT32_LOGTEST_DIR);
-        }
-    }
+    fw_1_run_fat_battery(HYPE_FAT32_SELFTEST_MARKER, HYPE_FAT32_SELFTEST_DIR, "FAT32-STICK",
+                         hype_fat32_selftest_run);
+    fw_1_run_fat_battery(HYPE_FAT32_LOGTEST_MARKER, HYPE_FAT32_LOGTEST_DIR, "LOGTEST-STICK",
+                         hype_fat32_logtest_run);
 
     /*
      * #326: resolve each VM's media, AFTER every host-discovery pass (NVMe, USB, then AHCI) has
