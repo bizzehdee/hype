@@ -107,11 +107,11 @@ void hype_tpm_crb_write(hype_tpm_crb_t *c, uint32_t offset, unsigned int size, u
          * assigned; Relinquish(bit2) releases it -- the driver polls LOC_STATE afterwards, and
          * without honouring these it saw locAssigned stuck set and logged
          * "TPM_LOC_STATE_x.Relinquish timed out". */
-        if (val & 0x1u) {        /* requestAccess */
+        if (val & 0x1u) {        /* requestAccess (CRB_LOC_CTRL_REQUEST_ACCESS = BIT(0)) */
             c->loc_state |= 0x2u; /* locAssigned */
             c->loc_sts = 0x1u;    /* granted */
         }
-        if (val & 0x4u) {        /* Relinquish */
+        if (val & 0x2u) {        /* Relinquish (CRB_LOC_CTRL_RELINQUISH = BIT(1)) */
             c->loc_state &= ~0x2u;
         }
         break;

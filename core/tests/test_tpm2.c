@@ -302,7 +302,7 @@ static void test_crb_registers(void) {
     hype_tpm_crb_write(&crb, HYPE_CRB_LOC_CTRL, 4, 0x1u);
     CHECK("requestAccess sets locAssigned",
           (hype_tpm_crb_read(&crb, HYPE_CRB_LOC_STATE, 4) & 0x2u) != 0u);
-    hype_tpm_crb_write(&crb, HYPE_CRB_LOC_CTRL, 4, 0x4u);
+    hype_tpm_crb_write(&crb, HYPE_CRB_LOC_CTRL, 4, 0x2u); /* Relinquish = BIT(1) */
     CHECK("relinquish clears locAssigned",
           (hype_tpm_crb_read(&crb, HYPE_CRB_LOC_STATE, 4) & 0x2u) == 0u);
     /* START with bit clear does nothing */
