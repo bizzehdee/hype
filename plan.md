@@ -3379,3 +3379,262 @@ counters live as FW-1-era statics in `boot/main.c` — is a refactor-in-place
 concern (#539's pattern), not missing capability.
 
 Disposition: **covered.** No ticket.
+
+## 15. Gap analysis, deep pass (2026-08-21)
+
+A second structured pass, over the sub-areas §14 did not examine, across
+thirteen categories. Same rules as §14: findings with citations, dispositions,
+no existing decision changed. Where §14 or its tickets (#599–#605) already
+dispositioned a sub-area, one line points there rather than re-analysing. New
+tickets from this pass: **#606–#611**.
+
+### 15.1 CPU virtualization core
+
+- Bring-up and capability detection: §14.5.
+- **VMCS/VMCB lifecycle**: VMX cross-core ownership and hand-off is §10
+  decision 43 (hard invariant, violation-counted). SVM VMCB clean bits are
+  modeled but always written 0 — "nothing clean, always reload"
+  (`arch/x86_64/svm/vmcb.h:62`; every control mutation clears them,
+  `svm_vcpu.c`). Correctness-first by design; a clean-bits optimization is
+  deliberately not planned until a measurement asks for it (§14.14's rule).
+- **Exit dispatch and unknown exits**: unknown MSRs are tolerate-and-trace-once
+  (`arch/x86_64/svm/svm_vcpu.c:2259`), unknown port I/O is
+  absorb-and-report (`hype_vmx_vcpu_handle_unknown_ioio`,
+  `hype_svm_vcpu_handle_unknown_ioio`), and an exit hype cannot attribute
+  stops that VM alone per decision 46. Systematic per-reason proof is #603.
+- **CPUID/MSR interception policy**: SVM runs a default-intercept MSRPM with
+  an explicit passthrough allowlist (`svm_vcpu.c:421 g_msrpm_passthrough`);
+  VMX enables no MSR bitmap at all, so every guest MSR access exits — the
+  safe posture, paid in exits. CPUID emulation is centralized and unit-tested
+  (`arch/x86_64/cpu/cpuid_emulate.c`; vendor honesty #298, brand string
+  #361). Covered; a VMX MSR bitmap is a perf item with no measurement behind
+  it, not planned.
+- **Exception/NMI injection**: EXITINTINFO re-staging is modeled (#315;
+  #580's retire-HLT-before-inject ordering landed in `22997ce`); NMI
+  injection exists (#484, `hype_svm_vcpu_inject_nmi`); STI/MOV-SS/NMI
+  blocking windows are respected on entry (`vmcs_hw.c:4586`). Double-fault
+  escalation happens inside the guest — exceptions are not intercepted by
+  default (VMX exception bitmap 0, `vmcs_hw.c:901`), so hype never has to
+  synthesize #DF. Correct by structure; window-by-window proof folds into
+  #603.
+- **TSC/clock virtualization**: the guest TSC is the raw host TSC —
+  tsc_offset 0, no intercept, no scaling, no IA32_TSC_ADJUST model
+  (`svm_vcpu.c:2176`; `hyperv.c:100`); TSC_DEADLINE and x2APIC are honestly
+  masked (`cpuid_emulate.c:288`; x2APIC is #601). Sound on the dedicated tier
+  because a vCPU never changes core and hosts require invariant TSC (#555).
+  The shared tier's core migration (SMP-13 #469) must keep guest-TSC
+  monotonicity, and SMP-20's proof (#476) should include it — noted here; the
+  SMP series owns it, no new ticket.
+- **Nested virtualization**: honestly absent (§14.5: CPUID masked #552/#316,
+  SVM instructions intercepted to #UD #317). On VMX the guest also cannot set
+  CR4.VMXE — it is host-owned in the CR4 guest/host mask and hidden from the
+  read shadow (`vmcs_hw.c:1088–1106`) — so a guest VMXON takes #UD in-guest
+  rather than reaching an unhandled exit. Covered.
+
+### 15.2 Memory
+
+- EPT/NPT structure, huge pages, permissions granularity: §14.4. Dirty-page
+  tracking: §14.4 — still no consumer (#131 snapshots disk images, not RAM).
+- **Guest #PF vs NPF attribution**: guest #PF is delivered natively (the
+  exception bitmap/mask excludes it), so a guest page fault never reaches
+  hype and cannot be misattributed; NPF/EPT-violation is the only
+  nested-paging exit and is attributed per decision 46. Covered; folds into
+  #603's reason coverage.
+- **Guest-side W^X**: nested paging grants RWX over all guest RAM
+  deliberately — the guest's own page tables are its W^X mechanism. What hype
+  actually withholds from guest self-defense today is speculation control,
+  which is #608 (15.11).
+- **MMIO window registration hygiene**: the two-places trap (AP loop vs BSP
+  chain) was closed by #482/#576 — one shared dispatch entry point. Proof
+  that every registered window and every hole behaves is #603's job.
+- **Ballooning / memory hotplug**: ballooning is §13 v2, explicitly out of
+  v1; RAM hotplug is not planned anywhere — §6i's fixed-size admission model
+  is the design.
+
+### 15.3 Interrupts
+
+- LAPIC virtualization: §14.3 (#599/#600/#605). x2APIC: #601. MSI/MSI-X:
+  §14.2 / decision 51. Remapping: §14.1. Posted interrupts: arrive with
+  APICv (#599) or not at all.
+- **IO-APIC pin exhaustion**: decided, not merely observed — decision 51: all
+  24 pins are allocated, a new device shares a line and extends that line's
+  single pending-OR computation, and widening the IO-APIC requires an
+  explicit argument. Handled by design; no ticket.
+
+### 15.4 PCI and devices
+
+- **Guest config-space model**: 256-byte config space, bus 0 only, no
+  PCI-to-PCI bridges — documented scope (`devices/pci.h:25`). Capability
+  chains are real (MSI + SATA caps, `devices/pci.c:170`; the virtio chain
+  #550); BAR sizing is modeled and proven by a real guest bus walk with
+  self-programmed BARs (#547); slot aliasing fixed (#573). 64-bit BARs are
+  not modeled (decision 26 records the 32-bit scope) and nothing on the fixed
+  device board needs one. Covered; conformance beyond this folds into
+  #602/#603.
+- **virtio conformance**: VIRTIO_F_VERSION_1 is negotiated
+  (`devices/virtio_blk.c:81`), SEG_MAX offered, reset and renegotiation
+  tested (#310). EVENT_IDX and multiqueue are unoffered optional features
+  with no measured need (15.13).
+- **virtio-scsi**: not needed — the optical path is AHCI/ATAPI for every
+  guest family (§6d) and the disk buses are decision 26's three plus
+  `usb-msc` (decision 55). §6d's passing "or a virtio-scsi CD-ROM" wording is
+  a never-chosen option, not a commitment. Deliberately not planned.
+- Passthrough and IOMMU: §14.1. Reset/FLR: §14.8. **SR-IOV**: out of scope
+  with passthrough (§1) — a VF is passthrough by definition.
+
+### 15.5 Guest boot
+
+- UEFI path: vendored OVMF, decision 1; Linux direct kernel: decision 45;
+  Windows/Linux/BSD paths: their milestones (M4–M7, GLADDER, BSD).
+- **BIOS/CSM**: a stretch goal by design (§6, STRETCH-1 #128) — but
+  `firmware = legacy` parses, round-trips, and is then silently ignored: the
+  VM boots UEFI OVMF anyway. **#607** — refuse at admission until #128
+  exists.
+- **MP tables (MPS)**: not synthesized, deliberately — decision 23's guests
+  are 64-bit UEFI-era systems that consume the MADT (§14.7). A guest needing
+  legacy MPS is out of scope.
+- **SMBIOS**: synthesized per VM and unit-tested (`devices/smbios.c`,
+  `core/tests/test_smbios.c`; Type 4 topology honesty fixed by #562).
+  Covered.
+- **Multiboot**: not needed — BSDs boot via their UEFI loaders (decision 23),
+  and `boot = kernel` is deliberately bzImage-shaped only (decision 45).
+  Deliberately not planned.
+
+### 15.6 SMP and scheduling
+
+- AP startup / INIT-SIPI: §14.6. Shared tier: SMP-11..22 (#467–#478).
+- **vCPU/VM teardown**: the lifecycle machine including Force-off and Delete
+  is implemented and unit-tested (`core/vm_lifecycle.*` + tests;
+  `core/vm_delete.h`, TERM-15 #491), and the RAM re-carve reports reuse so
+  the zeroing invariant cannot be skipped silently (`core/ram_pool.h`).
+  Covered — except two compile-time caps that contradict decision 33:
+  `HYPE_CFG_MAX_VMS 16` and `HYPE_RAM_POOL_MAX_CARVES 64`. **#606**.
+- **Oversubscription**: admission-only on the dedicated tier, ratio-bounded
+  on the shared tier (§6i, decision 39). Covered by design.
+- **Affinity**: `cpu_set` is the documented model (§5, decisions 16/47).
+  Covered.
+- **Pause/resume**: implemented (M8-5 #116; `HYPE_CMD_STOP`/`RESUME`) with
+  the state machine unit-tested. Covered.
+
+### 15.7 Timers
+
+- **PIT**: modeled (`devices/pit.c`); the open defect is bare-metal legacy
+  PIT/8259 delivery, #557. Covered by that ticket.
+- **HPET**: modeled (`devices/hpet.c`) with a per-VM ACPI table, default
+  absent on #436's Windows evidence (§14.7). Covered.
+- **RTC/CMOS**: periodic interrupt rates implemented (`devices/cmos.c:175`);
+  the earlier frozen-clock and probe defects are fixed (#303/#304). Covered.
+- **LAPIC timer**: one-shot and periodic modeled
+  (`devices/guest_lapic.c:434–451`); TSC-deadline mode is honestly masked
+  rather than half-modeled. Deliberately not planned until a guest needs it.
+- **Paravirtual clocks**: both exist — kvmclock (`devices/pvclock.c`, keyed
+  on the KVM CPUID signature; motivated by a real-hardware PIT-calibration
+  failure) and the Hyper-V reference TSC page + frequency MSRs
+  (`arch/x86_64/cpu/hyperv.c`, #436). Covered.
+
+### 15.8 Storage / network devices
+
+- virtio-blk: §14.9. virtio-net + NAT + peers: the NET milestone (closed
+  #81–#86).
+- **Switch/bridge**: NET-6 delivered with decision 53's semantics; L3 routing
+  between switches and VLANs are deferred by §6e's own text (future NET-7);
+  inbound DNAT is NET-8 #448, open. Covered by plan + board.
+- **TAP devices**: not applicable — hype is bare-metal; its uplink is its own
+  NIC drivers (§6e), not a host kernel's TAP.
+- **Interrupt moderation / multiqueue**: single queue, INTx, per decision 51;
+  no measurement asks for more (15.13).
+
+### 15.9 Host infrastructure
+
+- **Memory allocators**: one Phase-0 pool, carved by an allocator with loud
+  exhaustion statuses, overlap refusal and unit tests (`core/ram_pool.h`);
+  admission checks the budget (§6i). Covered — minus #606's fixed carve-table
+  constant.
+- Host paging permissions: #604. Host SMP startup: §14.6, plus the tracked
+  intermittent AP-trampoline #GP (#461).
+- **Host APIC abstraction**: exists and is unit-tested
+  (`arch/x86_64/cpu/lapic.c`); a few raw `0xFEE00000` literals remain in
+  `boot/main.c` — §14.15's refactor-in-place class, no missing capability.
+- **Host PCI**: legacy 0xCF8/0xCFC config access only, deliberately
+  (`core/host_pci.h`); no host-side ECAM, so extended config space (>0xFF)
+  and PCI segments ≠ 0 are unreachable. Nothing hype drives needs either
+  today; the first host device that does turns this line into a bug report.
+  Noted, not planned.
+- **Host ACPI parser**: none — topology comes from EFI MP services + CPUID
+  with firmware-quirk repair (#378), the timebase from TSC-via-Stall
+  (decision 37), PCI from brute-force enumeration. No host MADT/MCFG consumer
+  exists; deliberately absent until one does.
+- Host timer subsystem: decision 37, plus the #370 unguarded-RDMSR trap,
+  both settled. BSP loop cadence: bounded slices are decided (decision 28)
+  and its starvation regressions were found and fixed by measurement
+  (#368/#374/#375). Logging/serial/panic: §14.15 + decisions 28/57.
+
+### 15.10 Reliability
+
+- Guest-facing fuzzing: #602 (its scope already names PCI config writes and
+  hype.cfg). Exit coverage: #603. Watchdog: implemented and unit-tested
+  (`core/vm_watchdog.c`, `core/tests/test_vm_watchdog.c`). Crash dumps:
+  §14.15 — the panic flush persists the console log to the stick (#513); no
+  further post-mortem artifact is planned (decision 28 retired the
+  EFI-variable tail deliberately).
+- **Lock discipline**: few locks by design — ownership-over-locking is the
+  standing pattern (decision 57), and the two real cross-lock orderings are
+  documented where they live (decision 52's mailbox rule; blk_usb's ticket
+  lock + the controller-wide transfer lock, #343). There is no repo-wide lock
+  inventory or runtime order detection; at this lock count a detector is
+  disproportionate. The rule that keeps this true: new cross-core state gets
+  an ownership or ordering argument in its §10 entry, as decisions 52/57 did.
+  Noted; no ticket.
+- **Deterministic tests / flake tracking**: microtest verdict and
+  INVALID-retry rules (the `microtests` skill); a flake becomes a WATCH
+  ticket (#578 is the live example). Covered by practice.
+- **Privilege-boundary audit**: **#610** — enumerate every guest-writable
+  interface and cite the §6j check and test at each; the complement of #602
+  (fuzz exercises what the audit enumerates).
+
+### 15.11 Security
+
+- Isolation: §6g/§14. IOMMU/DMA containment: §14.1. Host NX/W^X/SMEP/
+  canaries: #604.
+- **Speculative-execution posture, two holes found**: guests are denied their
+  own mitigations — IA32_SPEC_CTRL/PRED_CMD are not virtualized, so the
+  masked CPUID bits make every guest kernel run unmitigated internally
+  (**#608**); and hype itself runs guest-reachable indirect branches with no
+  IBPB on exit, no IBRS, and no retpoline build — decision 48 covers L1TF
+  only, SMP-18 (#474) flushes only on shared-tier trust-group switches
+  (**#609**, Low, sibling of #604).
+- **Secure/measured boot of hype itself**: unsigned-with-SB-off is decision
+  5; the signing path is STRETCH-2 #129. Measuring hype into the host TPM
+  (hype's own chain — distinct from #432/#433's guest TPM) is deliberately
+  not planned: it has no v1 consumer, and it builds on the signing story
+  decision 5 already defers.
+- Privilege-boundary audit: #610 (15.10).
+
+### 15.12 Operations
+
+- Lifecycle API: decision 11 + TERM-9..15, all closed. Serial console and the
+  operator terminal: the TERM milestone. Disk snapshots: #131 (STRETCH).
+  Save/restore and migration: §14.10. Metrics/tracing: §14.15.
+- **Remote management**: §13 v2 plus the MGMT epic — #492 (MGMT-1) is the
+  pending plan revision, and #500–#504 stand behind it; decision 36 stands
+  until MGMT-1 lands. The board is deliberately ahead of the plan here, and
+  MGMT-1 is the reconciliation.
+- **Live introspection**: none on demand — deep dumps fire only on faults
+  (§14.15), and the terminal has no "where is this guest right now" command.
+  **#611** — a decision-43-safe published-snapshot dump from the terminal.
+
+### 15.13 Performance
+
+- Exit profiling: EXHIST buckets + the I/O histograms (§14.15). EPT/NPT
+  perf: §14.4. NUMA: #475. Host TSC calibration: decision 37.
+- **Perf regression harness**: none standing, deliberately — baselines are
+  per-ticket measurements (#107/#234/#295 pattern), the open measured work
+  sits on the PERF milestone (#295), and the shared-tier benchmark obligation
+  is SMP-22 (#478). Not planned until a regression escapes this practice.
+- **virtio multiqueue / interrupt moderation**: single-queue INTx is decision
+  51's stance, and multiqueue additionally requires the MSI-X delivery path
+  decision 51 defers. No measurement asks for it. Deliberately not planned.
+- **Exitless / low-exit fast paths**: IPI/EOI acceleration is #599/#600;
+  PIO/MMIO hot-exit work exists exactly where measurement justified it (#295
+  coalescing; the #367/#368 history). No general fast-path framework is
+  planned — the measure-before-optimizing rule.
