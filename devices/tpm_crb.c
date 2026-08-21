@@ -121,3 +121,38 @@ void hype_tpm_crb_write(hype_tpm_crb_t *c, uint32_t offset, unsigned int size, u
         break; /* read-only or reserved: dropped, like real hardware */
     }
 }
+
+int hype_tpm_crb_decode_movs(const uint8_t *bytes, unsigned int n, unsigned int *elem,
+                             unsigned int *len, int *is_rep) {
+    unsigned int i = 0;
+    int rep = 0, opsize = 0, rexw = 0;
+
+    if (bytes == 0 || n == 0u) {
+        return 0;
+    }
+    /* Legacy + REX prefixes in any order. movs takes no ModRM, so once the opcode byte is
+     * reached the instruction ends. */
+    for (; i < n; i++) {
+        uint8_t b = bytes[i];
+        if (b == 0xF3u) { rep = 1; continue; }       /* REP */
+        if (b == 0xF2u) { continue; }                /* REPNE (accepted, same iteration) */
+        if (b == 0x66u) { opsize = 1; continue; }    /* operand-size override */
+        if (b == 0x67u || b == 0x2Eu || b == 0x3Eu || b == 0x26u ||
+            b == 0x64u || b == 0x65u || b == 0x36u) { continue; } /* addr-size / segment */
+        if (b >= 0x40u && b <= 0x4Fu) { if (b & 0x08u) rexw = 1; continue; } /* REX, W bit */
+        break;
+    }
+    if (i >= n) {
+        return 0;
+    }
+    if (bytes[i] == 0xA4u) {          /* MOVSB */
+        *elem = 1u;
+    } else if (bytes[i] == 0xA5u) {   /* MOVSW/D/Q */
+        *elem = rexw ? 8u : (opsize ? 2u : 4u);
+    } else {
+        return 0;
+    }
+    *len = i + 1u;
+    *is_rep = rep;
+    return 1;
+}

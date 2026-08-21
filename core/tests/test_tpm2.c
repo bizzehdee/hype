@@ -314,6 +314,28 @@ static void test_crb_registers(void) {
     CHECK("zero size read", hype_tpm_crb_read(&crb, 0, 0) == 0u);
 }
 
+
+static void test_rep_movs_decode(void) {
+    unsigned int elem, len; int rep;
+    uint8_t movsd[] = {0xF3, 0xA5};                 /* rep movsd */
+    uint8_t movsb[] = {0xF3, 0xA4};                 /* rep movsb */
+    uint8_t movsq[] = {0xF3, 0x48, 0xA5};           /* rep movsq (REX.W) */
+    uint8_t movsw[] = {0xF3, 0x66, 0xA5};           /* rep movsw */
+    uint8_t plain[] = {0xA5};                       /* movsd, no rep */
+    uint8_t notmovs[] = {0x8B, 0x00};               /* mov -- not a string op */
+
+    CHECK("movsd recognized", hype_tpm_crb_decode_movs(movsd, 2, &elem, &len, &rep) == 1);
+    CHECK("movsd elem 4", elem == 4u && len == 2u && rep == 1);
+    CHECK("movsb elem 1", hype_tpm_crb_decode_movs(movsb, 2, &elem, &len, &rep) == 1 && elem == 1u);
+    CHECK("movsq elem 8", hype_tpm_crb_decode_movs(movsq, 3, &elem, &len, &rep) == 1 &&
+                          elem == 8u && len == 3u);
+    CHECK("movsw elem 2", hype_tpm_crb_decode_movs(movsw, 3, &elem, &len, &rep) == 1 && elem == 2u);
+    CHECK("plain movs no rep", hype_tpm_crb_decode_movs(plain, 1, &elem, &len, &rep) == 1 &&
+                               rep == 0);
+    CHECK("mov not a movs", hype_tpm_crb_decode_movs(notmovs, 2, &elem, &len, &rep) == 0);
+    CHECK("empty refused", hype_tpm_crb_decode_movs(movsd, 0, &elem, &len, &rep) == 0);
+}
+
 int main(void) {
     test_startup_gate();
     test_capabilities();
@@ -322,6 +344,7 @@ int main(void) {
     test_crb_round_trip();
     test_more_coverage();
     test_crb_registers();
+    test_rep_movs_decode();
     if (failures == 0) { printf("all tests passed\n"); return 0; }
     fprintf(stderr, "%d failure(s)\n", failures);
     return 1;

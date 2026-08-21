@@ -62,4 +62,14 @@ void hype_tpm_crb_reset(hype_tpm_crb_t *c, uint64_t (*entropy)(void *ctx), void 
 uint64_t hype_tpm_crb_read(hype_tpm_crb_t *c, uint32_t offset, unsigned int size);
 void hype_tpm_crb_write(hype_tpm_crb_t *c, uint32_t offset, unsigned int size, uint64_t val);
 
+/*
+ * #590: recognize a `rep movs{b,w,d,q}` at `bytes` (the string copy a guest's tpm_crb driver
+ * uses to bulk-read the control area, which hype's single-mov MMIO decoder cannot handle).
+ * Returns 1 and fills *elem (1/2/4/8), *len (instruction length incl. prefixes), *is_rep
+ * (1 if the F3 REP prefix is present) when it IS a movs; 0 otherwise. Pure. The caller owns
+ * the RSI/RDI/RCX/DF iteration -- see the arch NPF handlers.
+ */
+int hype_tpm_crb_decode_movs(const uint8_t *bytes, unsigned int n, unsigned int *elem,
+                             unsigned int *len, int *is_rep);
+
 #endif /* HYPE_DEVICES_TPM_CRB_H */

@@ -3776,10 +3776,63 @@ int hype_vmx_vcpu_handle_lapic_npf(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lap
 
 /* #433: the TPM 2.0 CRB window on the VMX backend -- ioapic's shape, variable size (1/2/4). */
 int hype_vmx_vcpu_handle_tpm_crb_npf(hype_vcpu_ctx_t *ctx, struct hype_tpm_crb *crb,
-                                     uint64_t crb_base_phys, const uint8_t *guest_insn_bytes) {
+                                     uint64_t crb_base_phys, const hype_gpa_map_t *dma_map,
+                                     const uint8_t *guest_insn_bytes) {
     vmx_ensure_current(ctx);
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     struct vmx_mmio_access m;
+
+    /* #590: rep movs bulk copy -- emulate element by element, like the SVM twin. */
+    {
+        unsigned int elem = 0, ilen = 0;
+        int is_rep = 0;
+        if (guest_insn_bytes != 0 &&
+            hype_tpm_crb_decode_movs(guest_insn_bytes, HYPE_VMX_MMIO_MAX_INSTR_BYTES, &elem, &ilen,
+                                     &is_rep)) {
+            int ok = 1;
+            uint64_t rsi = real->gprs[6], rdi = real->gprs[7], rcx = real->gprs[1];
+            uint64_t rflags = vmread(HYPE_VMCS_GUEST_RFLAGS, &ok);
+            uint64_t rip = vmread(HYPE_VMCS_GUEST_RIP, &ok);
+            uint64_t count = is_rep ? rcx : 1u;
+            int df = (rflags & (1ull << 10)) ? 1 : 0;
+            int64_t step = df ? -(int64_t)elem : (int64_t)elem;
+            int to_mmio;
+            if (!ok) {
+                return -1;
+            }
+            to_mmio = (rdi >= crb_base_phys && rdi < crb_base_phys + HYPE_TPM_CRB_SIZE);
+            while (count > 0u) {
+                uint64_t mmio_gpa = to_mmio ? rdi : rsi;
+                uint64_t ram_gpa = to_mmio ? rsi : rdi;
+                uint32_t moff = (uint32_t)(mmio_gpa - crb_base_phys);
+                uint64_t ram_host;
+                unsigned k;
+                if (mmio_gpa < crb_base_phys || mmio_gpa + elem > crb_base_phys + HYPE_TPM_CRB_SIZE) {
+                    return -1;
+                }
+                ram_host = vmx_dma_xlate(dma_map, ram_gpa, elem);
+                if (ram_host == 0) {
+                    return -1;
+                }
+                if (to_mmio) {
+                    uint64_t v = 0;
+                    for (k = 0; k < elem; k++) v |= (uint64_t)((uint8_t *)(uintptr_t)ram_host)[k] << (8u * k);
+                    hype_tpm_crb_write(crb, moff, elem, v);
+                } else {
+                    uint64_t v = hype_tpm_crb_read(crb, moff, elem);
+                    for (k = 0; k < elem; k++) ((uint8_t *)(uintptr_t)ram_host)[k] = (uint8_t)(v >> (8u * k));
+                }
+                rsi = (uint64_t)((int64_t)rsi + step);
+                rdi = (uint64_t)((int64_t)rdi + step);
+                count--;
+            }
+            real->gprs[6] = rsi;
+            real->gprs[7] = rdi;
+            if (is_rep) real->gprs[1] = 0u;
+            vmwrite(HYPE_VMCS_GUEST_RIP, rip + ilen);
+            return 0;
+        }
+    }
 
     if (vmx_mmio_begin_insn(real, crb_base_phys, HYPE_TPM_CRB_SIZE, guest_insn_bytes, &m) != 0) {
         return -1;

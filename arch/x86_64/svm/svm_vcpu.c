@@ -3998,7 +3998,8 @@ int hype_svm_vcpu_absorb_mmio_npf(hype_vcpu_ctx_t *ctx, const uint8_t *guest_ins
  * when the guest rings CTRL_START.
  */
 int hype_svm_vcpu_handle_tpm_crb_npf(hype_vcpu_ctx_t *ctx, hype_tpm_crb_t *crb,
-                                     uint64_t crb_base_phys, const uint8_t *guest_insn_bytes) {
+                                     uint64_t crb_base_phys, const hype_gpa_map_t *dma_map,
+                                     const uint8_t *guest_insn_bytes) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_svm_npf_t npf;
     hype_mmio_decode_t decoded;
@@ -4011,6 +4012,57 @@ int hype_svm_vcpu_handle_tpm_crb_npf(hype_vcpu_ctx_t *ctx, hype_tpm_crb_t *crb,
         return -1;
     }
     offset = (uint32_t)(npf.guest_phys_addr - crb_base_phys);
+    /* #590: a `rep movs` bulk copy (the driver snapshots the control area / drains the buffer)
+     * -- hype_mmio_decode handles only single movs. Emulate the string copy element by element,
+     * the CRB side through the model and the RAM side through the NPT translation. */
+    {
+        unsigned int elem = 0, ilen = 0;
+        int is_rep = 0;
+        if (guest_insn_bytes != 0 &&
+            hype_tpm_crb_decode_movs(guest_insn_bytes, HYPE_MMIO_MAX_INSTR_BYTES, &elem, &ilen,
+                                     &is_rep)) {
+            uint64_t *rsi = gpr_ptr(real, 6u);
+            uint64_t *rdi = gpr_ptr(real, 7u);
+            uint64_t *rcx = gpr_ptr(real, 1u);
+            uint64_t count = is_rep ? (rcx ? *rcx : 0u) : 1u;
+            int df = (real->vmcb->save.rflags & (1ull << 10)) ? 1 : 0;
+            int64_t step = df ? -(int64_t)elem : (int64_t)elem;
+            int to_mmio; /* 1 if RDI (dest) is the CRB window */
+            if (rsi == 0 || rdi == 0) {
+                return -1;
+            }
+            to_mmio = (*rdi >= crb_base_phys && *rdi < crb_base_phys + HYPE_TPM_CRB_SIZE);
+            while (count > 0u) {
+                uint64_t mmio_gpa = to_mmio ? *rdi : *rsi;
+                uint64_t ram_gpa = to_mmio ? *rsi : *rdi;
+                uint32_t moff = (uint32_t)(mmio_gpa - crb_base_phys);
+                uint64_t ram_host;
+                if (mmio_gpa < crb_base_phys || mmio_gpa + elem > crb_base_phys + HYPE_TPM_CRB_SIZE) {
+                    return -1; /* one end must stay inside the window for the whole run */
+                }
+                ram_host = guest_dma_xlate(dma_map, ram_gpa, elem);
+                if (ram_host == 0) {
+                    return -1;
+                }
+                if (to_mmio) {
+                    uint64_t v = 0;
+                    unsigned k;
+                    for (k = 0; k < elem; k++) v |= (uint64_t)((uint8_t *)(uintptr_t)ram_host)[k] << (8u * k);
+                    hype_tpm_crb_write(crb, moff, elem, v);
+                } else {
+                    uint64_t v = hype_tpm_crb_read(crb, moff, elem);
+                    unsigned k;
+                    for (k = 0; k < elem; k++) ((uint8_t *)(uintptr_t)ram_host)[k] = (uint8_t)(v >> (8u * k));
+                }
+                *rsi = (uint64_t)((int64_t)*rsi + step);
+                *rdi = (uint64_t)((int64_t)*rdi + step);
+                count--;
+            }
+            if (is_rep && rcx) *rcx = 0u;
+            real->vmcb->save.rip += ilen;
+            return 0;
+        }
+    }
     if (guest_insn_bytes == 0 ||
         hype_mmio_decode(guest_insn_bytes, HYPE_MMIO_MAX_INSTR_BYTES, &decoded) != 0) {
         return -1;

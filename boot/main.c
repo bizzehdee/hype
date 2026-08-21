@@ -10504,11 +10504,13 @@ static hype_fw_dev_t fw_1_shared_mmio_npf(hype_fw_vm_t *vm, hype_vmm_kind_t kind
     /* #433: the TPM CRB window at 0xFED40000, only for a VM that asked for one. Decoded and
      * completed by the arch handler, the same shape as HPET. */
     if (vm->tpm_present && kind == HYPE_VMM_KIND_SVM &&
-        hype_svm_vcpu_handle_tpm_crb_npf(ctx, &vm->tpm_crb, HYPE_TPM_CRB_BASE, insn) == 0) {
+        hype_svm_vcpu_handle_tpm_crb_npf(ctx, &vm->tpm_crb, HYPE_TPM_CRB_BASE, &g_fw_1_dma_map,
+                                         insn) == 0) {
         return HYPE_FW_DEV_TPM;
     }
     if (vm->tpm_present && kind == HYPE_VMM_KIND_VMX &&
-        hype_vmx_vcpu_handle_tpm_crb_npf(ctx, &vm->tpm_crb, HYPE_TPM_CRB_BASE, insn) == 0) {
+        hype_vmx_vcpu_handle_tpm_crb_npf(ctx, &vm->tpm_crb, HYPE_TPM_CRB_BASE, &g_fw_1_dma_map,
+                                         insn) == 0) {
         return HYPE_FW_DEV_TPM;
     }
 
