@@ -3093,6 +3093,32 @@ isn't lost.
     preserves one prior boot, and the two-boot validation protocol sometimes needs to look back
     further (a soak run followed by two short re-checks, for instance).
 
+62. **exFAT with two FAT copies: keep both in sync, matching FAT32's discipline -- decided
+    (2026-08-22).** #652 found that a `NumberOfFats == 2` exFAT volume (a TexFAT volume) has
+    hype write only the ACTIVE FAT copy and never touch the inactive one, while
+    `core/fs_ops.c` declares the exFAT driver's full write capability with no asterisk for this
+    case. After any hype write, the inactive copy describes an allocation map that no longer
+    exists: a repair tool or another implementation that trusts `ActiveFat` and later flips it
+    (the second copy's entire purpose) follows chains hype never wrote, and if anything flips
+    that bit between two hype sessions, hype's own next mount reads the stale map it left
+    behind. FAT32 has never had this gap -- `fat_set` (`core/fat_write_fs.c`) has always written
+    every copy in `num_fats` from one authoritative sector image, specifically because "reading
+    each copy independently before modifying it allowed a stale medium read to resurrect an
+    older allocation map."
+
+    **Decided.** Sync both copies, not refuse the write mount. `hype_exfat_fs_t` gains
+    `num_fats`, and `fat_set` (`core/fat_exfat_fs.c`) writes the same sector to every copy from
+    one authoritative image, mirroring FAT32's `fat_set` exactly. This keeps exFAT's declared
+    capability bits honest (#493) instead of narrowing them, and a TexFAT volume is not an
+    exotic case to refuse -- `mkfs.exfat` will produce one whenever asked, and an operator has
+    no way to know hype would silently half-write it.
+
+    **Alternatives considered.** Refuse to mount a `NumberOfFats == 2` volume for writing (mount
+    read-only, log the reason) -- rejected: exFAT already declares full write capability for
+    every other volume shape, and narrowing it here is a worse surprise than the small fixed
+    cost of one more sector write per FAT update. The sync-both-copies fix is also a direct,
+    already-proven port of FAT32's existing mechanism, not new design.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what
