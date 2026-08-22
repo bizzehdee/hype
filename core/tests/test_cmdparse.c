@@ -90,6 +90,10 @@ int main(void) {
         c = P("host reboot");
         CHECK("host verb", c.verb == HYPE_CMD_HOST && c.has_arg &&
               strcmp(c.arg, "reboot") == 0);
+        /* #611. */
+        c = P("dump vm0");
+        CHECK("dump verb", c.verb == HYPE_CMD_DUMP && c.has_arg &&
+              strcmp(c.arg, "vm0") == 0);
     }
 
     {
@@ -98,7 +102,7 @@ int main(void) {
          * verb without a usage entry (or the reverse) fails here, which is what caught #568's
          * `screenshot` before it shipped half-added. */
         CHECK("one usage entry per verb",
-              n == (unsigned)(HYPE_CMD_SCREENSHOT - HYPE_CMD_HELP + 1));
+              n == (unsigned)(HYPE_CMD_DUMP - HYPE_CMD_HELP + 1));
         for (i = 0; i < n; i++) {
             hype_cmd_t c = P(hype_cmd_usage(i));
             if (c.verb == HYPE_CMD_UNKNOWN || c.verb == HYPE_CMD_NONE) {
