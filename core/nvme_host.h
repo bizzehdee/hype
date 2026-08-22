@@ -154,6 +154,22 @@ int hype_nvme_host_read(uint64_t abar_phys, uint64_t lba, uint16_t count, void *
 int hype_nvme_host_write(uint64_t abar_phys, uint64_t lba, uint16_t count, const void *src);
 
 /*
+ * #660: records which core is the BSP, mirroring hype_ahci_host_set_bsp_apic()/
+ * hype_blk_usb_set_bsp_apic() -- so the shared queue/bounce-buffer lock can give the BSP a
+ * bounded wait instead of the unbounded one guest AP callers get. Call once, from the same place
+ * the other two are latched.
+ */
+void hype_nvme_host_set_bsp_apic(unsigned int apic_id);
+
+/* Nonzero after a real-HW run means the BSP hit its bounded lock budget at least once -- the
+ * NVMe counterpart of hype_ahci_host_bsp_lock_timeouts()/hype_blk_usb_bsp_lock_timeouts(). */
+unsigned long long hype_nvme_host_bsp_lock_timeouts(void);
+
+/* Total times a caller found the lock already held -- proves the lock is actually being
+ * exercised under real contention rather than assumed dormant (#660 acceptance criterion 3). */
+unsigned long long hype_nvme_host_lock_contended(void);
+
+/*
  * M10-6a (#227): the identity + capacity captured by the last successful
  * hype_nvme_host_init() -- the fields a `physical:` NVMe target needs (serial
  * for the #124 guard match, total 512-byte sectors for the block backend's

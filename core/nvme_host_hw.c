@@ -1,5 +1,6 @@
 #include "nvme_host.h"
 #include "host_pci_dma.h"
+#include "ticket_lock.h" /* #660: fair serialisation around the shared queues/bounce buffer */
 
 /*
  * Hardware shim for the host NVMe driver: real MMIO + DMA against the physical
@@ -266,7 +267,69 @@ uint64_t hype_nvme_host_total_sectors(void) {
     return g_nvme_total_sectors;
 }
 
-int hype_nvme_host_read(uint64_t abar_phys, uint64_t lba, uint16_t count, void *dst) {
+/*
+ * #660: NVMe has the identical dual-use shape as AHCI (#343/#658) and USB (#346) -- a physical
+ * host disk the BSP (media reads, install-to-physical) and a guest AP (a `physical:` NVMe disk
+ * attached to a VM) can both reach -- but had NO serialisation at all around the shared I/O
+ * queue (g_io_sq/g_io_cq/g_io_sq_tail/g_io_cq_head/g_io_phase/g_cid) or, worse, the single shared
+ * g_bounce/g_prp_list DMA staging buffer every read/write copies through. Two calls in flight at
+ * once could interleave into the same bounce buffer or reuse a submission slot before its
+ * completion was consumed -- AHCI's #343 failure mode, unmitigated.
+ *
+ * Same fix as #658 (AHCI): the shared core/ticket_lock.c primitive, held for the WHOLE logical
+ * transfer (every submit_and_poll() call the read/write loop makes), not just one command, since
+ * the bounce buffer is reused across the loop's own iterations too. Guest AP callers wait
+ * unbounded; the BSP gets a bounded claim so it can never freeze behind a stuck guest core.
+ */
+static volatile unsigned int g_nvme_ticket_next;
+static volatile unsigned int g_nvme_ticket_owner;
+static volatile unsigned int g_nvme_bsp_apic = 0xFFFFFFFFu;
+static volatile unsigned long long g_nvme_bsp_lock_timeouts;
+static volatile unsigned long long g_nvme_lock_contended; /* #660 (3): a waiter had to actually wait */
+
+void hype_nvme_host_set_bsp_apic(unsigned int apic_id) { g_nvme_bsp_apic = apic_id; }
+
+unsigned long long hype_nvme_host_bsp_lock_timeouts(void) { return g_nvme_bsp_lock_timeouts; }
+
+unsigned long long hype_nvme_host_lock_contended(void) { return g_nvme_lock_contended; }
+
+static unsigned int nvme_this_apic(void) {
+    return (*(volatile uint32_t *)(uintptr_t)0xFEE00020u) >> 24;
+}
+
+#define NVME_BSP_LOCK_BUDGET 20000000u
+
+static int nvme_host_lock_bounded(void) {
+    unsigned int budget = NVME_BSP_LOCK_BUDGET;
+
+    while (budget-- != 0u) {
+        if (hype_ticket_lock_try_claim(&g_nvme_ticket_next, &g_nvme_ticket_owner)) {
+            return 0;
+        }
+        g_nvme_lock_contended++;
+        __asm__ volatile("pause");
+    }
+    g_nvme_bsp_lock_timeouts++;
+    return -1;
+}
+
+static int nvme_host_lock_or_fail(void) {
+    if (nvme_this_apic() == g_nvme_bsp_apic) {
+        return nvme_host_lock_bounded();
+    }
+    if (__atomic_load_n(&g_nvme_ticket_owner, __ATOMIC_ACQUIRE) !=
+        __atomic_load_n(&g_nvme_ticket_next, __ATOMIC_ACQUIRE)) {
+        g_nvme_lock_contended++;
+    }
+    hype_ticket_lock_acquire(&g_nvme_ticket_next, &g_nvme_ticket_owner);
+    return 0;
+}
+
+static void nvme_host_unlock(void) {
+    hype_ticket_lock_release(&g_nvme_ticket_owner);
+}
+
+static int nvme_host_read_locked(uint64_t abar_phys, uint64_t lba, uint16_t count, void *dst) {
     volatile uint8_t *bar = (volatile uint8_t *)(uintptr_t)abar_phys;
     uint8_t *out = (uint8_t *)dst;
     uint16_t done = 0;
@@ -304,11 +367,22 @@ int hype_nvme_host_read(uint64_t abar_phys, uint64_t lba, uint16_t count, void *
     return 0;
 }
 
+int hype_nvme_host_read(uint64_t abar_phys, uint64_t lba, uint16_t count, void *dst) {
+    int rc;
+    if (nvme_host_lock_or_fail() != 0) {
+        return -1;
+    }
+    rc = nvme_host_read_locked(abar_phys, lba, count, dst);
+    nvme_host_unlock();
+    return rc;
+}
+
 /* M10-1c (#197): mirror of hype_nvme_host_read with a WRITE (0x01) SQE and the
  * copy direction reversed -- src is staged into the DMA bounce buffer BEFORE the
  * command is submitted. DESTRUCTIVE; caller must have passed the §6d/phys_guard
  * gate. */
-int hype_nvme_host_write(uint64_t abar_phys, uint64_t lba, uint16_t count, const void *src) {
+static int nvme_host_write_locked(uint64_t abar_phys, uint64_t lba, uint16_t count,
+                                  const void *src) {
     volatile uint8_t *bar = (volatile uint8_t *)(uintptr_t)abar_phys;
     const uint8_t *in = (const uint8_t *)src;
     uint16_t done = 0;
@@ -344,4 +418,14 @@ int hype_nvme_host_write(uint64_t abar_phys, uint64_t lba, uint16_t count, const
         done = (uint16_t)(done + nsec);
     }
     return 0;
+}
+
+int hype_nvme_host_write(uint64_t abar_phys, uint64_t lba, uint16_t count, const void *src) {
+    int rc;
+    if (nvme_host_lock_or_fail() != 0) {
+        return -1;
+    }
+    rc = nvme_host_write_locked(abar_phys, lba, count, src);
+    nvme_host_unlock();
+    return rc;
 }
