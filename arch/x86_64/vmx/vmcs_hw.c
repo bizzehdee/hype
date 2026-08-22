@@ -1,6 +1,7 @@
 #include "vmcs.h"
 #include "../cpu/fpu_state.h"
 #include "../cpu/hyperv.h"
+#include "../cpu/idt.h"
 #include "vmx.h"
 /* #315: the IDT-delivery replay decision is shared with the SVM backend -- same field layout, same
  * type encodings, so one tested pure function decides for both rather than two copies drifting. */
@@ -1577,13 +1578,28 @@ int hype_vmx_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
     if (real->guest_xcr0_valid && vmx_ensure_osxsave()) {
         xsetbv0(real->guest_xcr0);
     }
-    /* #260: restore AFTER the XCR0 switch (XSETBV can reinitialise state
+    /* #260/#637: restore AFTER the XCR0 switch (XSETBV can reinitialise state
      * components, discarding whatever we had just loaded) and save BEFORE
      * switching XCR0 back, for the same reason. Nothing between the restore and
-     * the launch may touch vector registers. */
+     * the launch may touch vector registers.
+     *
+     * hype_cli() closes the same window SVM's clgi() closes (see svm_vcpu.c's
+     * #436 comment): with host interrupts left enabled, the 1ms AP preempt
+     * tick could land right here, between the guest's FPU state landing in the
+     * registers and VMLAUNCH/VMRESUME actually running -- and the ISR dispatch
+     * chain's compiled C uses XMM (xorps/movups struct zeroing) with no FPU
+     * save of its own, silently zeroing the guest's vector registers. VMX has
+     * no single instruction equivalent to CLGI/STGI, so this brackets the same
+     * window with cli/sti instead. Per the SDM, VM entry and VM exit both
+     * force RFLAGS.IF to 0 regardless of what it was, so the cli() here only
+     * needs to hold through the pre-entry gap -- sti() below is what actually
+     * re-enables host interrupts once the guest's FPU state is safely saved.
+     */
+    hype_cli();
     hype_fpu_restore(&real->fpu);
     failed = hype_vmx_launch(ctx, (uint64_t)real->launched);
     hype_fpu_save(&real->fpu);
+    hype_sti();
     if (real->guest_xcr0_valid && g_vmx_host_xcr0 != 0ull) {
         xsetbv0(g_vmx_host_xcr0);
     }
