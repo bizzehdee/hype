@@ -1,3 +1,6 @@
+/* #496: fseeko needs POSIX visibility under -std=c11's strict ISO dialect
+ * (must precede every system header, per feature-test-macro rules). */
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1833,9 +1836,12 @@ static void test_extj_gates(void) {
     CHECK("external journal refused",
           hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w) != 0);
     /* filesystem feature gates */
+    /* #496: 64BIT is now accepted (test_496_64bit_highhalf below is the dedicated positive
+     * test) -- but a 64BIT volume whose s_desc_size is not a sane value (0 here: the field
+     * this synthetic fixture never populates) is still refused, matching core/ext.c's reader. */
     build_vol_ext3();
     put32(sb + 0x60, get32(sb + 0x60) | 0x0080u); /* 64BIT */
-    CHECK("64-bit volume refused",
+    CHECK("64-bit volume with a bogus desc_size refused",
           hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w) != 0);
     build_vol_ext3();
     put32(sb + 0x64, 0x0200u); /* BIGALLOC */
@@ -1980,6 +1986,193 @@ static void test_extj_metadata_csum(void) {
             CHECK_HEX("inode checksum hi", (uint16_t)(icrc >> 16), get16(in17 + 0x82u));
         }
     }
+}
+
+/*
+ * #496: the ticket's own "hard part" -- proving the group-descriptor and extent-tree HIGH
+ * HALVES are carried correctly, not silently truncated, when they are genuinely non-zero.
+ *
+ * This ticket's investigation (documented in tools/496/run-496.sh) found a REAL mkfs.ext4
+ * volume large enough for a non-zero high half impractical on this host: reaching it needs
+ * either ~2-4 million real inodes (every allocator tried -- e2fsprogs' own `-d` populate and a
+ * real kernel's mballoc via a live loop-mount -- places new blocks near the target file's own
+ * low-numbered inode for locality) or, independently, mke2fs on this e2fsprogs version (1.47.3)
+ * force-enables META_BG once a volume is that big even when explicitly told not to -- and
+ * META_BG is a separate feature this ticket requires hype to keep refusing.
+ *
+ * So this test builds the one thing that WAS practical: a real sparse temporary FILE (via
+ * tmpfile() + fseeko, exactly grow-harness.c's own read/write style, not an in-memory mock) big
+ * enough that group 2's own blocks genuinely start past 2^32, and drives hype's REAL
+ * hype_extj_open_rw / claim_block / leaf_make_room / extent_insert_block against it -- not a
+ * reimplementation. blocks_per_group is set to 2^31 (still a plain 32-bit field, the true
+ * on-disk limit) so group 2's base (2 * 2^31 + first_data_block) is genuinely > 2^32 -- the
+ * volume's DECLARED size, not the tiny sparse file's real disk footprint, which stays a few KiB.
+ *
+ * Groups 0 and 1 are given zero free blocks so claim_block's normal scan-from-the-inode's-group
+ * logic skips straight to group 2 for both allocations a hole-fill triggers: the new DATA block
+ * (proving GD_BLOCK_BITMAP_HI is read correctly to find group 2's real bitmap, and that the new
+ * extent leaf's ee_start_hi is written correctly) and, because the target file's extent root is
+ * pre-filled to its 4-entry capacity, the tree-growth node leaf_make_room allocates when the 5th
+ * entry doesn't fit (proving ei_leaf_hi -- the exact field this ticket's investigation found
+ * hard-coded to 0 in the pre-#496 code). Group 2's free-block count is also seeded straddling
+ * the 16-bit lo/hi boundary (65536, i.e. lo=0/hi=1) so both claims exercise a genuine borrow
+ * across GD_FREE_BLOCKS/GD_FREE_BLOCKS_HI, not just a hi field that happens to stay 0.
+ *
+ * Byte offsets throughout are the struct ext4_group_desc / ext4_extent / ext4_extent_idx layouts
+ * fetched from the kernel's include/linux/ext4.h-equivalent group-descriptor documentation and
+ * cross-checked against fs/ext4/super.c during this ticket's research -- not from memory.
+ */
+#define H496_BPG 0x80000000ULL                    /* 2^31: a plain 32-bit s_blocks_per_group */
+#define H496_G2_BASE (2ULL * H496_BPG + 1ULL)      /* group 2's base: 0x1_0000_0001, past 2^32 */
+#define H496_BLOCKS_COUNT (H496_G2_BASE + 8ULL)
+
+static FILE *g_496_file;
+
+static int h496_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
+    (void)ctx;
+    if (fseeko(g_496_file, (off_t)(lba * 512u), SEEK_SET) != 0) return -1;
+    return fread(dst, 512, count, g_496_file) == (size_t)count ? 0 : -1;
+}
+static int h496_write(void *ctx, uint64_t lba, uint32_t count, const void *src) {
+    (void)ctx;
+    if (fseeko(g_496_file, (off_t)(lba * 512u), SEEK_SET) != 0) return -1;
+    return fwrite(src, 512, count, g_496_file) == (size_t)count ? 0 : -1;
+}
+static void h496_read_block(uint64_t b, uint8_t *out) {
+    CHECK("496 raw block read", h496_read(0, b * SPB, SPB, out) == 0);
+}
+
+static void test_496_64bit_highhalf(void) {
+    static hype_extj_wfile_t w;
+    uint8_t *sb;
+    uint8_t *in;
+    uint32_t off, last;
+    uint8_t bitmap[BS];
+    uint8_t payload[BS], readback[BS];
+    unsigned i;
+
+    memset(g_vol, 0, sizeof g_vol);
+    sb = g_vol + 1024;
+
+    /* ---- superblock: 3 groups, 64-byte descriptors, blocks_count past 2^32 ---- */
+    put32(sb + 0x00, 24u);                                  /* inodes_count: 3 groups * 8 */
+    put32(sb + 0x04, (uint32_t)H496_BLOCKS_COUNT);          /* blocks_count_lo */
+    put32(sb + 0x150, (uint32_t)(H496_BLOCKS_COUNT >> 32)); /* blocks_count_hi (#496) */
+    put32(sb + 0x0C, 1000u);                                /* sb free blocks (uncross-checked) */
+    put32(sb + 0x14, 1u);                                   /* first_data_block */
+    put32(sb + 0x18, 0u);                                   /* log_block_size: 1024 */
+    put32(sb + 0x20, (uint32_t)H496_BPG);                   /* blocks_per_group */
+    put32(sb + 0x28, 8u);                                   /* inodes_per_group */
+    put16(sb + 0x38, 0xEF53u);
+    put16(sb + 0x3A, 0x0001u); /* state: cleanly unmounted */
+    put32(sb + 0x4C, 1u);      /* rev_level: dynamic */
+    put16(sb + 0x58, 256u);    /* inode_size */
+    put32(sb + 0x60, 0x0002u | 0x0040u | 0x0080u); /* FILETYPE|EXTENTS|64BIT */
+    put16(sb + 0xFE, 64u);                          /* s_desc_size (#496) */
+
+    /* ---- group descriptor table: block 2, 3 x 64-byte descriptors ----
+     * group 0 and group 1 both have zero free blocks, so claim_block's normal
+     * scan-from-the-inode's-own-group skips both without ever needing their
+     * bitmaps to be valid, landing on group 2 for every allocation this test makes. */
+    {
+        uint8_t *gd0 = blk(2) + 0u;
+        uint8_t *gd2 = blk(2) + 128u;
+        put32(gd0 + 0x08, 8u); /* group 0 inode_table */
+        put16(gd0 + 0x0C, 0u); /* group 0 free_blocks: 0 -> skipped */
+        /* group 1 (blk(2)+64) stays all-zero: free_blocks 0 -> skipped too */
+        put32(gd2 + 0x00, (uint32_t)H496_G2_BASE);              /* block_bitmap lo */
+        put32(gd2 + 0x20, (uint32_t)(H496_G2_BASE >> 32));      /* block_bitmap hi (#496) */
+        put16(gd2 + 0x0C, 0x0000u);                             /* free_blocks lo */
+        put16(gd2 + 0x2C, 0x0001u); /* free_blocks hi (#496): total 65536, a lo/hi boundary */
+    }
+
+    /* ---- root dir (inode 2): classic map -> block 30 ---- */
+    in = mk_inode(2u, 0x41EDu, BS, 0u);
+    put32(in + 0x28, 30u);
+    off = dirent(blk(30u), 0u, 2u, ".", 2u);
+    off = dirent(blk(30u), off, 2u, "..", 2u);
+    last = off;
+    off = dirent(blk(30u), off, 7u, "t.bin", 1u);
+    dirent_close(blk(30u), last, BS); /* stretch t.bin's own rec_len to the block end */
+
+    /* ---- target file (inode 7): extents, root already FULL (4/4) ----
+     * inserting a 5th entry (the write below) forces leaf_make_room's tree-growth path. */
+    in = mk_inode(7u, 0x81A4u, 20u * BS, 0x00080000u /* FL_EXTENTS */);
+    {
+        uint32_t runs[4][3] = {{0u, 40u, 1u}, {1u, 41u, 1u}, {2u, 42u, 1u}, {3u, 43u, 1u}};
+        extent_leaf_root(in, runs, 4u);
+    }
+
+    /* ---- journal (inode 8), reusing the shared low-block layout ---- */
+    graft_journal();
+
+    /* ---- push the fixture to a REAL sparse file: low blocks verbatim, plus group 2's
+     * bitmap at its real (>2^32) address. Bit 0 marks the bitmap's OWN block used (a
+     * realistic self-describing layout); the rest free. ---- */
+    g_496_file = tmpfile();
+    CHECK("496 tmpfile", g_496_file != 0);
+    if (g_496_file == 0) return;
+    CHECK_HEX("496 stage low blocks", 0,
+              fseeko(g_496_file, 0, SEEK_SET) || fwrite(g_vol, 1, sizeof g_vol, g_496_file) !=
+                                                     sizeof g_vol);
+    memset(bitmap, 0, sizeof bitmap);
+    bitmap[0] = 0x01u; /* bit 0: the bitmap's own block (group 2's base) is used */
+    CHECK_HEX("496 write group2 bitmap", 0,
+              h496_write(0, H496_G2_BASE * SPB, SPB, bitmap));
+
+    /* ---- open + write: a hole at logical block 10 (well inside the 20-block file) ---- */
+    CHECK_HEX("496 open", 0, hype_extj_open_rw(h496_read, h496_write, 0, "/t.bin", &w));
+    for (i = 0; i < BS; i++) payload[i] = pat(i + 99u);
+    CHECK_HEX("496 hole write", 0, hype_extj_write_at(&w, 10u * BS, payload, BS));
+
+    /* ---- byte-exact round trip through hype's OWN reader ---- */
+    CHECK_HEX("496 readback", 0, hype_extj_read_at(&w, 10u * BS, readback, BS));
+    CHECK_HEX("496 byte-exact", 0, memcmp(payload, readback, BS));
+
+    /* ---- raw, independent verification against the exact on-disk fields ---- */
+    {
+        uint8_t gdtblk[BS];
+        uint8_t root_in[BS];
+        uint8_t child[BS];
+        uint8_t dataup[BS];
+        uint32_t g2_free;
+        const uint8_t *gd2;
+        const uint8_t *eh;
+        const uint8_t *idx;
+        uint64_t child_blk, data_blk;
+
+        h496_read_block(2u, gdtblk);
+        gd2 = gdtblk + 128u;
+        g2_free = get16(gd2 + 0x0Cu) | ((uint32_t)get16(gd2 + 0x2Cu) << 16);
+        CHECK_HEX("496 free count borrowed across lo/hi", 65534u, g2_free);
+
+        h496_read_block(9u, root_in); /* inode 7 lives in the table's 2nd block */
+        eh = root_in + 512u + 0x28u;  /* index 6 within block 9: (7-1-8)%... see inode() math */
+        /* inode() places ino 7 at absolute byte 8*BS + 6*256 = 9728 = block 9 offset 512 */
+        CHECK_HEX("496 root entries after growth", 1u, get16(eh + 2u));
+        CHECK_HEX("496 root depth after growth", 1u, get16(eh + 6u));
+        idx = eh + 12u;
+        child_blk = (uint64_t)get32(idx + 4u) | ((uint64_t)get16(idx + 8u) << 32);
+        CHECK_HEX("496 ei_leaf_hi", 1u, (unsigned)(child_blk >> 32));
+        CHECK_HEX("496 ei_leaf (full)", H496_G2_BASE + 2ULL, child_blk);
+
+        h496_read_block(child_blk, child);
+        CHECK_HEX("496 child eh_magic", 0xF30Au, get16(child + 0u));
+        CHECK_HEX("496 child entries", 5u, get16(child + 2u));
+        {
+            const uint8_t *ee = child + 12u + 4u * 12u; /* the 5th (newest) entry */
+            CHECK_HEX("496 new entry logical block", 10u, get32(ee + 0u));
+            CHECK_HEX("496 new entry len", 1u, get16(ee + 4u));
+            data_blk = (uint64_t)get32(ee + 8u) | ((uint64_t)get16(ee + 6u) << 32);
+            CHECK_HEX("496 ee_start_hi", 1u, (unsigned)(data_blk >> 32));
+            CHECK_HEX("496 ee_start (full)", H496_G2_BASE + 1ULL, data_blk);
+        }
+
+        h496_read_block(data_blk, dataup);
+        CHECK_HEX("496 raw data byte-exact", 0, memcmp(payload, dataup, BS));
+    }
+
+    fclose(g_496_file);
 }
 
 static void test_extj_classic(void) {
@@ -3443,6 +3636,7 @@ int main(void) {
     test_384_coverage_tail();
     test_extj_gates();
     test_extj_metadata_csum();
+    test_496_64bit_highhalf();
     test_extj_classic();
     test_extj_extents();
     test_extj_crash_windows();

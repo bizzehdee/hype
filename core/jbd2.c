@@ -11,6 +11,8 @@
 #define BT_SB_V1 3u
 #define BT_SB_V2 4u
 
+#define JBD2_FEATURE_INCOMPAT_64BIT 0x00000002u /* #496 */
+
 /* journal superblock offsets (after the 12-byte header) */
 #define JSB_BLOCKSIZE 12u
 #define JSB_MAXLEN 16u
@@ -106,13 +108,30 @@ int hype_jbd2_open(hype_jbd2_t *j, hype_blk_read_fn read, hype_blk_write_fn writ
     if (j->maxlen < 8u || j->first == 0u || j->first >= j->maxlen) return -1;
     if ((uint64_t)j->maxlen * block_size > j->map.size_bytes) return -1;
     if (rd32be(sb + JSB_ERRNO) != 0u) return -1; /* the journal recorded an error */
-    /* feature gates: hype understands the plain 32-bit no-csum journal only */
-    if (rd32be(sb + JSB_FEAT_INCOMPAT) != 0u) return -1; /* 64BIT/CSUM/ASYNC/FAST_COMMIT */
+    /* feature gates: hype understands the plain 32-bit no-csum journal, plus
+     * (#496) the 64-bit-tag variant -- nothing else (REVOKE/CSUM/ASYNC/FAST_COMMIT). */
+    {
+        uint32_t jincompat = rd32be(sb + JSB_FEAT_INCOMPAT);
+        if (jincompat & ~JBD2_FEATURE_INCOMPAT_64BIT) return -1;
+        j->has_64bit = (jincompat & JBD2_FEATURE_INCOMPAT_64BIT) ? 1 : 0;
+    }
     if (rd32be(sb + JSB_FEAT_ROCOMPAT) != 0u) return -1;
     /* non-empty == a crashed writer's transactions await replay: refuse */
     if (rd32be(sb + JSB_START) != 0u) return -1;
     if (j->sequence == 0u) j->sequence = 1u;
     bcopy8(j->uuid, sb + JSB_UUID, 16u);
+    return 0;
+}
+
+int hype_jbd2_upgrade_64bit(hype_jbd2_t *j) {
+    static uint8_t sb[4096];
+    uint32_t jincompat;
+    if (j->has_64bit) return 0;
+    if (jblock_read(j, 0u, sb) != 0) return -1;
+    jincompat = rd32be(sb + JSB_FEAT_INCOMPAT);
+    wr32be(sb + JSB_FEAT_INCOMPAT, jincompat | JBD2_FEATURE_INCOMPAT_64BIT);
+    if (jblock_write(j, 0u, sb) != 0) return -1;
+    j->has_64bit = 1;
     return 0;
 }
 
@@ -132,14 +151,25 @@ int hype_jbd2_commit(hype_jbd2_t *j, const hype_jbd2_block_t *blocks, unsigned c
     uint32_t jb = j->first;
     unsigned i;
     uint32_t doff;
+    /* #496: journal_block_tag_s is 8 bytes (t_blocknr, t_checksum, t_flags);
+     * JBD2_FEATURE_INCOMPAT_64BIT appends a 4-byte t_blocknr_high, making it
+     * 12 -- see include/linux/jbd2.h's journal_tag_bytes(). Without the
+     * checksum/csum2/3 features hype never sets, t_checksum is always 0. */
+    uint32_t tagsz = j->has_64bit ? 12u : 8u;
 
     if (count == 0u || count > HYPE_JBD2_MAX_BLOCKS) return -1;
     if (2u + count > j->maxlen - j->first) return -1; /* must fit without wrapping */
+    if (!j->has_64bit) {
+        for (i = 0; i < count; i++) {
+            if (blocks[i].blocknr > 0xFFFFFFFFull) return -1; /* classic 32-bit tags only */
+        }
+    }
 
     /*
      * One descriptor block covers this bounded transaction comfortably: the
      * classic tag is 8 bytes (+16 UUID on the first), so 24 tags need at
-     * most 8 + 24*8 + 16 = 216 bytes of a >= 1024-byte block.
+     * most 8 + 24*8 + 16 = 216 bytes of a >= 1024-byte block (wide tags:
+     * 12 + 24*12 + 16 = 316 bytes -- still comfortably under 1024).
      */
     bzero8(desc, j->block_size);
     wr32be(desc + 0, JBD2_MAGIC);
@@ -151,15 +181,15 @@ int hype_jbd2_commit(hype_jbd2_t *j, const hype_jbd2_block_t *blocks, unsigned c
         if (rd32be(blocks[i].data) == JBD2_MAGIC) flags |= TAG_FLAG_ESCAPE;
         if (i != 0u) flags |= TAG_FLAG_SAME_UUID;
         if (i == count - 1u) flags |= TAG_FLAG_LAST;
-        if (blocks[i].blocknr > 0xFFFFFFFFull) return -1; /* 32-bit journals only */
         wr32be(desc + doff, (uint32_t)blocks[i].blocknr);
         wr32be(desc + doff + 4, flags);
-        doff += 8u;
+        if (j->has_64bit) wr32be(desc + doff + 8, (uint32_t)(blocks[i].blocknr >> 32));
+        doff += tagsz;
         if (i == 0u) {
             bcopy8(desc + doff, j->uuid, 16u);
             doff += 16u;
         }
-        if (doff + 8u > j->block_size) return -1;
+        if (doff + tagsz > j->block_size) return -1;
     }
     if (jblock_write(j, jb, desc) != 0) return -1;
     jb++;

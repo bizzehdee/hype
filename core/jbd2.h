@@ -30,10 +30,20 @@
  * repaired by replay. Escaped blocks (images that begin with the jbd2 magic)
  * are handled per the format.
  *
- * Refused: external journals, 64-bit journals, checksummed journals
- * (CSUM_V2/V3 track metadata_csum, which the ext writer refuses too),
- * async-commit, fast-commit, a non-empty journal, and any transaction that
- * does not fit the bounded tag/block budget below.
+ * Refused: external journals, checksummed journals (CSUM_V2/V3 track
+ * metadata_csum, which the ext writer refuses too), async-commit,
+ * fast-commit, a non-empty journal, and any transaction that does not fit
+ * the bounded tag/block budget below.
+ *
+ * #496: a journal already carrying JBD2_FEATURE_INCOMPAT_64BIT is accepted
+ * (its block tags gain a t_blocknr_high word -- see journal_tag_bytes() in
+ * the kernel's fs/jbd2/journal.c). A fresh `mkfs.ext4 -O 64bit` journal does
+ * NOT set this bit itself (verified empirically: e2fsprogs' own journal
+ * creation never does); the kernel sets it lazily on the FIRST real mount of
+ * a 64BIT-featured filesystem (fs/ext4/super.c, ext4_load_journal()). hype
+ * mirrors that: hype_jbd2_upgrade_64bit() sets the bit once, unconditionally,
+ * whenever the ext4 volume itself has INCOMPAT_64BIT -- so a metadata block
+ * anywhere on the volume, however far out, can always be journaled.
  */
 
 #define HYPE_JBD2_MAX_BLOCKS 24u /* metadata block images per transaction */
@@ -49,6 +59,8 @@ typedef struct {
     uint32_t first;           /* s_first: first log block */
     uint32_t sequence;        /* s_sequence: next transaction id */
     uint8_t uuid[16];
+    int has_64bit;            /* #496: JBD2_FEATURE_INCOMPAT_64BIT is active --
+                               * every tag carries a t_blocknr_high word */
 } hype_jbd2_t;
 
 typedef struct {
@@ -63,6 +75,16 @@ typedef struct {
  */
 int hype_jbd2_open(hype_jbd2_t *j, hype_blk_read_fn read, hype_blk_write_fn write, void *ctx,
                    uint32_t block_size, const hype_file_rmap_t *map);
+
+/*
+ * #496: idempotently sets JBD2_FEATURE_INCOMPAT_64BIT on the journal
+ * superblock -- a no-op if already set. Only valid on an empty journal (the
+ * only state hype_jbd2_open ever accepts), so this is a direct write, not a
+ * transaction: a crash right after it leaves an empty journal that simply
+ * declares wide tags, exactly the state a real mount would leave it in.
+ * Returns 0 or -1 on I/O failure.
+ */
+int hype_jbd2_upgrade_64bit(hype_jbd2_t *j);
 
 /*
  * Commits one bounded transaction: descriptor(s) + images + commit block,
