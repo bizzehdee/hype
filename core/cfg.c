@@ -1127,7 +1127,8 @@ static int add_section(hype_cfg_t *out, hype_cfg_section_kind_t kind, const char
 /* #450: *cur_over_cap is raised for a [vm.*] past capacity and cleared by any other section, so
  * that VM's keys are ignored instead of read as keys outside a section. */
 static hype_cfg_status_t process_section_header(char *line, hype_cfg_t *out, int *cur,
-                                                 const char *raw, int *cur_disk,
+                                                 const char *raw, int raw_truncated,
+                                                 int *cur_disk,
                                                  unsigned int *disk_seen, int *cur_is_hype,
                                                  unsigned int *in_hype_seen,
                                                  unsigned int line_no, int *cur_over_cap,
@@ -1243,6 +1244,21 @@ static hype_cfg_status_t process_section_header(char *line, hype_cfg_t *out, int
         return HYPE_CFG_OK;
     }
     if (!hype_strneq(body, "vm.", 3)) {
+        /*
+         * #678: `raw` is `line` truncated to HYPE_CFG_LINE_MAX for retention -- fine for a plain
+         * key/value or comment line (any shorter text is still valid), but a SECTION HEADER's
+         * validity depends on its LAST byte being ']' (the check at the top of this function,
+         * against the full untruncated `line`). Truncating a long header for storage can cut off
+         * the closing ']' that made the original line acceptable, so hype_cfg_serialize()'s
+         * re-emission of `raw` -- which the parser sees as a fresh, `\n`-terminated line next time
+         * -- fails that same check and the round-trip turns an OK config into a syntax error.
+         * Refuse here, at ORIGINAL parse time, rather than retain something that cannot reparse
+         * to what it meant: the same "detect at the point of truncation, not after" discipline the
+         * raw-snapshot comment above already applies to key/value retention.
+         */
+        if (raw_truncated) {
+            return HYPE_CFG_ERR_VALUE_TOO_LONG;
+        }
         /*
          * #222 (spec §4.1): an unknown section KIND is retained, not rejected. A `[disk.*]` or
          * `[nic.*]` section from a newer hype must not stop an older one booting, and the lines
@@ -1862,7 +1878,7 @@ hype_cfg_result_t hype_cfg_parse_into(char *text, hype_cfg_t *out, hype_cfg_vm_t
 
         in_vm_key = 0;
         if (line[0] == '[') {
-            st = process_section_header(line, out, &cur, raw, &cur_disk, &disk_seen,
+            st = process_section_header(line, out, &cur, raw, raw_truncated, &cur_disk, &disk_seen,
                                         &cur_is_hype, &in_hype_seen, line_no, &cur_over_cap,
                                         &cur_nic, &cur_switch, &nic_seen);
         } else {

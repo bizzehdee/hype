@@ -248,6 +248,60 @@ static void test_firmware_legacy_round_trips(void) {
 }
 
 /*
+ * #678: found by the #602 fuzz harness (tools/602/corpus/cfg/
+ * regression_serialize_roundtrip_unparseable.bin). An unknown section header long enough that its
+ * retained `raw` copy gets truncated to HYPE_CFG_LINE_MAX could still parse OK originally (the
+ * FULL, untruncated line ends in ']'), but hype_cfg_serialize()'s re-emission of the truncated
+ * `raw` -- which the parser next sees as its own complete, `\n`-terminated line -- no longer ends
+ * in ']' and fails to reparse. process_section_header() now refuses (HYPE_CFG_ERR_VALUE_TOO_LONG)
+ * an unknown section header it cannot retain losslessly, rather than accept it and corrupt it on
+ * the next save. This pins the invariant: any cfg hype_cfg_parse() accepts, once serialized
+ * without truncation/refusal, must reparse OK.
+ */
+static void test_overlong_unknown_section_header_refused_not_corrupted_on_save(void) {
+    /* The exact 197-byte regression corpus input: "[]\r[]\r" + a long run of 0xFF (no '\n'
+     * anywhere), ending " \r\r[]]" -- the untruncated line legitimately ends in ']', but its
+     * first HYPE_CFG_LINE_MAX-1 bytes (what raw retention keeps) do not. */
+    const char *cfg =
+        "[]\x0d[]\x0d\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff"
+        "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff"
+        "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff"
+        "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff"
+        "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff"
+        "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff"
+        "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff"
+        "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff"
+        "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff"
+        "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff"
+        "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff"
+        "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff"
+        "\xff\xff\xff\xff\xff\xff\xff\xff \x0d\x0d[]]";
+    hype_cfg_t out;
+    hype_cfg_result_t pr;
+    static char written[8192];
+    hype_cfg_serialize_result_t ser;
+
+    pr = parse_copy(cfg, &out);
+    /* The bug's original symptom was this returning HYPE_CFG_OK; the fix refuses it outright,
+     * which trivially satisfies the round-trip invariant by never entering it in the first place. */
+    CHECK_INT("overlong unknown section header refused (not silently accepted)",
+             HYPE_CFG_ERR_VALUE_TOO_LONG, pr.status);
+
+    /* Belt and braces: if some OTHER config still manages to reach this state (a future change
+     * loosens the refusal), the round-trip invariant itself must hold -- so also check that IF a
+     * parse of this exact input ever again returns OK, its serialization still reparses OK. */
+    if (pr.status == HYPE_CFG_OK) {
+        ser = hype_cfg_serialize(&out, written, sizeof(written));
+        if (!ser.truncated && !ser.refused_overflow) {
+            hype_cfg_t reparsed;
+            hype_cfg_result_t rr = hype_cfg_parse(written, &reparsed);
+            CHECK_INT("serialized output of an accepted overlong header still reparses OK",
+                     HYPE_CFG_OK, rr.status);
+        }
+    }
+}
+
+/*
  * #565 / decision 49: `display` selects an EXTRA adapter and defaults to none.
  *
  * The default matters more than the setting: a VM that never mentions `display` must not acquire a
@@ -3254,6 +3308,7 @@ int main(void) {
     test_cpu_set_comma_list();
     test_boot_disk_no_install_media_required();
     test_firmware_legacy_round_trips();
+    test_overlong_unknown_section_header_refused_not_corrupted_on_save();
     test_display_key();
     test_uplink_static_address();
     test_uplink_address_parsing_is_strict();
