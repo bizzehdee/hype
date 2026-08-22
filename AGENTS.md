@@ -96,3 +96,10 @@ from real incidents — the story behind a rule. See
 [`.learnings/README.md`](.learnings/README.md) for the index. Add a learning
 when an incident teaches something a future agent would otherwise re-learn the
 hard way.
+
+**Before running a real-hardware validation session** (any `HW-VAL`/hardware-
+validation ticket, or working `rig/hw-queue/`), read the `hwval-*` learnings
+first — each cold boot is expensive, and each of these cost one:
+[`hwval-config-validate-before-boot.md`](.learnings/hwval-config-validate-before-boot.md),
+[`hwval-live-image-no-persistence.md`](.learnings/hwval-live-image-no-persistence.md),
+[`hwval-repro-before-reboot.md`](.learnings/hwval-repro-before-reboot.md).

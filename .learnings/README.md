@@ -58,3 +58,14 @@ here for the full text and rationale.
   the unreadable Priority field.
 - [hype-logs-lc-all-c.md](hype-logs-lc-all-c.md) — hype's logs are invalid
   UTF-8; grep needs `LC_ALL=C grep -a`.
+- [hwval-config-validate-before-boot.md](hwval-config-validate-before-boot.md)
+  — validate `hype.cfg` against the real parser before every physical boot
+  (firmware=uefi, source_disk placement, target_disk/disks= exclusivity, bus
+  defaults, drive-serial mismatches — #687/#688/#689).
+- [hwval-live-image-no-persistence.md](hwval-live-image-no-persistence.md) — a
+  live/diskless guest image can never prove disk persistence; use a second,
+  guest-formatted disk, and independently confirm at the host byte level
+  (#687).
+- [hwval-repro-before-reboot.md](hwval-repro-before-reboot.md) — reproduce a
+  suspected storage-driver bug host-side (loopback images, no root needed)
+  before spending another physical boot on it (#696, #697).

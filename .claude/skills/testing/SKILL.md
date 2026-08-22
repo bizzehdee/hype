@@ -13,6 +13,13 @@ description: hype's testing requirements — QEMU/KVM nested-virt for fast itera
   necessary but not sufficient — nested VMX/SVM emulation does not reproduce
   every edge case. Move a ticket to **Done** only after this pass where the
   milestone requires it, not when the code merely compiles.
+- **Before running a real-hardware validation session, read the `hwval-*`
+  learnings** — each cold boot is expensive, and every one of these was found
+  the hard way: [`.learnings/hwval-config-validate-before-boot.md`](../../../.learnings/hwval-config-validate-before-boot.md)
+  (validate `hype.cfg` against the real parser first), [`.learnings/hwval-live-image-no-persistence.md`](../../../.learnings/hwval-live-image-no-persistence.md)
+  (a live/diskless guest image can't prove persistence), and
+  [`.learnings/hwval-repro-before-reboot.md`](../../../.learnings/hwval-repro-before-reboot.md)
+  (reproduce a suspected storage bug host-side before spending another boot on it).
 
 ## Unit testing
 
