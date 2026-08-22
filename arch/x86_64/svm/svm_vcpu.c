@@ -3300,6 +3300,20 @@ int process_ahci_ata_command_slot(hype_ahci_t *ahci, hype_ata_disk_t *disk,
     uint32_t pis_bit = HYPE_AHCI_PIS_DHRS;
     int is_write_direction = 0;
 
+    /*
+     * #672: the ATAPI sibling (process_ahci_command_slot) has always refused a rejected
+     * translation here; this disk path never did, so a guest could point PxCLB/PxCLBU
+     * (fully guest-controlled) outside its own mapped range and this function would
+     * dereference the resulting NULL in hype_ahci_decode_cmd_header() below -- a
+     * guest-triggerable host crash, not a guest-side fault, since hype has no process
+     * boundary to contain it. Same refusal shape and message as the ATAPI path.
+     */
+    if (cmd_hdr_bytes == 0) {
+        hype_debug_print("ahci: slot %u refused -- command list at gpa 0x%llx out of bounds\n",
+                         slot, (unsigned long long)cmd_list_phys);
+        return -1;
+    }
+
     /* #372: the disk path masters the bus for exactly the same structures as the ATAPI one, so it
      * gets the same gate. 0, not -1: the caller panics on -1, and a guest that has not enabled bus
      * mastering is doing something the hardware ignores, not something undecodable. */
