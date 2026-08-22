@@ -20448,25 +20448,30 @@ static void load_hype_cfg(void) {
     g_hype_cfg_raw_sum = fw_1_fnv1a(g_hype_cfg_text, sz);
 
     /*
-     * #393 (decision 33): size VM storage from what the file DECLARES, not from a constant.
+     * #393/#606 (decision 33): HYPE_CFG_MAX_VMS is sized from decision 33's own reasoning
+     * (core/cfg.h), not an arbitrary constant -- the config layer's actual hard limit is now
+     * HYPE_CPU_TOPOLOGY_MAX - 1, which is the most VMs any host this build can run on could ever
+     * be admitted for (decision 33: dedicated tier <= usable cores - 1, and hype cannot enumerate
+     * more usable cores than that).
      *
-     * The parser used to refuse VM #17 because its array was 16 long. Count the [vm.*] sections
-     * first, allocate that many from the UEFI pool, and let admission be the thing that refuses
-     * -- with the host's real core and RAM numbers -- rather than a compile-time bound nobody
-     * can see from the config file. Falls back to the struct's own storage only if the pool
-     * cannot serve the request, which keeps a small config bootable on a starved host.
+     * True per-machine sizing (allocate exactly `declared` from a pool) still is not possible
+     * HERE: hype.cfg is read post-ExitBootServices (decision 37, Phase 1, through hype's own
+     * storage stack), and AllocatePool does not survive that transition, so `vms_default` has to
+     * be the fixed-size array chosen ahead of time. Counting the declared [vm.*] sections first
+     * still means a config that outgrows it is named loudly (hype_serial_print, not a level-gated
+     * debug line -- a VM silently failing to exist is exactly what #341 exists to prevent) rather
+     * than silently losing VMs past the bound; hype_cfg_parse_into()'s own skipped-VM reporting
+     * names each one that does not fit.
      */
     {
         unsigned int declared = hype_cfg_count_vms(g_hype_cfg_text);
         hype_cfg_vm_t *vms = g_hype_cfg.vms_default;
         unsigned int cap = HYPE_CFG_MAX_VMS;
         if (declared > cap) {
-            /* #450: post-EBS there is no AllocatePool. The guest pool is for guest memory, not
-             * host structures, so a config declaring more VMs than the struct's own storage holds
-             * is bounded here and says so -- never silently truncated. */
-            hype_debug_print("cfg: %u [vm.*] section(s) declared but post-EBS storage holds %u -- "
-                             "the first %u are used and the rest are named below [#450 #393]\n",
-                             declared, cap, cap);
+            hype_serial_print("cfg: WARNING -- %u [vm.*] section(s) declared but hype supports at "
+                              "most %u VMs on this build -- the first %u are used, %u refused (see "
+                              "the SKIPPED VM report below for which) [#606]\n",
+                              declared, cap, cap, declared - cap);
         }
         res = hype_cfg_parse_into(g_hype_cfg_text, &g_hype_cfg, vms, cap);
     }
@@ -22023,7 +22028,16 @@ static void term_create_finish(void) {
     /* Appended through the config module, which adds the SECTION as well as the VM -- the
      * serializer emits sections, so a VM without one is written nowhere. */
     if (hype_cfg_append_vm(&cand, &g_wizard.vm) != 0) {
-        term_resultf("create: no room left in the config for another VM -- nothing created");
+        /* #606: name the real limit that was hit, not a generic "no room" -- these are two
+         * different resources and an operator cannot act on either without knowing which. */
+        if (cand.vm_count >= cand.vm_cap) {
+            term_resultf("create: refused -- hype supports at most %u VMs on this build and all "
+                         "%u are in use", cand.vm_cap, cand.vm_cap);
+        } else {
+            term_resultf("create: refused -- the config's section table is full (%u of %u) -- "
+                         "delete an unused VM/disk/nic/switch first", cand.section_count,
+                         (unsigned int)HYPE_CFG_MAX_SECTIONS);
+        }
         g_wizard_active = 0;
         return;
     }

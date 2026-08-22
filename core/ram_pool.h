@@ -2,6 +2,7 @@
 #define HYPE_CORE_RAM_POOL_H
 
 #include <stdint.h>
+#include "cpu_topology.h"
 
 /*
  * RAM-3 (#449): one guest-memory pool, reserved once, carved many times.
@@ -26,7 +27,22 @@
  */
 
 #define HYPE_RAM_POOL_ALIGN 0x200000ull /* 2 MB, the NPT/EPT large-page requirement */
-#define HYPE_RAM_POOL_MAX_CARVES 64u
+
+/*
+ * #606 (plan.md §10 decision 33): derived, not an independently-chosen constant. Each VM carves
+ * at most 3 regions from this pool -- boot/main.c's fw_1_pool_carve() call sites are firmware
+ * (HYPE_POOL_KIND_FW), guest RAM (HYPE_POOL_KIND_RAM) and vdisk backing (HYPE_POOL_KIND_VDISK) --
+ * and decision 33's own dedicated-tier bound on VM count is (usable cores - 1), which hype can
+ * never observe past HYPE_CPU_TOPOLOGY_MAX (core/cpu_topology.h's own ceiling on how many logical
+ * processors its EFI_MP_SERVICES_PROTOCOL enumeration can hold -- see core/cfg.h's
+ * HYPE_CFG_MAX_VMS, sized from the SAME bound for the SAME reason). +3 is slack for the one-off
+ * carves made outside the per-VM loop (vm0's early combined-firmware carve). A carve past this is
+ * not a silent drop: hype_ram_pool_carve() already returns HYPE_RAM_POOL_ERR_TOO_MANY, and every
+ * caller already reports it loudly with the real remaining/total pool size (see
+ * boot/main.c:fw_1_pool_carve()) -- this only raises the bound to match what decision 33 actually
+ * admits, rather than refusing at a compile-time number decision 33 never chose.
+ */
+#define HYPE_RAM_POOL_MAX_CARVES (((HYPE_CPU_TOPOLOGY_MAX - 1u) * 3u) + 3u)
 
 typedef enum {
     HYPE_RAM_POOL_OK = 0,
