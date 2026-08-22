@@ -22967,6 +22967,30 @@ static hype_fs_t *fw_1_boot_volume(void) {
 }
 
 /*
+ * #638: does THIS specific backend, at THIS specific partition base, carry the volume hype
+ * itself booted from -- not merely a mountable FAT32 volume. A blank stick that happens to
+ * enumerate first is mountable-or-not by luck; hype's own boot medium is identifiable, via the
+ * same loader+firmware check fw_1_boot_vol_verify() already uses for config write-back. USB MSC
+ * enumeration order is an accident of topology (which port, which controller, hub vs. direct)
+ * and must not decide which stick receives the run's logs -- the operator pulls the drive hype
+ * booted from to read them, not whichever drive happened to answer first.
+ *
+ * A throwaway hype_fs_t is used for the probe (never the log sink's own g_hype_log.fs) so a
+ * candidate that fails verification is left completely untouched: no file created, no write
+ * attempted, matching the "leave a bystander stick alone" bar exactly.
+ */
+static int usb_base_is_boot_volume(const hype_blk_backend_t *be, uint64_t base) {
+    usblog_ctx_t probe;
+    static hype_fs_t probe_fs;
+    probe.be = be;
+    probe.base = base;
+    if (hype_fs_mount_auto(&probe_fs, usblog_read, usblog_write, &probe) != 0) {
+        return 0;
+    }
+    return fw_1_boot_vol_verify(&probe_fs) == 0;
+}
+
+/*
  * M9-3 (#176): write the run-state record, as part of the host shutdown sequence.
  *
  * plan.md section 6h: "a small state record (which VMs were running vs. stopped at the moment
@@ -23130,7 +23154,10 @@ static void fw_1_read_run_state(void) {
     }
 }
 
-static void usb_log_setup(const hype_blk_backend_t *be) {
+/* #638: returns 1 if this backend was accepted as hype's log volume, 0 otherwise -- so a
+ * caller sweeping several MSCs (the boot ESP is not always the first one found) knows to keep
+ * trying the next candidate rather than assuming the very first stick took the role. */
+static int usb_log_setup(const hype_blk_backend_t *be) {
     uint64_t bases[8];
     unsigned int nb = 0, i;
     hype_gpt_partition_t part;
@@ -23160,6 +23187,20 @@ static void usb_log_setup(const hype_blk_backend_t *be) {
 
     for (i = 0; i < nb; i++) {
         int rc;
+        /*
+         * #638: a mountable FAT32 volume is not enough -- it must be the volume hype itself
+         * booted from. MSC enumeration order is an accident of USB topology; the operator
+         * pulls the drive hype booted from to read a run's logs, so a bystander stick (blank
+         * or not) must be left alone rather than silently claimed for HYPE.LOG. Checked BEFORE
+         * g_usb_log_ctx.base is set to this candidate and before HYPE.LOG is ever created, so a
+         * rejected candidate is untouched, not merely unwritten-to.
+         */
+        if (!usb_base_is_boot_volume(be, bases[i])) {
+            hype_debug_print("usb-log: base LBA %llu -- mounts, but is not the volume hype "
+                             "booted from -- leaving it alone [#638]\n",
+                             (unsigned long long)bases[i]);
+            continue;
+        }
         g_usb_log_ctx.base = bases[i];
         /*
          * #338: \HYPE.LOG is the primary sink now, and doubles as the volume probe.
@@ -23188,12 +23229,14 @@ static void usb_log_setup(const hype_blk_backend_t *be) {
                              "[offset] prefix to recover the combined stream [#338]\n",
                              (unsigned long long)bases[i]);
             split_log_setup();
-            return;
+            return 1;
         }
         /* Name the stage. "no mountable FAT32 volume" was printed even when the
          * volume HAD mounted and the file HAD been created and only the write
          * failed -- which points the reader at the filesystem when the fault is in
-         * the block path underneath it. */
+         * the block path underneath it. This candidate already passed the #638 boot-volume
+         * identity check, so a failure here is a real fault on hype's own boot device, not a
+         * bystander stick being (correctly) rejected. */
         hype_debug_print("usb-log: base LBA %llu -- %s\n", (unsigned long long)bases[i],
                          (rc == HYPE_LOG_SINK_ERR_MOUNT)    ? "not a FAT32 volume"
                          : (rc == HYPE_LOG_SINK_ERR_CREATE) ? "FAT32 mounted but HYPE.LOG "
@@ -23203,8 +23246,9 @@ static void usb_log_setup(const hype_blk_backend_t *be) {
                                "FAILED -- the USB block path (xHCI/MSC), not the filesystem"
                              : "unknown failure");
     }
-    hype_debug_print("usb-log: could not open a log sink on any of %u candidate base LBA(s); "
-                     "an EMPTY \\HYPE.LOG means the file was created and the write failed\n", nb);
+    hype_debug_print("usb-log: no candidate base LBA on this device is the volume hype booted "
+                     "from (%u checked) -- not this device's role [#638]\n", nb);
+    return 0;
 }
 
 /*
@@ -25331,6 +25375,18 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                             hype_blk_usb_init(&g_musbx_hw[k], &g_musbx_phys[k], &g_musbx_be[k],
                                               &g_musbx_xc[k], msc_slot, &g_musbx_eps[k], 512u,
                                               (uint64_t)xlast + 1u);
+                            /*
+                             * #638: the boot ESP is not always the FIRST MSC this sweep
+                             * reaches -- the primary path above already tried and may have
+                             * declined it (usb_log_setup() only accepts the candidate that
+                             * verifies as hype's own boot volume). Give every extra MSC the
+                             * same chance. The g_hype_log_ready gate means this is skipped
+                             * entirely once a sink is open, preserving #387's "never
+                             * re-point mid-run" rule -- at most one candidate ever wins.
+                             */
+                            if (!g_hype_log_ready) {
+                                (void)usb_log_setup(&g_musbx_be[k]);
+                            }
                             media_add_dev(g_musbx_rd[k], g_musbx_wr[k], "usb",
                                           g_musbx_serial[k], 0);
                             /* claimed: passthrough must never offer a device hype is using */
@@ -25417,20 +25473,32 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                  * outlives this probe scope (it streams for the whole run and
                                  * at the diagnostic halt). Stream whatever has been logged so far;
                                  * the BSP continues bounded live draining after EBS. */
-                                /* #299: the sweep now continues past this controller, so a
-                                 * second USB disk must not re-point the log sink at itself
-                                 * mid-run. First one wins. */
+                                /*
+                                 * #299/#638: the sweep now continues past this controller, so a
+                                 * second USB disk must not re-point the log sink once it is
+                                 * open -- that invariant is unchanged. What changed is WHICH
+                                 * stick gets to open it: usb_log_setup() now only accepts a
+                                 * candidate that is the volume hype itself booted from, not
+                                 * whichever MSC this sweep happens to reach first. If this one
+                                 * isn't it, the call below is a documented no-op and the extra-
+                                 * MSC branch further down gets its own chance at every later
+                                 * device the sweep finds.
+                                 */
                                 if (!msc_found_any) {
                                     g_usb_xc = xc;
                                     g_usb_msc = msc;
                                     hype_blk_usb_init(&g_usb_ubk, &g_usb_uphys, &g_usb_ube,
                                                       &g_usb_xc, msc_slot, &g_usb_msc, 512u,
                                                       (uint64_t)last_lba + 1u);
-                                    usb_log_setup(&g_usb_ube);
+                                    (void)usb_log_setup(&g_usb_ube);
                                     /* #326: the same backend is also a MEDIA source, so an ISO can
                                      * live on the stick hype booted from -- the one-stick
                                      * deployment. Registered after the log sink so a log still
-                                     * lands even if the media scan later finds nothing. */
+                                     * lands even if the media scan later finds nothing. This is
+                                     * independent of the #638 boot-volume check above: a stick
+                                     * that isn't hype's own boot medium can still host guest
+                                     * media, so it keeps this role even when usb_log_setup()
+                                     * declined it. */
                                     media_select_usb(&g_usb_ube);
                                 }
                             }

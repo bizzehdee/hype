@@ -3027,6 +3027,35 @@ isn't lost.
     a stall is visible in one counter, a gap is indistinguishable from the
     guest having nothing to say.
 
+60. **The log volume is the volume hype booted from, selected by identity, not by USB
+    enumeration order -- decided (2026-08-22).** A bare-metal i5 run had a blank USB stick
+    (no partition table) enumerate before the FAT32 stick hype actually booted from.
+    `usb_log_setup()` claimed the first MSC unconditionally (#387's "first one wins" rule,
+    written for a different concern -- never re-pointing an ALREADY-OPEN sink mid-run, not
+    choosing which stick opens it) and could not mount the blank one, so the whole run
+    produced zero on-disk logs. Operator ruling: enumeration order is irrelevant: the log
+    volume is, by definition, the device carrying the ESP hype loaded from, and a bystander
+    stick -- blank or not -- must never receive or deny that role.
+
+    **Decided.** `usb_base_is_boot_volume()` (boot/main.c) reuses `fw_1_boot_vol_verify()`'s
+    existing identity check -- hype's own loader plus both firmware images present, confirmed
+    against the parsed `\hype.cfg` when one was read -- the same check #447 already uses to
+    locate the boot volume for config write-back. `usb_log_setup()` now rejects any candidate
+    partition base that mounts but fails this check, touching nothing on it: no file created,
+    no write attempted. It is called on every MSC the sweep finds -- the primary path and every
+    #387 "extra" device -- gated by `g_hype_log_ready`, so at most one candidate ever wins and
+    the "never re-point once open" invariant is unchanged; only which stick gets the first
+    chance to open it changed. QEMU rig `tools/638/run-638-qemu.sh`: a blank stick enumerated
+    first is checked and left alone, the boot ESP enumerated second gets `\HYPE.LOG`, opened
+    exactly once.
+
+    **Alternatives considered.** (i) Match by USB serial number recorded at a prior boot --
+    rejected: needs a place to persist that serial before any log sink exists, a chicken-and-egg
+    #447 already solves structurally by checking content, not identity metadata. (ii) Always
+    prefer device 0 / the boot-order-designated device from firmware -- rejected: hype has
+    already left UEFI's boot services by the time USB enumeration runs (#447's own comment),
+    so no firmware boot-device handle survives to consult.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what
