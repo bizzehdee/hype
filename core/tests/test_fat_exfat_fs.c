@@ -1840,6 +1840,30 @@ static void test_fs_ops_exfat(void) {
     CHECK("append bogus tag", hype_fs_append(&f, buf, 1) != 0);
 }
 
+/*
+ * #646 (criterion 3): hype_fs_file_identity_error() must cover exFAT, not just FAT32 -- the
+ * whole point of a fs-agnostic diagnostic is that a caller does not need to know which driver it
+ * is talking to. Reproduces the reused-slot scenario through the fs_ops interface end to end.
+ */
+static void test_fs_ops_exfat_identity_error(void) {
+    hype_fs_t fs;
+    hype_fs_file_t a, b;
+
+    build_vol();
+    CHECK_HEX("auto-mount", 0, hype_fs_mount_auto(&fs, vol_read, vol_write, 0));
+    CHECK_HEX("create A", 0, hype_fs_create(&fs, "A.LOG", &a));
+    CHECK_HEX("seed A", 0, hype_fs_append(&a, "hello", 5));
+    CHECK("no identity error yet", hype_fs_file_identity_error(&a) == 0);
+
+    CHECK_HEX("rename A away", 0, hype_fs_rename(&fs, "A.LOG", "RENAMED.LOG"));
+    CHECK_HEX("create B (reuses A's old slot)", 0, hype_fs_create(&fs, "B.LOG", &b));
+    CHECK_HEX("seed B", 0, hype_fs_append(&b, "world", 5));
+
+    CHECK("append on the stale handle is refused", hype_fs_append(&a, "MORE", 4) != 0);
+    CHECK("hype_fs_file_identity_error reports it for exFAT", hype_fs_file_identity_error(&a) != 0);
+    CHECK("B is unaffected", b.size == 5);
+}
+
 
 /* ---- #383: ValidDataLength + random-write growth ---- */
 
@@ -2468,6 +2492,119 @@ static void test_write_at_revalidates_chain_before_growing(void) {
           hype_exfat_write_at(&f, sizeof full, "x", 1u) != 0);
 }
 
+/*
+ * #646: the #377 cross-link shape, exFAT flavour. A handle holds a stale (dir_cluster, set_index)
+ * after the entry set it named was retired and its slot handed to a DIFFERENT file by rename --
+ * the exact shape #338's single shared hype_fs_t makes reachable (one handle held across another
+ * writer's rename). Without an identity check, set_flush() publishes this handle's data straight
+ * into whatever now occupies that slot.
+ */
+static void test_set_flush_refuses_a_reused_slot(void) {
+    hype_exfat_wfile_t a, b;
+    uint8_t before[32], after[32];
+    uint32_t reused_index;
+
+    build_vol();
+    CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("create A", 0, hype_exfat_create(&g_fs, "A.LOG", &a));
+    CHECK_HEX("seed A", 0, hype_exfat_append(&a, "hello", 5u));
+    reused_index = a.set_index;
+
+    /* Retire A's slot by renaming it elsewhere -- the new entry set lands further into the
+     * directory, and A's old slot is freed. */
+    CHECK_HEX("rename A away", 0, hype_exfat_rename(&g_fs, "A.LOG", "RENAMED.LOG"));
+
+    /* B lands in the very slot the stale handle `a` still remembers: dir_scan_slots finds the
+     * first free run, which is now A's old, just-retired slot. */
+    CHECK_HEX("create B", 0, hype_exfat_create(&g_fs, "B.LOG", &b));
+    CHECK_HEX("B did reuse A's old slot (the scenario this test needs)", reused_index,
+              b.set_index);
+    CHECK_HEX("seed B", 0, hype_exfat_append(&b, "world", 5u));
+    memcpy(before, cluster(ROOT_CL) + (b.set_index + 1u) * 32u, sizeof before);
+
+    /* The stale handle `a` still has set_index == reused_index, and A's OWN NameHash. An append
+     * on it must be refused -- it is not B's data, and the slot is not A's anymore. */
+    CHECK("append on the stale handle is refused", hype_exfat_append(&a, "MORE", 4u) != 0);
+    CHECK_HEX("the identity error is reported", HYPE_EXFAT_WFILE_ERR_IDENTITY, a.last_error);
+
+    /* B's Stream entry must be byte-identical to what it was before the stale append attempt. */
+    memcpy(after, cluster(ROOT_CL) + (b.set_index + 1u) * 32u, sizeof after);
+    CHECK("B's entry set is untouched by the stale append", memcmp(before, after, sizeof before) == 0);
+
+    /* B itself is still perfectly readable under its own name. */
+    {
+        hype_exfat_wfile_t check;
+        uint8_t buf[10];
+        CHECK_HEX("B still resolves", 0, hype_exfat_lookup(&g_fs, "B.LOG", 0, &check));
+        CHECK_HEX("B's size is untouched", 5ull, check.size);
+        CHECK_HEX("B's content is untouched", 0, hype_exfat_read_at(&check, 0u, buf, 5u));
+        CHECK("B's content bytes", memcmp(buf, "world", 5u) == 0);
+    }
+}
+
+/*
+ * #646 (criterion 5): dirref_flush() carries the same identity check set_flush() does (wired via
+ * identity_set()/identity_valid() on the same local hype_exfat_wfile_t machinery), so a growing
+ * directory's own DataLength commit into its parent is guarded exactly like a file's.
+ *
+ * NOTE on coverage: dirref_t is a file-scope type in fat_exfat_fs.c that never crosses the public
+ * API -- resolve_parent() always resolves it FRESH, from the current on-disk state, at the start
+ * of the one synchronous create/mkdir/append call that goes on to use it, and it does not survive
+ * past that call. There is therefore no way to construct a genuinely STALE dirref_t through the
+ * public API the way test_set_flush_refuses_a_reused_slot does for a file handle (which the
+ * caller legitimately holds across separate calls). This test instead exercises the realistic
+ * adjacent case reachable black-box: an UNRELATED directory reuses the exact root slot a renamed
+ * directory used to occupy, and growing the renamed directory (a fresh, correct dirref_t,
+ * resolved after the reuse) must publish into ITS OWN current slot and never disturb the
+ * coincidentally same-numbered old one.
+ */
+static void test_dirref_flush_refuses_a_reused_owner_slot(void) {
+    hype_exfat_wfile_t f;
+    uint32_t d1_root_index;
+
+    build_vol();
+    CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("mkdir d1", 0, hype_exfat_mkdir(&g_fs, "\\d1"));
+    CHECK_HEX("lookup d1", 0, hype_exfat_lookup(&g_fs, "\\d1", 1, &f));
+    d1_root_index = f.set_index;
+
+    /* Retire d1's OWN entry set (in the root) by renaming it elsewhere. */
+    CHECK_HEX("rename d1 away", 0, hype_exfat_rename(&g_fs, "\\d1", "\\d1-renamed"));
+
+    /* A second, unrelated directory ends up in d1's old root slot. */
+    CHECK_HEX("mkdir d2", 0, hype_exfat_mkdir(&g_fs, "\\d2"));
+    {
+        hype_exfat_wfile_t check;
+        CHECK_HEX("lookup d2", 0, hype_exfat_lookup(&g_fs, "\\d2", 1, &check));
+        CHECK_HEX("d2 did reuse d1's old root slot (the scenario this test needs)", d1_root_index,
+                  check.set_index);
+    }
+
+    /* Force d1-renamed to grow: its OWN (freshly resolved) dirref_t names its actual, current
+     * root slot, well past d2's. Sixteen entries fill one cluster (16 * 32 = 512 bytes); nine
+     * 3-slot files force a grow. */
+    {
+        char path[40];
+        hype_exfat_wfile_t inner;
+        unsigned int i;
+        for (i = 0; i < 9u; i++) {
+            snprintf(path, sizeof path, "\\d1-renamed\\f%u.dat", i);
+            CHECK_HEX("create in d1-renamed", 0, hype_exfat_create(&g_fs, path, &inner));
+            CHECK_HEX("append in d1-renamed", 0,
+                      hype_exfat_append(&inner, path, (unsigned)strlen(path)));
+        }
+    }
+
+    /* d2 must be completely unaffected: still a directory, still exactly its original one-cluster
+     * DataLength (every exFAT directory starts at a whole cluster, per hype_exfat_mkdir). */
+    {
+        hype_exfat_wfile_t check;
+        CHECK_HEX("d2 still resolves as a directory", 0,
+                  hype_exfat_lookup(&g_fs, "\\d2", 1, &check));
+        CHECK_HEX("d2's DataLength is untouched", (uint64_t)SECSZ, check.size);
+    }
+}
+
 int main(void) {
     test_rollback_never_frees_under_a_published_larger_size(); /* #517 */
     test_cluster_growth_uses_durability_barriers();               /* #648 */
@@ -2477,7 +2614,10 @@ int main(void) {
     test_alloc_refuses_a_cluster_the_fat_still_chains();     /* #645 */
     test_lookup_chain_validation();                    /* #647 */
     test_write_at_revalidates_chain_before_growing();   /* #647 */
+    test_set_flush_refuses_a_reused_slot();             /* #646 */
+    test_dirref_flush_refuses_a_reused_owner_slot();    /* #646 */
     test_fs_ops_exfat();
+    test_fs_ops_exfat_identity_error();                 /* #646 */
     test_383_vdl();
     test_383_rollback_and_faults();
     test_exfat_set_time();

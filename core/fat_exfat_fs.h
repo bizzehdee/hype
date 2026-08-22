@@ -104,6 +104,11 @@ typedef struct {
 
 #define HYPE_EXFAT_USED_UNKNOWN 0xFFFFFFFFu
 
+/* #646: diagnostic codes for hype_exfat_wfile_t::last_error, mirroring
+ * HYPE_FAT32_WFILE_ERR_* (core/fat_write_fs.h). */
+#define HYPE_EXFAT_WFILE_ERR_NONE 0
+#define HYPE_EXFAT_WFILE_ERR_IDENTITY 1
+
 typedef struct {
     hype_exfat_fs_t *fs;
     uint32_t dir_cluster;   /* first cluster of the directory holding the entry set */
@@ -120,6 +125,19 @@ typedef struct {
      * sequential access does not re-walk the chain from the start each call. */
     uint32_t seek_index;
     uint32_t seek_cluster;
+    /*
+     * #646: identity binding, captured once at open/create and never touched again by this
+     * handle. NameHash/NameLength are the Stream Extension entry's own identifying fields, read
+     * back and compared at every flush so a set_index a rename/retire has handed to a DIFFERENT
+     * entry set is detected before this handle can publish over it. `identity_guard` is a
+     * tamper-evident hash over (dir_cluster, set_index, name_hash, name_length) -- a defensive
+     * check on the HANDLE's own fields, independent of the on-disk read-back, mirroring FAT32's
+     * first_cluster_guard.
+     */
+    uint16_t name_hash;
+    uint8_t name_length;
+    uint32_t identity_guard;
+    int last_error; /* HYPE_EXFAT_WFILE_ERR_* diagnostic for the last flush */
 } hype_exfat_wfile_t;
 
 /*

@@ -552,6 +552,38 @@ static int set_read(hype_exfat_fs_t *fs, uint32_t dir_first, int dir_contig, uin
 }
 
 /*
+ * #646: the entry set a handle names is identified by (dir_cluster, set_index, name_hash,
+ * name_length) -- everything set_flush() needs to prove, at flush time, that the slot it is
+ * about to publish into still belongs to THIS file. `identity_guard` is a tamper-evident hash of
+ * those fields over the handle itself, checked before every flush: a mismatch means something
+ * changed dir_cluster/set_index/name_hash/name_length without going through identity_set(), which
+ * must never happen. This is a guard, not the source of truth -- the on-disk entry is checked
+ * independently in set_flush(), exactly as FAT32's first_cluster_guard documents for the chain
+ * root.
+ */
+#define HYPE_EXFAT_IDENTITY_GUARD_SEED 0xB4D9F2E7u
+
+static uint32_t identity_guard_compute(uint32_t dir_cluster, uint32_t set_index,
+                                       uint16_t name_hash, uint8_t name_length) {
+    uint32_t v = HYPE_EXFAT_IDENTITY_GUARD_SEED ^ dir_cluster;
+    v = (v << 5) ^ (v >> 27) ^ set_index;
+    v = (v << 5) ^ (v >> 27) ^ name_hash;
+    v = (v << 5) ^ (v >> 27) ^ name_length;
+    return v;
+}
+
+static void identity_set(hype_exfat_wfile_t *f, uint16_t name_hash, uint8_t name_length) {
+    f->name_hash = name_hash;
+    f->name_length = name_length;
+    f->identity_guard = identity_guard_compute(f->dir_cluster, f->set_index, name_hash, name_length);
+}
+
+static int identity_valid(const hype_exfat_wfile_t *f) {
+    return f->identity_guard ==
+           identity_guard_compute(f->dir_cluster, f->set_index, f->name_hash, f->name_length);
+}
+
+/*
  * Rewrites the stream entry's allocation fields and the set's checksum.
  *
  * #648: `durable` is set by the caller exactly when this call extended the
@@ -567,14 +599,55 @@ static int set_flush(hype_exfat_wfile_t *f, int durable) {
     uint8_t ent[ENTSZ];
     uint16_t sum = 0u;
     unsigned int k;
+    uint32_t disk_first;
+
+    f->last_error = HYPE_EXFAT_WFILE_ERR_NONE;
+    /* #646: the handle's own identity fields must be exactly what identity_set() last put
+     * there -- a defensive check independent of the medium, mirroring FAT32's
+     * first_cluster_valid(). */
+    if (!identity_valid(f)) {
+        f->last_error = HYPE_EXFAT_WFILE_ERR_IDENTITY;
+        return -1;
+    }
 
     if (durable && fs->sync != (hype_blk_sync_fn)0 && fs->sync(fs->ctx) != 0) {
+        return -1;
+    }
+
+    /*
+     * #646: the primary File entry at set_index must still be an in-use File entry. A
+     * rename/unlink that retired this slot (or handed it to a different entry set) clears the
+     * InUse bit or changes the type byte; either way this handle no longer owns it.
+     */
+    if (entry_read(fs, f->dir_cluster, f->dir_contiguous, f->set_index, ent) != 0) {
+        return -1;
+    }
+    if (ent[0] != HYPE_EXFAT_ENT_FILE) {
+        f->last_error = HYPE_EXFAT_WFILE_ERR_IDENTITY;
         return -1;
     }
 
     /* set_read (via lookup) and create both establish that set_index + 1 is this
      * set's Stream Extension entry before a handle exists at all. */
     if (entry_read(fs, f->dir_cluster, f->dir_contiguous, f->set_index + 1u, ent) != 0) {
+        return -1;
+    }
+    /*
+     * #646: the Stream entry must still carry THIS handle's name -- a stale index left behind by
+     * rename/retire almost always now names a DIFFERENT file, and its NameHash/NameLength say so
+     * even though the slot's type byte alone would not. The already-published FirstCluster (if
+     * any) is PRESERVED and VERIFIED, never blindly overwritten from RAM, exactly as FAT32's
+     * flush_metadata treats the chain root: a stray write of this handle's first_cluster into a
+     * neighbouring file's Stream entry is refused, not silently accepted.
+     */
+    if (ent[0] != HYPE_EXFAT_ENT_STREAM || hype_rd16(ent + 4) != f->name_hash ||
+        ent[3] != f->name_length) {
+        f->last_error = HYPE_EXFAT_WFILE_ERR_IDENTITY;
+        return -1;
+    }
+    disk_first = hype_rd32(ent + 20);
+    if (disk_first != 0u && disk_first != f->first_cluster) {
+        f->last_error = HYPE_EXFAT_WFILE_ERR_IDENTITY;
         return -1;
     }
     ent[1] = (uint8_t)(HYPE_EXFAT_FLAG_ALLOC_POSSIBLE |
@@ -921,6 +994,8 @@ static void wfile_from_set(hype_exfat_wfile_t *f, hype_exfat_fs_t *fs, uint32_t 
     f->is_dir = (uint8_t)((set->attributes & HYPE_EXFAT_ATTR_DIRECTORY) ? 1 : 0);
     f->seek_index = 0u;
     f->seek_cluster = set->first_cluster;
+    f->last_error = HYPE_EXFAT_WFILE_ERR_NONE;
+    identity_set(f, set->name_hash, set->name_length);
 }
 
 int hype_exfat_lookup(hype_exfat_fs_t *fs, const char *path, int want_dir,
@@ -1016,6 +1091,11 @@ typedef struct {
     uint8_t owner_contig;
     uint32_t owner_set; /* entry index of its File entry there */
     uint8_t owner_secondary;
+    /* #646: this directory's OWN identity within owner_dir, so dirref_flush() can prove
+     * owner_set still names it before publishing into that slot -- captured by resolve_parent()
+     * from the entry set it just matched. */
+    uint16_t owner_name_hash;
+    uint8_t owner_name_length;
 } dirref_t;
 
 static void dirref_root(const hype_exfat_fs_t *fs, dirref_t *d) {
@@ -1027,10 +1107,16 @@ static void dirref_root(const hype_exfat_fs_t *fs, dirref_t *d) {
     d->owner_contig = 0u;
     d->owner_set = 0u;
     d->owner_secondary = 0u;
+    d->owner_name_hash = 0u;
+    d->owner_name_length = 0u;
 }
 
-/* Writes the directory's current allocation back into its own entry set (a
- * no-op for the root, which has none). */
+/*
+ * Writes the directory's current allocation back into its own entry set (a no-op for the root,
+ * which has none). #646: verifies, via set_flush()'s identity check, that owner_set still names
+ * THIS directory before publishing -- a dirref_t captured before some other change retired or
+ * reused that slot must fail closed, not overwrite whatever entry set is there now.
+ */
 static int dirref_flush(hype_exfat_fs_t *fs, const dirref_t *d) {
     hype_exfat_wfile_t f;
     if (!d->has_owner) {
@@ -1048,6 +1134,7 @@ static int dirref_flush(hype_exfat_fs_t *fs, const dirref_t *d) {
      * unset, set_flush()'s `valid > size` guard reads uninitialised stack. */
     f.valid = d->size;
     f.contiguous = d->contiguous;
+    identity_set(&f, d->owner_name_hash, d->owner_name_length);
     /* A directory's own allocation growth is out of #648's scope (the ticket
      * covers file DataLength publication); non-durable preserves prior
      * behaviour here. */
@@ -1156,6 +1243,8 @@ static int resolve_parent(hype_exfat_fs_t *fs, const char *path, unsigned int le
             dir->owner_contig = dir->contiguous;
             dir->owner_set = ei;
             dir->owner_secondary = set.secondary;
+            dir->owner_name_hash = set.name_hash;
+            dir->owner_name_length = set.name_length;
             dir->has_owner = 1u;
             dir->first = set.first_cluster;
             dir->size = set.data_length;
@@ -1465,6 +1554,8 @@ int hype_exfat_create(hype_exfat_fs_t *fs, const char *path, hype_exfat_wfile_t 
     out->is_dir = 0u;
     out->seek_index = 0u;
     out->seek_cluster = 0u;
+    out->last_error = HYPE_EXFAT_WFILE_ERR_NONE;
+    identity_set(out, hash, (uint8_t)nlen);
     return 0;
 }
 
