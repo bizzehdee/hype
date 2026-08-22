@@ -712,10 +712,16 @@ static int dir_search(ext_vol_t *v, const uint8_t dino[IN_CORE], const char *nam
 
 /* ---- path resolution ---- */
 
-/* Walks `path` to its final REGULAR-file inode. Fills ino[] and, when
- * out_ino is non-NULL, the inode number. Shared by every resolver flavour. */
-static int resolve_inode(ext_vol_t *v, const char *path, uint8_t ino[IN_CORE],
-                         uint32_t *out_ino) {
+/*
+ * Walks `path` to its final inode, requiring MODE_DIR (want_dir) or MODE_REG
+ * (!want_dir) there. Fills ino[] and, when out_ino is non-NULL, the inode
+ * number. want_dir also accepts "" or an all-separator path as the ROOT
+ * itself (inode 2) -- #498's namespace ops need to resolve a bare parent
+ * directory ("/" for a top-level create/mkdir), which no earlier caller did.
+ * Shared by every resolver flavour.
+ */
+static int resolve_inode_ex(ext_vol_t *v, const char *path, uint8_t ino[IN_CORE],
+                            uint32_t *out_ino, int want_dir) {
     unsigned int pos = 0;
 
     if (inode_read(v, 2u, ino) != 0) { /* the root directory is always inode 2 */
@@ -723,6 +729,18 @@ static int resolve_inode(ext_vol_t *v, const char *path, uint8_t ino[IN_CORE],
     }
     if ((hype_rd16(ino + IN_MODE) & MODE_FMT) != MODE_DIR) {
         return -1;
+    }
+    if (want_dir) {
+        unsigned int p2 = 0;
+        while (path[p2] == '/' || path[p2] == '\\') {
+            p2++;
+        }
+        if (path[p2] == '\0') {
+            if (out_ino != 0) {
+                *out_ino = 2u;
+            }
+            return 0;
+        }
     }
     for (;;) {
         char comp[EXT_MAX_NAME + 1u];
@@ -756,8 +774,10 @@ static int resolve_inode(ext_vol_t *v, const char *path, uint8_t ino[IN_CORE],
             return -1;
         }
         if (last) {
-            if ((hype_rd16(ino + IN_MODE) & MODE_FMT) != MODE_REG) {
-                return -1; /* directories and symlinks are not stream targets */
+            if ((hype_rd16(ino + IN_MODE) & MODE_FMT) != (want_dir ? MODE_DIR : MODE_REG)) {
+                /* !want_dir: directories and symlinks are not stream targets.
+                 * want_dir: #498 callers need a real directory, not a file. */
+                return -1;
             }
             if (out_ino != 0) {
                 *out_ino = next;
@@ -768,6 +788,12 @@ static int resolve_inode(ext_vol_t *v, const char *path, uint8_t ino[IN_CORE],
             return -1; /* a non-final component must be a directory */
         }
     }
+}
+
+/* Back-compat name for the (far more common) regular-file resolve. */
+static int resolve_inode(ext_vol_t *v, const char *path, uint8_t ino[IN_CORE],
+                         uint32_t *out_ino) {
+    return resolve_inode_ex(v, path, ino, out_ino, 0);
 }
 
 int hype_ext_resolve(hype_blk_read_fn read, void *ctx, const char *path, hype_file_map_t *out) {
@@ -814,6 +840,42 @@ int hype_ext_resolve_ino(hype_blk_read_fn read, void *ctx, const char *path, uin
         return -1;
     }
     return resolve_inode(&v, path, ino, out_ino);
+}
+
+/* #498: as hype_ext_resolve_ino, but resolves a DIRECTORY -- the namespace
+ * writers need their target's PARENT directory's inode number, and "" / "/"
+ * must resolve to the root (inode 2) itself, which no earlier caller needed. */
+int hype_ext_resolve_dir_ino(hype_blk_read_fn read, void *ctx, const char *path,
+                             uint32_t *out_ino) {
+    ext_vol_t v;
+    uint8_t ino[IN_CORE];
+    if (vol_open(read, ctx, &v) != 0) {
+        return -1;
+    }
+    return resolve_inode_ex(&v, path, ino, out_ino, 1);
+}
+
+/* #498: as hype_ext_map_ino_rmap, but for a DIRECTORY inode -- the namespace
+ * writers enumerate a directory's own data blocks (to scan/insert/remove
+ * entries) the same way #384's writer re-derives a FILE's map, but
+ * hype_ext_map_ino_rmap deliberately refuses anything that is not
+ * MODE_REG (a file writer must never be pointed at a directory's blocks by
+ * mistake), so a sibling with the opposite requirement is needed rather than
+ * loosening that guarantee. */
+int hype_ext_map_dir_ino_rmap(hype_blk_read_fn read, void *ctx, uint32_t ino_no,
+                              hype_file_rmap_t *out) {
+    ext_vol_t v;
+    uint8_t ino[IN_CORE];
+    if (vol_open(read, ctx, &v) != 0) {
+        return -1;
+    }
+    if (inode_read(&v, ino_no, ino) != 0) {
+        return -1;
+    }
+    if ((hype_rd16(ino + IN_MODE) & MODE_FMT) != MODE_DIR) {
+        return -1;
+    }
+    return map_inode_rmap(&v, ino, out);
 }
 
 /* #384: re-derive an inode's sparse map straight from its (just-committed)
