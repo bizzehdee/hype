@@ -142,6 +142,21 @@ static void handle_read(hype_atapi_t *dev, uint32_t lba, uint32_t count,
         set_check_condition(dev, out, HYPE_ATAPI_SENSE_KEY_ILLEGAL_REQUEST, HYPE_ATAPI_ASC_LBA_OUT_OF_RANGE);
         return;
     }
+    /*
+     * #656: READ(12)'s count field is 32-bit (unlike READ(10)'s 16-bit-derived count, max 65536 x
+     * 512B = 33MB, which never overflows here). For a >=4GiB backing ISO, a single in-range
+     * READ(12) can make `count * HYPE_ATAPI_SECTOR_SIZE` exceed UINT32_MAX and wrap in plain
+     * 32-bit arithmetic, silently truncating media_length while still completing GOOD -- a
+     * data-integrity bug (the wrapped value stays inside the already-validated true value, so it
+     * is never an out-of-bounds host read, just a wrong reported/transferred length). Compute in
+     * 64-bit and refuse rather than truncate: "one CDB never transfers >4GB" is the type's own
+     * documented invariant, so a request that would exceed it is invalid, not silently shrunk.
+     */
+    if ((uint64_t)count * (uint64_t)HYPE_ATAPI_SECTOR_SIZE > 0xFFFFFFFFull) {
+        set_check_condition(dev, out, HYPE_ATAPI_SENSE_KEY_ILLEGAL_REQUEST,
+                            HYPE_ATAPI_ASC_INVALID_FIELD_IN_CDB);
+        return;
+    }
 
     /* task #105 measure-first: record the transfer-size profile of the
      * actual data reads (successful path only -- a no-op or out-of-range

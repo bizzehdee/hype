@@ -318,6 +318,39 @@ static void test_read12_out_of_range(void) {
     CHECK_HEX("READ(12) OOR not in size profile", 0, dev.read10_sectors_total);
 }
 
+/*
+ * #656: READ(12)'s 32-bit count field lets a guest request a transfer whose byte length
+ * (count * HYPE_ATAPI_SECTOR_SIZE) exceeds UINT32_MAX for a large enough (>=4GiB) backing ISO --
+ * a plain 32-bit multiply wraps instead of refusing. Uses a streamed backing (hype_iso_stream_t)
+ * so the test can claim a >4GiB media_size without allocating that much real memory; the
+ * overflow check fires before any actual stream read is attempted.
+ */
+static void test_read12_count_overflowing_media_length_refused(void) {
+    hype_atapi_t dev;
+    hype_atapi_result_t out;
+    uint8_t cdb[HYPE_ATAPI_CDB_MAX];
+    hype_iso_stream_t stream;
+    uint32_t huge_count = 0x00300000u; /* 3,145,728 * 2048 = 6,442,450,944 > UINT32_MAX */
+
+    memset(&stream, 0, sizeof(stream));
+    stream.iso_size = (uint64_t)huge_count * HYPE_ATAPI_SECTOR_SIZE + 0x100000ull; /* room to spare */
+    hype_atapi_reset_stream(&dev, &stream);
+
+    make_cdb(cdb, HYPE_ATAPI_CMD_READ12);
+    cdb[2] = 0; cdb[3] = 0; cdb[4] = 0; cdb[5] = 0; /* LBA = 0 */
+    cdb[6] = (uint8_t)(huge_count >> 24);
+    cdb[7] = (uint8_t)(huge_count >> 16);
+    cdb[8] = (uint8_t)(huge_count >> 8);
+    cdb[9] = (uint8_t)huge_count;
+    hype_atapi_execute_cdb(&dev, cdb, &out);
+
+    CHECK_HEX("overflowing READ(12) -> CHECK_CONDITION, not GOOD-with-wrapped-length",
+             HYPE_ATAPI_STATUS_CHECK_CONDITION, out.status);
+    CHECK_HEX("sense key ILLEGAL_REQUEST", HYPE_ATAPI_SENSE_KEY_ILLEGAL_REQUEST, dev.sense_key);
+    CHECK_HEX("ASC INVALID_FIELD_IN_CDB", HYPE_ATAPI_ASC_INVALID_FIELD_IN_CDB, dev.asc);
+    CHECK_HEX("not counted as a completed transfer", 0, dev.read10_sectors_total);
+}
+
 static void test_diagnostic_counters(void) {
     hype_atapi_t dev;
     hype_atapi_result_t out;
@@ -647,6 +680,7 @@ int main(void) {
     test_build_identify_dma_words();
     test_read12_valid();
     test_read12_out_of_range();
+    test_read12_count_overflowing_media_length_refused();
     test_diagnostic_counters();
     test_read10_size_bucket_boundaries();
     test_read10_size_profile_accumulates();
