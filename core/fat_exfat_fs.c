@@ -96,16 +96,26 @@ static int fat_get(hype_exfat_fs_t *fs, uint32_t cl, uint32_t *out) {
  * fat_get() reads back, so a stale medium read can never resurrect an older
  * FAT entry within this mount. A write failure invalidates the cache instead
  * of leaving it holding a value that never reached the medium.
+ *
+ * plan.md decision 62: on a NumberOfFats == 2 volume, write the SAME complete
+ * sector to every FAT copy from this one authoritative image -- exactly
+ * core/fat_write_fs.c's fat_set() discipline for FAT32. Reading each copy
+ * independently before modifying it would let a stale medium read resurrect
+ * an older allocation map in the copy this mount is not actively reading.
  */
 static int fat_set(hype_exfat_fs_t *fs, uint32_t cl, uint32_t val) {
     uint32_t off = cl / FAT_ENTRIES_PER_SECTOR;
+    unsigned int copy;
     if (fat_cache_load(fs, off) != 0) {
         return -1;
     }
     hype_wr32(fs->fat_cache + (cl % FAT_ENTRIES_PER_SECTOR) * 4u, val);
-    if (fs->write(fs->ctx, (uint64_t)fs->fat_lba + off, 1u, fs->fat_cache) != 0) {
-        fs->fat_cache_valid = 0;
-        return -1;
+    for (copy = 0; copy < fs->num_fats; copy++) {
+        uint64_t slba = (uint64_t)fs->fat_base + (uint64_t)copy * fs->fat_length + off;
+        if (fs->write(fs->ctx, slba, 1u, fs->fat_cache) != 0) {
+            fs->fat_cache_valid = 0;
+            return -1;
+        }
     }
     return 0;
 }
@@ -868,8 +878,12 @@ int hype_exfat_fs_mount(hype_blk_read_fn read, hype_blk_write_fn write, void *ct
     hype_exfat_upcase_reset(&out->upcase);
 
     /* With two FATs, VolumeFlags bit 0 selects the live one; reading the stale
-     * copy would follow chains that no longer exist. */
-    out->fat_lba = hype_rd32(boot + 0x50);
+     * copy would follow chains that no longer exist. `fat_base` stays at copy
+     * 0 regardless -- decision 62's fat_set() writes every copy starting from
+     * there, independent of which one reads currently favour. */
+    out->fat_base = hype_rd32(boot + 0x50);
+    out->num_fats = num_fats;
+    out->fat_lba = out->fat_base;
     if (num_fats == 2u && (volume_flags & 0x0001u) != 0u) {
         out->fat_lba += out->fat_length;
     }

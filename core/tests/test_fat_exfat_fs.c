@@ -537,6 +537,10 @@ static void test_mount_critical_structures(void) {
 
 static void test_mount_two_fats(void) {
     unsigned s;
+    hype_exfat_wfile_t f;
+    static uint8_t data[1000];
+    unsigned i;
+
     build_vol();
     g_vol[0x6E] = 2;
     put16(g_vol + 0x6A, 0x0001u);          /* ActiveFat = 1 */
@@ -550,6 +554,28 @@ static void test_mount_two_fats(void) {
     CHECK_HEX("two-FAT mount picks the active FAT", 0,
               hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
     CHECK_HEX("active FAT is the second copy", FAT_LBA + FAT_LEN, g_fs.fat_lba);
+    CHECK_HEX("FAT copy 0's base is recorded regardless of which is active", FAT_LBA,
+              g_fs.fat_base);
+    CHECK_HEX("num_fats recorded", 2u, g_fs.num_fats);
+
+    /*
+     * plan.md decision 62: a mutation spanning two clusters (spc == 1, so
+     * 1000 bytes needs two FAT entries chained) must sync BOTH FAT copies
+     * from one authoritative image, not just the active one reads use.
+     * Before the fix, fat_set() wrote fat_lba only, and FAT copy 0 (the
+     * INACTIVE one here) would still show its pre-mutation zeros.
+     */
+    for (i = 0; i < sizeof data; i++) data[i] = pat(i);
+    CHECK_HEX("create ok", 0, hype_exfat_create(&g_fs, "twofats.bin", &f));
+    CHECK_HEX("append spanning two clusters", 0,
+              hype_exfat_append(&f, data, (unsigned)sizeof data));
+    CHECK("more than one cluster was allocated (spc == 1)", f.size > SECSZ);
+
+    CHECK_HEX("both FAT regions are byte-identical after the mutation", 0,
+              memcmp(g_vol + FAT_LBA * SECSZ, g_vol + (FAT_LBA + FAT_LEN) * SECSZ,
+                     FAT_LEN * SECSZ));
+    CHECK("the INACTIVE copy (FAT 0) shows the new chain too",
+          get32(g_vol + FAT_LBA * SECSZ + f.first_cluster * 4u) != 0u);
 }
 
 /* ---- create + append ---- */
