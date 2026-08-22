@@ -943,20 +943,73 @@ static int name_eq(const hype_exfat_fs_t *fs, const uint16_t *a, const uint16_t 
 }
 
 /*
+ * #644: entries a NON-CONTIGUOUS (FAT-chained) directory's current allocation actually holds,
+ * computed by walking its FAT chain to end-of-chain -- exFAT's counterpart of FAT32's
+ * dir_capacity (core/fat_write_fs.c:483). Every chained-directory walk below is bounded by this
+ * FIRST, so an entry_read() failure inside that bound can only be a genuine medium failure --
+ * "the allocation ends here" has already been accounted for by the bound itself, exactly the
+ * split dir_capacity gives the FAT32 walks. Returns -1 on an I/O error walking the chain, or a
+ * corrupt (looping / free / reserved / out-of-heap) chain.
+ */
+static int dir_capacity(hype_exfat_fs_t *fs, uint32_t first, uint64_t *out_entries) {
+    uint32_t entries_per_cluster = fs->spc * HYPE_EXFAT_ENTRIES_PER_SECTOR;
+    uint32_t cl = first;
+    uint64_t clusters = 0;
+    unsigned int guard = 0;
+
+    if (!cluster_valid(fs, cl)) {
+        return -1;
+    }
+    while (guard++ < WALK_GUARD) {
+        uint32_t next;
+        clusters++;
+        if (fat_get(fs, cl, &next) != 0) {
+            return -1; /* real I/O error */
+        }
+        if (next >= HYPE_EXFAT_EOC) {
+            *out_entries = clusters * (uint64_t)entries_per_cluster;
+            return 0;
+        }
+        if (!cluster_valid(fs, next)) {
+            return -1; /* free, reserved, bad, or out of the heap mid-chain */
+        }
+        cl = next;
+    }
+    return -1; /* the chain loops */
+}
+
+/*
  * Finds `name` in the directory starting at `dir_first`. Returns 1 and fills
  * *out_index / *set on a match, 0 if the directory ends without one, -1 on a
  * read error. Entry sets that fail validation are skipped -- a single corrupt
  * set must not hide the rest of the directory.
+ *
+ * #644: a NON-CONTIGUOUS directory's walk is bounded by dir_capacity() up front, so an
+ * entry_read() failure within that bound is unambiguously a real I/O error, never "ran off the
+ * end" -- the same conflation #390 fixed for FAT32's dir_find. A CONTIGUOUS directory has no
+ * chain to pre-measure; its terminator is always the 0x00 marker every mkdir()-created cluster is
+ * zeroed to carry (a run that ends by leaving the cluster heap is corruption, caught the same
+ * way). Either way, a read failure before that terminator is a real failure, not an empty
+ * directory or a missing name -- so create()/mkdir() cannot place a duplicate entry set, and
+ * rmdir() (via dir_is_empty, the same discipline) cannot free a directory that still has entries.
  */
 static int dir_find(hype_exfat_fs_t *fs, uint32_t dir_first, int dir_contig, const uint16_t *name,
                     unsigned int nlen, uint32_t *out_index, hype_exfat_set_t *set) {
     uint32_t ei = 0;
     unsigned int guard = 0;
+    uint64_t cap = 0;
+
+    if (!dir_contig && dir_capacity(fs, dir_first, &cap) != 0) {
+        return -1;
+    }
 
     while (guard++ < WALK_GUARD) {
         uint8_t ent[ENTSZ];
+        if (!dir_contig && (uint64_t)ei >= cap) {
+            return 0; /* legitimately past the end of a bounded, healthy chain */
+        }
         if (entry_read(fs, dir_first, dir_contig, ei, ent) != 0) {
-            return 0; /* ran off the end of the directory's allocation */
+            return -1; /* real I/O error: never "not found" */
         }
         if (ent[0] == 0x00u) {
             return 0;
@@ -1657,20 +1710,31 @@ int hype_exfat_mkdir(hype_exfat_fs_t *fs, const char *path) {
  * 1 == the directory holds no in-use entry of any type, 0 == something is
  * still there, -1 on a sector-read failure (which must not read as "empty":
  * removing a directory that still has entries orphans them). Bounded by the
- * allocation itself: DataLength for a NoFatChain directory, the FAT chain (with
- * the usual loop guard) otherwise.
+ * allocation itself: DataLength for a NoFatChain directory, the FAT chain
+ * (via dir_capacity(), #644) otherwise.
+ *
+ * #644: for a FAT-chained directory, `cap` used to be plain WALK_GUARD -- an arbitrary large
+ * bound, not the directory's real extent -- so an entry_lba() failure inside it could be either a
+ * genuine medium failure OR simply the point where fat_get() legitimately reached end-of-chain
+ * while walking towards an `ei` past the real capacity. Both read as "past the end of the
+ * allocation" (empty). Bounding by dir_capacity()'s WALKED chain length first removes the
+ * ambiguity: an entry_lba() failure inside that real bound can only be a genuine failure.
  */
 static int dir_is_empty(hype_exfat_fs_t *fs, uint32_t first, int contiguous, uint64_t size) {
-    uint64_t cap = contiguous
-                       ? clusters_for(fs, size) * (uint64_t)(fs->spc * HYPE_EXFAT_ENTRIES_PER_SECTOR)
-                       : (uint64_t)WALK_GUARD;
+    uint64_t cap;
     uint64_t ei;
+
+    if (contiguous) {
+        cap = clusters_for(fs, size) * (uint64_t)(fs->spc * HYPE_EXFAT_ENTRIES_PER_SECTOR);
+    } else if (dir_capacity(fs, first, &cap) != 0) {
+        return -1; /* #644: a real I/O error or a corrupt chain must never read as "empty" */
+    }
     for (ei = 0; ei < cap; ei++) {
         uint8_t sec[SECSZ];
         uint64_t lba;
         unsigned int off;
         if (entry_lba(fs, first, contiguous, (uint32_t)ei, &lba, &off) != 0) {
-            return 1; /* past the end of the allocation */
+            return -1; /* inside a validated bound, this can only be a real I/O error */
         }
         if (fs->read(fs->ctx, lba, 1u, sec) != 0) {
             return -1;
@@ -1682,7 +1746,7 @@ static int dir_is_empty(hype_exfat_fs_t *fs, uint32_t first, int contiguous, uin
             return 0;
         }
     }
-    return -1; /* the walk guard tripped: never treat a looping chain as empty */
+    return 1; /* the whole (correctly bounded) allocation is deleted slots: empty */
 }
 
 int hype_exfat_rmdir(hype_exfat_fs_t *fs, const char *path) {
