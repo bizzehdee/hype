@@ -1,5 +1,6 @@
 #include "ext_jalloc.h"
 #include "ext.h"
+#include "ext_csum.h"
 #include "lebytes.h"
 
 /* See ext_jalloc.h. The classic-map allocation logic deliberately parallels
@@ -16,6 +17,9 @@ typedef struct {
     uint64_t blocknr;
     int used;
     int dirty;
+    int is_extent; /* #495: a standalone (non-root) extent-tree node --
+                    * gets an et_checksum tail, unlike every other block
+                    * kind this cache ever holds */
     uint8_t data[4096];
 } extj_slot_t;
 static extj_slot_t g_cache[HYPE_EXTJ_CACHE];
@@ -36,6 +40,9 @@ static extj_slot_t g_cache[HYPE_EXTJ_CACHE];
 #define SB_FEATURE_RO_COMPAT 0x64u
 #define SB_JOURNAL_INUM 0xE0u
 #define SB_JOURNAL_DEV 0xE4u
+#define SB_UUID 0x68u           /* #495 */
+#define SB_CHECKSUM_TYPE 0x175u /* #495: only value 1 (crc32c) is defined */
+#define SB_CHECKSUM 0x3FCu      /* #495: also the byte count hashed before it */
 
 #define EXT_MAGIC 0xEF53u
 #define STATE_VALID 0x0001u
@@ -48,12 +55,19 @@ static extj_slot_t g_cache[HYPE_EXTJ_CACHE];
 #define INCOMPAT_64BIT 0x0080u
 #define INCOMPAT_FLEX_BG 0x0200u
 #define INCOMPAT_OK (INCOMPAT_FILETYPE | INCOMPAT_EXTENTS | INCOMPAT_FLEX_BG)
-#define RO_OK 0x006Bu /* SPARSE_SUPER|LARGE_FILE|HUGE_FILE|DIR_NLINK|EXTRA_ISIZE */
+#define RO_GDT_CSUM 0x0010u      /* #495: crc16 "uninit_bg" group-desc csum */
+#define RO_METADATA_CSUM 0x0400u /* #495: crc32c-seeded checksum family */
+#define RO_OK \
+    (0x006Bu | RO_GDT_CSUM | RO_METADATA_CSUM) /* SPARSE_SUPER|LARGE_FILE| \
+                                                 * HUGE_FILE|DIR_NLINK|EXTRA_ISIZE, \
+                                                 * plus the two above */
 
 /* group descriptor (32-byte, non-64bit) */
 #define GD_BLOCK_BITMAP 0x00u
 #define GD_INODE_TABLE 0x08u
 #define GD_FREE_BLOCKS 0x0Cu
+#define GD_BBITMAP_CSUM_LO 0x18u /* #495 */
+#define GD_CHECKSUM 0x1Eu        /* #495: also the byte count hashed before it */
 
 /* inode */
 #define IN_SIZE_LO 0x04u   /* #497 */
@@ -63,7 +77,11 @@ static extj_slot_t g_cache[HYPE_EXTJ_CACHE];
 #define IN_MTIME 0x10u
 #define IN_BLOCKS 0x1Cu
 #define IN_FLAGS 0x20u
+#define IN_GENERATION 0x64u /* #495 */
 #define IN_BLOCK 0x28u
+#define IN_CHECKSUM_LO 0x7Cu   /* #495: osd2.linux2.l_i_checksum_lo */
+#define IN_EXTRA_ISIZE 0x80u   /* #495 */
+#define IN_CHECKSUM_HI 0x82u   /* #495: only present if i_extra_isize >= 4 */
 #define FL_EXTENTS 0x00080000u
 #define MODE_FMT 0xF000u
 #define MODE_REG 0x8000u
@@ -71,6 +89,7 @@ static extj_slot_t g_cache[HYPE_EXTJ_CACHE];
 /* extent tree */
 #define EH_MAGIC 0xF30Au
 #define EE_UNWRIT 32768u
+#define EXT_TAIL_CHECKSUM 4u /* #495: struct ext4_extent_tail is one __le32 */
 
 #define JOURNAL_INO 8u
 
@@ -113,6 +132,7 @@ static extj_slot_t *cache_get(hype_extj_wfile_t *f, uint64_t blocknr) {
         s->blocknr = blocknr;
         s->used = 1;
         s->dirty = 0;
+        s->is_extent = 0;
         return s;
     }
 }
@@ -124,6 +144,67 @@ static void cache_reset(hype_extj_wfile_t *f) {
         g_cache[i].used = 0;
         g_cache[i].dirty = 0;
     }
+}
+
+/* ---- #495: metadata checksums ----
+ *
+ * Every function below writes its checksum directly into a cache slot's
+ * image, exactly like any other structural field this writer sets -- the
+ * checksum rides the same journal transaction as the bytes it covers,
+ * never a separate pass. See core/ext_csum.h for the crc32c/crc16
+ * conventions (raw, chainable, no final complement) these all rely on.
+ */
+
+/* The filesystem-level superblock checksum: crc32c(~0, sb, up to s_checksum). */
+static void sb_csum_finalize(hype_extj_wfile_t *f, extj_slot_t *sb, uint32_t sbo) {
+    uint32_t crc;
+    if (!f->has_metadata_csum) return;
+    crc = hype_ext_crc32c(0xFFFFFFFFu, sb->data + sbo, SB_CHECKSUM);
+    hype_wr32(sb->data + sbo + SB_CHECKSUM, crc);
+}
+
+/* The group descriptor's own checksum -- crc32c (METADATA_CSUM, zeroing the
+ * field into the hash) or crc16 (GDT_CSUM, excluding the field entirely).
+ * Recompute LAST, after every other byte of this one descriptor is final. */
+static void gd_csum_finalize(hype_extj_wfile_t *f, extj_slot_t *gd, uint32_t gd_off,
+                             uint32_t group) {
+    uint8_t grp_le[4];
+    hype_wr32(grp_le, group);
+    if (f->has_metadata_csum) {
+        uint32_t crc;
+        hype_wr16(gd->data + gd_off + GD_CHECKSUM, 0u);
+        crc = hype_ext_crc32c(f->csum_seed, grp_le, 4u);
+        crc = hype_ext_crc32c(crc, gd->data + gd_off, 32u);
+        hype_wr16(gd->data + gd_off + GD_CHECKSUM, (uint16_t)crc);
+    } else if (f->has_gdt_csum) {
+        uint16_t crc = hype_ext_crc16(0xFFFFu, f->uuid, 16u);
+        crc = hype_ext_crc16(crc, grp_le, 4u);
+        crc = hype_ext_crc16(crc, gd->data + gd_off, GD_CHECKSUM);
+        hype_wr16(gd->data + gd_off + GD_CHECKSUM, crc);
+    }
+}
+
+/* The block bitmap's own content checksum, stored (lo 16 bits only -- desc
+ * size is 32 bytes, the 64BIT hi half never exists) in the group
+ * descriptor. METADATA_CSUM only: GDT_CSUM has no bitmap-content checksum. */
+static void bitmap_csum_finalize(hype_extj_wfile_t *f, const extj_slot_t *bm, extj_slot_t *gd,
+                                 uint32_t gd_off) {
+    uint32_t crc;
+    if (!f->has_metadata_csum) return;
+    crc = hype_ext_crc32c(f->csum_seed, bm->data, f->block_size);
+    hype_wr16(gd->data + gd_off + GD_BBITMAP_CSUM_LO, (uint16_t)crc);
+}
+
+/* A standalone (non-root) extent-tree node's et_checksum tail: crc32c seeded
+ * with this file's i_csum_seed, over the header + every entry slot (used or
+ * not) up to the tail -- never the tail itself. */
+static void extent_csum_finalize(hype_extj_wfile_t *f, extj_slot_t *s) {
+    uint32_t eh_max = hype_rd16(s->data + 4);
+    uint32_t tail_off = 12u + eh_max * 12u;
+    uint32_t crc;
+    if (tail_off + EXT_TAIL_CHECKSUM > f->block_size) return; /* not a real extent block */
+    crc = hype_ext_crc32c(f->i_csum_seed, s->data, tail_off);
+    hype_wr32(s->data + tail_off, crc);
 }
 
 /*
@@ -139,6 +220,13 @@ static int txn_commit(hype_extj_wfile_t *f) {
 
     for (i = 0; i < HYPE_EXTJ_CACHE; i++) {
         if (g_cache[i].used && g_cache[i].dirty) {
+            /* #495: a dirty standalone extent-tree node's tail checksum is
+             * finalized here, once, right before its image is journaled --
+             * every earlier split/insert/convert on this node already
+             * happened, and nothing touches it again after this point. */
+            if (f->has_metadata_csum && g_cache[i].is_extent) {
+                extent_csum_finalize(f, &g_cache[i]);
+            }
             imgs[n].blocknr = g_cache[i].blocknr;
             imgs[n].data = g_cache[i].data;
             n++;
@@ -209,6 +297,7 @@ static int claim_block(hype_extj_wfile_t *f, uint64_t near, uint64_t *out) {
                 uint16_t freeb = hype_rd16(gd->data + gd_off + GD_FREE_BLOCKS);
                 bm->data[b / 8u] |= (uint8_t)(1u << (b % 8u));
                 bm->dirty = 1;
+                bitmap_csum_finalize(f, bm, gd, gd_off); /* #495: before GD_FREE_BLOCKS */
                 hype_wr16(gd->data + gd_off + GD_FREE_BLOCKS, (uint16_t)(freeb - 1u));
                 gd->dirty = 1;
                 /* superblock free count */
@@ -221,7 +310,10 @@ static int claim_block(hype_extj_wfile_t *f, uint64_t near, uint64_t *out) {
                     v = hype_rd32(sb->data + sbo + SB_FREE_BLOCKS);
                     hype_wr32(sb->data + sbo + SB_FREE_BLOCKS, v - 1u);
                     sb->dirty = 1;
+                    sb_csum_finalize(f, sb, sbo);
                 }
+                /* #495: last -- every other byte of this descriptor is final now */
+                gd_csum_finalize(f, gd, gd_off, group);
                 *out = base + b;
                 return 0;
             }
@@ -250,6 +342,29 @@ static void inode_add_blocks(hype_extj_wfile_t *f, uint32_t nblocks) {
         hype_wr32(s->data + off + IN_CTIME, f->mtime);
     }
     s->dirty = 1;
+}
+
+/* #495: the inode's own checksum -- i_checksum_lo always, i_checksum_hi
+ * when the inode is large enough to carry it. Zeroed for the hash, then
+ * set. Called once, right before commit, after every mutation this write
+ * made to the inode's image (size, block count, extent tree, ...). */
+static int inode_csum_finalize(hype_extj_wfile_t *f) {
+    uint32_t off;
+    extj_slot_t *s;
+    if (!f->has_metadata_csum) return 0;
+    s = inode_slot(f, &off);
+    if (s == 0) return -1;
+    if (!s->dirty) return 0; /* nothing this write touched */
+    {
+        int has_hi = f->inode_size > 128u && hype_rd16(s->data + off + IN_EXTRA_ISIZE) >= 4u;
+        uint32_t crc;
+        hype_wr16(s->data + off + IN_CHECKSUM_LO, 0u);
+        if (has_hi) hype_wr16(s->data + off + IN_CHECKSUM_HI, 0u);
+        crc = hype_ext_crc32c(f->i_csum_seed, s->data + off, f->inode_size);
+        hype_wr16(s->data + off + IN_CHECKSUM_LO, (uint16_t)crc);
+        if (has_hi) hype_wr16(s->data + off + IN_CHECKSUM_HI, (uint16_t)(crc >> 16));
+    }
+    return 0;
 }
 
 /*
@@ -476,6 +591,7 @@ static int epath_find(hype_extj_wfile_t *f, uint64_t lb, epath_t *path, uint32_t
         if (child == 0u || child >= f->blocks_count) return -1;
         path[d + 1u].slot = cache_get(f, child);
         if (path[d + 1u].slot == 0) return -1;
+        path[d + 1u].slot->is_extent = 1; /* #495: a standalone node, unlike path[0] */
         path[d + 1u].base = 0;
         if (hype_rd16(path[d + 1u].slot->data) != EH_MAGIC) return -1;
         if (node_depth(&path[d + 1u]) != depth - d - 1u) return -1;
@@ -513,6 +629,7 @@ static int leaf_make_room(hype_extj_wfile_t *f, uint64_t lb, epath_t *path, uint
         if (media_zero_block(f, nb) != 0) return -1;
         ns = cache_get(f, nb);
         if (ns == 0) return -1;
+        ns->is_extent = 1; /* #495 */
         bzero8(ns->data, f->block_size);
         /* the new node inherits every root entry, same depth as the root had */
         hype_wr16(ns->data + 0, EH_MAGIC);
@@ -551,6 +668,7 @@ static int leaf_make_room(hype_extj_wfile_t *f, uint64_t lb, epath_t *path, uint
         if (media_zero_block(f, nb) != 0) return -1;
         ns = cache_get(f, nb);
         if (ns == 0) return -1;
+        ns->is_extent = 1; /* #495 */
         bzero8(ns->data, f->block_size);
         hype_wr16(ns->data + 0, EH_MAGIC);
         hype_wr16(ns->data + 2, (uint16_t)(cnt - keep));
@@ -718,7 +836,14 @@ int hype_extj_open_rw(hype_blk_read_fn read, hype_blk_write_fn write, void *ctx,
     if (incompat & INCOMPAT_RECOVER) return -1;    /* unreplayed journal */
     if (incompat & INCOMPAT_JOURNAL_DEV) return -1;
     if (incompat & ~INCOMPAT_OK) return -1;        /* 64BIT, META_BG, bigalloc-adjacent, ... */
-    if (rocompat & ~RO_OK) return -1;              /* incl. GDT_CSUM/METADATA_CSUM/BIGALLOC */
+    if (rocompat & ~RO_OK) return -1;              /* incl. BIGALLOC */
+    out->has_gdt_csum = (rocompat & RO_GDT_CSUM) ? 1 : 0;
+    out->has_metadata_csum = (rocompat & RO_METADATA_CSUM) ? 1 : 0;
+    if (out->has_metadata_csum && sb[SB_CHECKSUM_TYPE] != 1u) {
+        return -1; /* #495: the spec defines no algorithm but crc32c */
+    }
+    bcopy8(out->uuid, sb + SB_UUID, 16u);
+    out->csum_seed = out->has_metadata_csum ? hype_ext_crc32c(0xFFFFFFFFu, out->uuid, 16u) : 0u;
     state = hype_rd16(sb + SB_STATE);
     if ((state & STATE_VALID) == 0u || (state & STATE_ERROR) != 0u) return -1;
     log_bs = hype_rd32(sb + SB_LOG_BLOCK_SIZE);
@@ -772,6 +897,15 @@ int hype_extj_open_rw(hype_blk_read_fn read, hype_blk_write_fn write, void *ctx,
         if (read(ctx, out->inode_byte / SECSZ, 1u, sec) != 0) return -1;
         out->is_extents = (hype_rd32(sec + out->inode_byte % SECSZ + IN_FLAGS) & FL_EXTENTS) ? 1 : 0;
         if ((hype_rd16(sec + out->inode_byte % SECSZ + IN_MODE) & MODE_FMT) != MODE_REG) return -1;
+        if (out->has_metadata_csum) {
+            /* #495: this file's checksum seed -- the inode's own checksum and
+             * its extent-tree tail checksums both key off this one value. */
+            uint8_t inum_le[4];
+            hype_wr32(inum_le, out->ino);
+            out->i_csum_seed = hype_ext_crc32c(out->csum_seed, inum_le, 4u);
+            out->i_csum_seed = hype_ext_crc32c(
+                out->i_csum_seed, sec + out->inode_byte % SECSZ + IN_GENERATION, 4u);
+        }
     }
     cache_reset(out);
     return 0;
@@ -976,6 +1110,7 @@ int hype_extj_write_at(hype_extj_wfile_t *f, uint64_t offset, const void *data,
         if (inode_set_size(f, end) != 0) return -1;
     }
 
+    if (inode_csum_finalize(f) != 0) return -1; /* #495: last touch on the inode's image */
     if (txn_commit(f) != 0) return -1;
     cache_reset(f);
     if (grow) {

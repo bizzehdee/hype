@@ -29,11 +29,17 @@
  * ext2 writer's case), an EXTERNAL journal, a NON-EMPTY journal (a crashed
  * writer's transactions await replay: fsck/mount on a real OS recovers, hype
  * never guesses), unsupported journal features (64-bit, checksummed, async
- * or fast commit), bigalloc, 64-bit block numbers, META_BG, and any
- * checksummed-metadata volume (GDT_CSUM / METADATA_CSUM: hype must not
- * write structures whose checksums it does not maintain -- supporting them
- * is an explicit follow-on). Refused per write: a transaction that would
- * exceed the fixed journal-credit bound (HYPE_JBD2_MAX_BLOCKS images).
+ * or fast commit), bigalloc, 64-bit block numbers, and META_BG. Refused per
+ * write: a transaction that would exceed the fixed journal-credit bound
+ * (HYPE_JBD2_MAX_BLOCKS images).
+ *
+ * #495: GDT_CSUM (crc16 "uninit_bg") and METADATA_CSUM (crc32c, seeded from
+ * the FS UUID) volumes are supported -- every structure this writer ever
+ * mutates (superblock, group descriptor, block bitmap, inode, extent-tree
+ * blocks) has its checksum recomputed inside the same transaction, before
+ * the image is handed to jbd2. A METADATA_CSUM volume whose s_checksum_type
+ * is not the one defined value (crc32c) is still refused: hype does not
+ * guess at an algorithm the spec does not define.
  */
 
 #define HYPE_EXTJ_CACHE 24u /* == HYPE_JBD2_MAX_BLOCKS: one image per slot */
@@ -60,6 +66,14 @@ typedef struct {
     uint32_t mtime;
     hype_jbd2_t journal;
     hype_file_rmap_t map;
+    /* #495: metadata-checksum state */
+    int has_gdt_csum;      /* RO_COMPAT_GDT_CSUM: crc16 group-desc checksum */
+    int has_metadata_csum; /* RO_COMPAT_METADATA_CSUM: crc32c-seeded family */
+    uint8_t uuid[16];      /* s_uuid -- the crc16 (GDT_CSUM) path rehashes it */
+    uint32_t csum_seed;    /* crc32c(~0, uuid) -- the METADATA_CSUM fs seed */
+    uint32_t i_csum_seed;  /* seed chained with THIS inode's number+generation:
+                            * the inode's own checksum and its extent-tree
+                            * tail checksums both key off this one value */
     /* the transaction block cache is a module-static single instance
      * (ext_jalloc.c): the writer is BSP-serialized, one transaction ever in
      * flight, and 96 KiB per handle would bloat every hype_fs_file_t */
