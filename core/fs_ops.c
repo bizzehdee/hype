@@ -351,6 +351,9 @@ static int exfat_sync(hype_fs_t *fs) {
 static void exfat_set_time(hype_fs_t *fs, const hype_rtc_time_t *now) {
     hype_exfat_fs_set_time(&fs->u.exfat, now);
 }
+static void exfat_set_barrier(hype_fs_t *fs, hype_blk_sync_fn sync) {
+    hype_exfat_fs_set_sync(&fs->u.exfat, sync);
+}
 
 static const hype_fs_ops_t exfat_ops = {
     "exfat",
@@ -370,7 +373,7 @@ static const hype_fs_ops_t exfat_ops = {
     exfat_rename,
     exfat_sync,
     exfat_set_time,
-    0, /* set_barrier: the exFAT writer orders its own commits */
+    exfat_set_barrier, /* #648: exFAT publishes DataLength durably too */
 };
 
 /* ---------------- ext2/3/4 ---------------- */

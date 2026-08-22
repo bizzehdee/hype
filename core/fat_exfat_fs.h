@@ -66,6 +66,7 @@
 typedef struct {
     hype_blk_read_fn read;
     hype_blk_write_fn write;
+    hype_blk_sync_fn sync; /* optional persistence barrier (#648) */
     void *ctx;
     uint64_t volume_length; /* total sectors, from the boot sector */
     uint32_t fat_lba;       /* first sector of the ACTIVE FAT */
@@ -117,6 +118,10 @@ typedef struct {
  */
 int hype_exfat_fs_mount(hype_blk_read_fn read, hype_blk_write_fn write, void *ctx,
                         hype_exfat_fs_t *out);
+
+/* Install an optional persistence barrier (#648). The exFAT writer invokes it
+ * around an entry-set commit only when that call extended the allocation. */
+void hype_exfat_fs_set_sync(hype_exfat_fs_t *fs, hype_blk_sync_fn sync);
 
 /*
  * Resolves `path` ('\\' or '/' separated, case-insensitive via the volume's

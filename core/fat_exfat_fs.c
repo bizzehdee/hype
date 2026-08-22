@@ -171,6 +171,12 @@ int hype_exfat_fs_sync(hype_exfat_fs_t *fs) {
     return 0;
 }
 
+void hype_exfat_fs_set_sync(hype_exfat_fs_t *fs, hype_blk_sync_fn sync) {
+    if (fs != (hype_exfat_fs_t *)0) {
+        fs->sync = sync;
+    }
+}
+
 /*
  * Allocates one free cluster: claims its bitmap bit, marks its FAT entry
  * end-of-chain, and advances the search hint. Scans the bitmap a sector at a
@@ -398,12 +404,26 @@ static int set_read(hype_exfat_fs_t *fs, uint32_t dir_first, int dir_contig, uin
     return 0;
 }
 
-/* Rewrites the stream entry's allocation fields and the set's checksum. */
-static int set_flush(hype_exfat_wfile_t *f) {
+/*
+ * Rewrites the stream entry's allocation fields and the set's checksum.
+ *
+ * #648: `durable` is set by the caller exactly when this call extended the
+ * allocation -- a new cluster's FAT link must be durable BEFORE the entry set
+ * that exposes it commits (plan.md decision 56, the same ordering #377 gave
+ * FAT32's flush_metadata). The barrier brackets the whole entry-set update:
+ * once before the first write, once after the last, matching
+ * core/fat_write_fs.c:405-408 and :439. A call that only advances
+ * ValidDataLength inside an already-published allocation stays non-durable.
+ */
+static int set_flush(hype_exfat_wfile_t *f, int durable) {
     hype_exfat_fs_t *fs = f->fs;
     uint8_t ent[ENTSZ];
     uint16_t sum = 0u;
     unsigned int k;
+
+    if (durable && fs->sync != (hype_blk_sync_fn)0 && fs->sync(fs->ctx) != 0) {
+        return -1;
+    }
 
     /* set_read (via lookup) and create both establish that set_index + 1 is this
      * set's Stream Extension entry before a handle exists at all. */
@@ -431,7 +451,13 @@ static int set_flush(hype_exfat_wfile_t *f) {
         return -1;
     }
     hype_exfat_file_entry_set_checksum(ent, sum);
-    return entry_write(fs, f->dir_cluster, f->dir_contiguous, f->set_index, ent);
+    if (entry_write(fs, f->dir_cluster, f->dir_contiguous, f->set_index, ent) != 0) {
+        return -1;
+    }
+    if (durable && fs->sync != (hype_blk_sync_fn)0 && fs->sync(fs->ctx) != 0) {
+        return -1;
+    }
+    return 0;
 }
 
 /* ---- mount ---- */
@@ -550,6 +576,7 @@ int hype_exfat_fs_mount(hype_blk_read_fn read, hype_blk_write_fn write, void *ct
 
     out->read = read;
     out->write = write;
+    out->sync = (hype_blk_sync_fn)0;
     out->ctx = ctx;
     out->volume_length = hype_rd64(boot + 0x48);
     out->fat_length = hype_rd32(boot + 0x54);
@@ -840,7 +867,10 @@ static int dirref_flush(hype_exfat_fs_t *fs, const dirref_t *d) {
     f.first_cluster = d->first;
     f.size = d->size;
     f.contiguous = d->contiguous;
-    return set_flush(&f);
+    /* A directory's own allocation growth is out of #648's scope (the ticket
+     * covers file DataLength publication); non-durable preserves prior
+     * behaviour here. */
+    return set_flush(&f, 0);
 }
 
 /* ---- path handling ----
@@ -1720,9 +1750,12 @@ int hype_exfat_write_at(hype_exfat_wfile_t *f, uint64_t offset, const void *data
     }
 
     /* 4. Publish: DataLength + ValidDataLength + first cluster + checksum in
-     *    one entry-set update, after the bytes are on the medium. */
+     *    one entry-set update, after the bytes are on the medium. #648:
+     *    durable exactly when this call allocated a cluster (first_new != 0) --
+     *    a call that only advances ValidDataLength inside the existing
+     *    allocation needs no barrier. */
     f->valid = end;
-    if (set_flush(f) != 0) {
+    if (set_flush(f, first_new != 0u) != 0) {
         goto rollback;
     }
     return 0;
@@ -1751,7 +1784,13 @@ rollback:
     f->contiguous = (old_contig && first_new == 0u) ? old_contig : f->contiguous;
     f->seek_index = 0u;
     f->seek_cluster = f->first_cluster;
-    if (set_flush(f) != 0) {
+    /*
+     * #648/#517 (mirrors core/fat_write_fs.c:1366-1374's growth_rollback): the restore must not
+     * depend on the barrier. A persistently failing barrier must not stop the entry set from being
+     * pushed back to its old, safe shape -- shrinking never reaches a cluster the medium has not
+     * already linked, so it needs no preceding barrier.
+     */
+    if (set_flush(f, 0) != 0) {
         g_exfat_rollback_failures++;
     }
     /*
@@ -1894,6 +1933,8 @@ int hype_exfat_append(hype_exfat_wfile_t *f, const void *data, unsigned int len)
     hype_exfat_fs_t *fs = f->fs;
     const uint8_t *src = (const uint8_t *)data;
     uint64_t cb = cluster_bytes(fs);
+    int grew = 0; /* #648: did THIS call allocate a cluster? -> the entry-set
+                   * publication that follows needs a durability barrier. */
 
     if (fs->write == 0 || f->is_dir) {
         return -1;
@@ -1919,6 +1960,7 @@ int hype_exfat_append(hype_exfat_wfile_t *f, const void *data, unsigned int len)
             f->contiguous = 0u;
             f->seek_index = 0u;
             f->seek_cluster = cl;
+            grew = 1;
         } else if (within == 0u) {
             /* The last cluster is exactly full: extend the chain. */
             uint32_t cl;
@@ -1935,6 +1977,7 @@ int hype_exfat_append(hype_exfat_wfile_t *f, const void *data, unsigned int len)
                 return -1;
             }
             f->tail_cluster = cl;
+            grew = 1;
         } else if (resolve_tail(f) != 0) {
             return -1;
         }
@@ -1963,7 +2006,7 @@ int hype_exfat_append(hype_exfat_wfile_t *f, const void *data, unsigned int len)
         f->size += n;
     }
     f->valid = f->size; /* an append writes every byte through the new end */
-    return set_flush(f);
+    return set_flush(f, grew);
 }
 
 void hype_exfat_fs_set_time(hype_exfat_fs_t *fs, const hype_rtc_time_t *now) {

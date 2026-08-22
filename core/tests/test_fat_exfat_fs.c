@@ -69,6 +69,10 @@ static long g_write_countdown = -1;
 static long g_dir_writes_allowed = -1;
 static uint64_t g_dir_write_lba;
 static long g_dir_writes_seen;
+/* #648: durability-barrier instrumentation, mirroring test_fat_write_fs.c's vol_sync. */
+static unsigned int g_sync_calls;
+static long g_sync_countdown = -1;
+static int g_sync_hardfail; /* once the countdown fires, every later barrier fails too */
 
 static int vol_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
     (void)ctx;
@@ -88,6 +92,15 @@ static int vol_write(void *ctx, uint64_t lba, uint32_t count, const void *src) {
         g_dir_writes_seen++;
     }
     memcpy(g_vol + lba * SECSZ, src, (size_t)count * SECSZ);
+    return 0;
+}
+static int vol_sync(void *ctx) {
+    (void)ctx;
+    g_sync_calls++;
+    if (g_sync_countdown >= 0 && g_sync_countdown-- == 0) {
+        if (g_sync_hardfail) g_sync_countdown = 0; /* stay failing */
+        return -1;
+    }
     return 0;
 }
 
@@ -2043,8 +2056,156 @@ static void test_rollback_never_frees_under_a_published_larger_size(void) {
               (unsigned)(claimed <= (uint64_t)walked * SECSZ));
 }
 
+/*
+ * #648: exFAT had no durability barrier at all -- set_flush() published DataLength straight after
+ * the data write returned, with no ordering guarantee that the preceding FAT link (or the data
+ * itself) reached the medium first. plan.md decision 56 requires that ordering; FAT32 already has
+ * it (core/fat_write_fs.c:405-408, :439). This checks the barrier is issued exactly where it
+ * should be -- bracketing an entry-set publish that extended the allocation -- and nowhere else.
+ */
+static void test_cluster_growth_uses_durability_barriers(void) {
+    hype_exfat_wfile_t f;
+    uint8_t data[700];
+    unsigned int i;
+
+    for (i = 0; i < sizeof data; i++) data[i] = pat(i);
+
+    build_vol();
+    CHECK_HEX("durable mount", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    hype_exfat_fs_set_sync(&g_fs, vol_sync);
+    g_sync_calls = 0u;
+
+    /* create() never allocates a data cluster (empty files start at first_cluster
+     * == 0), so it must not touch the barrier at all. */
+    CHECK_HEX("durable create", 0, hype_exfat_create(&g_fs, "DUR.LOG", &f));
+    CHECK_HEX("create issues no barrier", 0u, g_sync_calls);
+
+    /* First append allocates the file's first cluster: durable publish, two
+     * barrier calls (before the entry-set update, and after it). */
+    CHECK_HEX("first append allocates the initial cluster", 0, hype_exfat_append(&f, data, 400u));
+    CHECK_HEX("initial cluster publication is bracketed", 2u, g_sync_calls);
+
+    /* Second append stays inside the already-allocated cluster (400+100 < 512):
+     * no new allocation, so no barrier. */
+    CHECK_HEX("append inside the same cluster", 0, hype_exfat_append(&f, data + 400u, 100u));
+    CHECK_HEX("no new allocation, no barrier", 2u, g_sync_calls);
+
+    /* Third append crosses the cluster boundary (500 + 200 > 512): a new
+     * cluster is linked, so the publish is durable again. */
+    CHECK_HEX("append across cluster boundary", 0, hype_exfat_append(&f, data + 500u, 200u));
+    CHECK_HEX("cluster extension brackets the publish", 4u, g_sync_calls);
+    CHECK_HEX("extended file size committed", 700u, f.size);
+
+    /* An in-place write wholly inside ValidDataLength never reaches set_flush
+     * at all (file_rw_at only) -- confirm it therefore never reaches the
+     * barrier either. */
+    CHECK_HEX("in-place write inside VDL", 0, hype_exfat_write_at(&f, 0, data, 10u));
+    CHECK_HEX("in-place write issues no barrier", 4u, g_sync_calls);
+
+    /*
+     * A failed PRE-publish barrier must leave the on-disk DataLength inside the
+     * already-durable allocation: set_flush() checks the barrier before it writes
+     * anything, so a failure there must not touch the medium at all.
+     */
+    build_vol();
+    CHECK_HEX("remount barrier-failure volume", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    hype_exfat_fs_set_sync(&g_fs, vol_sync);
+    CHECK_HEX("create before barrier failure", 0, hype_exfat_create(&g_fs, "FAIL.LOG", &f));
+    CHECK_HEX("seed within one cluster", 0, hype_exfat_append(&f, data, 400u));
+    g_sync_countdown = 0;
+    CHECK("extension surfaces failed persistence barrier",
+          hype_exfat_append(&f, data + 400u, 200u) != 0);
+    g_sync_countdown = -1;
+    {
+        const uint8_t *root = cluster(g_root);
+        unsigned int e;
+        uint64_t claimed = (uint64_t)-1;
+        for (e = 0; e < SECSZ / 32u; e++) {
+            if (root[e * 32u] == HYPE_EXFAT_ENT_STREAM) {
+                claimed = get64(root + e * 32u + 24);
+                break;
+            }
+        }
+        CHECK_HEX("failed barrier did not publish a larger size", 1u,
+                  (unsigned)(claimed <= 400u));
+    }
+    hype_exfat_fs_set_sync(&g_fs, 0); /* NULL sync is safe */
+}
+
+/*
+ * #648: the harder case -- the barrier that PRECEDES the entry-set write succeeds (so the bigger
+ * DataLength really does reach the medium), and every barrier after it fails and keeps failing,
+ * exactly as #516 found a real stick do. write_at's rollback must still leave the on-disk entry
+ * set claiming no more than its chain holds; and when the restore write ITSELF cannot land either
+ * (the directory sector is out of allowed writes), hype_exfat_write_rollback_failures() must say so
+ * rather than the volume silently looking clean.
+ */
+static void test_persistent_barrier_failure_never_leaves_entry_past_chain(void) {
+    hype_exfat_wfile_t f;
+    static uint8_t data[900];
+    unsigned int i;
+    unsigned long long before;
+    uint64_t claimed;
+    uint32_t cl, walked;
+
+    for (i = 0; i < sizeof data; i++) data[i] = pat(i);
+
+    build_vol();
+    CHECK_HEX("hardfail mount", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    hype_exfat_fs_set_sync(&g_fs, vol_sync);
+    CHECK_HEX("hardfail create", 0, hype_exfat_create(&g_fs, "SYNCDEAD.BIN", &f));
+    CHECK_HEX("seed 400 while barriers work", 0, hype_exfat_write_at(&f, 0, data, 400u));
+
+    /*
+     * Allow exactly the two directory writes the growing publish itself makes (the Stream entry,
+     * then the File entry carrying the checksum) -- the SAME window #517's test uses -- and let the
+     * barrier succeed once (so those writes are the ones that land) and fail forever after,
+     * covering the restore too.
+     */
+    g_dir_write_lba = clba(g_root);
+    g_dir_writes_seen = 0;
+    g_dir_writes_allowed = 2;
+    g_sync_countdown = 1;
+    g_sync_hardfail = 1;
+    before = hype_exfat_write_rollback_failures();
+    CHECK("growing write reports failure", hype_exfat_write_at(&f, 0, data, sizeof data) != 0);
+    g_sync_countdown = -1;
+    g_sync_hardfail = 0;
+    g_dir_writes_allowed = -1;
+
+    CHECK("a restore that cannot reach the medium is counted, not hidden",
+          hype_exfat_write_rollback_failures() > before);
+
+    claimed = 0;
+    cl = 0;
+    {
+        const uint8_t *root = cluster(g_root);
+        unsigned int e;
+        for (e = 0; e < SECSZ / 32u; e++) {
+            if (root[e * 32u] == HYPE_EXFAT_ENT_STREAM) {
+                claimed = get64(root + e * 32u + 24);
+                cl = get32(root + e * 32u + 20);
+                break;
+            }
+        }
+    }
+    CHECK("hardfail found the stream extension entry", cl != 0u);
+    walked = 0;
+    while (cl >= 2u && cl < 0xFFFFFFF7u && walked < 64u) {
+        uint32_t next = fat_get(cl);
+        walked++;
+        if (next >= 0xFFFFFFF7u || next < 2u) break;
+        cl = next;
+    }
+    CHECK("hardfail chain terminates", walked < 64u);
+    CHECK_HEX("entry never claims more than the chain holds", 1u,
+              (unsigned)(claimed <= (uint64_t)walked * SECSZ));
+}
+
 int main(void) {
     test_rollback_never_frees_under_a_published_larger_size(); /* #517 */
+    test_cluster_growth_uses_durability_barriers();               /* #648 */
+    test_persistent_barrier_failure_never_leaves_entry_past_chain(); /* #648 */
     test_fs_ops_exfat();
     test_383_vdl();
     test_383_rollback_and_faults();
