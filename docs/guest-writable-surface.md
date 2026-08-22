@@ -117,20 +117,18 @@ instead of a read.
 
 ## Summary
 
-- **Surfaces enumerated: 27** (rows above, counting each distinct
-  guest-writable field/structure once; several share one underlying check
-  function where the code itself treats them as one unit, e.g. the three
-  AHCI DMA structures).
-- **Check + test already proven: 20.**
-- **Check present, test missing → defect ticket filed: 7**, covering 4
-  tickets (some tickets bundle multiple rows that share one root cause —
-  the same untested function, or the same "lives in an unlinked file"
-  structural gap):
-  - [#663](https://github.com/bizzehdee/hype/issues/663) — AHCI command-list/PRDT/FIS (3 rows)
+- **Surfaces enumerated: 33** (rows across the six tables above; each row is
+  one distinct guest-writable field/structure, even where several rows share
+  one underlying check function, e.g. the three AHCI DMA structures).
+- **Check + test already proven: 22.**
+- **Check present, test missing → defect ticket filed: 10 rows**, covering 4
+  tickets (each ticket bundles the rows that share one root cause — the same
+  untested function, or the same "lives in an unlinked file" structural gap):
+  - [#663](https://github.com/bizzehdee/hype/issues/663) — AHCI command-list/command-table+PRDT/received-FIS (3 rows)
   - [#665](https://github.com/bizzehdee/hype/issues/665) — xHCI rings/DCBAA (1 row)
-  - [#667](https://github.com/bizzehdee/hype/issues/667) — fw_cfg DMA + kvmclock MSR writes (4 rows)
-  - [#669](https://github.com/bizzehdee/hype/issues/669) — NVMe guest-memory callback + ramfb GPA translation (2 rows)
-- **No check needed (no guest-memory access at all):** ACPI PM1a_CNT.
+  - [#667](https://github.com/bizzehdee/hype/issues/667) — fw_cfg DMA access-struct+data-buffer, kvmclock system-time+wall-clock MSR writes (4 rows)
+  - [#669](https://github.com/bizzehdee/hype/issues/669) — NVMe guest-memory callback, ramfb GPA translation (2 rows)
+- **No check needed (no guest-memory access at all): 1** — ACPI PM1a_CNT.
 
 Every gap above is a *missing regression test* for a check that already
 looks correct by inspection, not a known-broken bounds check. #602's
