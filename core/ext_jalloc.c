@@ -43,6 +43,8 @@ static extj_slot_t g_cache[HYPE_EXTJ_CACHE];
 #define SB_UUID 0x68u           /* #495 */
 #define SB_CHECKSUM_TYPE 0x175u /* #495: only value 1 (crc32c) is defined */
 #define SB_CHECKSUM 0x3FCu      /* #495: also the byte count hashed before it */
+#define SB_DESC_SIZE 0xFEu      /* #496: s_desc_size, present under 64BIT */
+#define SB_BLOCKS_COUNT_HI 0x150u /* #496: s_blocks_count_hi, under 64BIT */
 
 #define EXT_MAGIC 0xEF53u
 #define STATE_VALID 0x0001u
@@ -54,7 +56,7 @@ static extj_slot_t g_cache[HYPE_EXTJ_CACHE];
 #define INCOMPAT_EXTENTS 0x0040u
 #define INCOMPAT_64BIT 0x0080u
 #define INCOMPAT_FLEX_BG 0x0200u
-#define INCOMPAT_OK (INCOMPAT_FILETYPE | INCOMPAT_EXTENTS | INCOMPAT_FLEX_BG)
+#define INCOMPAT_OK (INCOMPAT_FILETYPE | INCOMPAT_EXTENTS | INCOMPAT_FLEX_BG | INCOMPAT_64BIT)
 #define RO_GDT_CSUM 0x0010u      /* #495: crc16 "uninit_bg" group-desc csum */
 #define RO_METADATA_CSUM 0x0400u /* #495: crc32c-seeded checksum family */
 #define RO_OK \
@@ -62,12 +64,17 @@ static extj_slot_t g_cache[HYPE_EXTJ_CACHE];
                                                  * HUGE_FILE|DIR_NLINK|EXTRA_ISIZE, \
                                                  * plus the two above */
 
-/* group descriptor (32-byte, non-64bit) */
+/* group descriptor -- 32 bytes always present; 64-and-up (#496, under
+ * INCOMPAT_64BIT with s_desc_size >= 64) adds the _HI fields below. */
 #define GD_BLOCK_BITMAP 0x00u
 #define GD_INODE_TABLE 0x08u
 #define GD_FREE_BLOCKS 0x0Cu
 #define GD_BBITMAP_CSUM_LO 0x18u /* #495 */
 #define GD_CHECKSUM 0x1Eu        /* #495: also the byte count hashed before it */
+#define GD_BLOCK_BITMAP_HI 0x20u /* #496 */
+#define GD_INODE_TABLE_HI 0x28u  /* #496 */
+#define GD_FREE_BLOCKS_HI 0x2Cu  /* #496 */
+#define GD_BBITMAP_CSUM_HI 0x38u /* #496: METADATA_CSUM only, desc_size >= 64 */
 
 /* inode */
 #define IN_SIZE_LO 0x04u   /* #497 */
@@ -165,34 +172,56 @@ static void sb_csum_finalize(hype_extj_wfile_t *f, extj_slot_t *sb, uint32_t sbo
 
 /* The group descriptor's own checksum -- crc32c (METADATA_CSUM, zeroing the
  * field into the hash) or crc16 (GDT_CSUM, excluding the field entirely).
- * Recompute LAST, after every other byte of this one descriptor is final. */
+ * Recompute LAST, after every other byte of this one descriptor is final.
+ *
+ * #496: once desc_size > 32 (INCOMPAT_64BIT), the hash does not stop at
+ * byte 32 -- it continues over the added high-half bytes too. Verified
+ * against the kernel's fs/ext4/super.c ext4_group_desc_csum(): both the
+ * crc32c and crc16 paths hash [0, offsetof(bg_checksum)) + a stand-in for
+ * the (zeroed or skipped) checksum field itself, then -- if desc_size still
+ * has bytes left after that -- the remaining [0x20, desc_size) tail. Get
+ * this wrong and the descriptor's OWN bytes are right but its checksum is
+ * not, which e2fsck reports as corruption even though nothing was
+ * truncated. */
 static void gd_csum_finalize(hype_extj_wfile_t *f, extj_slot_t *gd, uint32_t gd_off,
                              uint32_t group) {
     uint8_t grp_le[4];
+    uint32_t tail_off = GD_CHECKSUM + 2u; /* 0x20: past the 2-byte checksum field */
     hype_wr32(grp_le, group);
     if (f->has_metadata_csum) {
         uint32_t crc;
         hype_wr16(gd->data + gd_off + GD_CHECKSUM, 0u);
         crc = hype_ext_crc32c(f->csum_seed, grp_le, 4u);
         crc = hype_ext_crc32c(crc, gd->data + gd_off, 32u);
+        if (f->desc_size > tail_off) {
+            crc = hype_ext_crc32c(crc, gd->data + gd_off + tail_off, f->desc_size - tail_off);
+        }
         hype_wr16(gd->data + gd_off + GD_CHECKSUM, (uint16_t)crc);
     } else if (f->has_gdt_csum) {
         uint16_t crc = hype_ext_crc16(0xFFFFu, f->uuid, 16u);
         crc = hype_ext_crc16(crc, grp_le, 4u);
         crc = hype_ext_crc16(crc, gd->data + gd_off, GD_CHECKSUM);
+        if (f->desc_size > tail_off) {
+            crc = hype_ext_crc16(crc, gd->data + gd_off + tail_off, f->desc_size - tail_off);
+        }
         hype_wr16(gd->data + gd_off + GD_CHECKSUM, crc);
     }
 }
 
-/* The block bitmap's own content checksum, stored (lo 16 bits only -- desc
- * size is 32 bytes, the 64BIT hi half never exists) in the group
- * descriptor. METADATA_CSUM only: GDT_CSUM has no bitmap-content checksum. */
+/* The block bitmap's own content checksum, stored in the group descriptor.
+ * METADATA_CSUM only: GDT_CSUM has no bitmap-content checksum. #496: the low
+ * 16 bits always go in GD_BBITMAP_CSUM_LO; once desc_size >= 64 the upper 16
+ * bits of the crc32c also exist (GD_BBITMAP_CSUM_HI) and must be written --
+ * verified against the kernel's fs/ext4/bitmap.c ext4_block_bitmap_csum_set(). */
 static void bitmap_csum_finalize(hype_extj_wfile_t *f, const extj_slot_t *bm, extj_slot_t *gd,
                                  uint32_t gd_off) {
     uint32_t crc;
     if (!f->has_metadata_csum) return;
     crc = hype_ext_crc32c(f->csum_seed, bm->data, f->block_size);
     hype_wr16(gd->data + gd_off + GD_BBITMAP_CSUM_LO, (uint16_t)crc);
+    if (f->desc_size >= 64u) {
+        hype_wr16(gd->data + gd_off + GD_BBITMAP_CSUM_HI, (uint16_t)(crc >> 16));
+    }
 }
 
 /* A standalone (non-root) extent-tree node's et_checksum tail: crc32c seeded
@@ -260,9 +289,25 @@ static int txn_commit(hype_extj_wfile_t *f) {
 /* ---- cached metadata accessors ---- */
 
 static uint64_t gd_blocknr(const hype_extj_wfile_t *f, uint32_t group, uint32_t *out_off) {
-    uint64_t byte = (uint64_t)(f->first_data_block + 1u) * f->block_size + (uint64_t)group * 32u;
+    uint64_t byte =
+        (uint64_t)(f->first_data_block + 1u) * f->block_size + (uint64_t)group * f->desc_size;
     *out_off = (uint32_t)(byte % f->block_size);
     return byte / f->block_size;
+}
+
+/* #496: the group's free-block count, assembled from GD_FREE_BLOCKS (always
+ * present) and GD_FREE_BLOCKS_HI (desc_size >= 64 only). */
+static uint32_t gd_free_blocks(const hype_extj_wfile_t *f, const extj_slot_t *gd,
+                               uint32_t gd_off) {
+    uint32_t v = hype_rd16(gd->data + gd_off + GD_FREE_BLOCKS);
+    if (f->desc_size >= 64u) v |= (uint32_t)hype_rd16(gd->data + gd_off + GD_FREE_BLOCKS_HI) << 16;
+    return v;
+}
+
+static void gd_set_free_blocks(const hype_extj_wfile_t *f, extj_slot_t *gd, uint32_t gd_off,
+                               uint32_t v) {
+    hype_wr16(gd->data + gd_off + GD_FREE_BLOCKS, (uint16_t)v);
+    if (f->desc_size >= 64u) hype_wr16(gd->data + gd_off + GD_FREE_BLOCKS_HI, (uint16_t)(v >> 16));
 }
 
 /* Find + claim one free block; all bookkeeping through the cache. */
@@ -287,18 +332,21 @@ static int claim_block(hype_extj_wfile_t *f, uint64_t near, uint64_t *out) {
         if (gd == 0) return -1;
         if (base >= f->blocks_count) break;
         if (in_group > f->blocks_count - base) in_group = (uint32_t)(f->blocks_count - base);
-        if (hype_rd16(gd->data + gd_off + GD_FREE_BLOCKS) == 0u) continue;
+        if (gd_free_blocks(f, gd, gd_off) == 0u) continue;
         bmb = hype_rd32(gd->data + gd_off + GD_BLOCK_BITMAP);
+        if (f->desc_size >= 64u) {
+            bmb |= (uint64_t)hype_rd32(gd->data + gd_off + GD_BLOCK_BITMAP_HI) << 32; /* #496 */
+        }
         if (bmb == 0u || bmb >= f->blocks_count) return -1;
         bm = cache_get(f, bmb);
         if (bm == 0) return -1;
         for (b = 0; b < in_group; b++) {
             if (!(bm->data[b / 8u] & (1u << (b % 8u)))) {
-                uint16_t freeb = hype_rd16(gd->data + gd_off + GD_FREE_BLOCKS);
+                uint32_t freeb = gd_free_blocks(f, gd, gd_off);
                 bm->data[b / 8u] |= (uint8_t)(1u << (b % 8u));
                 bm->dirty = 1;
                 bitmap_csum_finalize(f, bm, gd, gd_off); /* #495: before GD_FREE_BLOCKS */
-                hype_wr16(gd->data + gd_off + GD_FREE_BLOCKS, (uint16_t)(freeb - 1u));
+                gd_set_free_blocks(f, gd, gd_off, freeb - 1u);
                 gd->dirty = 1;
                 /* superblock free count */
                 {
@@ -444,6 +492,13 @@ static int media_block_content(hype_extj_wfile_t *f, uint64_t blk, uint64_t lb, 
 
 /* ---- classic (ext3) block maps: allocation through the cache ---- */
 
+/* #496: i_block's direct/indirect entries are genuinely 32-bit-only fields
+ * on disk -- classic block maps have no ee_start_hi-equivalent, under 64BIT
+ * or not (verified against the kernel's Documentation/filesystems/ext4/
+ * blockmap.rst: no high-half field exists anywhere in this scheme). A block
+ * number that does not fit is refused here rather than silently wrapped. */
+static int fits_classic_ptr(uint64_t blk) { return blk < 0x100000000ull; }
+
 static int classic_map_block(hype_extj_wfile_t *f, uint64_t lb, uint64_t *out_blk,
                              int *out_fresh) {
     uint32_t ppb = f->block_size / 4u;
@@ -478,6 +533,7 @@ static int classic_map_block(hype_extj_wfile_t *f, uint64_t lb, uint64_t *out_bl
     if (levels == 0u) {
         if (node != 0u) { *out_blk = node; *out_fresh = 0; return 0; }
         if (claim_block(f, f->inode_byte / SECSZ / f->spb, out_blk) != 0) return -1;
+        if (!fits_classic_ptr(*out_blk)) return -1; /* #496: cannot be stored, never truncated */
         hype_wr32(is->data + ioff + IN_BLOCK + root_slot * 4u, (uint32_t)*out_blk);
         is->dirty = 1;
         inode_add_blocks(f, 1u);
@@ -488,6 +544,7 @@ static int classic_map_block(hype_extj_wfile_t *f, uint64_t lb, uint64_t *out_bl
         uint64_t nb;
         extj_slot_t *ps;
         if (claim_block(f, f->inode_byte / SECSZ / f->spb, &nb) != 0) return -1;
+        if (!fits_classic_ptr(nb)) return -1; /* #496: cannot be stored, never truncated */
         if (media_zero_block(f, nb) != 0) return -1; /* pre-image for replay */
         ps = cache_get(f, nb);
         if (ps == 0) return -1;
@@ -507,6 +564,7 @@ static int classic_map_block(hype_extj_wfile_t *f, uint64_t lb, uint64_t *out_bl
             uint64_t nb;
             extj_slot_t *cs;
             if (claim_block(f, node, &nb) != 0) return -1;
+            if (!fits_classic_ptr(nb)) return -1; /* #496: cannot be stored, never truncated */
             if (media_zero_block(f, nb) != 0) return -1;
             cs = cache_get(f, nb);
             if (cs == 0) return -1;
@@ -528,6 +586,7 @@ static int classic_map_block(hype_extj_wfile_t *f, uint64_t lb, uint64_t *out_bl
         blk = hype_rd32(ps->data + path[levels - 1u] * 4u);
         if (blk != 0u) { *out_blk = blk; *out_fresh = 0; return 0; }
         if (claim_block(f, node, &blk) != 0) return -1;
+        if (!fits_classic_ptr(blk)) return -1; /* #496: cannot be stored, never truncated */
         hype_wr32(ps->data + path[levels - 1u] * 4u, (uint32_t)blk);
         ps->dirty = 1;
         inode_add_blocks(f, 1u);
@@ -644,7 +703,7 @@ static int leaf_make_room(hype_extj_wfile_t *f, uint64_t lb, epath_t *path, uint
         node_set_entries(&path[0], 0u);
         hype_wr32(ent + 0, hype_rd32(ns->data + 12u)); /* first key below */
         hype_wr32(ent + 4, (uint32_t)nb);
-        hype_wr16(ent + 8, 0u);
+        hype_wr16(ent + 8, (uint16_t)(nb >> 32)); /* #496: ei_leaf_hi -- was hardcoded 0 */
         hype_wr16(ent + 10, 0u);
         node_insert(&path[0], 0u, ent);
         inode_add_blocks(f, 1u);
@@ -679,7 +738,7 @@ static int leaf_make_room(hype_extj_wfile_t *f, uint64_t lb, epath_t *path, uint
         node_set_entries(leaf, keep);
         hype_wr32(ent + 0, hype_rd32(ns->data + 12u));
         hype_wr32(ent + 4, (uint32_t)nb);
-        hype_wr16(ent + 8, 0u);
+        hype_wr16(ent + 8, (uint16_t)(nb >> 32)); /* #496: ei_leaf_hi -- was hardcoded 0 */
         hype_wr16(ent + 10, 0u);
         node_insert(parent, idx[*depth - 1u] + 1u, ent);
         inode_add_blocks(f, 1u);
@@ -835,7 +894,7 @@ int hype_extj_open_rw(hype_blk_read_fn read, hype_blk_write_fn write, void *ctx,
     if (!(compat & COMPAT_HAS_JOURNAL)) return -1; /* ext2: the OTHER writer */
     if (incompat & INCOMPAT_RECOVER) return -1;    /* unreplayed journal */
     if (incompat & INCOMPAT_JOURNAL_DEV) return -1;
-    if (incompat & ~INCOMPAT_OK) return -1;        /* 64BIT, META_BG, bigalloc-adjacent, ... */
+    if (incompat & ~INCOMPAT_OK) return -1;        /* META_BG, bigalloc-adjacent, ... */
     if (rocompat & ~RO_OK) return -1;              /* incl. BIGALLOC */
     out->has_gdt_csum = (rocompat & RO_GDT_CSUM) ? 1 : 0;
     out->has_metadata_csum = (rocompat & RO_METADATA_CSUM) ? 1 : 0;
@@ -856,15 +915,25 @@ int hype_extj_open_rw(hype_blk_read_fn read, hype_blk_write_fn write, void *ctx,
     out->block_size = 1024u << log_bs;
     out->spb = out->block_size / SECSZ;
     out->blocks_count = hype_rd32(sb + SB_BLOCKS_COUNT);
+    if (incompat & INCOMPAT_64BIT) {
+        out->blocks_count |= (uint64_t)hype_rd32(sb + SB_BLOCKS_COUNT_HI) << 32; /* #496 */
+    }
     out->blocks_per_group = hype_rd32(sb + SB_BLOCKS_PER_GROUP);
     out->first_data_block = hype_rd32(sb + SB_FIRST_DATA_BLOCK);
     out->inodes_per_group = hype_rd32(sb + SB_INODES_PER_GROUP);
     rev = hype_rd32(sb + SB_REV_LEVEL);
     out->inode_size = (rev == 0u) ? 128u : (uint32_t)hype_rd16(sb + SB_INODE_SIZE);
+    /* #496: same desc_size derivation + validation as core/ext.c's reader --
+     * either exactly 32, or a declared power of two in [64, 512]. */
+    out->desc_size = (incompat & INCOMPAT_64BIT) ? (uint32_t)hype_rd16(sb + SB_DESC_SIZE) : 32u;
     out->mtime = 0;
     out->dead = 0;
     if (out->blocks_per_group == 0u || out->inodes_per_group == 0u || out->blocks_count < 2u ||
         out->inode_size < 128u) {
+        return -1;
+    }
+    if (out->desc_size != 32u && (out->desc_size < 64u || out->desc_size > 512u ||
+                                  (out->desc_size & (out->desc_size - 1u)) != 0u)) {
         return -1;
     }
     out->groups = (uint32_t)((out->blocks_count - out->first_data_block +
@@ -878,6 +947,13 @@ int hype_extj_open_rw(hype_blk_read_fn read, hype_blk_write_fn write, void *ctx,
         if (hype_jbd2_open(&out->journal, read, write, ctx, out->block_size, &jmap) != 0) {
             return -1;
         }
+        /* #496: mirror the kernel's own ext4_load_journal() -- a 64BIT volume's
+         * journal gains wide (12-byte) block tags so a metadata block anywhere
+         * on the volume, however far out, can always be journaled. Idempotent:
+         * a real prior mount may already have done this. */
+        if ((incompat & INCOMPAT_64BIT) && hype_jbd2_upgrade_64bit(&out->journal) != 0) {
+            return -1;
+        }
     }
 
     if (hype_ext_resolve_rmap(read, ctx, path, &out->map) != 0) return -1;
@@ -887,11 +963,20 @@ int hype_extj_open_rw(hype_blk_read_fn read, hype_blk_write_fn write, void *ctx,
         uint8_t sec[SECSZ];
         uint32_t group = (out->ino - 1u) / out->inodes_per_group;
         uint32_t index = (out->ino - 1u) % out->inodes_per_group;
-        uint64_t gdb = (uint64_t)(out->first_data_block + 1u) * out->block_size +
-                       (uint64_t)group * 32u + GD_INODE_TABLE;
+        /* #496: the descriptor's BASE byte, not a specific field's -- desc_size
+         * is always a power of two dividing 512, so the whole descriptor
+         * (lo and hi halves alike) lives in this one sector, never straddling. */
+        uint64_t gdt_byte = (uint64_t)(out->first_data_block + 1u) * out->block_size +
+                            (uint64_t)group * out->desc_size;
         uint64_t table;
-        if (read(ctx, gdb / SECSZ, 1u, sec) != 0) return -1;
-        table = hype_rd32(sec + gdb % SECSZ);
+        if (read(ctx, gdt_byte / SECSZ, 1u, sec) != 0) return -1;
+        {
+            const uint8_t *gd = sec + (gdt_byte % SECSZ);
+            table = hype_rd32(gd + GD_INODE_TABLE);
+            if (out->desc_size >= 64u) {
+                table |= (uint64_t)hype_rd32(gd + GD_INODE_TABLE_HI) << 32; /* #496 */
+            }
+        }
         if (table == 0u || table >= out->blocks_count) return -1;
         out->inode_byte = table * out->block_size + (uint64_t)index * out->inode_size;
         if (read(ctx, out->inode_byte / SECSZ, 1u, sec) != 0) return -1;

@@ -28,10 +28,10 @@
  * Refused at open, per the ticket: a volume without a journal (that is the
  * ext2 writer's case), an EXTERNAL journal, a NON-EMPTY journal (a crashed
  * writer's transactions await replay: fsck/mount on a real OS recovers, hype
- * never guesses), unsupported journal features (64-bit, checksummed, async
- * or fast commit), bigalloc, 64-bit block numbers, and META_BG. Refused per
- * write: a transaction that would exceed the fixed journal-credit bound
- * (HYPE_JBD2_MAX_BLOCKS images).
+ * never guesses), unsupported journal metadata features (checksummed, async
+ * or fast commit -- see core/jbd2.h for the journal's own 64-bit handling),
+ * bigalloc, and META_BG. Refused per write: a transaction that would exceed
+ * the fixed journal-credit bound (HYPE_JBD2_MAX_BLOCKS images).
  *
  * #495: GDT_CSUM (crc16 "uninit_bg") and METADATA_CSUM (crc32c, seeded from
  * the FS UUID) volumes are supported -- every structure this writer ever
@@ -40,6 +40,23 @@
  * the image is handed to jbd2. A METADATA_CSUM volume whose s_checksum_type
  * is not the one defined value (crc32c) is still refused: hype does not
  * guess at an algorithm the spec does not define.
+ *
+ * #496: 64BIT (64-bit block numbers, 64-byte-or-larger group descriptors) is
+ * supported. `mkfs.ext4` turns it on by DEFAULT (verified on this machine:
+ * /etc/mke2fs.conf's `ext4` fs_type lists it), so refusing it meant refusing
+ * ordinary modern volumes, not exotic ones. The group descriptor's high
+ * halves (block-bitmap, inode-table, and free-block-count pointers), the
+ * superblock's s_blocks_count_hi, and the extent tree's ee_start_hi /
+ * ei_leaf_hi are all carried as genuine uint64_t values end to end -- never
+ * truncated. The group-descriptor checksum (crc16 GDT_CSUM or crc32c
+ * METADATA_CSUM) covers the FULL descriptor width once desc_size > 32
+ * (verified against the kernel's fs/ext4/super.c ext4_group_desc_csum() and
+ * fs/ext4/bitmap.c's block-bitmap checksum setters, not from memory), so the
+ * #495 checksum paths above extend their hash over the added high-half bytes
+ * too. Classic (non-extent) block maps stay genuinely 32-bit-only pointers
+ * -- that is the on-disk format, not a shortcut -- so an allocation for a
+ * classic-mapped file that would land above 2^32 is refused rather than
+ * truncated.
  */
 
 #define HYPE_EXTJ_CACHE 24u /* == HYPE_JBD2_MAX_BLOCKS: one image per slot */
@@ -56,6 +73,7 @@ typedef struct {
     uint32_t groups;
     uint32_t inode_size;
     uint32_t inodes_per_group;
+    uint32_t desc_size; /* #496: 32, or a power of two >= 64 under INCOMPAT_64BIT */
     uint32_t ino;
     uint64_t inode_byte;
     uint64_t size_bytes;
