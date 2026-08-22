@@ -3604,11 +3604,31 @@ int process_ahci_ata_command_slot(hype_ahci_t *ahci, hype_ata_disk_t *disk,
         } else if (is_write_direction) {
             const uint8_t *guest_src =
                 (const uint8_t *)(uintptr_t)guest_dma_xlate(dma_map, prd.data_phys, chunk);
+            /*
+             * #675: VALID-3, matching the ATAPI sibling's own PRD-buffer check just above in
+             * this file. This flat-media branch (no blk_backend under the disk) passed a
+             * rejected translation straight into ahci_copy_fast() with nothing dereferencing
+             * disk->be to catch it first -- a guest that points a PRD's data pointer outside
+             * its own mapped range got a NULL src copied from, a guest-triggerable host crash.
+             */
+            if (guest_src == 0) {
+                hype_debug_print("fw-1 ahci: slot %u refused -- PRD %u buffer gpa 0x%llx len %u "
+                                 "out of bounds\n", slot, (unsigned int)prd_idx,
+                                 (unsigned long long)prd.data_phys, (unsigned int)chunk);
+                return -1;
+            }
             ahci_copy_fast(dst_media, guest_src, chunk);
             dst_media += chunk;
         } else {
             uint8_t *guest_dst =
                 (uint8_t *)(uintptr_t)guest_dma_xlate(dma_map, prd.data_phys, chunk);
+            /* #675: same as the write-direction check just above, other direction. */
+            if (guest_dst == 0) {
+                hype_debug_print("fw-1 ahci: slot %u refused -- PRD %u buffer gpa 0x%llx len %u "
+                                 "out of bounds\n", slot, (unsigned int)prd_idx,
+                                 (unsigned long long)prd.data_phys, (unsigned int)chunk);
+                return -1;
+            }
             ahci_copy_fast(guest_dst, src, chunk);
             src += chunk;
         }
