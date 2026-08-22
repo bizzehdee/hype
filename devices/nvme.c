@@ -630,6 +630,18 @@ static uint16_t exec_admin(hype_nvme_t *dev, const hype_nvme_cmd_t *cmd, const h
                 uint32_t qid2 = cmd->cdw10 & 0xFFFFu;
                 uint32_t qs = ((cmd->cdw10 >> 16) & 0xFFFFu) + 1u;
                 dev->cq_entries[qid2] = (qs > HYPE_NVME_QUEUE_ENTRIES) ? HYPE_NVME_QUEUE_ENTRIES : qs;
+                /*
+                 * #674: a real driver never re-creates a live queue without deleting it first
+                 * (hype has no DELETE_IO_SQ/CQ to do that legitimately), but nothing here
+                 * refused a guest that does it anyway -- and head/tail/phase are per-queue
+                 * STATE, not derived from entries, so a re-create with a smaller size left a
+                 * stale tail value that was only ever valid for the old, larger size. Reset to
+                 * the power-on state on every (re)create, matching what deleting and
+                 * re-creating the queue would have done.
+                 */
+                dev->cq_head[qid2] = 0u;
+                dev->cq_tail[qid2] = 0u;
+                dev->cq_phase[qid2] = 1u;
             }
             return HYPE_NVME_SC_SUCCESS;
         case HYPE_NVME_ADMIN_CREATE_IO_SQ:
@@ -644,6 +656,11 @@ static uint16_t exec_admin(hype_nvme_t *dev, const hype_nvme_cmd_t *cmd, const h
                 uint32_t qid2 = cmd->cdw10 & 0xFFFFu;
                 uint32_t qs = ((cmd->cdw10 >> 16) & 0xFFFFu) + 1u;
                 dev->sq_entries[qid2] = (qs > HYPE_NVME_QUEUE_ENTRIES) ? HYPE_NVME_QUEUE_ENTRIES : qs;
+                /* #674: same reasoning as CREATE_IO_CQ above -- a stale sq_tail surviving a
+                 * resize to a smaller sq_entries is what let sq_head cycle forever without
+                 * ever observing sq_tail again (hype_nvme_process_sq() never returned). */
+                dev->sq_head[qid2] = 0u;
+                dev->sq_tail[qid2] = 0u;
             }
             return HYPE_NVME_SC_SUCCESS;
         case HYPE_NVME_ADMIN_SET_FEATURES:
@@ -683,48 +700,65 @@ int hype_nvme_process_sq(hype_nvme_t *dev, unsigned int qid, const hype_nvme_ctx
         return -1; /* the guest has not told hype where this queue is */
     }
 
-    while (dev->sq_head[qid] != dev->sq_tail[qid]) {
-        uint8_t sqe[HYPE_NVME_SQE_BYTES];
-        uint8_t cqe[HYPE_NVME_CQE_BYTES];
-        hype_nvme_cmd_t cmd;
-        uint16_t status;
-        uint8_t phase;
-        uint64_t cqe_gpa;
+    /*
+     * #674: a hard cap, bounded by this queue's own entry count, on top of the CREATE_IO_SQ/CQ
+     * reset above -- the same defense-in-depth shape virtio-blk's descriptor-chain walk already
+     * uses (virtq_validate_chain()) for the identical class of guest-induced spin. The reset
+     * closes the specific hang found; this cap means the NEXT variant of the same bug fails one
+     * command instead of hanging the VM's dispatch loop.
+     */
+    {
+        uint32_t cap = dev->sq_entries[qid];
+        uint32_t iterations = 0;
+        while (dev->sq_head[qid] != dev->sq_tail[qid]) {
+            uint8_t sqe[HYPE_NVME_SQE_BYTES];
+            uint8_t cqe[HYPE_NVME_CQE_BYTES];
+            hype_nvme_cmd_t cmd;
+            uint16_t status;
+            uint8_t phase;
+            uint64_t cqe_gpa;
 
-        if (c->gread(c->gctx, sqb + (uint64_t)dev->sq_head[qid] * HYPE_NVME_SQE_BYTES,
-                     HYPE_NVME_SQE_BYTES, sqe) != 0) {
-            /* Cannot even fetch the command; stop rather than advance past it. Advancing would lose the
-             * command silently, and the guest would wait forever for a completion. */
-            return processed;
-        }
-        hype_nvme_sqe_decode(sqe, &cmd);
+            if (++iterations > cap) {
+                return processed; /* sq_head/sq_tail disagree in a way this queue's own size cannot
+                                    * explain -- stop rather than spin; the guest sees a short queue,
+                                    * not a hung vCPU. */
+            }
 
-        /*
-         * Consume the entry BEFORE executing it. The sq_head reported in the completion must reflect
-         * that this slot is free, and doing it after would let a driver see a completion while still
-         * believing its queue full.
-         */
-        dev->sq_head[qid]++;
-        if (dev->sq_head[qid] >= dev->sq_entries[qid]) {
-            dev->sq_head[qid] = 0;
-        }
+            if (c->gread(c->gctx, sqb + (uint64_t)dev->sq_head[qid] * HYPE_NVME_SQE_BYTES,
+                         HYPE_NVME_SQE_BYTES, sqe) != 0) {
+                /* Cannot even fetch the command; stop rather than advance past it. Advancing would lose the
+                 * command silently, and the guest would wait forever for a completion. */
+                return processed;
+            }
+            hype_nvme_sqe_decode(sqe, &cmd);
 
-        if (qid == 0u) {
-            status = exec_admin(dev, &cmd, c);
-        } else {
-            status = hype_nvme_exec_io(&cmd, c->be, c->total_sectors, c->page_size, c->gread,
-                                       c->gwrite, c->gctx, c->bounce, c->bounce_len);
-        }
+            /*
+             * Consume the entry BEFORE executing it. The sq_head reported in the completion must reflect
+             * that this slot is free, and doing it after would let a driver see a completion while still
+             * believing its queue full.
+             */
+            dev->sq_head[qid]++;
+            if (dev->sq_head[qid] >= dev->sq_entries[qid]) {
+                dev->sq_head[qid] = 0;
+            }
 
-        /* Post the completion. The phase comes from the advance, so it is stamped by the one function
-         * that owns the wrap rule. */
-        cqe_gpa = cqb + (uint64_t)dev->cq_tail[qid] * HYPE_NVME_CQE_BYTES;
-        phase = hype_nvme_cq_advance(dev, qid);
-        hype_nvme_cqe_build(cqe, cmd.cid, (uint16_t)dev->sq_head[qid], (uint16_t)qid, phase, status);
-        if (c->gwrite(c->gctx, cqe_gpa, HYPE_NVME_CQE_BYTES, cqe) != 0) {
-            return processed; /* the guest's CQ is unreachable -- nothing useful left to do */
+            if (qid == 0u) {
+                status = exec_admin(dev, &cmd, c);
+            } else {
+                status = hype_nvme_exec_io(&cmd, c->be, c->total_sectors, c->page_size, c->gread,
+                                           c->gwrite, c->gctx, c->bounce, c->bounce_len);
+            }
+
+            /* Post the completion. The phase comes from the advance, so it is stamped by the one function
+             * that owns the wrap rule. */
+            cqe_gpa = cqb + (uint64_t)dev->cq_tail[qid] * HYPE_NVME_CQE_BYTES;
+            phase = hype_nvme_cq_advance(dev, qid);
+            hype_nvme_cqe_build(cqe, cmd.cid, (uint16_t)dev->sq_head[qid], (uint16_t)qid, phase, status);
+            if (c->gwrite(c->gctx, cqe_gpa, HYPE_NVME_CQE_BYTES, cqe) != 0) {
+                return processed; /* the guest's CQ is unreachable -- nothing useful left to do */
+            }
+            processed++;
         }
-        processed++;
     }
     return processed;
 }

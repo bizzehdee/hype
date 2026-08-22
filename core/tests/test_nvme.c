@@ -1253,6 +1253,52 @@ static void test_active_ns_list(void) {
               (unsigned)(buf[0] | (buf[1] << 8) | (buf[2] << 16) | ((uint32_t)buf[3] << 24)));
 }
 
+/*
+ * #674: CREATE_IO_SQ re-run against an already-live qid, with a SMALLER size than before, left
+ * sq_tail at whatever the doorbell last set it to under the OLD (larger) size -- a value
+ * hype_nvme_process_sq()'s drain loop could then never observe again, since sq_head only ever
+ * cycles through [0, new sq_entries). Before the fix this hung the drain loop forever (a
+ * guest-triggerable denial of service); the fix resets sq_head/sq_tail on every (re)create.
+ *
+ * Found by the #602 fuzz harness after ~1.5M iterations.
+ */
+static void test_recreating_a_live_sq_smaller_does_not_hang_the_drain(void) {
+    hype_nvme_t d;
+    hype_blk_backend_t be;
+    hype_nvme_ctx_t c;
+    static uint8_t bounce[8192];
+
+    io_backend(&be);
+    enable_with_admin_queues(&d);
+    fill_ctx(&c, &be, bounce, sizeof(bounce));
+
+    /* Create IO SQ qid=1 with a LARGE size (64 entries). */
+    put_sqe(ASQ_BASE, 0, HYPE_NVME_ADMIN_CREATE_IO_CQ, 1u, 0, IOCQ_BASE, (63u << 16) | 1u, 0, 0);
+    put_sqe(ASQ_BASE, 1, HYPE_NVME_ADMIN_CREATE_IO_SQ, 2u, 0, IOSQ_BASE, (63u << 16) | 1u, 0, 0);
+    hype_nvme_mmio_write32(&d, HYPE_NVME_REG_DOORBELL_BASE, 2u);
+    CHECK_HEX("CQ+SQ created at size 64", 2, hype_nvme_process_sq(&d, 0u, &c));
+
+    /* Ring SQ1's doorbell to a tail only valid for the size-64 queue -- the doorbell write path
+     * validates against sq_entries AT THAT TIME, so 50 is accepted. */
+    hype_nvme_mmio_write32(&d, HYPE_NVME_REG_DOORBELL_BASE + 8u, 50u);
+
+    /* Re-create the SAME qid, now with a SMALLER size (8 entries). A real driver never does
+     * this without deleting the queue first; hype has no DELETE_IO_SQ to do that legitimately,
+     * so the create handler itself must leave the queue in a consistent state. */
+    put_sqe(ASQ_BASE, 2, HYPE_NVME_ADMIN_CREATE_IO_SQ, 3u, 0, IOSQ_BASE, (7u << 16) | 1u, 0, 0);
+    hype_nvme_mmio_write32(&d, HYPE_NVME_REG_DOORBELL_BASE, 3u);
+    CHECK_HEX("the resize command was processed", 1, hype_nvme_process_sq(&d, 0u, &c));
+    CHECK_HEX("the resize succeeded", HYPE_NVME_SC_SUCCESS, cqe_status_at(ACQ_BASE, 2));
+
+    /*
+     * The regression: this call used to never return. sq_head/sq_tail must have been reset by
+     * the resize, so an empty queue at its new size drains zero commands immediately rather
+     * than cycling through stale state.
+     */
+    CHECK_HEX("the resized queue drains cleanly instead of hanging", 0,
+             hype_nvme_process_sq(&d, 1u, &c));
+}
+
 int main(void) {
     test_irq_pending_tracks_unconsumed_completions(); /* #519 */
     test_active_ns_list();                            /* #519 */
@@ -1295,6 +1341,7 @@ int main(void) {
     test_doorbell_is_bounded_by_the_declared_size();
     test_io_queue_size_from_qsize_is_honoured();
     test_reset_restores_default_queue_sizes();
+    test_recreating_a_live_sq_smaller_does_not_hang_the_drain(); /* #674 */
 
     if (failures == 0) {
         printf("all tests passed\n");
