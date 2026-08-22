@@ -218,6 +218,36 @@ static void test_boot_disk_no_install_media_required(void) {
 }
 
 /*
+ * #607: `firmware = legacy` has no boot path yet (STRETCH-1 #128) -- admission refuses to START
+ * such a VM -- but the key itself must keep parsing and round-tripping through write-back exactly
+ * as it always has. Only startup is gated; the config load/save contract does not change.
+ */
+static void test_firmware_legacy_round_trips(void) {
+    const char *cfg =
+        "[vm.a]\n"
+        "vcpus = 1\n"
+        "mem_mb = 512\n"
+        "boot = disk\n"
+        "target_disk = file:x.img\n"
+        "firmware = legacy\n"
+        "os_hint = none\n";
+    hype_cfg_t out, back;
+    static char written[16384];
+    hype_cfg_serialize_result_t ser;
+
+    CHECK_INT("parse ok", HYPE_CFG_OK, parse_copy(cfg, &out).status);
+    CHECK_INT("firmware legacy parsed", (int)HYPE_CFG_FW_LEGACY, (int)out.vms[0].firmware);
+
+    ser = hype_cfg_serialize(&out, written, sizeof(written));
+    CHECK_INT("serialize not truncated", 0, ser.truncated || ser.refused_overflow);
+    CHECK_INT("firmware = legacy was written", 1, strstr(written, "firmware = legacy") != NULL);
+
+    CHECK_INT("re-parse of written config ok", HYPE_CFG_OK, parse_copy(written, &back).status);
+    CHECK_INT("firmware legacy survived the round trip", (int)HYPE_CFG_FW_LEGACY,
+              (int)back.vms[0].firmware);
+}
+
+/*
  * #565 / decision 49: `display` selects an EXTRA adapter and defaults to none.
  *
  * The default matters more than the setting: a VM that never mentions `display` must not acquire a
@@ -3133,6 +3163,7 @@ int main(void) {
     test_seen_fields_survives_compaction();
     test_cpu_set_comma_list();
     test_boot_disk_no_install_media_required();
+    test_firmware_legacy_round_trips();
     test_display_key();
     test_uplink_static_address();
     test_uplink_address_parsing_is_strict();

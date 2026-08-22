@@ -13024,6 +13024,20 @@ static void fw_1_phase1_config(void) {
                                  (ir.vm_index_a < g_hype_cfg.vm_count)
                                      ? g_hype_cfg.vms[ir.vm_index_a].nics_count : 0u);
             }
+            /*
+             * #607 (plan.md §15.5, STRETCH-1 #128): `firmware = legacy` parses and round-trips
+             * (the lossless write-back contract, #220/#221 -- only STARTING the VM is refused
+             * here, never the config load/save), but there is no BIOS/CSM boot path. Left
+             * unchecked, the VM silently booted the normal UEFI OVMF path instead, which is the
+             * #285/#331/#339 shape: a key that reads as satisfied while doing nothing.
+             */
+            ir = hype_adm_check_firmware(&g_hype_cfg);
+            if (ir.status != HYPE_ADM_OK) {
+                HYPE_LOGF(HYPE_LOG_ERROR, "adm: REFUSED -- vm%u sets firmware = legacy: there is no "
+                                 "BIOS/CSM boot path (STRETCH-1 #128 is not built yet), so only the "
+                                 "UEFI OVMF path exists today [#607]\n", ir.vm_index_a);
+                fw_1_refuse_vm(ir.vm_index_a);
+            }
             /* NET-6 (#223): the refs and sharing above are clean -- build the switches now. */
             fw_1_build_switches();
             /*
