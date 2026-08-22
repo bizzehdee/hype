@@ -221,6 +221,35 @@ static void test_acknowledge_picks_lowest_numbered_irq_first(void) {
     CHECK_HEX("the other IRQ is still pending", 1, (pic.master.irr & (1u << 3)) != 0);
 }
 
+/*
+ * #654: hype_pic_emu_acknowledge_highest_priority() lacked the #364 fully-nested-priority gate
+ * its sibling hype_pic_emu_acknowledge() has. Reproduces the exact #364 shape on the single-chip
+ * entry point: IRQ1 in service, IRQ3 pending and unmasked -- a lower-priority (higher-numbered)
+ * line must NOT be acknowledged while a higher-priority one is still in service.
+ */
+static void test_acknowledge_highest_priority_respects_in_service_gate(void) {
+    hype_pic_emu_t pic;
+    uint8_t vector = 0xAAu;
+
+    hype_pic_emu_reset(&pic);
+    pic.master.irq_offset = 0x20u;
+    pic.master.imr = 0x00u;
+    pic.master.isr = (uint8_t)(1u << 1); /* IRQ1 already in service */
+    hype_pic_emu_raise_irq(&pic.master, 3); /* IRQ3 pending, lower priority than IRQ1 */
+
+    CHECK_HEX("a lower-priority pending line is NOT acknowledged while IRQ1 is in service", 0,
+             hype_pic_emu_acknowledge_highest_priority(&pic.master, &vector));
+    CHECK_HEX("out_vector left untouched", 0xAAu, vector);
+    CHECK_HEX("IRQ3 stays pending, not moved to ISR", 1, (pic.master.irr & (1u << 3)) != 0);
+    CHECK_HEX("ISR unchanged", (1u << 1), pic.master.isr);
+
+    /* A HIGHER-priority pending line (IRQ0) still preempts IRQ1's in-service state. */
+    hype_pic_emu_raise_irq(&pic.master, 0);
+    CHECK_HEX("a higher-priority pending line still preempts", 1,
+             hype_pic_emu_acknowledge_highest_priority(&pic.master, &vector));
+    CHECK_HEX("vector = irq_offset + 0", 0x20u, vector);
+}
+
 static void test_raise_global_irq_routes_master_vs_slave(void) {
     hype_pic_emu_t pic;
     hype_pic_emu_reset(&pic);
@@ -408,6 +437,7 @@ int main(void) {
     test_acknowledge_returns_zero_when_masked();
     test_acknowledge_returns_zero_when_nothing_pending();
     test_acknowledge_picks_lowest_numbered_irq_first();
+    test_acknowledge_highest_priority_respects_in_service_gate();
     test_raise_global_irq_routes_master_vs_slave();
     test_acknowledge_cascade_delivers_slave_irq();
     test_acknowledge_master_beats_cascade_by_priority();

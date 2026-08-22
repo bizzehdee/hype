@@ -132,29 +132,6 @@ void hype_pic_emu_raise_irq(hype_pic_emu_chip_t *chip, uint8_t irq) {
     chip->irr |= (uint8_t)(1u << irq);
 }
 
-int hype_pic_emu_acknowledge_highest_priority(hype_pic_emu_chip_t *chip, uint8_t *out_vector) {
-    uint8_t pending = chip->irr & (uint8_t)~chip->imr;
-    int i;
-
-    for (i = 0; i < 8; i++) {
-        if (pending & (uint8_t)(1u << i)) {
-            chip->irr &= (uint8_t) ~(1u << i);
-            chip->isr |= (uint8_t)(1u << i);
-            *out_vector = (uint8_t)(chip->irq_offset + i);
-            return 1;
-        }
-    }
-    return 0;
-}
-
-void hype_pic_emu_raise_global_irq(hype_pic_emu_t *pic, uint8_t global_irq) {
-    if (global_irq < 8u) {
-        pic->master.irr |= (uint8_t)(1u << global_irq);
-    } else if (global_irq < 16u) {
-        pic->slave.irr |= (uint8_t)(1u << (global_irq - 8u));
-    }
-}
-
 /*
  * #364: the highest-priority line currently IN SERVICE on `chip`, or 8 when none is.
  *
@@ -170,6 +147,39 @@ static int highest_in_service(const hype_pic_emu_chip_t *chip) {
         }
     }
     return 8;
+}
+
+int hype_pic_emu_acknowledge_highest_priority(hype_pic_emu_chip_t *chip, uint8_t *out_vector) {
+    uint8_t pending = chip->irr & (uint8_t)~chip->imr;
+    int isr = highest_in_service(chip);
+    int i;
+
+    for (i = 0; i < 8; i++) {
+        if ((pending & (uint8_t)(1u << i)) == 0u) {
+            continue;
+        }
+        /* #654: this single-chip entry point never got the #364 fully-nested-priority gate its
+         * sibling hype_pic_emu_acknowledge() has -- see that function's own comment for the full
+         * story. Without it, a line already in service does not block a lower-priority pending
+         * line from being acknowledged too, which is not 8259 behaviour and can starve the
+         * higher-priority line exactly as #364 originally found. */
+        if (i >= isr) {
+            return 0; /* every remaining line is lower priority still */
+        }
+        chip->irr &= (uint8_t) ~(1u << i);
+        chip->isr |= (uint8_t)(1u << i);
+        *out_vector = (uint8_t)(chip->irq_offset + i);
+        return 1;
+    }
+    return 0;
+}
+
+void hype_pic_emu_raise_global_irq(hype_pic_emu_t *pic, uint8_t global_irq) {
+    if (global_irq < 8u) {
+        pic->master.irr |= (uint8_t)(1u << global_irq);
+    } else if (global_irq < 16u) {
+        pic->slave.irr |= (uint8_t)(1u << (global_irq - 8u));
+    }
 }
 
 int hype_pic_emu_acknowledge(hype_pic_emu_t *pic, uint8_t *out_vector) {
