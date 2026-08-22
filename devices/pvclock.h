@@ -2,6 +2,7 @@
 #define HYPE_DEVICES_PVCLOCK_H
 
 #include <stdint.h>
+#include "../core/guest_mem.h" /* hype_gpa_map_t, for hype_pvclock_arm_*'s VALID-3 checks */
 
 /*
  * kvmclock (KVM paravirtual clock) -- the guest-facing side.
@@ -100,5 +101,26 @@ void hype_pvclock_write_wall_clock(volatile struct hype_pvclock_wall_clock *wc, 
  * tidy-up for whenever pvclock gets its own translation unit.
  */
 extern volatile uint32_t g_hype_pvclock_arm_count;
+
+/*
+ * #667: the whole MSR_KVM_SYSTEM_TIME arm sequence, extracted from the SVM/VMX MSR-write handlers
+ * (arch/x86_64/svm/svm_vcpu.c, arch/x86_64/vmx/vmcs_hw.c -- both call this instead of duplicating
+ * it) so the VALID-3 GPA-rejection path is independently unit-testable without a full vcpu
+ * context, mirroring hype_hv_reference_tsc_write's shape (arch/x86_64/cpu/hyperv.c). `tsc_now`,
+ * `mul` and `shift` are the caller's already-known TSC reading and scale (each backend keeps its
+ * own file-scope mul/shift state) rather than globals this module would have to own.
+ *
+ * Returns 1 if the page was armed, 0 if the write is a no-op by the KVM ABI's own rules (ENABLE
+ * bit clear, or no pvclock map registered yet -- neither is an error), or -1 if the requested GPA
+ * could not be translated (the page is left untouched). The call sites do not need to inspect
+ * this -- a WRMSR always "succeeds" from the guest's perspective either way -- it exists so a
+ * test can distinguish the three outcomes.
+ */
+int hype_pvclock_arm_system_time(uint64_t msr_value, const hype_gpa_map_t *map, uint64_t tsc_now,
+                                 uint32_t mul, int8_t shift);
+
+/* Same contract as hype_pvclock_arm_system_time, for MSR_KVM_WALL_CLOCK -- no ENABLE bit to gate
+ * on, so the only no-op case is "no pvclock map registered yet". */
+int hype_pvclock_arm_wall_clock(uint64_t msr_value, const hype_gpa_map_t *map);
 
 #endif /* HYPE_DEVICES_PVCLOCK_H */

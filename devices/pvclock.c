@@ -89,3 +89,37 @@ void hype_pvclock_write_wall_clock(volatile struct hype_pvclock_wall_clock *wc, 
     HYPE_PVCLOCK_BARRIER();
     wc->version = v + 2;
 }
+
+int hype_pvclock_arm_system_time(uint64_t msr_value, const hype_gpa_map_t *map, uint64_t tsc_now,
+                                 uint32_t mul, int8_t shift) {
+    uint64_t gpa, host, system_ns;
+
+    if ((msr_value & HYPE_KVM_SYSTEM_TIME_ENABLE) == 0u || map == 0) {
+        return 0;
+    }
+    gpa = msr_value & HYPE_KVM_MSR_ADDR_MASK;
+    host = hype_gpa_to_host(map, gpa, sizeof(struct hype_pvclock_vcpu_time_info));
+    if (host == 0u) {
+        return -1;
+    }
+    system_ns = hype_pvclock_scale_delta(tsc_now, mul, shift);
+    hype_pvclock_write_time_info((volatile struct hype_pvclock_vcpu_time_info *)(uintptr_t)host,
+                                 tsc_now, system_ns, mul, shift, HYPE_PVCLOCK_TSC_STABLE_BIT);
+    g_hype_pvclock_arm_count++;
+    return 1;
+}
+
+int hype_pvclock_arm_wall_clock(uint64_t msr_value, const hype_gpa_map_t *map) {
+    uint64_t gpa, host;
+
+    if (map == 0) {
+        return 0;
+    }
+    gpa = msr_value & HYPE_KVM_MSR_ADDR_MASK;
+    host = hype_gpa_to_host(map, gpa, sizeof(struct hype_pvclock_wall_clock));
+    if (host == 0u) {
+        return -1;
+    }
+    hype_pvclock_write_wall_clock((volatile struct hype_pvclock_wall_clock *)(uintptr_t)host, 0, 0);
+    return 1;
+}

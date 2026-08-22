@@ -258,3 +258,46 @@ uint32_t hype_fw_cfg_dma_execute(hype_fw_cfg_t *fw, const hype_fw_cfg_dma_op_t *
      * data movement. */
     return 0;
 }
+
+static uint64_t fw_cfg_dma_xlate(const hype_gpa_map_t *map, uint64_t gpa, uint64_t len) {
+    if (map == 0) {
+        return gpa; /* trusted identity-mapped guest, matching every other DMA call site */
+    }
+    return hype_gpa_to_host(map, gpa, len);
+}
+
+int hype_fw_cfg_dma_op_run(hype_fw_cfg_t *fw, const hype_gpa_map_t *dma_map, uint64_t access_phys) {
+    uint64_t access_host;
+    uint8_t raw[16];
+    hype_fw_cfg_dma_op_t op;
+    uint8_t *control_bytes;
+    uint32_t result;
+    int i;
+
+    access_host = fw_cfg_dma_xlate(dma_map, access_phys, 16u);
+    if (access_host == 0u) {
+        return -1;
+    }
+    for (i = 0; i < 16; i++) {
+        raw[i] = ((const uint8_t *)(uintptr_t)access_host)[i];
+    }
+    hype_fw_cfg_dma_decode(raw, &op);
+
+    if (op.length != 0u) {
+        uint64_t data_host = fw_cfg_dma_xlate(dma_map, op.address, op.length);
+        if (data_host == 0u) {
+            result = HYPE_FW_CFG_DMA_CTL_ERROR;
+        } else {
+            result = hype_fw_cfg_dma_execute(fw, &op, (uint8_t *)(uintptr_t)data_host);
+        }
+    } else {
+        result = hype_fw_cfg_dma_execute(fw, &op, 0);
+    }
+
+    control_bytes = (uint8_t *)(uintptr_t)access_host;
+    control_bytes[0] = (uint8_t)(result >> 24);
+    control_bytes[1] = (uint8_t)(result >> 16);
+    control_bytes[2] = (uint8_t)(result >> 8);
+    control_bytes[3] = (uint8_t)result;
+    return 0;
+}

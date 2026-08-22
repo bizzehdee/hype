@@ -127,6 +127,103 @@ static void test_struct_layout_matches_kvm_abi(void) {
     CHECK_U64("wall_clock size", 12u, sizeof(struct hype_pvclock_wall_clock));
 }
 
+/*
+ * #667: hype_pvclock_arm_system_time()/hype_pvclock_arm_wall_clock() are the extracted VALID-3
+ * sequences the SVM/VMX MSR-write handlers share -- these prove the GPA-rejection paths directly.
+ */
+#define PVM_GBASE 0x9100000000ull
+#define PVM_MAP_SIZE 4096u
+
+typedef struct {
+    uint8_t img[PVM_MAP_SIZE];
+    hype_gpa_map_t map;
+} pvm_rig_t;
+
+static void pvm_rig_init(pvm_rig_t *r) {
+    unsigned i;
+    for (i = 0; i < sizeof(*r); i++) {
+        ((uint8_t *)r)[i] = 0;
+    }
+    hype_gpa_map_reset(&r->map);
+    hype_gpa_map_add(&r->map, PVM_GBASE, (uint64_t)(uintptr_t)r->img, PVM_MAP_SIZE);
+}
+
+static void test_arm_system_time_legitimate_gpa_arms_page(void) {
+    pvm_rig_t r;
+    struct hype_pvclock_vcpu_time_info *ti;
+    uint32_t before;
+    int rc;
+
+    pvm_rig_init(&r);
+    before = g_hype_pvclock_arm_count;
+    rc = hype_pvclock_arm_system_time(PVM_GBASE | HYPE_KVM_SYSTEM_TIME_ENABLE, &r.map, 12345ull,
+                                      1u << 20, 12);
+    CHECK_U64("legitimate GPA arms the page (rc=1)", 1u, (uint64_t)rc);
+    CHECK_U64("arm count incremented", (uint64_t)before + 1u, (uint64_t)g_hype_pvclock_arm_count);
+    ti = (struct hype_pvclock_vcpu_time_info *)(void *)r.img;
+    CHECK_U64("version left even (complete)", 2u, ti->version);
+    CHECK_U64("tsc_timestamp recorded", 12345ull, ti->tsc_timestamp);
+}
+
+static void test_arm_system_time_disabled_is_a_noop(void) {
+    pvm_rig_t r;
+    uint32_t before;
+    int rc;
+
+    pvm_rig_init(&r);
+    before = g_hype_pvclock_arm_count;
+    rc = hype_pvclock_arm_system_time(PVM_GBASE, &r.map, 1ull, 1u, 0); /* ENABLE bit clear */
+    CHECK_U64("disabled write is a no-op (rc=0)", 0u, (uint64_t)rc);
+    CHECK_U64("arm count unchanged", (uint64_t)before, (uint64_t)g_hype_pvclock_arm_count);
+    CHECK_U64("page untouched", 0u, (uint64_t)r.img[0]);
+}
+
+static void test_arm_system_time_no_map_is_a_noop(void) {
+    int rc = hype_pvclock_arm_system_time(0x1000ull | HYPE_KVM_SYSTEM_TIME_ENABLE, 0, 1ull, 1u, 0);
+    CHECK_U64("no pvclock map registered yet is a no-op (rc=0)", 0u, (uint64_t)rc);
+}
+
+static void test_arm_system_time_out_of_range_gpa_refused(void) {
+    pvm_rig_t r;
+    uint32_t before;
+    int rc;
+
+    pvm_rig_init(&r);
+    before = g_hype_pvclock_arm_count;
+    rc = hype_pvclock_arm_system_time((PVM_GBASE + PVM_MAP_SIZE + 0x1000ull) | HYPE_KVM_SYSTEM_TIME_ENABLE,
+                                      &r.map, 1ull, 1u, 0);
+    CHECK_U64("out-of-range GPA is refused (rc=-1)", (uint64_t)(int64_t)-1, (uint64_t)(int64_t)rc);
+    CHECK_U64("arm count unchanged", (uint64_t)before, (uint64_t)g_hype_pvclock_arm_count);
+    CHECK_U64("page untouched", 0u, (uint64_t)r.img[0]);
+}
+
+static void test_arm_wall_clock_legitimate_gpa_arms_page(void) {
+    pvm_rig_t r;
+    struct hype_pvclock_wall_clock *wc;
+    int rc;
+
+    pvm_rig_init(&r);
+    rc = hype_pvclock_arm_wall_clock(PVM_GBASE, &r.map);
+    CHECK_U64("legitimate GPA arms the page (rc=1)", 1u, (uint64_t)rc);
+    wc = (struct hype_pvclock_wall_clock *)(void *)r.img;
+    CHECK_U64("version left even (complete)", 2u, wc->version);
+}
+
+static void test_arm_wall_clock_no_map_is_a_noop(void) {
+    int rc = hype_pvclock_arm_wall_clock(0x1000ull, 0);
+    CHECK_U64("no pvclock map registered yet is a no-op (rc=0)", 0u, (uint64_t)rc);
+}
+
+static void test_arm_wall_clock_out_of_range_gpa_refused(void) {
+    pvm_rig_t r;
+    int rc;
+
+    pvm_rig_init(&r);
+    rc = hype_pvclock_arm_wall_clock(PVM_GBASE + PVM_MAP_SIZE + 0x1000ull, &r.map);
+    CHECK_U64("out-of-range GPA is refused (rc=-1)", (uint64_t)(int64_t)-1, (uint64_t)(int64_t)rc);
+    CHECK_U64("page untouched", 0u, (uint64_t)r.img[0]);
+}
+
 int main(void) {
     test_scale_1ghz_exact();
     test_scale_various_frequencies();
@@ -136,6 +233,13 @@ int main(void) {
     test_write_time_info_second_update_bumps_version();
     test_write_wall_clock();
     test_struct_layout_matches_kvm_abi();
+    test_arm_system_time_legitimate_gpa_arms_page();
+    test_arm_system_time_disabled_is_a_noop();
+    test_arm_system_time_no_map_is_a_noop();
+    test_arm_system_time_out_of_range_gpa_refused();
+    test_arm_wall_clock_legitimate_gpa_arms_page();
+    test_arm_wall_clock_no_map_is_a_noop();
+    test_arm_wall_clock_out_of_range_gpa_refused();
 
     if (failures == 0) {
         printf("all tests passed\n");

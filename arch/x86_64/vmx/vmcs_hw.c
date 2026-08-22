@@ -2684,37 +2684,17 @@ int hype_vmx_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw,
         }
         hype_fw_cfg_dma_addr_high(fw, (uint32_t)(rax & 0xFFFFFFFFu));
     } else if (port == 0x518u) {
-        uint64_t access_phys, access_host;
-        uint8_t raw[16];
-        hype_fw_cfg_dma_op_t op;
-        uint8_t *control_bytes;
-        uint32_t result;
-        int i;
+        uint64_t access_phys;
 
         if (is_in) {
             return -1;
         }
         access_phys = hype_fw_cfg_dma_addr_low(fw, (uint32_t)(rax & 0xFFFFFFFFu));
-        access_host = vmx_dma_xlate(dma_map, access_phys, 16);
-        if (access_host == 0) {
+        /* #667: shared with the SVM handler -- see hype_fw_cfg_dma_op_run()'s own comment
+         * (devices/fw_cfg.c) for the VALID-3 rejection contract this preserves. */
+        if (hype_fw_cfg_dma_op_run(fw, dma_map, access_phys) != 0) {
             return -1;
         }
-        for (i = 0; i < 16; i++) {
-            raw[i] = ((const uint8_t *)(uintptr_t)access_host)[i];
-        }
-        hype_fw_cfg_dma_decode(raw, &op);
-        if (op.length != 0) {
-            uint64_t data_host = vmx_dma_xlate(dma_map, op.address, op.length);
-            result = (data_host == 0) ? HYPE_FW_CFG_DMA_CTL_ERROR
-                                      : hype_fw_cfg_dma_execute(fw, &op, (uint8_t *)(uintptr_t)data_host);
-        } else {
-            result = hype_fw_cfg_dma_execute(fw, &op, 0);
-        }
-        control_bytes = (uint8_t *)(uintptr_t)access_host;
-        control_bytes[0] = (uint8_t)(result >> 24);
-        control_bytes[1] = (uint8_t)(result >> 16);
-        control_bytes[2] = (uint8_t)(result >> 8);
-        control_bytes[3] = (uint8_t)result;
     } else {
         return -1;
     }
@@ -3931,34 +3911,14 @@ void hype_vmx_vcpu_get_intr_state(hype_vcpu_ctx_t *ctx, hype_vmm_intr_state_t *o
 static uint32_t g_vmx_pvclock_mul;
 static int8_t g_vmx_pvclock_shift;
 static void vmx_pvclock_arm_system_time(struct hype_vcpu_ctx *real, uint64_t msr_value) {
-    uint64_t gpa, host, now, system_ns;
-    if ((msr_value & HYPE_KVM_SYSTEM_TIME_ENABLE) == 0 || real->pvclock_map == 0) {
-        return;
-    }
-    gpa = msr_value & HYPE_KVM_MSR_ADDR_MASK;
-    host = hype_gpa_to_host(real->pvclock_map, gpa, sizeof(struct hype_pvclock_vcpu_time_info));
-    if (host == 0) {
-        return;
-    }
-    now = vmx_real_rdtsc();
-    system_ns = hype_pvclock_scale_delta(now, g_vmx_pvclock_mul, g_vmx_pvclock_shift);
-    hype_pvclock_write_time_info((volatile struct hype_pvclock_vcpu_time_info *)(uintptr_t)host, now,
-                                 system_ns, g_vmx_pvclock_mul, g_vmx_pvclock_shift,
-                                 HYPE_PVCLOCK_TSC_STABLE_BIT);
-    g_hype_pvclock_arm_count++;
+    /* #667: shared with the SVM backend -- see hype_pvclock_arm_system_time()'s own comment
+     * (devices/pvclock.c) for the VALID-3 rejection contract this preserves. */
+    (void)hype_pvclock_arm_system_time(msr_value, real->pvclock_map, vmx_real_rdtsc(),
+                                       g_vmx_pvclock_mul, g_vmx_pvclock_shift);
 }
 
 static void vmx_pvclock_arm_wall_clock(struct hype_vcpu_ctx *real, uint64_t msr_value) {
-    uint64_t gpa, host;
-    if (real->pvclock_map == 0) {
-        return;
-    }
-    gpa = msr_value & HYPE_KVM_MSR_ADDR_MASK;
-    host = hype_gpa_to_host(real->pvclock_map, gpa, sizeof(struct hype_pvclock_wall_clock));
-    if (host == 0) {
-        return;
-    }
-    hype_pvclock_write_wall_clock((volatile struct hype_pvclock_wall_clock *)(uintptr_t)host, 0, 0);
+    (void)hype_pvclock_arm_wall_clock(msr_value, real->pvclock_map);
 }
 
 void hype_vmx_vcpu_set_pvclock(hype_vcpu_ctx_t *ctx, const hype_gpa_map_t *map, uint64_t tsc_hz) {

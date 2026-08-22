@@ -1884,36 +1884,18 @@ void hype_svm_vcpu_set_pvclock(hype_vcpu_ctx_t *ctx, const hype_gpa_map_t *map, 
  * system_time = scale(now) with tsc_timestamp = now, so guest time == scale of
  * the raw (passthrough) TSC -- monotonic, TSC_STABLE, no guest calibration. */
 static void hype_svm_pvclock_arm_system_time(struct hype_vcpu_ctx *real, uint64_t msr_value) {
-    uint64_t gpa, host, now, system_ns;
-    if ((msr_value & HYPE_KVM_SYSTEM_TIME_ENABLE) == 0 || real->pvclock_map == 0) {
-        return;
-    }
-    gpa = msr_value & HYPE_KVM_MSR_ADDR_MASK;
-    host = hype_gpa_to_host(real->pvclock_map, gpa, sizeof(struct hype_pvclock_vcpu_time_info));
-    if (host == 0) {
-        return;
-    }
-    now = real_rdtsc();
-    system_ns = hype_pvclock_scale_delta(now, g_pvclock_mul, g_pvclock_shift);
-    hype_pvclock_write_time_info((volatile struct hype_pvclock_vcpu_time_info *)(uintptr_t)host, now,
-                                 system_ns, g_pvclock_mul, g_pvclock_shift, HYPE_PVCLOCK_TSC_STABLE_BIT);
-    g_hype_pvclock_arm_count++;
+    /* #667: the GPA-translate/write sequence itself now lives in hype_pvclock_arm_system_time()
+     * (devices/pvclock.c), shared verbatim with the VMX backend, so its VALID-3 rejection path is
+     * independently unit-testable without a full vcpu context. */
+    (void)hype_pvclock_arm_system_time(msr_value, real->pvclock_map, real_rdtsc(), g_pvclock_mul,
+                                       g_pvclock_shift);
 }
 
 /* Guest wrote MSR_KVM_WALL_CLOCK: fill the boot-wall-time page. hype has no
  * RTC (CMOS returns 0), so publish epoch 0 -- the guest's monotonic clock
  * (above) is correct; only wall-clock date is unknown, same as today. */
 static void hype_svm_pvclock_arm_wall_clock(struct hype_vcpu_ctx *real, uint64_t msr_value) {
-    uint64_t gpa, host;
-    if (real->pvclock_map == 0) {
-        return;
-    }
-    gpa = msr_value & HYPE_KVM_MSR_ADDR_MASK;
-    host = hype_gpa_to_host(real->pvclock_map, gpa, sizeof(struct hype_pvclock_wall_clock));
-    if (host == 0) {
-        return;
-    }
-    hype_pvclock_write_wall_clock((volatile struct hype_pvclock_wall_clock *)(uintptr_t)host, 0, 0);
+    (void)hype_pvclock_arm_wall_clock(msr_value, real->pvclock_map);
 }
 
 /* #275: IA32_TSC_AUX, read by RDTSCP into ECX. Not covered by VMSAVE/VMLOAD. */
@@ -5459,12 +5441,6 @@ int hype_svm_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw,
         hype_fw_cfg_dma_addr_high(fw, (uint32_t)(real->vmcb->save.rax & 0xFFFFFFFFu));
     } else if (io.port == 0x518u) {
         uint64_t access_phys;
-        uint64_t access_host;
-        uint8_t raw[16];
-        hype_fw_cfg_dma_op_t op;
-        uint8_t *control_bytes;
-        uint32_t result;
-        int i;
 
         if (io.is_in) {
             return -1;
@@ -5472,49 +5448,17 @@ int hype_svm_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw,
 
         access_phys = hype_fw_cfg_dma_addr_low(fw, (uint32_t)(real->vmcb->save.rax & 0xFFFFFFFFu));
 
-        /* The 16-byte fw_cfg DMA access struct lives in guest RAM: translate +
-         * bounds-check its guest-physical address (FW-1's RAM is NOT identity-
-         * mapped). */
-        access_host = guest_dma_xlate(dma_map, access_phys, 16);
-        if (access_host == 0) {
+        /*
+         * #667: the whole access-struct-translate / data-buffer-translate / execute / write-back
+         * sequence now lives in hype_fw_cfg_dma_op_run() (devices/fw_cfg.c), shared verbatim with
+         * the VMX handler, so the VALID-3 GPA-rejection path is independently unit-testable
+         * without a full vcpu context. A failed access-struct translation (FW-1's RAM is NOT
+         * identity-mapped) is the only case that refuses the exit outright; a bad data-buffer GPA
+         * still completes with HYPE_FW_CFG_DMA_CTL_ERROR written back, exactly as before.
+         */
+        if (hype_fw_cfg_dma_op_run(fw, dma_map, access_phys) != 0) {
             return -1;
         }
-        for (i = 0; i < 16; i++) {
-            raw[i] = ((const uint8_t *)(uintptr_t)access_host)[i];
-        }
-        hype_fw_cfg_dma_decode(raw, &op);
-
-        {
-            static unsigned n_dc = 0;
-            if (n_dc < 400) {
-                n_dc++;
-                hype_debug_print("DC%u: sel=0x%x ctl=0x%x len=%u addr=0x%llx\n", n_dc,
-                                 (unsigned int)fw->selected_key, (unsigned int)op.control,
-                                 (unsigned int)op.length, (unsigned long long)op.address);
-            }
-        }
-
-        if (op.length != 0) {
-            /* The data buffer is a separate guest-physical range: translate it
-             * with its declared length before the transfer touches it. A bad
-             * range reports a DMA error to the guest rather than scribbling
-             * arbitrary host memory. */
-            uint64_t data_host = guest_dma_xlate(dma_map, op.address, op.length);
-            if (data_host == 0) {
-                result = HYPE_FW_CFG_DMA_CTL_ERROR;
-            } else {
-                result = hype_fw_cfg_dma_execute(fw, &op, (uint8_t *)(uintptr_t)data_host);
-            }
-        } else {
-            /* SELECT-only / zero-length: no data buffer touched. */
-            result = hype_fw_cfg_dma_execute(fw, &op, 0);
-        }
-
-        control_bytes = (uint8_t *)(uintptr_t)access_host;
-        control_bytes[0] = (uint8_t)(result >> 24);
-        control_bytes[1] = (uint8_t)(result >> 16);
-        control_bytes[2] = (uint8_t)(result >> 8);
-        control_bytes[3] = (uint8_t)result;
     } else {
         return -1;
     }

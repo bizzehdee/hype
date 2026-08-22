@@ -411,6 +411,106 @@ static void test_dma_execute_unrecognized_key_reads_zero(void) {
     CHECK_HEX("unrecognized-key read returns 0", 0, guest_buf[0]);
 }
 
+/*
+ * #667: hype_fw_cfg_dma_op_run() is the extracted VALID-3 sequence the SVM/VMX port-0x518
+ * handlers share -- these cases prove its GPA-rejection paths directly, without needing a full
+ * vcpu context (the ticket's own suggested fix). Guest layout: a 16-byte access struct at
+ * GBASE+0, a 4-byte data buffer at GBASE+0x100, mapped as [GBASE, GBASE+0x200).
+ */
+#define FWDMA_GBASE 0x9000000000ull
+#define FWDMA_ACCESS_OFF 0u
+#define FWDMA_DATA_OFF 0x100u
+#define FWDMA_MAP_SIZE 0x200u
+
+typedef struct {
+    uint8_t img[FWDMA_MAP_SIZE];
+    hype_gpa_map_t map;
+} fwdma_rig_t;
+
+static void fwdma_put32(fwdma_rig_t *r, uint32_t off, uint32_t v) {
+    r->img[off + 0] = (uint8_t)(v >> 24);
+    r->img[off + 1] = (uint8_t)(v >> 16);
+    r->img[off + 2] = (uint8_t)(v >> 8);
+    r->img[off + 3] = (uint8_t)v;
+}
+static void fwdma_put64(fwdma_rig_t *r, uint32_t off, uint64_t v) {
+    int i;
+    for (i = 0; i < 8; i++) {
+        r->img[off + i] = (uint8_t)(v >> (56 - 8 * i));
+    }
+}
+static uint32_t fwdma_get32(fwdma_rig_t *r, uint32_t off) {
+    return ((uint32_t)r->img[off] << 24) | ((uint32_t)r->img[off + 1] << 16) |
+           ((uint32_t)r->img[off + 2] << 8) | (uint32_t)r->img[off + 3];
+}
+
+static void fwdma_rig_init(fwdma_rig_t *r) {
+    memset(r, 0, sizeof(*r));
+    hype_gpa_map_reset(&r->map);
+    hype_gpa_map_add(&r->map, FWDMA_GBASE, (uint64_t)(uintptr_t)r->img, FWDMA_MAP_SIZE);
+}
+
+/* Writes a well-formed access struct: SELECT|WRITE control naming `key`, a 4-byte length, and
+ * `data_gpa` as the data-buffer address (caller's choice -- in or out of the map). */
+static void fwdma_build_access(fwdma_rig_t *r, uint16_t key, uint64_t data_gpa) {
+    uint32_t control = HYPE_FW_CFG_DMA_CTL_SELECT | HYPE_FW_CFG_DMA_CTL_WRITE | ((uint32_t)key << 16);
+    fwdma_put32(r, FWDMA_ACCESS_OFF + 0, control);
+    fwdma_put32(r, FWDMA_ACCESS_OFF + 4, 4u);
+    fwdma_put64(r, FWDMA_ACCESS_OFF + 8, data_gpa);
+}
+
+static void test_dma_op_run_legitimate_write_succeeds(void) {
+    fwdma_rig_t r;
+    hype_fw_cfg_t fw;
+    uint8_t backing[4] = {0, 0, 0, 0};
+    int key, rc;
+
+    fwdma_rig_init(&r);
+    hype_fw_cfg_reset(&fw);
+    key = hype_fw_cfg_add_writable_file(&fw, "etc/ramfb", backing, sizeof(backing));
+    fwdma_build_access(&r, (uint16_t)key, FWDMA_GBASE + FWDMA_DATA_OFF);
+    r.img[FWDMA_DATA_OFF + 0] = 0xAA;
+    r.img[FWDMA_DATA_OFF + 1] = 0xBB;
+    r.img[FWDMA_DATA_OFF + 2] = 0xCC;
+    r.img[FWDMA_DATA_OFF + 3] = 0xDD;
+
+    rc = hype_fw_cfg_dma_op_run(&fw, &r.map, FWDMA_GBASE + FWDMA_ACCESS_OFF);
+    CHECK_HEX("a fully in-bounds op runs", 0, rc);
+    CHECK_HEX("Control field reports success", 0u, fwdma_get32(&r, FWDMA_ACCESS_OFF + 0));
+    CHECK_HEX("backing[0]", 0xAA, backing[0]);
+    CHECK_HEX("backing[3]", 0xDD, backing[3]);
+}
+
+static void test_dma_op_run_out_of_range_access_struct_refused(void) {
+    fwdma_rig_t r;
+    hype_fw_cfg_t fw;
+    int rc;
+
+    fwdma_rig_init(&r);
+    hype_fw_cfg_reset(&fw);
+    rc = hype_fw_cfg_dma_op_run(&fw, &r.map, FWDMA_GBASE + FWDMA_MAP_SIZE + 0x1000u);
+    CHECK_HEX("out-of-map access struct is refused, not touched", (unsigned)-1, (unsigned)rc);
+}
+
+static void test_dma_op_run_out_of_range_data_buffer_reports_dma_error(void) {
+    fwdma_rig_t r;
+    hype_fw_cfg_t fw;
+    uint8_t backing[4] = {0x11, 0x22, 0x33, 0x44};
+    int key, rc;
+
+    fwdma_rig_init(&r);
+    hype_fw_cfg_reset(&fw);
+    key = hype_fw_cfg_add_writable_file(&fw, "etc/ramfb", backing, sizeof(backing));
+    /* The access struct itself is in-bounds; the data buffer it names is not. */
+    fwdma_build_access(&r, (uint16_t)key, FWDMA_GBASE + FWDMA_MAP_SIZE + 0x1000u);
+
+    rc = hype_fw_cfg_dma_op_run(&fw, &r.map, FWDMA_GBASE + FWDMA_ACCESS_OFF);
+    CHECK_HEX("the access struct step itself still succeeds", 0, rc);
+    CHECK_HEX("Control field reports a DMA error, not silent success",
+             (uint32_t)HYPE_FW_CFG_DMA_CTL_ERROR, fwdma_get32(&r, FWDMA_ACCESS_OFF + 0));
+    CHECK_HEX("the out-of-range data buffer was never touched (backing unchanged)", 0x11, backing[0]);
+}
+
 int main(void) {
     test_signature_via_classic_interface();
     test_id_advertises_dma_support();
@@ -431,6 +531,9 @@ int main(void) {
     test_read_byte_unrecognized_key_returns_zero();
     test_dma_execute_select_only_is_a_harmless_no_op();
     test_dma_execute_unrecognized_key_reads_zero();
+    test_dma_op_run_legitimate_write_succeeds();
+    test_dma_op_run_out_of_range_access_struct_refused();
+    test_dma_op_run_out_of_range_data_buffer_reports_dma_error();
 
     if (failures == 0) {
         printf("all tests passed\n");

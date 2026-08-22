@@ -2,6 +2,7 @@
 #define HYPE_DEVICES_FW_CFG_H
 
 #include <stdint.h>
+#include "../core/guest_mem.h" /* hype_gpa_map_t, for hype_fw_cfg_dma_op_run's VALID-3 checks */
 
 /*
  * QEMU-compatible fw_cfg device (M4-4) -- how guest firmware (this
@@ -196,5 +197,23 @@ void hype_fw_cfg_dma_decode(const uint8_t raw[16], hype_fw_cfg_dma_op_t *out);
  * field: 0 on success, HYPE_FW_CFG_DMA_CTL_ERROR set otherwise.
  */
 uint32_t hype_fw_cfg_dma_execute(hype_fw_cfg_t *fw, const hype_fw_cfg_dma_op_t *op, uint8_t *guest_data_ptr);
+
+/*
+ * #667: the whole port-0x518 DMA sequence for an access struct already known to live at
+ * `access_phys`, extracted from the SVM/VMX IOIO handlers (arch/x86_64/svm/svm_vcpu.c,
+ * arch/x86_64/vmx/vmcs_hw.c -- both call this instead of duplicating it) so the VALID-3
+ * GPA-translation/rejection path is independently unit-testable without a full vcpu context.
+ *
+ * Translates the 16-byte access struct through `dma_map` (VALID-1; a NULL map means "trusted
+ * identity-mapped guest", matching every other DMA call site's convention). If that translation
+ * fails, returns -1 and touches NOTHING -- not even a partial write -- since there is nowhere
+ * safe to report a Control-field error. Otherwise decodes the struct; if it names a nonzero-
+ * length data buffer, translates THAT through `dma_map` too and reports
+ * HYPE_FW_CFG_DMA_CTL_ERROR in the write-back (matching real hardware's own DMA-error signalling)
+ * rather than touching an unmapped address, but still writes the (big-endian) result back into
+ * the access struct's Control field either way. Returns 0 whenever the access struct itself was
+ * reachable, regardless of whether the data-buffer step succeeded.
+ */
+int hype_fw_cfg_dma_op_run(hype_fw_cfg_t *fw, const hype_gpa_map_t *dma_map, uint64_t access_phys);
 
 #endif /* HYPE_DEVICES_FW_CFG_H */
