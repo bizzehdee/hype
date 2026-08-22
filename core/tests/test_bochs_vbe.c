@@ -267,6 +267,55 @@ static void test_disable_does_not_latch(void) {
         CHECK_HEX("disable leaves virt_width alone", 0u, read_reg(&dev, HYPE_BOCHS_VBE_INDEX_VIRT_WIDTH));
 }
 
+/*
+ * #655: stride_bytes/fb_offset_bytes and the VIDEO_MEMORY_64K report are all products of
+ * guest-controlled 16-bit register values. At large enough values (near the 0xFFFF a guest can
+ * legitimately write to any DISPI register) the products exceed UINT32_MAX; a plain uint32_t
+ * multiply wraps to a small, wrong value instead of the true (too-large-to-represent) one.
+ */
+static void test_large_registers_do_not_overflow_stride_or_offset(void) {
+    hype_bochs_vbe_t dev;
+    hype_bochs_vbe_mode_t mode;
+
+    hype_bochs_vbe_reset(&dev);
+    write_reg(&dev, HYPE_BOCHS_VBE_INDEX_XRES, 0xFFFFu);
+    write_reg(&dev, HYPE_BOCHS_VBE_INDEX_YRES, 0xFFFFu);
+    write_reg(&dev, HYPE_BOCHS_VBE_INDEX_BPP, 32u);
+    write_reg(&dev, HYPE_BOCHS_VBE_INDEX_VIRT_WIDTH, 0xFFFFu);
+    write_reg(&dev, HYPE_BOCHS_VBE_INDEX_VIRT_HEIGHT, 0xFFFFu);
+    write_reg(&dev, HYPE_BOCHS_VBE_INDEX_Y_OFFSET, 0xFFFFu);
+    write_reg(&dev, HYPE_BOCHS_VBE_INDEX_ENABLE,
+             HYPE_BOCHS_VBE_ENABLE_ENABLED | HYPE_BOCHS_VBE_ENABLE_LFB_ENABLED);
+
+    hype_bochs_vbe_get_mode(&dev, &mode);
+    /* stride = 0xFFFF * 4 = 0x3FFFC, well within 32 bits -- not the overflowing factor here. */
+    CHECK_HEX("stride computed correctly", 0xFFFFu * 4u, mode.stride_bytes);
+    /* fb_offset = y_offset(0xFFFF) * stride(0x3FFFC) ~= 17.18e9, which does NOT fit in 32 bits --
+     * the mode must be reported invalid rather than publish a wrapped small offset. */
+    CHECK_HEX("mode reported invalid rather than a wrapped fb_offset", 0u, mode.valid);
+}
+
+static void test_video_memory_64k_saturates_rather_than_wraps(void) {
+    hype_bochs_vbe_t dev;
+    uint16_t units;
+
+    hype_bochs_vbe_reset(&dev);
+    write_reg(&dev, HYPE_BOCHS_VBE_INDEX_XRES, 0xFFFFu);
+    write_reg(&dev, HYPE_BOCHS_VBE_INDEX_YRES, 0xFFFFu);
+    write_reg(&dev, HYPE_BOCHS_VBE_INDEX_BPP, 32u);
+    write_reg(&dev, HYPE_BOCHS_VBE_INDEX_VIRT_WIDTH, 0xFFFFu);
+    write_reg(&dev, HYPE_BOCHS_VBE_INDEX_VIRT_HEIGHT, 0xFFFFu);
+    write_reg(&dev, HYPE_BOCHS_VBE_INDEX_ENABLE,
+             HYPE_BOCHS_VBE_ENABLE_ENABLED | HYPE_BOCHS_VBE_ENABLE_LFB_ENABLED);
+
+    /* stride(0x3FFFC) * virt_height(0xFFFF) ~= 17.18e9 -- a 32-bit product wraps to a SMALL
+     * value (about 262145 mod 2^32, itself still > 0xFFFF, but the point generalizes: any
+     * wrapped product could land anywhere, including implausibly small). The fixed 64-bit
+     * computation must saturate at the register's own 16-bit ceiling instead. */
+    units = read_reg(&dev, HYPE_BOCHS_VBE_INDEX_VIDEO_MEMORY_64K);
+    CHECK_HEX("VIDEO_MEMORY_64K saturates at 0xFFFF rather than wrapping", 0xFFFFu, units);
+}
+
 int main(void) {
     test_reset_clears_all_registers();
     test_id_register_always_reads_id5();
@@ -283,6 +332,8 @@ int main(void) {
     test_enable_latches_virtual_dimensions();
     test_enable_keeps_a_larger_virtual_width();
     test_disable_does_not_latch();
+    test_large_registers_do_not_overflow_stride_or_offset();
+    test_video_memory_64k_saturates_rather_than_wraps();
 
     if (failures == 0) {
         printf("all tests passed\n");

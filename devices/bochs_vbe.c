@@ -54,13 +54,19 @@ int hype_bochs_vbe_mmio_read(const hype_bochs_vbe_t *dev, uint32_t offset, uint1
     if (index == HYPE_BOCHS_VBE_INDEX_VIDEO_MEMORY_64K) {
         hype_bochs_vbe_mode_t mode;
         uint32_t virt_height;
-        uint32_t total_bytes;
+        uint64_t total_bytes64;
+        uint64_t units64;
 
         hype_bochs_vbe_get_mode(dev, &mode);
         virt_height = effective_virtual_dimension(dev->regs[HYPE_BOCHS_VBE_INDEX_VIRT_HEIGHT],
                                                    dev->regs[HYPE_BOCHS_VBE_INDEX_YRES]);
-        total_bytes = mode.stride_bytes * virt_height;
-        *out_value = (uint16_t)((total_bytes + 0xFFFFu) >> 16);
+        /* #655: stride_bytes is guest-controlled and so is virt_height -- their product can
+         * exceed UINT32_MAX (see hype_bochs_vbe_get_mode's own comment). Compute in uint64_t and
+         * saturate to 0xFFFF (this register is a 16-bit count of 64 KiB units, so any real
+         * hardware report is bounded the same way) rather than silently wrapping. */
+        total_bytes64 = (uint64_t)mode.stride_bytes * (uint64_t)virt_height;
+        units64 = (total_bytes64 + 0xFFFFu) >> 16;
+        *out_value = (units64 > 0xFFFFu) ? (uint16_t)0xFFFFu : (uint16_t)units64;
         return 0;
     }
 
@@ -115,6 +121,8 @@ void hype_bochs_vbe_get_mode(const hype_bochs_vbe_t *dev, hype_bochs_vbe_mode_t 
     uint32_t virt_width;
     uint32_t x_offset;
     uint32_t y_offset;
+    uint64_t stride_bytes64;
+    uint64_t fb_offset_bytes64;
 
     out_mode->width = dev->regs[HYPE_BOCHS_VBE_INDEX_XRES];
     out_mode->height = dev->regs[HYPE_BOCHS_VBE_INDEX_YRES];
@@ -124,14 +132,27 @@ void hype_bochs_vbe_get_mode(const hype_bochs_vbe_t *dev, hype_bochs_vbe_mode_t 
     x_offset = dev->regs[HYPE_BOCHS_VBE_INDEX_X_OFFSET];
     y_offset = dev->regs[HYPE_BOCHS_VBE_INDEX_Y_OFFSET];
 
-    out_mode->stride_bytes = virt_width * bytes_per_pixel;
-    out_mode->fb_offset_bytes = (x_offset * bytes_per_pixel) + (y_offset * out_mode->stride_bytes);
+    /*
+     * #655: every factor here is guest-controlled (DISPI registers, up to 0xFFFF each), and their
+     * products can exceed UINT32_MAX -- e.g. a virt_width/virt_height near 0xFFFF at 32bpp
+     * overflows a plain uint32_t multiply and silently wraps to a small, wrong value. Compute in
+     * uint64_t (matching devices/ramfb.c's hype_ramfb_frame_size, the guarded sibling this file
+     * did not match) and refuse the mode -- rather than publish a wrapped stride/offset -- if
+     * either product does not fit the 32-bit fields real bochs-display hardware actually reports.
+     */
+    stride_bytes64 = (uint64_t)virt_width * (uint64_t)bytes_per_pixel;
+    fb_offset_bytes64 =
+        (uint64_t)x_offset * (uint64_t)bytes_per_pixel + (uint64_t)y_offset * stride_bytes64;
+
+    out_mode->stride_bytes = (uint32_t)stride_bytes64;
+    out_mode->fb_offset_bytes = (uint32_t)fb_offset_bytes64;
 
     out_mode->valid = 0;
     if (bytes_per_pixel != 0u &&
         (enable & HYPE_BOCHS_VBE_ENABLE_ENABLED) != 0u &&
         (enable & HYPE_BOCHS_VBE_ENABLE_LFB_ENABLED) != 0u &&
-        out_mode->width != 0u && out_mode->height != 0u) {
+        out_mode->width != 0u && out_mode->height != 0u &&
+        stride_bytes64 <= 0xFFFFFFFFu && fb_offset_bytes64 <= 0xFFFFFFFFu) {
         out_mode->valid = 1;
     }
 }
