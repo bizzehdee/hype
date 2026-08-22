@@ -54,9 +54,12 @@ document in `.learnings/`. Read the document before touching anything near it.
   [`.learnings/invariant-core-allocation.md`](.learnings/invariant-core-allocation.md)
 - **Guest RAM is zeroed before first execution**, every (re)start.
   [`.learnings/invariant-guest-ram-zeroed.md`](.learnings/invariant-guest-ram-zeroed.md)
-- **No guest gets direct hardware access** — always host-driver + emulated
-  frontend, never passthrough/guest DMA.
-  [`.learnings/invariant-no-direct-hw-access.md`](.learnings/invariant-no-direct-hw-access.md)
+- **No guest gets UNAUTHORIZED direct hardware access** — by default, always
+  host-driver + emulated frontend, never passthrough/guest DMA. The one
+  narrow exception (PCI-e passthrough, #699, in design) requires explicit
+  per-VM identity-based authorization plus IOMMU-enforced DMA/interrupt
+  containment — never a default, never positional.
+  [`.learnings/invariant-authorized-hw-access.md`](.learnings/invariant-authorized-hw-access.md)
 - **Destructive `physical:` writes are triple-guarded** — serial match,
   interactive confirm, non-empty-partition-table guard.
   [`.learnings/invariant-physical-write-guard.md`](.learnings/invariant-physical-write-guard.md)

@@ -30,8 +30,10 @@ here for the full text and rationale.
   idle a sibling or disable SMT.
 - [invariant-guest-ram-zeroed.md](invariant-guest-ram-zeroed.md) — guest RAM is
   zeroed before first execution, every (re)start.
-- [invariant-no-direct-hw-access.md](invariant-no-direct-hw-access.md) — no
-  guest gets direct hardware access; always host-driver + emulated frontend.
+- [invariant-authorized-hw-access.md](invariant-authorized-hw-access.md) — no
+  guest gets UNAUTHORIZED direct hardware access; by default always
+  host-driver + emulated frontend, with one narrow IOMMU-backed exception for
+  explicitly-assigned passthrough devices (#699).
 - [invariant-physical-write-guard.md](invariant-physical-write-guard.md) —
   destructive `physical:` writes are triple-guarded (serial match, confirm,
   non-empty-PT guard).
