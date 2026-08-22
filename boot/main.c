@@ -23479,6 +23479,8 @@ static void usb_log_latch_bsp_core(void) {
     /* #363: and tell blk_usb, so the BSP's USB waits are bounded and a stuck guest core cannot
      * take the console down with it. */
     hype_blk_usb_set_bsp_apic(g_usb_log_bsp_apic_id);
+    /* #658: same reason, for the AHCI host port lock. */
+    hype_ahci_host_set_bsp_apic(g_usb_log_bsp_apic_id);
 }
 
 /* 1 when this core owns USB I/O. Pre-MP (marker not yet latched) only the BSP
@@ -26670,12 +26672,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                         }
                         hype_debug_print("fw-1 KBDIRQ: isr_entries=%llu (+%llu since last) eois=%llu "
                                          "last_apic=%u | polled=%llu chords=%llu ps2polled=%llu | "
-                                         "bsp_usb_timeouts=%llu [#363]\n",
+                                         "bsp_usb_timeouts=%llu bsp_ahci_timeouts=%llu [#363 #658]\n",
                                          e, e - kbd_prev_entries, eo, ap,
                                          (unsigned long long)g_hostkbd_scancodes,
                                          (unsigned long long)g_hostkbd_chords,
                                          (unsigned long long)hype_host_kbd_polled_bytes(),
-                                         hype_blk_usb_bsp_lock_timeouts());
+                                         hype_blk_usb_bsp_lock_timeouts(),
+                                         hype_ahci_host_bsp_lock_timeouts());
                         {
                             unsigned vi;
                             for (vi = 0; vi < g_vm_count; vi++) {

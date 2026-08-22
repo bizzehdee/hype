@@ -1,6 +1,7 @@
 #include "ahci_host.h"
 #include "../devices/ahci.h" /* HYPE_AHCI_REG_* / HYPE_AHCI_PREG_* / PxCMD bits / signatures */
 #include "fatal.h"           /* hype_debug_print -- temporary GLADDER-10 stall instrumentation */
+#include "ticket_lock.h"     /* #658: fair per-port lock, BSP-bounded -- see ahci_port_lock_or_fail */
 
 /*
  * Hardware shim for the host AHCI driver: real MMIO against the physical HBA.
@@ -59,17 +60,67 @@ static uint8_t g_cmd_table[AHCI_HOST_MAX_PORTS]
  * The USB host path already does exactly this (g_usb_xfer_lock, #346). This is the same fix for
  * the AHCI one. Host reads are not a throughput path -- they fill a bounce buffer -- so a spin
  * lock costs nothing worth measuring against silently corrupting a guest.
+ *
+ * #658: that exchange lock has no fairness -- exactly the shape #362 found on the identical USB
+ * host lock: a guest AP issuing back-to-back transfers on a shared port can hold it "effectively
+ * continuously" and starve a third contender indefinitely. core/blk_usb.c was hardened past this
+ * twice (#362: a ticket lock for arrival-order fairness; #363: a bounded claim for the BSP, since
+ * the BSP's own AHCI use -- install-to-physical, media reads, disk inventory, all from
+ * boot/main.c -- must never block forever behind a guest core that stops making progress). AHCI's
+ * lock never got either fix. This brings it up to the same shape, reusing the shared
+ * core/ticket_lock.c primitive rather than re-deriving blk_usb.c's own private one.
  */
-static volatile int g_ahci_port_lock[AHCI_HOST_MAX_PORTS];
+static volatile unsigned int g_ahci_ticket_next[AHCI_HOST_MAX_PORTS];
+static volatile unsigned int g_ahci_ticket_owner[AHCI_HOST_MAX_PORTS];
 
-static void ahci_port_lock(unsigned port) {
-    while (__atomic_exchange_n(&g_ahci_port_lock[port], 1, __ATOMIC_ACQUIRE) != 0) {
+static volatile unsigned int g_ahci_bsp_apic = 0xFFFFFFFFu;
+static volatile unsigned long long g_ahci_bsp_lock_timeouts;
+
+/* Records which core is the BSP, the same way hype_blk_usb_set_bsp_apic() does, so
+ * ahci_port_lock_or_fail() can tell "the BSP" from "a guest AP" without a vcpu context. */
+void hype_ahci_host_set_bsp_apic(unsigned int apic_id) { g_ahci_bsp_apic = apic_id; }
+
+/* Nonzero after a real-HW run means the BSP hit the bounded budget below at least once -- the
+ * AHCI counterpart of hype_blk_usb_bsp_lock_timeouts(). */
+unsigned long long hype_ahci_host_bsp_lock_timeouts(void) { return g_ahci_bsp_lock_timeouts; }
+
+static unsigned int ahci_this_apic(void) {
+    return (*(volatile uint32_t *)(uintptr_t)0xFEE00020u) >> 24;
+}
+
+/* Matches USB_BSP_LOCK_BUDGET's order of magnitude (core/blk_usb.c) -- large enough to ride out
+ * ordinary contention, bounded so the BSP's console/keyboard/log never freeze behind a guest core
+ * that has stopped making progress. */
+#define AHCI_BSP_LOCK_BUDGET 20000000u
+
+static int ahci_port_lock_bounded(unsigned port) {
+    unsigned int budget = AHCI_BSP_LOCK_BUDGET;
+
+    /* #377-shaped care (see core/blk_usb.c's own comment on this exact point): claim only while
+     * next == owner, so a timing-out BSP never advances the queue out from under whoever is
+     * really holding it or waiting ahead of it. A failed claim mutates neither counter. */
+    while (budget-- != 0u) {
+        if (hype_ticket_lock_try_claim(&g_ahci_ticket_next[port], &g_ahci_ticket_owner[port])) {
+            return 0;
+        }
         __builtin_ia32_pause();
     }
+    g_ahci_bsp_lock_timeouts++;
+    return -1;
+}
+
+/* Guest AP callers wait as long as it takes (returning short data to a guest is not an option);
+ * the BSP gets the bounded claim above and fails instead, matching usb_xfer_lock_or_fail(). */
+static int ahci_port_lock_or_fail(unsigned port) {
+    if (ahci_this_apic() == g_ahci_bsp_apic) {
+        return ahci_port_lock_bounded(port);
+    }
+    hype_ticket_lock_acquire(&g_ahci_ticket_next[port], &g_ahci_ticket_owner[port]);
+    return 0;
 }
 
 static void ahci_port_unlock(unsigned port) {
-    __atomic_store_n(&g_ahci_port_lock[port], 0, __ATOMIC_RELEASE);
+    hype_ticket_lock_release(&g_ahci_ticket_owner[port]);
 }
 
 /* The unlocked bodies; each public entry point below takes the port lock and calls its own. */
@@ -261,7 +312,9 @@ int hype_ahci_host_atapi_read(uint64_t abar_phys, unsigned port, uint32_t lba2k,
     if (port >= AHCI_HOST_MAX_PORTS) {
         return -1;
     }
-    ahci_port_lock(port);
+    if (ahci_port_lock_or_fail(port) != 0) {
+        return -1;
+    }
     rc = ahci_atapi_read_locked(abar_phys, port, lba2k, count2k, dst);
     ahci_port_unlock(port);
     return rc;
@@ -377,7 +430,9 @@ int hype_ahci_host_read(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_
     if (port >= AHCI_HOST_MAX_PORTS) {
         return -1;
     }
-    ahci_port_lock(port);
+    if (ahci_port_lock_or_fail(port) != 0) {
+        return -1;
+    }
     rc = ahci_read_locked(abar_phys, port, lba, count, dst);
     ahci_port_unlock(port);
     return rc;
@@ -468,7 +523,9 @@ int hype_ahci_host_write(uint64_t abar_phys, unsigned port, uint64_t lba, uint16
     if (port >= AHCI_HOST_MAX_PORTS) {
         return -1;
     }
-    ahci_port_lock(port);
+    if (ahci_port_lock_or_fail(port) != 0) {
+        return -1;
+    }
     rc = ahci_write_locked(abar_phys, port, lba, count, src);
     ahci_port_unlock(port);
     return rc;
@@ -545,7 +602,9 @@ int hype_ahci_host_writev(uint64_t abar_phys, unsigned port, uint64_t lba,
     if (port >= AHCI_HOST_MAX_PORTS) {
         return -1;
     }
-    ahci_port_lock(port);
+    if (ahci_port_lock_or_fail(port) != 0) {
+        return -1;
+    }
     rc = ahci_writev_locked(abar_phys, port, lba, sg, nsegs, count);
     ahci_port_unlock(port);
     return rc;
@@ -556,7 +615,9 @@ int hype_ahci_host_identify(uint64_t abar_phys, unsigned port, void *dst512) {
     if (port >= AHCI_HOST_MAX_PORTS) {
         return -1;
     }
-    ahci_port_lock(port);
+    if (ahci_port_lock_or_fail(port) != 0) {
+        return -1;
+    }
     rc = ahci_identify_locked(abar_phys, port, dst512);
     ahci_port_unlock(port);
     return rc;

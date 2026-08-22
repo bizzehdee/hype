@@ -206,6 +206,17 @@ int hype_ahci_host_init(uint64_t abar_phys, unsigned port);
 int hype_ahci_host_read(uint64_t abar_phys, unsigned port, uint64_t lba, uint16_t count, void *dst);
 
 /*
+ * #658: records which core is the BSP, mirroring hype_blk_usb_set_bsp_apic() (core/blk_usb.h) --
+ * so the per-port lock can give the BSP a bounded wait instead of the unbounded one guest AP
+ * callers get. Call once, from the same place USB's BSP core is latched.
+ */
+void hype_ahci_host_set_bsp_apic(unsigned int apic_id);
+
+/* Nonzero after a real-HW run means the BSP hit its bounded lock budget at least once -- the
+ * AHCI counterpart of hype_blk_usb_bsp_lock_timeouts() (core/blk_usb.h). */
+unsigned long long hype_ahci_host_bsp_lock_timeouts(void);
+
+/*
  * Issues IDENTIFY DEVICE to an already-initialised `port` (see
  * hype_ahci_host_init) and copies the 512-byte response into `dst512` (a
  * 512-byte, identity-mapped, sector-aligned host buffer). Builds slot 0
