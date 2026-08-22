@@ -4,6 +4,7 @@
 #include "../ext.h"
 #include "../fs_ops.h"
 #include "../ext_jalloc.h"
+#include "../ext_csum.h"
 #include "../jbd2.h"
 
 static int failures = 0;
@@ -1839,13 +1840,146 @@ static void test_extj_gates(void) {
     build_vol_ext3();
     put32(sb + 0x64, 0x0200u); /* BIGALLOC */
     CHECK("bigalloc refused", hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w) != 0);
+    /* #495: METADATA_CSUM is now maintained, not refused -- but only with the
+     * one algorithm the spec defines (s_checksum_type == 1, crc32c). */
     build_vol_ext3();
     put32(sb + 0x64, 0x0400u); /* METADATA_CSUM */
-    CHECK("checksummed metadata refused",
+    CHECK("metadata_csum with no checksum_type still refused",
           hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w) != 0);
+    sb[0x175] = 1u; /* s_checksum_type: crc32c */
+    CHECK_HEX("metadata_csum with crc32c accepted", 0,
+              hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w));
+    build_vol_ext3();
+    put32(sb + 0x64, 0x0010u); /* GDT_CSUM (uninit_bg) -- the other, older algorithm */
+    CHECK_HEX("gdt_csum accepted", 0,
+              hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w));
     build_vol_ext3();
     put16(sb + 0x3A, 0x0000u); /* dirty */
     CHECK("dirty volume refused", hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w) != 0);
+}
+
+/* #495: metadata checksums, verified byte-for-byte against the same
+ * hype_ext_crc32c/hype_ext_crc16 primitives the writer itself calls -- the
+ * real, e2fsck-graded proof lives in tools/495 (host mkfs.ext4 + e2fsck),
+ * but this pins the exact byte ranges, seed order and field placement for
+ * every structure this writer ever mutates. */
+static void test_extj_metadata_csum(void) {
+    static hype_extj_wfile_t w;
+    uint8_t *sb = g_vol + 1024;
+    uint8_t uuid[16];
+    unsigned i;
+
+    for (i = 0; i < 16u; i++) uuid[i] = (uint8_t)(i * 17u + 3u);
+
+    /* ---- METADATA_CSUM (crc32c): superblock, group desc, bitmap, inode ---- */
+    build_vol_ext3();
+    put32(sb + 0x64, 0x0400u); /* RO_COMPAT metadata_csum */
+    sb[0x175] = 1u;            /* s_checksum_type: crc32c */
+    for (i = 0; i < 16u; i++) sb[0x68 + i] = uuid[i];
+    CHECK_HEX("metadata_csum open", 0,
+              hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w));
+    CHECK_HEX("write into a classic hole", 0, hype_extj_write_at(&w, BS, "Q", 1));
+    {
+        uint32_t seed = hype_ext_crc32c(0xFFFFFFFFu, uuid, 16u);
+
+        CHECK_HEX("superblock checksum", hype_ext_crc32c(0xFFFFFFFFu, sb, 0x3FCu),
+                  get32(sb + 0x3FCu));
+
+        {
+            uint8_t gd_copy[32];
+            uint8_t grp_le[4] = {0, 0, 0, 0};
+            uint32_t crc;
+            memcpy(gd_copy, blk(2), 32);
+            put16(gd_copy + 0x1E, 0); /* the field is zeroed for the hash */
+            crc = hype_ext_crc32c(seed, grp_le, 4u);
+            crc = hype_ext_crc32c(crc, gd_copy, 32u);
+            CHECK_HEX("group descriptor checksum", (uint16_t)crc, get16(blk(2) + 0x1E));
+        }
+        CHECK_HEX("block bitmap checksum", (uint16_t)hype_ext_crc32c(seed, blk(BITMAP_BLK), BS),
+                  get16(blk(2) + 0x18));
+        {
+            uint8_t *in13 = inode(13u);
+            uint8_t inum_le[4] = {13, 0, 0, 0};
+            uint8_t gen_le[4] = {0, 0, 0, 0};
+            uint8_t copy[INODE_SIZE];
+            uint32_t iseed, crc;
+            memcpy(copy, in13, INODE_SIZE);
+            put16(copy + 0x7C, 0); /* i_checksum_lo zeroed for the hash */
+            iseed = hype_ext_crc32c(seed, inum_le, 4u);
+            iseed = hype_ext_crc32c(iseed, gen_le, 4u);
+            crc = hype_ext_crc32c(iseed, copy, INODE_SIZE);
+            CHECK_HEX("inode checksum lo (no extra_isize -> no hi)", (uint16_t)crc,
+                      get16(in13 + 0x7C));
+            CHECK_HEX("no i_checksum_hi without room for it", 0, get16(in13 + 0x82));
+        }
+    }
+
+    /* a checksum_type other than crc32c is still refused: the spec defines no other */
+    build_vol_ext3();
+    put32(sb + 0x64, 0x0400u);
+    sb[0x175] = 2u;
+    CHECK("unknown checksum_type refused",
+          hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w) != 0);
+
+    /* ---- GDT_CSUM (crc16): a different algorithm covering less ---- */
+    build_vol_ext3();
+    put32(sb + 0x64, 0x0010u);
+    for (i = 0; i < 16u; i++) sb[0x68 + i] = uuid[i];
+    CHECK_HEX("gdt_csum open", 0, hype_extj_open_rw(vol_read, vol_write2, 0, "/swiss.bin", &w));
+    CHECK_HEX("write into a classic hole (gdt_csum)", 0, hype_extj_write_at(&w, BS, "Q", 1));
+    {
+        uint8_t grp_le[4] = {0, 0, 0, 0};
+        uint16_t crc = hype_ext_crc16(0xFFFFu, uuid, 16u);
+        crc = hype_ext_crc16(crc, grp_le, 4u);
+        crc = hype_ext_crc16(crc, blk(2), 0x1Eu); /* excludes bg_checksum entirely */
+        CHECK_HEX("gdt_csum group descriptor checksum", crc, get16(blk(2) + 0x1E));
+        CHECK_HEX("gdt_csum never sets a bitmap checksum", 0, get16(blk(2) + 0x18));
+    }
+
+    /* ---- extent-tree tail checksum: force a standalone leaf via a root split ---- */
+    build_vol_ext4j();
+    put32(sb + 0x64, 0x0400u);
+    sb[0x175] = 1u;
+    for (i = 0; i < 16u; i++) sb[0x68 + i] = uuid[i];
+    put16(inode(17u) + 0x80, 32u); /* i_extra_isize: room for i_checksum_hi too */
+    CHECK_HEX("extents open", 0, hype_extj_open_rw(vol_read, vol_write2, 0, "/esp.bin", &w));
+    /* esp.bin's in-inode root already holds 2 entries (max 4); three more
+     * disjoint single-block holes push it past capacity and force a split. */
+    CHECK_HEX("extent hole 1", 0, hype_extj_write_at(&w, 8u * BS, "a", 1));
+    CHECK_HEX("extent hole 2", 0, hype_extj_write_at(&w, 10u * BS, "b", 1));
+    CHECK_HEX("extent hole 3 (forces the split)", 0, hype_extj_write_at(&w, 12u * BS, "c", 1));
+    {
+        uint8_t *in17 = inode(17u);
+        uint32_t seed = hype_ext_crc32c(0xFFFFFFFFu, uuid, 16u);
+        uint8_t inum_le[4] = {17, 0, 0, 0};
+        uint8_t gen_le[4] = {0, 0, 0, 0};
+        uint32_t iseed = hype_ext_crc32c(seed, inum_le, 4u);
+        uint8_t *node;
+        uint16_t eh_max;
+        uint32_t tail_off, nb;
+
+        iseed = hype_ext_crc32c(iseed, gen_le, 4u);
+        CHECK("root grew to depth 1", get16(in17 + 0x28 + 6u) == 1u);
+        nb = get32(in17 + 0x28 + 12u + 4u);
+        node = blk(nb);
+        CHECK_HEX("standalone node has the extent magic", 0xF30Au, get16(node));
+        eh_max = get16(node + 4u);
+        tail_off = 12u + (uint32_t)eh_max * 12u;
+        CHECK_HEX("extent tail checksum", hype_ext_crc32c(iseed, node, tail_off),
+                  get32(node + tail_off));
+
+        /* the inode's own checksum, now with room for i_checksum_hi */
+        {
+            uint8_t copy[INODE_SIZE];
+            uint32_t icrc;
+            memcpy(copy, in17, INODE_SIZE);
+            put16(copy + 0x7C, 0);
+            put16(copy + 0x82, 0);
+            icrc = hype_ext_crc32c(iseed, copy, INODE_SIZE);
+            CHECK_HEX("inode checksum lo", (uint16_t)icrc, get16(in17 + 0x7Cu));
+            CHECK_HEX("inode checksum hi", (uint16_t)(icrc >> 16), get16(in17 + 0x82u));
+        }
+    }
 }
 
 static void test_extj_classic(void) {
@@ -3308,6 +3442,7 @@ int main(void) {
     test_384_final_edges();
     test_384_coverage_tail();
     test_extj_gates();
+    test_extj_metadata_csum();
     test_extj_classic();
     test_extj_extents();
     test_extj_crash_windows();
