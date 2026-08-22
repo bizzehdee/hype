@@ -102,7 +102,13 @@ typedef struct {
  * (48-bit words 100-103 when word 83 bit 10 marks 48-bit addressing supported,
  * otherwise the 28-bit words 60-61 fallback). Pure.
  */
-void hype_ahci_host_parse_identify(const uint8_t id[512], hype_host_disk_info_t *out);
+/*
+ * #657: returns 0 on success, -1 if both the 48-bit and 28-bit capacity fields are zero (an
+ * implausible/garbled response -- there is no sane "0-sector disk"), matching
+ * hype_nvme_parse_identify_ns's contract (core/nvme_host.c). Callers must not inventory or attach
+ * a disk whose IDENTIFY failed to parse.
+ */
+int hype_ahci_host_parse_identify(const uint8_t id[512], hype_host_disk_info_t *out);
 
 /* --- Hardware bring-up (host_pci_hw-style shim; real MMIO, not unit-tested) --- */
 

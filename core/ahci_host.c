@@ -200,7 +200,7 @@ static void read_swapped_ascii(char *dst, const uint8_t *src, unsigned field_byt
     }
 }
 
-void hype_ahci_host_parse_identify(const uint8_t id[512], hype_host_disk_info_t *out) {
+int hype_ahci_host_parse_identify(const uint8_t id[512], hype_host_disk_info_t *out) {
     uint64_t lba48 = 0;
     uint32_t lba28;
     unsigned i;
@@ -214,12 +214,21 @@ void hype_ahci_host_parse_identify(const uint8_t id[512], hype_host_disk_info_t 
     lba28 = (uint32_t)id[120] | ((uint32_t)id[121] << 8) |
             ((uint32_t)id[122] << 16) | ((uint32_t)id[123] << 24); /* words 60-61 */
 
+    /* #657: both capacity fields zero means there is no sane "0-sector disk" to inventory -- an
+     * implausible/garbled IDENTIFY (mid-negotiation, a firmware quirk) must be rejected here, the
+     * one place every caller funnels through, matching hype_nvme_parse_identify_ns's contract
+     * (core/nvme_host.c) rather than silently attaching a 0-sector disk. */
+    if (lba48 == 0u && lba28 == 0u) {
+        return -1;
+    }
+
     /* Word 83 bit 10 (high byte 167, bit 2 = 0x04) = 48-bit addressing supported. */
     if ((id[167] & 0x04u) != 0u && lba48 != 0u) {
         out->total_sectors = lba48;
     } else {
         out->total_sectors = lba28;
     }
+    return 0;
 }
 
 void hype_ahci_host_build_cmd_header_atapi(uint8_t slot[32], uint16_t prdtl,

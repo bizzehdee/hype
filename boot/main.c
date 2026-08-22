@@ -25956,7 +25956,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                          "not inventoried [#258]\n", pp);
                         continue;
                     }
-                    hype_ahci_host_parse_identify(inv_id, &idi);
+                    if (hype_ahci_host_parse_identify(inv_id, &idi) != 0) {
+                        hype_debug_print("host-disk: port %u IDENTIFY implausible (no capacity) -- "
+                                         "not inventoried [#657]\n", pp);
+                        continue;
+                    }
                     if (hype_disk_inventory_add(&g_disk_inv, HYPE_DISK_BUS_AHCI, hs.bar_phys, pp,
                                                 idi.serial, idi.model, idi.total_sectors) != 0) {
                         hype_debug_print("host-disk: inventory FULL -- %02x:%02x.%x port %u not "
@@ -26009,11 +26013,14 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 {
                     static uint8_t g_hostdisk_id[512] __attribute__((aligned(4096)));
                     static uint8_t g_hostdisk_lba1[512] __attribute__((aligned(4096)));
-                    if (hype_ahci_host_identify(hs.bar_phys, (unsigned)sp, g_hostdisk_id) == 0) {
-                        hype_host_disk_info_t di;
+                    hype_host_disk_info_t di;
+                    /* #657: an implausible/garbled IDENTIFY (no capacity in either field) must
+                     * not be inventoried/attached, matching hype_nvme_parse_identify_ns's
+                     * contract -- checked in the same condition as the read itself failing. */
+                    if (hype_ahci_host_identify(hs.bar_phys, (unsigned)sp, g_hostdisk_id) == 0 &&
+                        hype_ahci_host_parse_identify(g_hostdisk_id, &di) == 0) {
                         uint8_t guid[16];
                         int have_guid = 0;
-                        hype_ahci_host_parse_identify(g_hostdisk_id, &di);
                         { /* #262: keep the accepted-by-firmware IDENTIFY for diffing */
                             unsigned ci;
                             for (ci = 0; ci < 512u; ci++) {
@@ -26080,7 +26087,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                             }
                         }
                     } else {
-                        hype_serial_print("host-disk: IDENTIFY failed\n");
+                        hype_serial_print("host-disk: IDENTIFY failed or implausible (no capacity) [#657]\n");
                     }
                 }
             }

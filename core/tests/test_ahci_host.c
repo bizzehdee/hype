@@ -156,6 +156,40 @@ static void test_parse_identify_lba28_fallback(void) {
     CHECK_STR("empty serial trims to nothing", "", info.serial);
 }
 
+/*
+ * #657: an all-zero IDENTIFY (both the 48-bit and 28-bit capacity fields zero -- no sane
+ * "0-sector disk") must be rejected, matching hype_nvme_parse_identify_ns's
+ * "ns nsze 0 rejected" contract (core/tests/test_nvme_host.c) rather than silently accepted.
+ */
+static void test_parse_identify_all_zero_rejected(void) {
+    uint8_t id[512];
+    hype_host_disk_info_t info;
+    unsigned i;
+    int rc;
+
+    for (i = 0; i < 512u; i++) {
+        id[i] = 0;
+    }
+    rc = hype_ahci_host_parse_identify(id, &info);
+    CHECK_HEX("all-zero IDENTIFY rejected", (unsigned)-1, (unsigned)rc);
+}
+
+/* A legitimate response (either capacity field nonzero) must still succeed. */
+static void test_parse_identify_nonzero_capacity_accepted(void) {
+    uint8_t id[512];
+    hype_host_disk_info_t info;
+    unsigned i;
+    int rc;
+
+    for (i = 0; i < 512u; i++) {
+        id[i] = 0;
+    }
+    id[120] = 0x01u; /* 28-bit capacity = 1 sector */
+    rc = hype_ahci_host_parse_identify(id, &info);
+    CHECK_HEX("nonzero capacity accepted", 0, rc);
+    CHECK_HEX("capacity parsed", 1ull, info.total_sectors);
+}
+
 /* ---- #325: host-side ATAPI (reading a real optical drive) ---- */
 
 static void test_atapi_header_sets_the_A_bit(void) {
@@ -502,6 +536,8 @@ int main(void) {
     test_identify_cmd_table();
     test_parse_identify_roundtrip();
     test_parse_identify_lba28_fallback();
+    test_parse_identify_all_zero_rejected();
+    test_parse_identify_nonzero_capacity_accepted();
     test_atapi_header_sets_the_A_bit();
     test_atapi_read10_cdb_and_byte_count();
     test_atapi_read10_refuses_impossible_sizes();
