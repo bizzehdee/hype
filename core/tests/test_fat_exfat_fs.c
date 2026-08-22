@@ -95,6 +95,9 @@ static uint64_t g_lba_read_target = (uint64_t)-1;
 static long g_lba_reads_to_fail;
 static long g_lba_reads_seen;
 
+/* #651: total vol_read invocations, for the directory-cursor call-count tests. */
+static unsigned int g_read_calls;
+
 static int vol_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
     (void)ctx;
     if (lba + count > VOL_SECTORS) return -1;
@@ -104,6 +107,7 @@ static int vol_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
         g_lba_reads_seen++;
         return -1;
     }
+    g_read_calls++;
     if (g_stale_reads && count == 1u) {
         if (lba == FAT_LBA) {
             memcpy(dst, g_stale_fat_sector, SECSZ);
@@ -2749,7 +2753,131 @@ static void test_dir_walk_io_error_is_distinct_from_not_found(void) {
     g_fail_read_lba = (uint64_t)-1;
 }
 
+/*
+ * #651: a root directory chained across FOUR clusters (ROOT_CL, plus three
+ * more, 16 entries each -- HYPE_EXFAT_ENTRIES_PER_SECTOR with spc == 1 --
+ * 64 slots total), with the target entry set placed in the very LAST three
+ * slots of the LAST cluster. Every other slot is an unused (deleted) filler,
+ * so a lookup must examine every entry of every cluster before it matches --
+ * exactly the shape that was O(entries x clusters) before this ticket.
+ */
+#define LONGDIR_B_CL 10u
+#define LONGDIR_C_CL 11u
+#define LONGDIR_D_CL 12u
+#define LONGDIR_CLUSTERS 4u
+
+static void build_exfat_longdir(void) {
+    unsigned i;
+    build_vol();
+    put32(fat_ent(ROOT_CL), LONGDIR_B_CL);
+    put32(fat_ent(LONGDIR_B_CL), LONGDIR_C_CL);
+    put32(fat_ent(LONGDIR_C_CL), LONGDIR_D_CL);
+    put32(fat_ent(LONGDIR_D_CL), 0xFFFFFFFFu);
+    bit_mark(LONGDIR_B_CL, 1);
+    bit_mark(LONGDIR_C_CL, 1);
+    bit_mark(LONGDIR_D_CL, 1);
+
+    /* ei3..15 of the root's first cluster (ei0..2 hold the label/bitmap/
+     * up-case entries build_vol() placed there) are unused. */
+    for (i = 3u; i < 16u; i++) {
+        cluster(ROOT_CL)[i * 32u] = 0x05u;
+    }
+    for (i = 0; i < 16u; i++) {
+        cluster(LONGDIR_B_CL)[i * 32u] = 0x05u;
+        cluster(LONGDIR_C_CL)[i * 32u] = 0x05u;
+    }
+    for (i = 0; i < 13u; i++) {
+        cluster(LONGDIR_D_CL)[i * 32u] = 0x05u;
+    }
+    place_set(cluster(LONGDIR_D_CL) + 13u * 32u, "deepfile", HYPE_EXFAT_ATTR_ARCHIVE, 0u, 0u, 0);
+}
+
+/*
+ * #651 acceptance criterion 5: the read-callback count for a lookup that has
+ * to scan to the very end of a 4-cluster directory must grow linearly in
+ * entries + clusters, not quadratically.
+ */
+static void test_exfat_lookup_directory_cursor_scales_linearly(void) {
+    hype_exfat_wfile_t f;
+    unsigned reads;
+
+    build_exfat_longdir();
+    CHECK_HEX("mount longdir volume", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    g_read_calls = 0u;
+    CHECK_HEX("deepfile resolves at the very end of a 4-cluster root", 0,
+              hype_exfat_lookup(&g_fs, "deepfile", 0, &f));
+    reads = g_read_calls;
+
+    /*
+     * With the #651 cursor, resolving costs about one directory-sector read
+     * per entry examined (<= 64 slots, plus the matched set's own few entries)
+     * and one FAT read per cluster boundary crossed (<= LONGDIR_CLUSTERS) --
+     * linear in entries + clusters. WITHOUT it, chain_cluster_at() re-walked
+     * the FAT from the first cluster for EVERY single entry: summing ei/16
+     * extra FAT steps over ei = 0..63 alone comes to 16*(0+1+2+3) = 96
+     * additional reads on top of the same ~64 directory-sector reads, i.e.
+     * ~160 total -- computed here from the fixture's own geometry, not by
+     * re-running the old code. Bounding well under that combined total, and
+     * linearly in entries + clusters, proves the fix.
+     */
+    CHECK_HEX("lookup cost bounded linearly in entries + clusters, not quadratically", 1u,
+              (unsigned)(reads <= 64u + 4u * LONGDIR_CLUSTERS));
+    CHECK_HEX("strictly lower than the pre-#651 (quadratic) shape's ~160 reads", 1u,
+              (unsigned)(reads < 160u));
+}
+
+/*
+ * #651 acceptance criterion 6: dir_find_slots()'s dirref_t cursor must survive
+ * a dir_grow() triggered mid-operation -- a stale cursor pointing at the OLD
+ * (pre-growth) cluster shape could hand back a slot index that does not
+ * actually map to the LBA the entry was written to, corrupting either the new
+ * entry or an old one sharing the same directory.
+ */
+static void test_exfat_dir_find_slots_cursor_survives_growth(void) {
+    static const char *names[4] = {"f1", "f2", "f3", "f4"};
+    hype_exfat_wfile_t f;
+    uint8_t buf[8];
+    unsigned i;
+
+    build_vol();
+    CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    /* Root's one cluster holds 16 entries; label/bitmap/upcase already use 3,
+     * leaving 13 -- room for four 3-slot files (12) with one slot spare. */
+    for (i = 0; i < 4u; i++) {
+        CHECK_HEX("create ok", 0, hype_exfat_create(&g_fs, names[i], &f));
+    }
+    CHECK_HEX("root has not grown yet", 0xFFFFFFFFu, fat_get(ROOT_CL));
+
+    /* The fifth file needs 3 slots where only 1 remains: dir_find_slots() must
+     * scan, grow, and scan again -- exactly the cursor-across-dir_grow() path,
+     * and the new set ends up straddling the cluster boundary (slot 15 of the
+     * first cluster, slots 16-17 of the new one). */
+    CHECK_HEX("create f5 forces the root to grow", 0, hype_exfat_create(&g_fs, "f5", &f));
+    CHECK("root directory actually grew", fat_get(ROOT_CL) != 0xFFFFFFFFu);
+
+    CHECK_HEX("append to the newly created f5", 0, hype_exfat_append(&f, "hello!!!", 8u));
+    memset(buf, 0, sizeof buf);
+    CHECK_HEX("f5 reads back its own data", 0, hype_exfat_read_at(&f, 0, buf, 8u));
+    CHECK_HEX("f5 data byte-correct", 0, memcmp(buf, "hello!!!", 8u));
+
+    /* Every file, old and new, must still resolve -- the slot index dir_grow()
+     * led dir_find_slots() to must map to the LBA the entry was actually
+     * written to, for every entry, not just the newest one. */
+    for (i = 0; i < 4u; i++) {
+        hype_exfat_wfile_t g;
+        CHECK_HEX("every pre-existing file still resolves after the grow", 0,
+                  hype_exfat_lookup(&g_fs, names[i], 0, &g));
+    }
+    {
+        hype_exfat_wfile_t g;
+        CHECK_HEX("f5 itself still resolves after the grow", 0,
+                  hype_exfat_lookup(&g_fs, "f5", 0, &g));
+    }
+}
+
 int main(void) {
+    test_exfat_lookup_directory_cursor_scales_linearly();          /* #651 */
+    test_exfat_dir_find_slots_cursor_survives_growth();            /* #651 */
     test_rollback_never_frees_under_a_published_larger_size(); /* #517 */
     test_cluster_growth_uses_durability_barriers();               /* #648 */
     test_persistent_barrier_failure_never_leaves_entry_past_chain(); /* #648 */

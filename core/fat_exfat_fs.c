@@ -353,9 +353,31 @@ static int free_allocation(hype_exfat_fs_t *fs, uint32_t first, int contiguous, 
 
 /* ---- directory-entry access ---- */
 
-/* Cluster at index `index` of an allocation. */
+/*
+ * #651: a forward-only seek cache for a directory's cluster chain, structurally
+ * identical to file_cluster_at()'s own seek_index/seek_cluster (below) -- exFAT
+ * gave its FILES one but not its DIRECTORIES, which is exactly the gap this
+ * ticket closes. `valid` is 0 until the first use. Never assume a cursor stays
+ * correct across a directory GROW or a NoFatChain->chained materialisation:
+ * both are handled by invalidating it (see dir_grow), not by trusting it.
+ */
+typedef struct {
+    uint32_t index;
+    uint32_t cluster;
+    int valid;
+} exfat_dir_cursor_t;
+
+/*
+ * Cluster at index `index` of an allocation. `cursor`, if non-NULL, is a
+ * forward-only seek cache: a monotonically increasing sequence of `index`
+ * values (the shape every caller below has) costs one chain step per cluster
+ * boundary crossed since the last call, instead of a full walk from `first`
+ * every time. A `index` that goes backwards (or a cursor past `index`) simply
+ * falls back to walking from `first`, so an out-of-order caller stays correct,
+ * just not accelerated.
+ */
 static int chain_cluster_at(hype_exfat_fs_t *fs, uint32_t first, int contiguous, uint32_t index,
-                            uint32_t *out) {
+                            exfat_dir_cursor_t *cursor, uint32_t *out) {
     if (contiguous) {
         uint32_t cl = first + index;
         if (!cluster_valid(fs, cl)) {
@@ -365,17 +387,34 @@ static int chain_cluster_at(hype_exfat_fs_t *fs, uint32_t first, int contiguous,
         return 0;
     }
     {
-        uint32_t cl = first;
-        uint32_t i;
-        for (i = 0; i < index; i++) {
+        uint32_t cl, i;
+        if (cursor != 0 && cursor->valid && cursor->index <= index) {
+            cl = cursor->cluster;
+            i = cursor->index;
+        } else {
+            cl = first;
+            i = 0u;
+        }
+        for (; i < index; i++) {
             uint32_t next;
             if (fat_get(fs, cl, &next) != 0 || next >= HYPE_EXFAT_EOC) {
+                if (cursor != 0) {
+                    cursor->valid = 0;
+                }
                 return -1;
             }
             cl = next;
         }
         if (!cluster_valid(fs, cl)) {
+            if (cursor != 0) {
+                cursor->valid = 0;
+            }
             return -1;
+        }
+        if (cursor != 0) {
+            cursor->index = index;
+            cursor->cluster = cl;
+            cursor->valid = 1;
         }
         *out = cl;
         return 0;
@@ -459,11 +498,13 @@ static int contiguous_run_all_used(hype_exfat_fs_t *fs, uint32_t first, uint64_t
     return 0;
 }
 
+/* `cursor` is optional (NULL is always correct, just unaccelerated) and is
+ * forwarded straight to chain_cluster_at() -- see its comment. */
 static int entry_lba(hype_exfat_fs_t *fs, uint32_t dir_first, int dir_contig, uint32_t ei,
-                     uint64_t *out_lba, unsigned int *out_off) {
+                     exfat_dir_cursor_t *cursor, uint64_t *out_lba, unsigned int *out_off) {
     uint32_t ci, sic, cl;
     hype_exfat_entry_pos(ei, fs->spc, &ci, &sic, out_off);
-    if (chain_cluster_at(fs, dir_first, dir_contig, ci, &cl) != 0) {
+    if (chain_cluster_at(fs, dir_first, dir_contig, ci, cursor, &cl) != 0) {
         return -1;
     }
     *out_lba = clba(fs, cl) + sic;
@@ -471,11 +512,11 @@ static int entry_lba(hype_exfat_fs_t *fs, uint32_t dir_first, int dir_contig, ui
 }
 
 static int entry_read(hype_exfat_fs_t *fs, uint32_t dir_first, int dir_contig, uint32_t ei,
-                      uint8_t ent[ENTSZ]) {
+                      exfat_dir_cursor_t *cursor, uint8_t ent[ENTSZ]) {
     uint8_t sec[SECSZ];
     uint64_t lba;
     unsigned int off;
-    if (entry_lba(fs, dir_first, dir_contig, ei, &lba, &off) != 0) {
+    if (entry_lba(fs, dir_first, dir_contig, ei, cursor, &lba, &off) != 0) {
         return -1;
     }
     if (fs->read(fs->ctx, lba, 1u, sec) != 0) {
@@ -486,11 +527,11 @@ static int entry_read(hype_exfat_fs_t *fs, uint32_t dir_first, int dir_contig, u
 }
 
 static int entry_write(hype_exfat_fs_t *fs, uint32_t dir_first, int dir_contig, uint32_t ei,
-                       const uint8_t ent[ENTSZ]) {
+                       exfat_dir_cursor_t *cursor, const uint8_t ent[ENTSZ]) {
     uint8_t sec[SECSZ];
     uint64_t lba;
     unsigned int off;
-    if (entry_lba(fs, dir_first, dir_contig, ei, &lba, &off) != 0) {
+    if (entry_lba(fs, dir_first, dir_contig, ei, cursor, &lba, &off) != 0) {
         return -1;
     }
     if (fs->read(fs->ctx, lba, 1u, sec) != 0) {
@@ -502,30 +543,36 @@ static int entry_write(hype_exfat_fs_t *fs, uint32_t dir_first, int dir_contig, 
 
 /* ---- entry sets ---- */
 
-/* Context for the shared hype_exfat_set_read() entry-fetch callback. */
+/* Context for the shared hype_exfat_set_read() entry-fetch callback. `cursor`
+ * is optional and, when supplied by the caller, is the SAME cursor that
+ * caller's own directory walk uses -- so the few entries of one set (File +
+ * Stream + name entries, all at consecutive indices right where the caller's
+ * scan already is) cost no extra chain walk beyond what reaching `ei` did. */
 typedef struct {
     hype_exfat_fs_t *fs;
     uint32_t dir_first;
     int dir_contig;
+    exfat_dir_cursor_t *cursor;
 } set_ctx_t;
 
 static int set_ctx_read(void *ctx, uint32_t ei, uint8_t ent[ENTSZ]) {
     set_ctx_t *c = (set_ctx_t *)ctx;
-    return entry_read(c->fs, c->dir_first, c->dir_contig, ei, ent);
+    return entry_read(c->fs, c->dir_first, c->dir_contig, ei, c->cursor, ent);
 }
 
 /*
  * Reads the entry set whose File entry sits at `ei` (structural validation --
  * checksum, entry types, name length -- in hype_exfat_set_read), then range-checks
  * its allocation against this volume's cluster heap. Returns 0 on a set that is
- * safe to act on, -1 otherwise.
+ * safe to act on, -1 otherwise. `cursor` is optional; see set_ctx_t.
  */
 static int set_read(hype_exfat_fs_t *fs, uint32_t dir_first, int dir_contig, uint32_t ei,
-                    hype_exfat_set_t *set) {
+                    exfat_dir_cursor_t *cursor, hype_exfat_set_t *set) {
     set_ctx_t ctx;
     ctx.fs = fs;
     ctx.dir_first = dir_first;
     ctx.dir_contig = dir_contig;
+    ctx.cursor = cursor;
     if (hype_exfat_set_read(set_ctx_read, &ctx, ei, set) != 0) {
         return -1;
     }
@@ -600,6 +647,12 @@ static int set_flush(hype_exfat_wfile_t *f, int durable) {
     uint16_t sum = 0u;
     unsigned int k;
     uint32_t disk_first;
+    /* #651: every entry this function touches (set_index, set_index+1, and
+     * set_index..set_index+secondary in the checksum loop) sits within the
+     * same handful of directory entries, so one cursor for the whole call
+     * turns all but the very first access into a same-cluster cache hit. */
+    exfat_dir_cursor_t cur;
+    cur.valid = 0;
 
     f->last_error = HYPE_EXFAT_WFILE_ERR_NONE;
     /* #646: the handle's own identity fields must be exactly what identity_set() last put
@@ -619,7 +672,7 @@ static int set_flush(hype_exfat_wfile_t *f, int durable) {
      * rename/unlink that retired this slot (or handed it to a different entry set) clears the
      * InUse bit or changes the type byte; either way this handle no longer owns it.
      */
-    if (entry_read(fs, f->dir_cluster, f->dir_contiguous, f->set_index, ent) != 0) {
+    if (entry_read(fs, f->dir_cluster, f->dir_contiguous, f->set_index, &cur, ent) != 0) {
         return -1;
     }
     if (ent[0] != HYPE_EXFAT_ENT_FILE) {
@@ -629,7 +682,7 @@ static int set_flush(hype_exfat_wfile_t *f, int durable) {
 
     /* set_read (via lookup) and create both establish that set_index + 1 is this
      * set's Stream Extension entry before a handle exists at all. */
-    if (entry_read(fs, f->dir_cluster, f->dir_contiguous, f->set_index + 1u, ent) != 0) {
+    if (entry_read(fs, f->dir_cluster, f->dir_contiguous, f->set_index + 1u, &cur, ent) != 0) {
         return -1;
     }
     /*
@@ -658,20 +711,20 @@ static int set_flush(hype_exfat_wfile_t *f, int durable) {
     hype_wr64(ent + 8, f->valid); /* ValidDataLength (#383) */
     hype_wr32(ent + 20, f->first_cluster);
     hype_wr64(ent + 24, f->size);
-    if (entry_write(fs, f->dir_cluster, f->dir_contiguous, f->set_index + 1u, ent) != 0) {
+    if (entry_write(fs, f->dir_cluster, f->dir_contiguous, f->set_index + 1u, &cur, ent) != 0) {
         return -1;
     }
     for (k = 0; k <= f->secondary; k++) {
-        if (entry_read(fs, f->dir_cluster, f->dir_contiguous, f->set_index + k, ent) != 0) {
+        if (entry_read(fs, f->dir_cluster, f->dir_contiguous, f->set_index + k, &cur, ent) != 0) {
             return -1;
         }
         sum = hype_exfat_set_checksum_update(sum, k * ENTSZ, ent, ENTSZ);
     }
-    if (entry_read(fs, f->dir_cluster, f->dir_contiguous, f->set_index, ent) != 0) {
+    if (entry_read(fs, f->dir_cluster, f->dir_contiguous, f->set_index, &cur, ent) != 0) {
         return -1;
     }
     hype_exfat_file_entry_set_checksum(ent, sum);
-    if (entry_write(fs, f->dir_cluster, f->dir_contiguous, f->set_index, ent) != 0) {
+    if (entry_write(fs, f->dir_cluster, f->dir_contiguous, f->set_index, &cur, ent) != 0) {
         return -1;
     }
     if (durable && fs->sync != (hype_blk_sync_fn)0 && fs->sync(fs->ctx) != 0) {
@@ -768,6 +821,7 @@ int hype_exfat_fs_mount(hype_blk_read_fn read, hype_blk_write_fn write, void *ct
     uint64_t bitmap_bytes = 0u;
     uint32_t upcase_checksum = 0u;
     uint32_t ei;
+    exfat_dir_cursor_t mount_cur;
     int have_bitmap = 0;
     int have_upcase = 0;
     int contiguous = 0;
@@ -846,10 +900,16 @@ int hype_exfat_fs_mount(hype_blk_read_fn read, hype_blk_write_fn write, void *ct
      * mandatory: without the bitmap nothing can be allocated, and without a
      * checksum-verified up-case table names cannot be compared or hashed the way
      * every other exFAT implementation would.
+     *
+     * #651: this scan's own local cursor -- mount runs once, so there is
+     * nothing to persist beyond this loop, but a root directory grown across
+     * several clusters (a log volume with many \VMn.LOG entries, #246)
+     * otherwise pays one full chain walk per entry here too.
      */
+    mount_cur.valid = 0;
     for (ei = 0; ei < WALK_GUARD; ei++) {
         uint8_t ent[ENTSZ];
-        if (entry_read(out, out->root_cluster, 0, ei, ent) != 0) {
+        if (entry_read(out, out->root_cluster, 0, ei, &mount_cur, ent) != 0) {
             break; /* end of the root directory's chain */
         }
         if (ent[0] == 0x00u) {
@@ -993,8 +1053,16 @@ static int dir_capacity(hype_exfat_fs_t *fs, uint32_t first, uint64_t *out_entri
  * directory or a missing name -- so create()/mkdir() cannot place a duplicate entry set, and
  * rmdir() (via dir_is_empty, the same discipline) cannot free a directory that still has entries.
  */
+/*
+ * #651: `cursor` is optional and forward-only (see exfat_dir_cursor_t) -- a
+ * caller re-using the same dirref_t's cursor across dir_find/dir_scan_slots/
+ * dir_find_slots/set_place shares its progress with all of them. Passing NULL
+ * is always correct, just unaccelerated (dir_find is itself still linear in
+ * its OWN loop below regardless, since ei only ever increases within one call).
+ */
 static int dir_find(hype_exfat_fs_t *fs, uint32_t dir_first, int dir_contig, const uint16_t *name,
-                    unsigned int nlen, uint32_t *out_index, hype_exfat_set_t *set) {
+                    unsigned int nlen, exfat_dir_cursor_t *cursor, uint32_t *out_index,
+                    hype_exfat_set_t *set) {
     uint32_t ei = 0;
     unsigned int guard = 0;
     uint64_t cap = 0;
@@ -1008,7 +1076,7 @@ static int dir_find(hype_exfat_fs_t *fs, uint32_t dir_first, int dir_contig, con
         if (!dir_contig && (uint64_t)ei >= cap) {
             return 0; /* legitimately past the end of a bounded, healthy chain */
         }
-        if (entry_read(fs, dir_first, dir_contig, ei, ent) != 0) {
+        if (entry_read(fs, dir_first, dir_contig, ei, cursor, ent) != 0) {
             return -1; /* real I/O error: never "not found" */
         }
         if (ent[0] == 0x00u) {
@@ -1018,7 +1086,7 @@ static int dir_find(hype_exfat_fs_t *fs, uint32_t dir_first, int dir_contig, con
             ei++;
             continue;
         }
-        if (set_read(fs, dir_first, dir_contig, ei, set) != 0) {
+        if (set_read(fs, dir_first, dir_contig, ei, cursor, set) != 0) {
             ei++; /* malformed set: step over its File entry and keep looking */
             continue;
         }
@@ -1065,6 +1133,13 @@ int hype_exfat_lookup(hype_exfat_fs_t *fs, const char *path, int want_dir,
         int overflow = 0;
         int rc;
         int last;
+        /* #651: fresh every iteration -- each level of the path is a DIFFERENT
+         * directory, so there is nothing to carry from the previous one. Still
+         * accelerates dir_find's own (single-call) linear scan of ei within
+         * this one level, which is exactly what a directory spanning several
+         * clusters needs. */
+        exfat_dir_cursor_t cur;
+        cur.valid = 0;
 
         nlen = path_component(path, &pos, comp, HYPE_EXFAT_MAX_NAME, &overflow);
         if (nlen == 0u || overflow) {
@@ -1079,7 +1154,7 @@ int hype_exfat_lookup(hype_exfat_fs_t *fs, const char *path, int want_dir,
             last = (path_component(path, &peek, tmp, 1u, &ovf2) == 0u) ? 1 : 0;
         }
 
-        rc = dir_find(fs, dir_first, dir_contig, comp, nlen, &ei, &set);
+        rc = dir_find(fs, dir_first, dir_contig, comp, nlen, &cur, &ei, &set);
         if (rc <= 0) {
             return -1;
         }
@@ -1149,6 +1224,17 @@ typedef struct {
      * from the entry set it just matched. */
     uint16_t owner_name_hash;
     uint8_t owner_name_length;
+    /*
+     * #651: a forward-only cursor over THIS directory's own cluster chain,
+     * shared by every dir_find/dir_scan_slots/dir_find_slots/set_place call
+     * made against this dirref_t during one operation (create/mkdir/rmdir/
+     * unlink/rename/lookup all construct a fresh dirref_t per directory, so
+     * there is no cross-operation lifetime to worry about). Invalidated
+     * whenever the directory's shape can change under it: dir_grow() resets
+     * it unconditionally, and descending into a DIFFERENT directory (which
+     * dir_first as a value change is a proxy for) always starts a fresh one.
+     */
+    exfat_dir_cursor_t cursor;
 } dirref_t;
 
 static void dirref_root(const hype_exfat_fs_t *fs, dirref_t *d) {
@@ -1162,6 +1248,7 @@ static void dirref_root(const hype_exfat_fs_t *fs, dirref_t *d) {
     d->owner_secondary = 0u;
     d->owner_name_hash = 0u;
     d->owner_name_length = 0u;
+    d->cursor.valid = 0;
 }
 
 /*
@@ -1282,7 +1369,8 @@ static int resolve_parent(hype_exfat_fs_t *fs, const char *path, unsigned int le
             if (nlen == 0u || overflow) {
                 return -1;
             }
-            if (dir_find(fs, dir->first, dir->contiguous, comp, nlen, &ei, &set) != 1) {
+            if (dir_find(fs, dir->first, dir->contiguous, comp, nlen, &dir->cursor, &ei, &set) !=
+                1) {
                 return -1;
             }
             if ((set.attributes & HYPE_EXFAT_ATTR_DIRECTORY) == 0u) {
@@ -1302,6 +1390,7 @@ static int resolve_parent(hype_exfat_fs_t *fs, const char *path, unsigned int le
             dir->first = set.first_cluster;
             dir->size = set.data_length;
             dir->contiguous = set.contiguous;
+            dir->cursor.valid = 0; /* descending: the cursor belonged to the directory just left */
         }
     }
 }
@@ -1339,13 +1428,17 @@ static int name_prepare(hype_exfat_fs_t *fs, const char *name,
 static int set_delete(hype_exfat_fs_t *fs, uint32_t dir_first, int dir_contig, uint32_t ei,
                       uint8_t secondary) {
     unsigned int k;
+    /* #651: local to this one retirement -- ei..ei+secondary is a short
+     * monotonic run, and the read+write pair per k share the same cursor. */
+    exfat_dir_cursor_t cur;
+    cur.valid = 0;
     for (k = 0; k <= secondary; k++) {
         uint8_t ent[ENTSZ];
-        if (entry_read(fs, dir_first, dir_contig, ei + k, ent) != 0) {
+        if (entry_read(fs, dir_first, dir_contig, ei + k, &cur, ent) != 0) {
             return -1;
         }
         ent[0] = (uint8_t)(ent[0] & (uint8_t)~(uint8_t)HYPE_EXFAT_ENT_INUSE);
-        if (entry_write(fs, dir_first, dir_contig, ei + k, ent) != 0) {
+        if (entry_write(fs, dir_first, dir_contig, ei + k, &cur, ent) != 0) {
             return -1;
         }
     }
@@ -1357,7 +1450,7 @@ static int set_delete(hype_exfat_fs_t *fs, uint32_t dir_first, int dir_contig, u
  * must be contiguous, so a run that would spill past the directory's current
  * allocation does not count. Returns 1 found, 0 not found, -1 on I/O error.
  */
-static int dir_scan_slots(hype_exfat_fs_t *fs, const dirref_t *d, unsigned int need,
+static int dir_scan_slots(hype_exfat_fs_t *fs, dirref_t *d, unsigned int need,
                           uint32_t *out_index) {
     uint32_t entries_per_cluster = fs->spc * HYPE_EXFAT_ENTRIES_PER_SECTOR;
     uint32_t clusters = 0;
@@ -1392,7 +1485,10 @@ static int dir_scan_slots(hype_exfat_fs_t *fs, const dirref_t *d, unsigned int n
 
     for (ei = 0; ei < capacity; ei++) {
         uint8_t ent[ENTSZ];
-        if (entry_read(fs, d->first, d->contiguous, ei, ent) != 0) {
+        /* #651: shared with dir_find/dir_find_slots/set_place through *d, so a
+         * fresh scan after a dir_grow() retry (which invalidates it) is the
+         * only time this falls back to walking from the start. */
+        if (entry_read(fs, d->first, d->contiguous, ei, &d->cursor, ent) != 0) {
             return -1;
         }
         if (ent[0] == 0x00u || (ent[0] & HYPE_EXFAT_ENT_INUSE) == 0u) {
@@ -1474,6 +1570,13 @@ static int dir_grow(hype_exfat_fs_t *fs, dirref_t *d) {
         return -1;
     }
     d->size += cluster_bytes(fs);
+    /*
+     * #651: invalidate unconditionally -- the directory's own extent just
+     * changed (a new cluster on the end, and possibly a NoFatChain->chained
+     * materialisation above), so any index this cursor cached must not be
+     * trusted by whatever scans it next.
+     */
+    d->cursor.valid = 0;
     return dirref_flush(fs, d);
 }
 
@@ -1504,7 +1607,7 @@ static int dir_find_slots(hype_exfat_fs_t *fs, dirref_t *d, unsigned int need,
 /* Builds a complete entry set in `entries` so its checksum covers exactly the
  * bytes that land on the medium, then writes it at `ei`. The File and Stream
  * entries are already in place; this fills the name entries and the checksum. */
-static int set_place(hype_exfat_fs_t *fs, const dirref_t *d, uint32_t ei, uint8_t *entries,
+static int set_place(hype_exfat_fs_t *fs, dirref_t *d, uint32_t ei, uint8_t *entries,
                      const uint16_t *chars, unsigned int nlen, unsigned int need) {
     unsigned int name_entries = need - 2u;
     unsigned int k;
@@ -1522,7 +1625,8 @@ static int set_place(hype_exfat_fs_t *fs, const dirref_t *d, uint32_t ei, uint8_
     hype_exfat_file_entry_set_checksum(entries, sum);
 
     for (k = 0; k < need; k++) {
-        if (entry_write(fs, d->first, d->contiguous, ei + k, entries + k * ENTSZ) != 0) {
+        if (entry_write(fs, d->first, d->contiguous, ei + k, &d->cursor, entries + k * ENTSZ) !=
+            0) {
             return -1;
         }
     }
@@ -1566,7 +1670,7 @@ int hype_exfat_create(hype_exfat_fs_t *fs, const char *path, hype_exfat_wfile_t 
      * reused in place; a set carrying extra secondary entries hype does not
      * generate is retired wholesale instead, so no stale entry is left inside a
      * set whose checksum no longer covers it. */
-    rc = dir_find(fs, dir.first, dir.contiguous, chars, nlen, &ei, &set);
+    rc = dir_find(fs, dir.first, dir.contiguous, chars, nlen, &dir.cursor, &ei, &set);
     if (rc < 0) {
         return -1;
     }
@@ -1631,7 +1735,7 @@ int hype_exfat_unlink(hype_exfat_fs_t *fs, const char *path) {
     if (nlen == 0u) {
         return -1;
     }
-    if (dir_find(fs, dir.first, dir.contiguous, comp, nlen, &ei, &set) != 1) {
+    if (dir_find(fs, dir.first, dir.contiguous, comp, nlen, &dir.cursor, &ei, &set) != 1) {
         return -1;
     }
     if ((set.attributes & HYPE_EXFAT_ATTR_DIRECTORY) != 0u) {
@@ -1670,7 +1774,7 @@ int hype_exfat_mkdir(hype_exfat_fs_t *fs, const char *path) {
     if (name_prepare(fs, leafbuf, chars, &nlen, &hash) != 0) {
         return -1;
     }
-    if (dir_find(fs, dir.first, dir.contiguous, chars, nlen, &ei, &set) != 0) {
+    if (dir_find(fs, dir.first, dir.contiguous, chars, nlen, &dir.cursor, &ei, &set) != 0) {
         return -1; /* an existing entry of EITHER kind, or an I/O error */
     }
     need = 2u + (nlen + HYPE_EXFAT_NAME_CHARS_PER_ENTRY - 1u) / HYPE_EXFAT_NAME_CHARS_PER_ENTRY;
@@ -1723,6 +1827,10 @@ int hype_exfat_mkdir(hype_exfat_fs_t *fs, const char *path) {
 static int dir_is_empty(hype_exfat_fs_t *fs, uint32_t first, int contiguous, uint64_t size) {
     uint64_t cap;
     uint64_t ei;
+    /* #651: local to this one scan, which -- like dir_find -- only ever walks
+     * ei forward. */
+    exfat_dir_cursor_t cur;
+    cur.valid = 0;
 
     if (contiguous) {
         cap = clusters_for(fs, size) * (uint64_t)(fs->spc * HYPE_EXFAT_ENTRIES_PER_SECTOR);
@@ -1733,7 +1841,7 @@ static int dir_is_empty(hype_exfat_fs_t *fs, uint32_t first, int contiguous, uin
         uint8_t sec[SECSZ];
         uint64_t lba;
         unsigned int off;
-        if (entry_lba(fs, first, contiguous, (uint32_t)ei, &lba, &off) != 0) {
+        if (entry_lba(fs, first, contiguous, (uint32_t)ei, &cur, &lba, &off) != 0) {
             return -1; /* inside a validated bound, this can only be a real I/O error */
         }
         if (fs->read(fs->ctx, lba, 1u, sec) != 0) {
@@ -1767,7 +1875,7 @@ int hype_exfat_rmdir(hype_exfat_fs_t *fs, const char *path) {
     if (nlen == 0u) {
         return -1;
     }
-    if (dir_find(fs, dir.first, dir.contiguous, comp, nlen, &ei, &set) != 1) {
+    if (dir_find(fs, dir.first, dir.contiguous, comp, nlen, &dir.cursor, &ei, &set) != 1) {
         return -1;
     }
     if ((set.attributes & HYPE_EXFAT_ATTR_DIRECTORY) == 0u) {
@@ -1809,7 +1917,7 @@ int hype_exfat_rename(hype_exfat_fs_t *fs, const char *from, const char *to) {
     if (fnlen == 0u) {
         return -1;
     }
-    if (dir_find(fs, fdir.first, fdir.contiguous, fcomp, fnlen, &fei, &fset) != 1) {
+    if (dir_find(fs, fdir.first, fdir.contiguous, fcomp, fnlen, &fdir.cursor, &fei, &fset) != 1) {
         return -1;
     }
     /*
@@ -1832,7 +1940,7 @@ int hype_exfat_rename(hype_exfat_fs_t *fs, const char *from, const char *to) {
     }
     /* Rename never replaces. NOTE this also refuses a pure case change of the
      * same name -- the case-insensitive search finds the source itself. */
-    if (dir_find(fs, tdir.first, tdir.contiguous, tchars, tnlen, &tei, &tset) != 0) {
+    if (dir_find(fs, tdir.first, tdir.contiguous, tchars, tnlen, &tdir.cursor, &tei, &tset) != 0) {
         return -1;
     }
     need = 2u + (tnlen + HYPE_EXFAT_NAME_CHARS_PER_ENTRY - 1u) / HYPE_EXFAT_NAME_CHARS_PER_ENTRY;
@@ -1847,7 +1955,7 @@ int hype_exfat_rename(hype_exfat_fs_t *fs, const char *from, const char *to) {
      * around the SAME allocation -- ValidDataLength included, which append never
      * leaves short but another writer may have.
      */
-    if (entry_read(fs, fdir.first, fdir.contiguous, fei, entries) != 0) {
+    if (entry_read(fs, fdir.first, fdir.contiguous, fei, &fdir.cursor, entries) != 0) {
         return -1;
     }
     entries[1] = (uint8_t)(need - 1u);
@@ -1879,7 +1987,8 @@ static int file_cluster_at(hype_exfat_wfile_t *f, uint32_t index, uint32_t *out)
     /* Reached only for an offset inside the file's size, which set_read has
      * already tied to a non-zero first cluster. */
     if (f->contiguous) {
-        return chain_cluster_at(fs, f->first_cluster, 1, index, out);
+        /* Contiguous is O(1) arithmetic in chain_cluster_at(); no cursor needed. */
+        return chain_cluster_at(fs, f->first_cluster, 1, index, 0, out);
     }
     if (f->seek_cluster != 0u && f->seek_index <= index) {
         cl = f->seek_cluster;
@@ -1995,7 +2104,7 @@ unsigned long long hype_exfat_write_rollback_failures(void) { return g_exfat_rol
  */
 static int entry_set_claims_at_most(hype_exfat_wfile_t *f, uint64_t bytes) {
     uint8_t ent[ENTSZ];
-    if (entry_read(f->fs, f->dir_cluster, f->dir_contiguous, f->set_index + 1u, ent) != 0) {
+    if (entry_read(f->fs, f->dir_cluster, f->dir_contiguous, f->set_index + 1u, 0, ent) != 0) {
         return 0;
     }
     return (hype_rd64(ent + 24) <= bytes) ? 1 : 0;
