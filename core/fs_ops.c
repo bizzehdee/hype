@@ -2,6 +2,7 @@
 
 #include "fat.h" /* hype_fat32_resolve / hype_exfat_resolve */
 #include "ext_jalloc.h"
+#include "ext_namespace.h" /* #498: ext create/unlink/mkdir/rmdir/rename */
 #include "lebytes.h"
 
 /*
@@ -378,6 +379,18 @@ static const hype_fs_ops_t exfat_ops = {
 
 /* ---------------- ext2/3/4 ---------------- */
 
+/*
+ * #498: ext has no persistent per-mount state (see ext_mount's comment
+ * below) and its namespace ops take a plain Unix-epoch uint32_t rather than
+ * a hype_rtc_time_t, so set_time stores the converted value here -- exactly
+ * the same "revalidate everything else per call" posture the rest of the
+ * ext writer family already has, just extended to the one piece of state
+ * (the clock) that genuinely needs to survive between set_time and whatever
+ * later call (a namespace op, or a lookup that opens a writable handle) it
+ * needs to stamp.
+ */
+static uint32_t g_ext_ns_mtime;
+
 static int ext_probe(hype_blk_read_fn read, void *ctx) {
     return hype_ext_probe(read, ctx);
 }
@@ -408,11 +421,16 @@ static int ext_lookup(hype_fs_t *fs, const char *path, hype_fs_file_t *out) {
          * legacy in-place-only handle. All require a clean volume. */
         out->tag = TAG_EXTJ;
         if (hype_extj_open_rw(fs->read, fs->write, fs->ctx, path, &out->u.extj) == 0) {
+            /* #498: set_time's mtime, previously never wired to anything --
+             * ext_jalloc.c/ext2_alloc.c have carried this parameter since
+             * #385/#384 but no caller ever supplied one. */
+            hype_extj_set_time(&out->u.extj, g_ext_ns_mtime);
             out->size = out->u.extj.size_bytes;
             return 0;
         }
         out->tag = TAG_EXT2;
         if (hype_ext2_open_rw(fs->read, fs->write, fs->ctx, path, &out->u.ext2) == 0) {
+            hype_ext2_set_time(&out->u.ext2, g_ext_ns_mtime);
             out->size = out->u.ext2.size_bytes;
             return 0;
         }
@@ -498,10 +516,42 @@ static int ext_append(hype_fs_file_t *f, const void *src, unsigned int len) {
     return ext_write_chunked(f, f->size, src, len);
 }
 
+static int ext_create(hype_fs_t *fs, const char *path, hype_fs_file_t *out) {
+    if (hype_ext_ns_create(fs->read, fs->write, fs->ctx, path, g_ext_ns_mtime) != 0) {
+        return -1;
+    }
+    /* the namespace op only places the inode + dirent; open the real
+     * writable handle the same way ext_lookup's write arm already does, so
+     * the caller can append/write_at into the new (empty) file. */
+    return ext_lookup(fs, path, out);
+}
+static int ext_unlink(hype_fs_t *fs, const char *path) {
+    return hype_ext_ns_unlink(fs->read, fs->write, fs->ctx, path, g_ext_ns_mtime);
+}
+static int ext_mkdir(hype_fs_t *fs, const char *path) {
+    return hype_ext_ns_mkdir(fs->read, fs->write, fs->ctx, path, g_ext_ns_mtime);
+}
+static int ext_rmdir(hype_fs_t *fs, const char *path) {
+    return hype_ext_ns_rmdir(fs->read, fs->write, fs->ctx, path, g_ext_ns_mtime);
+}
+static int ext_rename(hype_fs_t *fs, const char *from, const char *to) {
+    return hype_ext_ns_rename(fs->read, fs->write, fs->ctx, from, to, g_ext_ns_mtime);
+}
+static int ext_sync(hype_fs_t *fs) {
+    (void)fs; /* every namespace op and #384/#385/#497 write already commits (and, on ext3/4,
+              * journals) durably before returning -- nothing is ever left buffered for a
+              * separate flush to catch. */
+    return 0;
+}
+static void ext_set_time(hype_fs_t *fs, const hype_rtc_time_t *now) {
+    (void)fs;
+    g_ext_ns_mtime = hype_rtc_to_unix(now);
+}
+
 static const hype_fs_ops_t ext_ops = {
     "ext",
     HYPE_FS_CAP_READ | HYPE_FS_CAP_WRITE_INPLACE | HYPE_FS_CAP_SPARSE |
-        HYPE_FS_CAP_WRITE_GROW | HYPE_FS_CAP_APPEND, /* #497 */
+        HYPE_FS_CAP_WRITE_GROW | HYPE_FS_CAP_APPEND | HYPE_FS_CAP_NAMESPACE, /* #497, #498 */
     ext_probe,
     ext_mount,
     ext_lookup,
@@ -509,13 +559,13 @@ static const hype_fs_ops_t ext_ops = {
     ext_read_at,
     ext_write_at,
     ext_append, /* #497 */
-    0, /* create */
-    0, /* unlink */
-    0, /* mkdir */
-    0, /* rmdir */
-    0, /* rename */
-    0, /* sync */
-    0, /* set_time */
+    ext_create, /* #498 */
+    ext_unlink, /* #498 */
+    ext_mkdir,  /* #498 */
+    ext_rmdir,  /* #498 */
+    ext_rename, /* #498 */
+    ext_sync,     /* #498 */
+    ext_set_time, /* #498 */
     0, /* set_barrier */
 };
 

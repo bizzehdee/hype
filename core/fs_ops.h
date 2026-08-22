@@ -9,6 +9,7 @@
 #include "fat_exfat_fs.h"  /* hype_exfat_fs_t / hype_exfat_wfile_t */
 #include "ext.h"           /* hype_ext_wfile_t */
 #include "ext_jalloc.h"    /* hype_extj_wfile_t (#385) */
+#include "ext_namespace.h" /* hype_ext_ns_* (#498) */
 #include "ntfs.h"          /* hype_ntfs_t (#337) */
 #include "rtc.h"
 
@@ -52,10 +53,12 @@
  *   ext      sparse-aware read (#384: holes/unwritten read as zeros);
  *            write_at in place, plus HOLE-FILLING allocation -- journaled
  *            (jbd2) on ext3/4, direct on ext2 -- and unwritten-extent
- *            conversion on ext4 (#385); no namespace mutation, no append.
- *            Filling a hole does not change the file SIZE, which is why this
- *            is WRITE_INPLACE and not WRITE_GROW.
- *            READ | WRITE_INPLACE | SPARSE.
+ *            conversion on ext4 (#385); write_at/append GROW the file past
+ *            EOF (#497); create/unlink/mkdir/rmdir/rename (#498), journaled
+ *            on ext3/4 and checksummed there where the volume requires it,
+ *            direct-ordered on ext2 -- refused outright on an htree-indexed
+ *            (dir_index) parent rather than risking a linear insert into one.
+ *            READ | WRITE_INPLACE | SPARSE | WRITE_GROW | APPEND | NAMESPACE.
  *   NTFS     read (sparse runs read as zeroes) + IN-PLACE write_at into
  *            DATA ranges only; a write into a HOLE or UNWRITTEN range is
  *            refused (#337, plan.md §10 decision 30). No mutation beyond
@@ -150,7 +153,11 @@ struct hype_fs {
             uint64_t size_bytes; /* whole image, from the PVD */
         } iso;
         /* ext keeps no mount state: its resolver revalidates the superblock
-         * per call, which also re-checks the clean-unmount gate. */
+         * per call, which also re-checks the clean-unmount gate. #498's
+         * set_time -> namespace-op mtime handoff lives in fs_ops.c's own
+         * g_ext_ns_mtime instead (see that file), the same "BSP-serialized,
+         * one transaction ever in flight" singleton core/ext_jalloc.c's
+         * transaction cache already relies on. */
     } u;
 };
 

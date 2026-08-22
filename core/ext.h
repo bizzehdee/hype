@@ -124,6 +124,17 @@ int hype_ext_resolve_ino(hype_blk_read_fn read, void *ctx, const char *path, uin
 int hype_ext_map_ino_rmap(hype_blk_read_fn read, void *ctx, uint32_t ino_no,
                           hype_file_rmap_t *out);
 
+/* #498: as hype_ext_resolve_ino, but the path must resolve to a DIRECTORY
+ * ("" or "/" resolves to the root, inode 2, itself). */
+int hype_ext_resolve_dir_ino(hype_blk_read_fn read, void *ctx, const char *path,
+                             uint32_t *out_ino);
+
+/* #498: as hype_ext_map_ino_rmap, but requires the inode to be a DIRECTORY
+ * instead of a regular file -- the namespace writers' own directory-block
+ * enumeration. */
+int hype_ext_map_dir_ino_rmap(hype_blk_read_fn read, void *ctx, uint32_t ino_no,
+                              hype_file_rmap_t *out);
+
 /*
  * #384: the ext2 allocating writer (core/ext2_alloc.c) -- persist guest
  * writes into a sparse backing file on an EXT2 volume, allocating blocks

@@ -206,6 +206,31 @@ void hype_rtc_advance(const hype_rtc_time_t *base, uint64_t seconds, hype_rtc_ti
     }
 }
 
+uint32_t hype_rtc_to_unix(const hype_rtc_time_t *t) {
+    uint32_t y, m, era, yoe, doy, doe;
+    uint64_t days;
+
+    if (!hype_rtc_time_valid(t)) {
+        return 0u;
+    }
+    /* days_from_civil: shift so March is month 0 of a "computing year" that
+     * starts on 1 March -- puts the messy Feb-29 leap day at the END of the
+     * cycle, which is what makes the era/yoe division exact. */
+    y = t->year;
+    m = t->month;
+    if (m <= 2u) {
+        y--;
+    }
+    era = y / 400u;
+    yoe = y - era * 400u; /* 0..399 */
+    doy = (153u * (m > 2u ? m - 3u : m + 9u) + 2u) / 5u + t->day - 1u; /* 0..365 */
+    doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;                   /* 0..146096 */
+    days = (uint64_t)era * 146097u + doe - 719468u; /* shift to a 1970-01-01 epoch */
+
+    return (uint32_t)(days * 86400u + (uint32_t)t->hour * 3600u + (uint32_t)t->minute * 60u +
+                      t->second);
+}
+
 uint32_t hype_exfat_encode_timestamp(const hype_rtc_time_t *t) {
     if (!hype_rtc_time_valid(t)) {
         /* 1980-01-01 00:00:00 -- month and day are 1-based in exFAT, so zero is
