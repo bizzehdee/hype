@@ -73,12 +73,32 @@ static long g_dir_writes_seen;
 static unsigned int g_sync_calls;
 static long g_sync_countdown = -1;
 static int g_sync_hardfail; /* once the countdown fires, every later barrier fails too */
+/*
+ * #645: mirrors test_fat_write_fs.c's g_stale_fat0_reads -- once armed, reads of the FAT's first
+ * sector and the allocation bitmap's first sector are answered from a PRE-WRITE snapshot instead
+ * of the medium, exactly as a device that serves stale read-after-write data would. Every cluster
+ * this test's volumes ever allocate falls inside these two sectors, so this alone is enough to
+ * prove a writer with no authoritative cached view would resurrect a cluster it already handed out.
+ */
+static int g_stale_reads;
+static uint8_t g_stale_fat_sector[SECSZ];
+static uint8_t g_stale_bitmap_sector[SECSZ];
 
 static int vol_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
     (void)ctx;
     if (lba + count > VOL_SECTORS) return -1;
     if (lba == g_fail_read_lba) return -1;
     if (g_read_countdown >= 0 && g_read_countdown-- == 0) return -1;
+    if (g_stale_reads && count == 1u) {
+        if (lba == FAT_LBA) {
+            memcpy(dst, g_stale_fat_sector, SECSZ);
+            return 0;
+        }
+        if (lba == (uint64_t)g_heap + (g_bitmap_cl - 2u)) { /* clba(g_bitmap_cl); spc == 1 */
+            memcpy(dst, g_stale_bitmap_sector, SECSZ);
+            return 0;
+        }
+    }
     memcpy(dst, g_vol + lba * SECSZ, (size_t)count * SECSZ);
     return 0;
 }
@@ -2202,10 +2222,166 @@ static void test_persistent_barrier_failure_never_leaves_entry_past_chain(void) 
               (unsigned)(claimed <= (uint64_t)walked * SECSZ));
 }
 
+/*
+ * #645: exFAT's counterpart of test_fat_write_fs.c's test_shared_mount_survives_stale_fat_reads.
+ * Without an authoritative write-through view of the FAT and the allocation bitmap, a medium that
+ * keeps answering with a PRE-WRITE snapshot lets a second allocation land on a cluster the first
+ * one already claimed, because the second alloc_cluster() scan never sees the first one's write.
+ * Two files, grown alternately so each allocation interleaves with the other's, must end up with
+ * completely disjoint cluster sets.
+ */
+static void test_shared_mount_survives_stale_fat_and_bitmap_reads(void) {
+    hype_exfat_wfile_t a, b;
+    uint8_t full[SECSZ];
+    uint32_t a_clusters[8], b_clusters[8];
+    unsigned int na = 0, nb = 0, i, k;
+
+    for (i = 0; i < sizeof full; i++) full[i] = pat(i);
+
+    build_vol();
+    memcpy(g_stale_fat_sector, g_vol + FAT_LBA * SECSZ, SECSZ);
+    memcpy(g_stale_bitmap_sector, g_vol + clba(BITMAP_CL) * SECSZ, SECSZ);
+    g_stale_reads = 1;
+    CHECK_HEX("stale-read mount", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("stale-read create A", 0, hype_exfat_create(&g_fs, "A.LOG", &a));
+    /* A fills its whole first cluster, exactly as the combined log does before any per-VM
+     * sink exists. */
+    CHECK_HEX("A claims and fills its first cluster", 0, hype_exfat_append(&a, full, sizeof full));
+    CHECK_HEX("stale-read create B", 0, hype_exfat_create(&g_fs, "B.LOG", &b));
+    CHECK_HEX("B claims its own first cluster", 0, hype_exfat_append(&b, "V", 1u));
+    CHECK("initial clusters differ", a.first_cluster != b.first_cluster);
+
+    /*
+     * A extends past its first cluster: this is exactly the read-modify-write that, without an
+     * authoritative cached view, reads the FROZEN pre-allocation snapshot of the shared FAT
+     * sector, patches only A's own entry, and writes the WHOLE sector back -- silently reverting
+     * B's chain terminator (set moments ago) to whatever that snapshot said, i.e. free.
+     */
+    CHECK_HEX("A extends despite stale medium reads", 0, hype_exfat_append(&a, "x", 1u));
+    CHECK("A's extension does not link to B's cluster", fat_get(a.first_cluster) != b.first_cluster);
+    CHECK_HEX("B's cluster remains end-of-chain, not reverted to free", 0xFFFFFFFFu,
+              fat_get(b.first_cluster));
+    g_stale_reads = 0;
+
+    /* And, as test_two_files_never_share_a_cluster checks for FAT32: collect both complete
+     * chains and confirm they share nothing. */
+    {
+        uint32_t cl = a.first_cluster;
+        unsigned int guard = 0;
+        while (cl >= 2u && cl < 0xFFFFFFF7u && na < 8u && guard++ < 64u) {
+            a_clusters[na++] = cl;
+            cl = fat_get(cl);
+        }
+    }
+    {
+        uint32_t cl = b.first_cluster;
+        unsigned int guard = 0;
+        while (cl >= 2u && cl < 0xFFFFFFF7u && nb < 8u && guard++ < 64u) {
+            b_clusters[nb++] = cl;
+            cl = fat_get(cl);
+        }
+    }
+    CHECK("A actually got clusters", na > 0u);
+    CHECK("B actually got clusters", nb > 0u);
+    for (i = 0; i < na; i++) {
+        for (k = 0; k < nb; k++) {
+            CHECK("A and B never share a cluster", a_clusters[i] != b_clusters[k]);
+        }
+    }
+}
+
+/*
+ * #645 (criterion 3): a fat_set() whose write fails must invalidate the cached view, so the next
+ * fat_get() re-reads the medium rather than serving a value that never reached it -- the FAT32
+ * writer's fat_set() has carried this discipline from the start (core/fat_write_fs.c:238).
+ *
+ * Without it, a later, unrelated write to the SAME FAT sector would flush the stale in-memory
+ * value as a side effect, publishing a link to a cluster the medium never actually recorded.
+ */
+static void test_fat_set_failure_invalidates_cache(void) {
+    hype_exfat_wfile_t f, fresh;
+    uint8_t full[SECSZ];
+    uint32_t leaked = 0, cl, after;
+    unsigned int i;
+
+    for (i = 0; i < sizeof full; i++) full[i] = 'H';
+
+    build_vol();
+    CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("create A", 0, hype_exfat_create(&g_fs, "A.LOG", &f));
+    CHECK_HEX("fill the first cluster exactly", 0, hype_exfat_append(&f, full, sizeof full));
+
+    /*
+     * Allow exactly ONE write to the FAT sector from here -- the new cluster's own EOC mark,
+     * inside alloc_cluster -- and fail the next one, which is the link that would attach it to
+     * the file's tail. The candidate cluster is allocated (bitmap bit set, FAT[cl] = EOC) but
+     * never linked in: a leak, not corruption, and out of THIS ticket's scope to recover.
+     */
+    g_dir_write_lba = FAT_LBA;
+    g_dir_writes_seen = 0;
+    g_dir_writes_allowed = 1;
+    CHECK("extension surfaces the forced FAT write failure", hype_exfat_append(&f, "x", 1u) != 0);
+    g_dir_writes_allowed = -1;
+
+    CHECK_HEX("the original tail is untouched on the medium", 0xFFFFFFFFu,
+              fat_get(f.first_cluster));
+    for (cl = 2u; cl < g_clusters; cl++) {
+        if (bit_used(cl) && cl != g_bitmap_cl && cl != g_upcase_cl && cl != g_root &&
+            cl != f.first_cluster) {
+            leaked = cl;
+            break;
+        }
+    }
+    CHECK("the failed attempt's candidate cluster is allocated but orphaned", leaked != 0u);
+
+    /*
+     * A FRESH handle resolves its tail from scratch (tail_cluster starts at 0), so its very first
+     * fat_get() on the file's only cluster is exactly the read that would serve the unlanded
+     * cache entry if fat_set() had not invalidated it above.
+     */
+    CHECK_HEX("fresh lookup", 0, hype_exfat_lookup(&g_fs, "A.LOG", 0, &fresh));
+    CHECK_HEX("append reads medium truth, not an unlanded cache entry", 0,
+              hype_exfat_append(&fresh, "y", 1u));
+
+    after = fat_get(f.first_cluster);
+    CHECK("the original tail links to a real, valid cluster",
+          after >= 2u && after < 0xFFFFFFF7u);
+    CHECK("it is NOT the failed attempt's orphaned cluster", after != leaked);
+}
+
+/*
+ * #645 (criterion 4): the allocator must not trust the bitmap alone. A bitmap bit reading clear
+ * while the FAT still describes that cluster as chained is exactly the disagreement a stale
+ * medium read (or plain corruption) produces -- the allocator must fail CLOSED on that candidate
+ * and keep scanning, never hand out a cluster something else still chains through.
+ */
+static void test_alloc_refuses_a_cluster_the_fat_still_chains(void) {
+    hype_exfat_wfile_t f;
+
+    build_vol();
+    /* Cluster 5 is the very first candidate alloc_cluster tries on a fresh volume. Its bitmap
+     * bit is (correctly) clear, but give it a FAT entry as if some other chain already claims
+     * it -- the disagreement this test exists to catch. */
+    put32(fat_ent(5u), 0xFFFFFFFFu);
+
+    CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("create ok", 0, hype_exfat_create(&g_fs, "SAFE.LOG", &f));
+    CHECK_HEX("append allocates a cluster", 0, hype_exfat_append(&f, "x", 1u));
+
+    CHECK("the disagreeing candidate was skipped", f.first_cluster != 5u);
+    CHECK("a genuinely free cluster was used instead",
+          f.first_cluster >= 2u && f.first_cluster < 0xFFFFFFF7u);
+    CHECK_HEX("the skipped cluster's bitmap bit is untouched", 0u, bit_used(5u));
+    CHECK_HEX("the skipped cluster's FAT entry is untouched", 0xFFFFFFFFu, fat_get(5u));
+}
+
 int main(void) {
     test_rollback_never_frees_under_a_published_larger_size(); /* #517 */
     test_cluster_growth_uses_durability_barriers();               /* #648 */
     test_persistent_barrier_failure_never_leaves_entry_past_chain(); /* #648 */
+    test_shared_mount_survives_stale_fat_and_bitmap_reads(); /* #645 */
+    test_fat_set_failure_invalidates_cache();                /* #645 */
+    test_alloc_refuses_a_cluster_the_fat_still_chains();     /* #645 */
     test_fs_ops_exfat();
     test_383_vdl();
     test_383_rollback_and_faults();

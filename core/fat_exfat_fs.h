@@ -82,6 +82,20 @@ typedef struct {
     uint32_t next_free;       /* allocation search hint */
     uint32_t used_clusters;   /* allocated clusters, or HYPE_EXFAT_USED_UNKNOWN */
     uint8_t dirty;            /* 1 == VolumeDirty has been set on the medium */
+    /*
+     * #645: authoritative write-through view of the most recently used FAT
+     * sector and the most recently used allocation-bitmap sector. Every
+     * writer on one mounted volume must share this fs object -- exactly the
+     * FAT32 discipline at core/fat_write_fs.h's fat_cache_* fields. Without
+     * it, a medium that serves stale read-after-write data can make a
+     * cluster this mount already handed out read back as free.
+     */
+    uint32_t fat_cache_off;
+    int fat_cache_valid;
+    uint8_t fat_cache[HYPE_BLK_SECTOR_SIZE];
+    uint64_t bitmap_cache_off; /* absolute LBA, not sector-relative (unlike the FAT cache) */
+    int bitmap_cache_valid;
+    uint8_t bitmap_cache[HYPE_BLK_SECTOR_SIZE];
     hype_exfat_upcase_t upcase;
     /* Wall-clock snapshot for directory entries; zeroed (invalid) by mount so
      * the 1980 epoch is used until hype_exfat_fs_set_time() supplies one. */

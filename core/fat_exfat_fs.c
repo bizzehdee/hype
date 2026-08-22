@@ -52,47 +52,99 @@ static uint64_t clusters_for(const hype_exfat_fs_t *fs, uint64_t bytes) {
     return (bytes + cb - 1u) / cb;
 }
 
-static int fat_get(hype_exfat_fs_t *fs, uint32_t cl, uint32_t *out) {
-    uint8_t sec[SECSZ];
-    uint64_t slba = (uint64_t)fs->fat_lba + cl / FAT_ENTRIES_PER_SECTOR;
-    if (!cluster_valid(fs, cl)) {
+/*
+ * #645: load this mount's authoritative view of FAT sector `off` (the FAT-LBA-
+ * relative sector index), re-reading from the medium only when a different
+ * sector is wanted. Every fat_get/fat_set on one mounted volume goes through
+ * this one cached image, exactly as core/fat_write_fs.c's fat_cache_load does
+ * for FAT32 -- so a cluster this mount has already written can never read back
+ * as something else because the medium served a stale copy.
+ */
+static int fat_cache_load(hype_exfat_fs_t *fs, uint32_t off) {
+    uint64_t slba;
+    if (fs->fat_cache_valid && fs->fat_cache_off == off) {
+        return 0;
+    }
+    slba = (uint64_t)fs->fat_lba + off;
+    if (fs->read(fs->ctx, slba, 1u, fs->fat_cache) != 0) {
+        fs->fat_cache_valid = 0;
         return -1;
     }
-    if (fs->read(fs->ctx, slba, 1u, sec) != 0) {
-        return -1;
-    }
-    *out = hype_rd32(sec + (cl % FAT_ENTRIES_PER_SECTOR) * 4u);
+    fs->fat_cache_off = off;
+    fs->fat_cache_valid = 1;
     return 0;
 }
 
-/* `cl` is always a cluster the caller has already validated -- either freshly
- * allocated or reached through a chain walk that range-checked it -- and only the
- * mutating entry points, which require a write callback, get here. */
-static int fat_set(hype_exfat_fs_t *fs, uint32_t cl, uint32_t val) {
-    uint8_t sec[SECSZ];
-    uint64_t slba = (uint64_t)fs->fat_lba + cl / FAT_ENTRIES_PER_SECTOR;
-    if (fs->read(fs->ctx, slba, 1u, sec) != 0) {
+static int fat_get(hype_exfat_fs_t *fs, uint32_t cl, uint32_t *out) {
+    uint32_t off = cl / FAT_ENTRIES_PER_SECTOR;
+    if (!cluster_valid(fs, cl)) {
         return -1;
     }
-    hype_wr32(sec + (cl % FAT_ENTRIES_PER_SECTOR) * 4u, val);
-    return fs->write(fs->ctx, slba, 1u, sec);
+    if (fat_cache_load(fs, off) != 0) {
+        return -1;
+    }
+    *out = hype_rd32(fs->fat_cache + (cl % FAT_ENTRIES_PER_SECTOR) * 4u);
+    return 0;
+}
+
+/*
+ * `cl` is always a cluster the caller has already validated -- either freshly
+ * allocated or reached through a chain walk that range-checked it -- and only the
+ * mutating entry points, which require a write callback, get here.
+ *
+ * #645: the cache is updated in place and the SAME image is what the next
+ * fat_get() reads back, so a stale medium read can never resurrect an older
+ * FAT entry within this mount. A write failure invalidates the cache instead
+ * of leaving it holding a value that never reached the medium.
+ */
+static int fat_set(hype_exfat_fs_t *fs, uint32_t cl, uint32_t val) {
+    uint32_t off = cl / FAT_ENTRIES_PER_SECTOR;
+    if (fat_cache_load(fs, off) != 0) {
+        return -1;
+    }
+    hype_wr32(fs->fat_cache + (cl % FAT_ENTRIES_PER_SECTOR) * 4u, val);
+    if (fs->write(fs->ctx, (uint64_t)fs->fat_lba + off, 1u, fs->fat_cache) != 0) {
+        fs->fat_cache_valid = 0;
+        return -1;
+    }
+    return 0;
 }
 
 /* ---- allocation bitmap ---- */
+
+/* #645: the bitmap's counterpart to fat_cache_load -- `lba` is the absolute
+ * sector LBA (the bitmap, unlike the FAT, is addressed by plain sector
+ * arithmetic off bitmap_lba, per decision #24), so it is used as the cache key
+ * directly. */
+static int bitmap_cache_load(hype_exfat_fs_t *fs, uint64_t lba) {
+    if (fs->bitmap_cache_valid && fs->bitmap_cache_off == lba) {
+        return 0;
+    }
+    if (fs->read(fs->ctx, lba, 1u, fs->bitmap_cache) != 0) {
+        fs->bitmap_cache_valid = 0;
+        return -1;
+    }
+    fs->bitmap_cache_off = lba;
+    fs->bitmap_cache_valid = 1;
+    return 0;
+}
 
 /* Clears one cluster's bitmap bit (allocation goes through alloc_cluster, which
  * already has the right bitmap sector in hand). As with fat_set, `cl` has been
  * range-checked by the caller. */
 static int bitmap_release(hype_exfat_fs_t *fs, uint32_t cl) {
-    uint8_t sec[SECSZ];
     uint64_t lba;
     unsigned int bit;
     hype_exfat_bitmap_location(cl, fs->bitmap_lba, &lba, &bit);
-    if (fs->read(fs->ctx, lba, 1u, sec) != 0) {
+    if (bitmap_cache_load(fs, lba) != 0) {
         return -1;
     }
-    hype_exfat_bitmap_set(sec, bit, 0);
-    return fs->write(fs->ctx, lba, 1u, sec);
+    hype_exfat_bitmap_set(fs->bitmap_cache, bit, 0);
+    if (fs->write(fs->ctx, lba, 1u, fs->bitmap_cache) != 0) {
+        fs->bitmap_cache_valid = 0;
+        return -1;
+    }
+    return 0;
 }
 
 /* "EXFAT   " -- all eight bytes, so a volume whose name merely starts with those
@@ -192,26 +244,44 @@ static int alloc_cluster(hype_exfat_fs_t *fs, uint32_t *out) {
     uint32_t pass;
 
     for (pass = 0; pass <= sectors; pass++) {
-        uint8_t sec[SECSZ];
         uint32_t s = (start_bit / BITMAP_BITS_PER_SECTOR + pass) % sectors;
         unsigned int from = (pass == 0u) ? (start_bit % BITMAP_BITS_PER_SECTOR) : 0u;
         unsigned int limit = BITMAP_BITS_PER_SECTOR;
-        unsigned int bit;
+        uint64_t lba = fs->bitmap_lba + s;
         if (s == sectors - 1u) {
             limit = fs->cluster_count - s * BITMAP_BITS_PER_SECTOR;
         }
         /* `from` is always inside `limit`: next_free never exceeds the last valid
          * cluster, so its bit index never reaches the end of its own sector. */
-        if (fs->read(fs->ctx, fs->bitmap_lba + s, 1u, sec) != 0) {
+        if (bitmap_cache_load(fs, lba) != 0) {
             return -1;
         }
-        if (hype_exfat_bitmap_find_free(sec, from, limit, &bit) != 0) {
-            continue;
-        }
-        {
-            uint32_t cl = 2u + s * BITMAP_BITS_PER_SECTOR + bit;
-            hype_exfat_bitmap_set(sec, bit, 1);
-            if (fs->write(fs->ctx, fs->bitmap_lba + s, 1u, sec) != 0) {
+        for (;;) {
+            unsigned int bit;
+            uint32_t cl, fv;
+            if (hype_exfat_bitmap_find_free(fs->bitmap_cache, from, limit, &bit) != 0) {
+                break; /* no more clear bits in this sector */
+            }
+            cl = 2u + s * BITMAP_BITS_PER_SECTOR + bit;
+            /*
+             * #645: the bitmap used to be the ONLY source of truth an allocation
+             * consulted. A bitmap that has drifted from the FAT -- its
+             * chain-of-record -- because of a stale medium read, or simple
+             * corruption, would then hand out a cluster something else still
+             * chains through. Cross-check the FAT before committing to this
+             * cluster; a non-zero entry means fail CLOSED (skip it and keep
+             * scanning), never hand it out anyway.
+             */
+            if (fat_get(fs, cl, &fv) != 0) {
+                return -1;
+            }
+            if (fv != 0u) {
+                from = bit + 1u;
+                continue;
+            }
+            hype_exfat_bitmap_set(fs->bitmap_cache, bit, 1);
+            if (fs->write(fs->ctx, lba, 1u, fs->bitmap_cache) != 0) {
+                fs->bitmap_cache_valid = 0;
                 return -1;
             }
             if (fat_set(fs, cl, EOC_MARK) != 0) {
@@ -587,6 +657,10 @@ int hype_exfat_fs_mount(hype_blk_read_fn read, hype_blk_write_fn write, void *ct
     out->next_free = 2u;
     out->used_clusters = HYPE_EXFAT_USED_UNKNOWN;
     out->dirty = (uint8_t)((volume_flags & HYPE_EXFAT_VOLUME_DIRTY) ? 1u : 0u);
+    out->fat_cache_valid = 0;
+    out->fat_cache_off = 0u;
+    out->bitmap_cache_valid = 0;
+    out->bitmap_cache_off = 0u;
     hype_exfat_upcase_reset(&out->upcase);
 
     /* With two FATs, VolumeFlags bit 0 selects the live one; reading the stale
@@ -866,6 +940,10 @@ static int dirref_flush(hype_exfat_fs_t *fs, const dirref_t *d) {
     f.secondary = d->owner_secondary;
     f.first_cluster = d->first;
     f.size = d->size;
+    /* A directory has no ValidDataLength concept of its own -- every byte of
+     * its allocation is meaningful -- so this is always the whole size. Left
+     * unset, set_flush()'s `valid > size` guard reads uninitialised stack. */
+    f.valid = d->size;
     f.contiguous = d->contiguous;
     /* A directory's own allocation growth is out of #648's scope (the ticket
      * covers file DataLength publication); non-durable preserves prior
