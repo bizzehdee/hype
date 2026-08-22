@@ -105,9 +105,14 @@ uint32_t hype_vmx_vcpu_tlb_tag(hype_vcpu_ctx_t *ctx);
 /* VMX exit handlers (VMX-2), mirrors of the SVM ones: emulate CPUID / MSR
  * against the guest GPRs in ctx (+ the VMCS for guest EFER) and advance guest
  * RIP. handle_msr's is_write distinguishes WRMSR (exit reason 32) from RDMSR
- * (31); returns 0 if handled, -1 to reject. */
+ * (31); returns 0 if handled, -1 to reject, or 1 if the caller should inject
+ * #GP(0) (an illegal IA32_APIC_BASE transition or x2APIC MSR access -- #601,
+ * only reachable in a HYPE_ENABLE_X2APIC build). `lapic` is this vCPU's own
+ * guest LAPIC model (devices/guest_lapic.h), the same one
+ * hype_vmx_vcpu_handle_lapic_npf() serves over MMIO -- consulted here only
+ * in a HYPE_ENABLE_X2APIC build. */
 void hype_vmx_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx);
-int hype_vmx_vcpu_handle_msr(hype_vcpu_ctx_t *ctx, int is_write);
+int hype_vmx_vcpu_handle_msr(hype_vcpu_ctx_t *ctx, int is_write, hype_guest_lapic_t *lapic);
 /* M7-1b (#300): service an intercepted Hyper-V VMCALL and retire it. */
 int hype_vmx_vcpu_handle_hypercall(hype_vcpu_ctx_t *ctx);
 /* set_rsi seeds guest RSI before entry (Linux zero-page ptr, m3-5). handle_ioio

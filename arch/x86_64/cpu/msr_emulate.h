@@ -29,6 +29,31 @@
 
 #define HYPE_MSR_NUMBER_APIC_BASE 0x1Bu
 #define HYPE_MSR_NUMBER_TSC 0x10u
+
+/*
+ * #601: the x2APIC MSR interface (Intel SDM Vol 3A 10.12), MSRs 0x800-0x8FF. Every
+ * x2APIC register lives at MSR address 0x800 + (its xAPIC MMIO byte offset >> 4) --
+ * e.g. the ID register (MMIO 0x020) is MSR 0x802 -- with two exceptions handled in
+ * devices/guest_lapic.h, not here: the ICR folds xAPIC's two 32-bit halves
+ * (0x300/0x310) into one 64-bit MSR (0x830), and Self IPI (0x83F) has no xAPIC MMIO
+ * counterpart at all. This module only recognizes the range; devices/guest_lapic.h
+ * owns what each register means, so both access paths (MMIO trap and this MSR
+ * range) read/write the exact same per-vCPU state.
+ */
+#define HYPE_MSR_X2APIC_RANGE_BASE 0x800u
+#define HYPE_MSR_X2APIC_RANGE_LAST 0x8FFu
+
+/*
+ * #601: the IA32_APIC_BASE mode this vCPU's LAPIC is in. Numerically matches
+ * devices/guest_lapic.h's HYPE_GUEST_LAPIC_MODE_* constants (0/1/2) -- kept as
+ * separate #defines rather than a shared header because devices/ must not depend
+ * on arch/x86_64/cpu/ (the reverse dependency already exists via svm.h/vmcs.h
+ * including guest_lapic.h). The _hw callers cast between them; a comment at each
+ * cast site says so.
+ */
+#define HYPE_APIC_MODE_DISABLED 0
+#define HYPE_APIC_MODE_XAPIC 1
+#define HYPE_APIC_MODE_X2APIC 2
 /* IA32_FS_BASE / IA32_GS_BASE (#251). Duplicated here rather than pulled from a
  * backend header, same as HYPE_MSR_NUMBER_EFER above: these are architectural
  * constants, and this module deliberately depends on nothing. */
@@ -148,6 +173,44 @@ hype_msr_action_t hype_msr_decide_ex(uint32_t msr_number, int is_write, int hv_e
  * the BSP branch and faults on a null service table.
  */
 uint64_t hype_msr_apic_base_value(int is_bsp);
+
+/*
+ * #601: as hype_msr_apic_base_value(), but reporting bits 11 (EN) and 10 (EXTD)
+ * for the given `apic_mode` (a HYPE_APIC_MODE_* value) instead of hardcoding
+ * "always xAPIC-enabled". hype_msr_apic_base_value() is the
+ * HYPE_APIC_MODE_XAPIC case, so its result is unchanged by this addition.
+ * Pure computation -- fully unit tested.
+ */
+uint64_t hype_msr_apic_base_value_mode(int is_bsp, int apic_mode);
+
+/*
+ * #601: is `msr_number` in the x2APIC MSR range (0x800-0x8FF)? Pure range
+ * check -- fully unit tested. Whether the range is actually LEGAL to touch
+ * still depends on the vCPU's current APIC mode (HYPE_APIC_MODE_X2APIC), which
+ * this function does not know and does not need to.
+ */
+int hype_msr_is_x2apic_range(uint32_t msr_number);
+
+/*
+ * #601: the Intel SDM's IA32_APIC_BASE state machine (Vol 3A, "Local APIC",
+ * the IA32_APIC_BASE MSR section). `current` and `*next_out` are
+ * HYPE_APIC_MODE_* values; `want_en`/`want_extd` are the EN (bit 11) and EXTD
+ * (bit 10) bits the guest is writing.
+ *
+ *   want_en=0, want_extd=0 -> Disabled   want_en=1, want_extd=0 -> xAPIC
+ *   want_en=1, want_extd=1 -> x2APIC     want_en=0, want_extd=1 -> not a state (always illegal)
+ *
+ * xAPIC -> x2APIC and Disabled -> either enabled mode are legal upgrades.
+ * x2APIC -> xAPIC directly is the one guest-reachable illegal transition: the
+ * SDM requires a full disable (-> Disabled) first, then a separate write back
+ * into xAPIC. Writing the CURRENT mode back is a legal no-op.
+ *
+ * Returns 0 and fills *next_out on a legal transition; returns -1 (the
+ * caller injects #GP(0), same convention as this module's Hyper-V hypercall
+ * actions) on an illegal one, leaving *next_out untouched. Pure logic, no
+ * vCPU/MSR access of its own -- fully unit tested against every combination.
+ */
+int hype_apic_base_mode_transition(int current, int want_en, int want_extd, int *next_out);
 
 /*
  * Convert a TSC delta into Hyper-V reference-counter units (100ns ticks), given the

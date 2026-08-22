@@ -3294,7 +3294,18 @@ controls M2-4 defined are **deliberately dropped** at VMCS build time
 (`arch/x86_64/vmx/vmcs_hw.c`: APIC_REGISTER_VIRT, VIRTUAL_INTERRUPT_DELIVERY
 and USE_TPR_SHADOW are not requested). x2APIC guest mode is masked (CPUID
 leaf 1 ECX bit 21 forced clear, `arch/x86_64/cpu/cpuid_emulate.c`); the
-x2APIC MSR range is unhandled.
+x2APIC MSR range is unhandled by default.
+
+**#601 update:** the x2APIC MSR interface (0x800-0x8FF) and the
+IA32_APIC_BASE mode state machine now exist, over the same per-vCPU model
+`devices/guest_lapic.c` already used for xAPIC MMIO -- but both are build-time
+opt-in, default OFF, same convention as AVIC (`-DHYPE_ENABLE_X2APIC=1`; the
+gate lives in `arch/x86_64/cpu/cpuid_emulate.c`, `arch/x86_64/svm/svm_vcpu.c`,
+`arch/x86_64/vmx/vmcs_hw.c`). Default builds are unaffected: CPUID leaf 1 ECX
+bit 21 stays forced clear and the MSR range stays unrecognized exactly as
+before this work. Pending: a QEMU Linux-guest boot with x2apic enabled in
+dmesg, and the same real-hardware validation gate #600/#605 set for AVIC/APICv,
+before the default can move.
 
 Gap: this contradicts decision 6 and §4, which require APICv/AVIC "from the
 start." M2-4 (#30) is closed against that decision, but only structures and

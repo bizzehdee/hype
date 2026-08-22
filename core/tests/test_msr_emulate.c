@@ -177,6 +177,101 @@ static void test_hv_ref_count_conversion(void) {
               hype_msr_hv_ref_count_from_tsc(123456789ULL, 0ULL));
 }
 
+/* --- #601: the x2APIC MSR range and the IA32_APIC_BASE state machine --- */
+
+static void test_x2apic_range_check(void) {
+    CHECK_HEX("0x800 is in range", 1, hype_msr_is_x2apic_range(0x800u));
+    CHECK_HEX("0x8FF is in range", 1, hype_msr_is_x2apic_range(0x8FFu));
+    CHECK_HEX("0x830 (ICR) is in range", 1, hype_msr_is_x2apic_range(0x830u));
+    CHECK_HEX("0x7FF is NOT in range", 0, hype_msr_is_x2apic_range(0x7FFu));
+    CHECK_HEX("0x900 is NOT in range", 0, hype_msr_is_x2apic_range(0x900u));
+    CHECK_HEX("APIC_BASE itself is NOT in the x2APIC MSR range", 0,
+              hype_msr_is_x2apic_range(HYPE_MSR_NUMBER_APIC_BASE));
+}
+
+/*
+ * hype_msr_apic_base_value() must stay the HYPE_APIC_MODE_XAPIC case forever --
+ * this is the byte-identical-when-masked regression bar #601 set for itself,
+ * proven directly rather than by inspection.
+ */
+static void test_apic_base_value_mode_matches_legacy_helper(void) {
+    CHECK_HEX("BSP: mode helper matches legacy helper", hype_msr_apic_base_value(1),
+              hype_msr_apic_base_value_mode(1, HYPE_APIC_MODE_XAPIC));
+    CHECK_HEX("AP: mode helper matches legacy helper", hype_msr_apic_base_value(0),
+              hype_msr_apic_base_value_mode(0, HYPE_APIC_MODE_XAPIC));
+}
+
+static void test_apic_base_value_mode_disabled_clears_en(void) {
+    uint64_t value = hype_msr_apic_base_value_mode(1, HYPE_APIC_MODE_DISABLED);
+    CHECK_HEX("Disabled: EN clear", 0, (value & (1ULL << 11)) != 0);
+    CHECK_HEX("Disabled: EXTD clear", 0, (value & (1ULL << 10)) != 0);
+    CHECK_HEX("Disabled: BSP bit unaffected", 1, (value & (1ULL << 8)) != 0);
+}
+
+static void test_apic_base_value_mode_x2apic_sets_extd(void) {
+    uint64_t value = hype_msr_apic_base_value_mode(0, HYPE_APIC_MODE_X2APIC);
+    CHECK_HEX("x2APIC: EN set", 1, (value & (1ULL << 11)) != 0);
+    CHECK_HEX("x2APIC: EXTD set", 1, (value & (1ULL << 10)) != 0);
+    CHECK_HEX("x2APIC: AP BSP bit clear", 0, (value & (1ULL << 8)) != 0);
+}
+
+/* Every legal transition the SDM's state machine allows. */
+static void test_apic_base_transition_legal_paths(void) {
+    int next;
+
+    CHECK_HEX("Disabled -> xAPIC", 0,
+              hype_apic_base_mode_transition(HYPE_APIC_MODE_DISABLED, 1, 0, &next));
+    CHECK_HEX("Disabled -> xAPIC: next", HYPE_APIC_MODE_XAPIC, next);
+
+    CHECK_HEX("Disabled -> x2APIC", 0,
+              hype_apic_base_mode_transition(HYPE_APIC_MODE_DISABLED, 1, 1, &next));
+    CHECK_HEX("Disabled -> x2APIC: next", HYPE_APIC_MODE_X2APIC, next);
+
+    CHECK_HEX("xAPIC -> x2APIC (the guest-initiated upgrade)", 0,
+              hype_apic_base_mode_transition(HYPE_APIC_MODE_XAPIC, 1, 1, &next));
+    CHECK_HEX("xAPIC -> x2APIC: next", HYPE_APIC_MODE_X2APIC, next);
+
+    CHECK_HEX("xAPIC -> Disabled", 0,
+              hype_apic_base_mode_transition(HYPE_APIC_MODE_XAPIC, 0, 0, &next));
+    CHECK_HEX("xAPIC -> Disabled: next", HYPE_APIC_MODE_DISABLED, next);
+
+    CHECK_HEX("x2APIC -> Disabled (the required first step of a downgrade)", 0,
+              hype_apic_base_mode_transition(HYPE_APIC_MODE_X2APIC, 0, 0, &next));
+    CHECK_HEX("x2APIC -> Disabled: next", HYPE_APIC_MODE_DISABLED, next);
+}
+
+static void test_apic_base_transition_noop_rewrites_are_legal(void) {
+    int next;
+
+    CHECK_HEX("Disabled -> Disabled (no-op)", 0,
+              hype_apic_base_mode_transition(HYPE_APIC_MODE_DISABLED, 0, 0, &next));
+    CHECK_HEX("xAPIC -> xAPIC (no-op)", 0,
+              hype_apic_base_mode_transition(HYPE_APIC_MODE_XAPIC, 1, 0, &next));
+    CHECK_HEX("x2APIC -> x2APIC (no-op)", 0,
+              hype_apic_base_mode_transition(HYPE_APIC_MODE_X2APIC, 1, 1, &next));
+}
+
+/*
+ * The one guest-reachable illegal transition this ticket exists to guard:
+ * downgrading straight from x2APIC to xAPIC without passing through Disabled.
+ */
+static void test_apic_base_transition_x2apic_to_xapic_is_illegal(void) {
+    int next = 12345; /* poisoned: must stay untouched on the illegal path */
+    CHECK_HEX("x2APIC -> xAPIC directly is illegal", -1,
+              hype_apic_base_mode_transition(HYPE_APIC_MODE_X2APIC, 1, 0, &next));
+    CHECK_HEX("x2APIC -> xAPIC: *next_out untouched on failure", 12345, next);
+}
+
+static void test_apic_base_transition_en0_extd1_always_illegal(void) {
+    int next;
+    CHECK_HEX("Disabled: EN=0,EXTD=1 is illegal", -1,
+              hype_apic_base_mode_transition(HYPE_APIC_MODE_DISABLED, 0, 1, &next));
+    CHECK_HEX("xAPIC: EN=0,EXTD=1 is illegal", -1,
+              hype_apic_base_mode_transition(HYPE_APIC_MODE_XAPIC, 0, 1, &next));
+    CHECK_HEX("x2APIC: EN=0,EXTD=1 is illegal", -1,
+              hype_apic_base_mode_transition(HYPE_APIC_MODE_X2APIC, 0, 1, &next));
+}
+
 int main(void) {
     test_fs_gs_base_readwrite();
     test_fs_gs_base_are_distinct_actions();
@@ -194,6 +289,14 @@ int main(void) {
     test_hv_reference_tsc_msr_matches_cpuid();
     test_hv_enable_does_not_disturb_existing_msrs();
     test_hv_ref_count_conversion();
+    test_x2apic_range_check();
+    test_apic_base_value_mode_matches_legacy_helper();
+    test_apic_base_value_mode_disabled_clears_en();
+    test_apic_base_value_mode_x2apic_sets_extd();
+    test_apic_base_transition_legal_paths();
+    test_apic_base_transition_noop_rewrites_are_legal();
+    test_apic_base_transition_x2apic_to_xapic_is_illegal();
+    test_apic_base_transition_en0_extd1_always_illegal();
 
     if (failures == 0) {
         printf("all tests passed\n");

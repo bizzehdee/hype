@@ -846,6 +846,152 @@ static void test_all_excluding_self_never_self_pends(void) {
               ipi.shorthand);
 }
 
+/* --- #601: the x2APIC MSR interface over the same per-vCPU state --- */
+
+static void test_reset_defaults_to_xapic_mode(void) {
+    /* The regression bar #601 set for itself: a LAPIC nothing has touched must
+     * still behave as "always xAPIC-enabled", exactly as before this ticket. */
+    hype_guest_lapic_t l;
+    hype_guest_lapic_reset(&l);
+    CHECK_HEX("reset leaves the LAPIC in xAPIC mode", HYPE_GUEST_LAPIC_MODE_XAPIC, l.apic_mode);
+}
+
+static void test_x2apic_msrs_reject_outside_x2apic_mode(void) {
+    hype_guest_lapic_t l;
+    uint64_t v;
+    hype_guest_lapic_reset(&l);
+    /* Still in xAPIC mode (the default) -- the MSR range does not exist yet. */
+    CHECK_HEX("x2APIC ID read rejected outside x2APIC mode", -1,
+              hype_guest_lapic_x2apic_read(&l, 0x802u, &v));
+    CHECK_HEX("x2APIC SVR write rejected outside x2APIC mode", -1,
+              hype_guest_lapic_x2apic_write(&l, 0x80Fu, 0x1FFu));
+}
+
+static void test_x2apic_id_is_full_32bit_unshifted(void) {
+    hype_guest_lapic_t l;
+    uint64_t v;
+    hype_guest_lapic_reset(&l);
+    hype_guest_lapic_set_apic_mode(&l, HYPE_GUEST_LAPIC_MODE_X2APIC);
+    /* 0x1234 does not fit xAPIC's 8-bit ID at all -- this value can only be
+     * read back correctly if the x2APIC path reports the RAW 32-bit ID
+     * instead of xAPIC's `(id & 0xFF) << 24` MMIO encoding. */
+    hype_guest_lapic_set_apic_id(&l, 0x1234u);
+    CHECK_HEX("x2APIC ID MSR read ok", 0, hype_guest_lapic_x2apic_read(&l, 0x802u, &v));
+    CHECK_HEX("x2APIC ID is the raw 32-bit value, unshifted", 0x1234u, v);
+}
+
+static void test_x2apic_version_and_ppr_are_read_only(void) {
+    hype_guest_lapic_t l;
+    uint64_t v;
+    hype_guest_lapic_reset(&l);
+    hype_guest_lapic_set_apic_mode(&l, HYPE_GUEST_LAPIC_MODE_X2APIC);
+    CHECK_HEX("VERSION write rejected (read-only)", -1,
+              hype_guest_lapic_x2apic_write(&l, 0x803u, 0x99u));
+    CHECK_HEX("VERSION read matches the xAPIC value", HYPE_GUEST_LAPIC_VERSION_VALUE,
+              (hype_guest_lapic_x2apic_read(&l, 0x803u, &v), v));
+    CHECK_HEX("PPR write rejected (read-only)", -1,
+              hype_guest_lapic_x2apic_write(&l, 0x80Au, 0x10u));
+}
+
+static void test_x2apic_dfr_and_icr_high_are_not_addressable(void) {
+    hype_guest_lapic_t l;
+    uint64_t v;
+    hype_guest_lapic_reset(&l);
+    hype_guest_lapic_set_apic_mode(&l, HYPE_GUEST_LAPIC_MODE_X2APIC);
+    CHECK_HEX("DFR read rejected (does not exist in x2APIC mode)", -1,
+              hype_guest_lapic_x2apic_read(&l, 0x80Eu, &v));
+    CHECK_HEX("DFR write rejected", -1, hype_guest_lapic_x2apic_write(&l, 0x80Eu, 0u));
+    CHECK_HEX("ICR_HIGH read rejected (folded into the 64-bit ICR MSR)", -1,
+              hype_guest_lapic_x2apic_read(&l, 0x831u, &v));
+    CHECK_HEX("ICR_HIGH write rejected", -1, hype_guest_lapic_x2apic_write(&l, 0x831u, 0u));
+}
+
+static void test_x2apic_ldr_is_derived_from_id(void) {
+    hype_guest_lapic_t l;
+    uint64_t v;
+    hype_guest_lapic_reset(&l);
+    hype_guest_lapic_set_apic_mode(&l, HYPE_GUEST_LAPIC_MODE_X2APIC);
+    hype_guest_lapic_set_apic_id(&l, 0x25u); /* SDM 10.12.10.2: cluster=id[19:4]=2, logical=id[3:0]=5 */
+    CHECK_HEX("LDR write rejected (read-only in x2APIC mode)", -1,
+              hype_guest_lapic_x2apic_write(&l, 0x80Du, 0x1234u));
+    CHECK_HEX("LDR derived per SDM 10.12.10.2", (0x2u << 16) | (1u << 5),
+              (hype_guest_lapic_x2apic_read(&l, 0x80Du, &v), v));
+}
+
+static void test_x2apic_eoi_requires_a_write_of_zero(void) {
+    hype_guest_lapic_t l;
+    hype_guest_lapic_reset(&l);
+    hype_guest_lapic_set_apic_mode(&l, HYPE_GUEST_LAPIC_MODE_X2APIC);
+    hype_guest_lapic_accept_vector(&l, 0x40u);
+    CHECK_HEX("nonzero EOI write rejected", -1, hype_guest_lapic_x2apic_write(&l, 0x80Bu, 1u));
+    CHECK_HEX("vector still in service after the rejected write", 0x40,
+              hype_guest_lapic_isr_highest(&l));
+    CHECK_HEX("EOI write of 0 accepted", 0, hype_guest_lapic_x2apic_write(&l, 0x80Bu, 0u));
+    CHECK_HEX("vector retired", -1, hype_guest_lapic_isr_highest(&l));
+}
+
+static void test_x2apic_self_ipi_msr(void) {
+    hype_guest_lapic_t l;
+    uint64_t v;
+    uint8_t vec = 0;
+    hype_guest_lapic_reset(&l);
+    hype_guest_lapic_set_apic_mode(&l, HYPE_GUEST_LAPIC_MODE_X2APIC);
+    CHECK_HEX("Self IPI MSR is write-only", -1,
+              hype_guest_lapic_x2apic_read(&l, HYPE_GUEST_LAPIC_X2APIC_MSR_SELF_IPI, &v));
+    CHECK_HEX("vector < 16 rejected", -1,
+              hype_guest_lapic_x2apic_write(&l, HYPE_GUEST_LAPIC_X2APIC_MSR_SELF_IPI, 0x0Fu));
+    CHECK_HEX("reserved bits above the vector rejected", -1,
+              hype_guest_lapic_x2apic_write(&l, HYPE_GUEST_LAPIC_X2APIC_MSR_SELF_IPI, 0x100u));
+    CHECK_HEX("Self IPI write accepted", 0,
+              hype_guest_lapic_x2apic_write(&l, HYPE_GUEST_LAPIC_X2APIC_MSR_SELF_IPI, 0x33u));
+    CHECK_HEX("pended exactly like an ICR shorthand=SELF write", 1,
+              hype_guest_lapic_take_self_ipi(&l, &vec));
+    CHECK_HEX("same vector", 0x33u, vec);
+}
+
+static void test_x2apic_icr_write_uses_full_32bit_destination(void) {
+    hype_guest_lapic_t l;
+    uint8_t vec = 0;
+    uint64_t v;
+    hype_guest_lapic_reset(&l);
+    hype_guest_lapic_set_apic_mode(&l, HYPE_GUEST_LAPIC_MODE_X2APIC);
+    /* 0x105 cannot even be EXPRESSED in xAPIC's 8-bit ICR_HIGH destination --
+     * proving this path reads the full 32-bit x2APIC destination unshifted,
+     * not an 8-bit truncation of it. */
+    hype_guest_lapic_set_apic_id(&l, 0x105u);
+    CHECK_HEX("x2APIC ICR write (self, full-width dest match)", 0,
+              hype_guest_lapic_x2apic_write(&l, HYPE_GUEST_LAPIC_X2APIC_MSR_ICR,
+                                            ((uint64_t)0x105u << 32) | 0x77u));
+    CHECK_HEX("delivered to self", 1, hype_guest_lapic_take_self_ipi(&l, &vec));
+    CHECK_HEX("vector 0x77", 0x77u, vec);
+    CHECK_HEX("x2APIC ICR readback ok", 0,
+              hype_guest_lapic_x2apic_read(&l, HYPE_GUEST_LAPIC_X2APIC_MSR_ICR, &v));
+    CHECK_HEX("readback carries the full 64-bit value back", ((uint64_t)0x105u << 32) | 0x77u, v);
+}
+
+static void test_x2apic_broadcast_is_the_32bit_all_ones_id(void) {
+    hype_guest_lapic_t l;
+    uint8_t vec = 0;
+    hype_guest_lapic_ipi_t ipi;
+    hype_guest_lapic_reset(&l);
+    hype_guest_lapic_set_apic_mode(&l, HYPE_GUEST_LAPIC_MODE_X2APIC);
+    hype_guest_lapic_set_apic_id(&l, 3u);
+    /* xAPIC's 8-bit broadcast ID (0xFF) is an ORDINARY destination in x2APIC
+     * mode -- our ID (3) does not match it, so it must not self-deliver. */
+    CHECK_HEX("0xFF ICR write ok", 0,
+              hype_guest_lapic_x2apic_write(&l, HYPE_GUEST_LAPIC_X2APIC_MSR_ICR,
+                                            ((uint64_t)0xFFu << 32) | 0x50u));
+    CHECK_HEX("0xFF is NOT broadcast in x2APIC mode", 0,
+              hype_guest_lapic_take_self_ipi(&l, &vec));
+    CHECK_HEX("but still goes outbound (dest != self)", 1, hype_guest_lapic_take_ipi(&l, &ipi));
+    /* The real x2APIC physical broadcast ID is the 32-bit all-ones value. */
+    CHECK_HEX("0xFFFFFFFF ICR write ok", 0,
+              hype_guest_lapic_x2apic_write(&l, HYPE_GUEST_LAPIC_X2APIC_MSR_ICR,
+                                            ((uint64_t)0xFFFFFFFFu << 32) | 0x51u));
+    CHECK_HEX("0xFFFFFFFF IS broadcast in x2APIC mode", 1,
+              hype_guest_lapic_take_self_ipi(&l, &vec));
+}
+
 static void test_an_undrained_slot_is_counted_not_hidden(void) {
     /* One slot is only safe because the caller drains on the same exit. If that ever stops
      * being true the count says so, rather than an IPI vanishing. */
@@ -900,6 +1046,16 @@ int main(void) {
     test_icr_nondeliverable_shapes_dropped();
     test_icr_coalesces_and_drains_multiple();
     test_icr_readback_and_reset();
+    test_reset_defaults_to_xapic_mode();
+    test_x2apic_msrs_reject_outside_x2apic_mode();
+    test_x2apic_id_is_full_32bit_unshifted();
+    test_x2apic_version_and_ppr_are_read_only();
+    test_x2apic_dfr_and_icr_high_are_not_addressable();
+    test_x2apic_ldr_is_derived_from_id();
+    test_x2apic_eoi_requires_a_write_of_zero();
+    test_x2apic_self_ipi_msr();
+    test_x2apic_icr_write_uses_full_32bit_destination();
+    test_x2apic_broadcast_is_the_32bit_all_ones_id();
 
     if (failures == 0) {
         printf("all tests passed\n");

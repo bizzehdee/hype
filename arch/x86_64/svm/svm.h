@@ -846,9 +846,17 @@ uint64_t hype_svm_vcpu_get_gpr(hype_vcpu_ctx_t *ctx, unsigned idx);
  * VMCB/GPR fields this backend's real VMRUN produces and executes a
  * real RDTSC instruction; hype_msr_decide()/hype_msr_apic_base_value()
  * are already fully tested in isolation. Returns 0 on success, -1 for
- * a rejected MSR.
+ * a rejected MSR, or 1 if the caller should inject #GP(0) (an illegal
+ * IA32_APIC_BASE transition or x2APIC MSR access -- #601, only reachable
+ * in a HYPE_ENABLE_X2APIC build).
+ *
+ * `lapic` is this vCPU's own guest LAPIC model (devices/guest_lapic.h) --
+ * the same one the NPF path serves over MMIO (hype_svm_vcpu_handle_lapic_npf).
+ * #601: only consulted in a HYPE_ENABLE_X2APIC build, for IA32_APIC_BASE mode
+ * transitions and the x2APIC MSR range; every other MSR here is
+ * lapic-independent, same as before that ticket.
  */
-int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx);
+int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lapic);
 
 /* M7-1b (#300): service an intercepted Hyper-V VMMCALL and retire it. */
 int hype_svm_vcpu_handle_hypercall(hype_vcpu_ctx_t *ctx);

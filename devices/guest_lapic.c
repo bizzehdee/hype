@@ -31,6 +31,7 @@ void hype_guest_lapic_reset(hype_guest_lapic_t *lapic) {
     lapic->timer_in_service = 0;
     lapic->eoi_count = 0;
     lapic->apic_id = 0; /* SMP-3: the BSP's ID; APs are set explicitly after reset */
+    lapic->apic_mode = HYPE_GUEST_LAPIC_MODE_XAPIC; /* #601: matches pre-#601 behavior */
     /* SMP-4: no IPI in flight across a reset. */
     lapic->ipi_out_valid = 0;
     lapic->ipi_out_dropped = 0;
@@ -73,6 +74,10 @@ static void lapic_post_ipi(hype_guest_lapic_t *lapic, uint32_t icr_low, uint32_t
 
 void hype_guest_lapic_set_apic_id(hype_guest_lapic_t *lapic, uint32_t apic_id) {
     lapic->apic_id = apic_id;
+}
+
+void hype_guest_lapic_set_apic_mode(hype_guest_lapic_t *lapic, uint32_t apic_mode) {
+    lapic->apic_mode = apic_mode;
 }
 
 void hype_guest_lapic_accept_vector(hype_guest_lapic_t *lapic, uint8_t vector) {
@@ -251,8 +256,28 @@ int hype_guest_lapic_write(hype_guest_lapic_t *lapic, uint32_t offset, unsigned 
             uint32_t delmode =
                 (value & HYPE_GUEST_LAPIC_ICR_DELMODE_MASK) >> HYPE_GUEST_LAPIC_ICR_DELMODE_SHIFT;
             uint32_t shorthand = value & HYPE_GUEST_LAPIC_ICR_SHORTHAND_MASK;
-            uint32_t dest = lapic->icr_high >> 24;
-            uint32_t self_id = lapic->apic_id & 0xFFu;
+            /*
+             * #601: xAPIC's ICR_HIGH shifts an 8-bit destination into bits 31:24;
+             * x2APIC's 64-bit ICR MSR carries the full 32-bit destination
+             * unshifted in its high half (hype_guest_lapic_x2apic_write stores it
+             * into icr_high as-is). Same field, two encodings -- the mode this
+             * LAPIC is in says which one `icr_high` currently holds.
+             */
+            uint32_t dest = (lapic->apic_mode == HYPE_GUEST_LAPIC_MODE_X2APIC)
+                                 ? lapic->icr_high
+                                 : (lapic->icr_high >> 24);
+            /*
+             * #601: x2APIC's destination comparisons are against the FULL 32-bit
+             * ID (there is no 8-bit truncation in x2APIC mode); xAPIC's physical
+             * destination is 8 bits, and 0xFF is its broadcast shorthand-by-ID.
+             */
+            uint32_t self_id =
+                (lapic->apic_mode == HYPE_GUEST_LAPIC_MODE_X2APIC) ? lapic->apic_id
+                                                                    : (lapic->apic_id & 0xFFu);
+            /* xAPIC's physical broadcast ID is the 8-bit all-ones value (0xFF); x2APIC's is
+             * the 32-bit all-ones value -- 0xFF there is an ordinary specific destination. */
+            uint32_t broadcast_id =
+                (lapic->apic_mode == HYPE_GUEST_LAPIC_MODE_X2APIC) ? 0xFFFFFFFFu : 0xFFu;
             int to_self = 0;
             int to_others = 0;
 
@@ -276,8 +301,8 @@ int hype_guest_lapic_write(hype_guest_lapic_t *lapic, uint32_t offset, unsigned 
                          * against every vCPU's LDR, which is knowledge this model lacks. */
                         to_others = 1;
                     } else {
-                        to_self = (dest == self_id) || (dest == 0xFFu);
-                        to_others = (dest != self_id) || (dest == 0xFFu);
+                        to_self = (dest == self_id) || (dest == broadcast_id);
+                        to_others = (dest != self_id) || (dest == broadcast_id);
                     }
                     break;
             }
@@ -361,6 +386,121 @@ int hype_guest_lapic_write(hype_guest_lapic_t *lapic, uint32_t offset, unsigned 
         default:
             /* Unmodeled register in the window -- ignore, benign. */
             return 0;
+    }
+}
+
+/* #601: x2APIC MSR number -> xAPIC MMIO byte offset, per the 0x800 + (offset>>4)
+ * rule both hype_guest_lapic_x2apic_read/write use. Returns -1 for a number
+ * outside the range (the caller has usually already checked this). */
+static int guest_lapic_x2apic_offset(uint32_t msr_number, uint32_t *offset_out) {
+    if (msr_number < HYPE_GUEST_LAPIC_X2APIC_MSR_BASE || msr_number > HYPE_GUEST_LAPIC_X2APIC_MSR_LAST) {
+        return -1;
+    }
+    *offset_out = (msr_number - HYPE_GUEST_LAPIC_X2APIC_MSR_BASE) << 4;
+    return 0;
+}
+
+/*
+ * #601: x2APIC's logical ID is DERIVED from the APIC ID, not independently
+ * settable -- Intel SDM Vol 3A 10.12.10.2: logical x2APIC ID =
+ * (x2APIC ID[19:4] << 16) | (1 << x2APIC ID[3:0]). Reading LDR (or, in xAPIC
+ * terms, MSR 0x80D) recomputes this every time rather than caching it, so it
+ * can never drift from whatever hype_guest_lapic_set_apic_id() last set.
+ */
+static uint32_t guest_lapic_x2apic_derived_ldr(uint32_t apic_id) {
+    uint32_t cluster = (apic_id >> 4) & 0xFFFFu;
+    uint32_t logical = apic_id & 0xFu;
+    return (cluster << 16) | (1u << logical);
+}
+
+int hype_guest_lapic_x2apic_read(hype_guest_lapic_t *lapic, uint32_t msr_number, uint64_t *out) {
+    uint32_t offset;
+    uint32_t lo;
+
+    if (lapic->apic_mode != HYPE_GUEST_LAPIC_MODE_X2APIC) {
+        return -1; /* the MSR range does not exist outside x2APIC mode */
+    }
+    if (msr_number == HYPE_GUEST_LAPIC_X2APIC_MSR_SELF_IPI) {
+        return -1; /* write-only */
+    }
+    if (guest_lapic_x2apic_offset(msr_number, &offset) != 0) {
+        return -1;
+    }
+    switch (offset) {
+        case HYPE_GUEST_LAPIC_REG_ID:
+            /* Unlike xAPIC's 8-bit ID shifted into MMIO bits [31:24], the x2APIC
+             * ID register is the full 32-bit value, unshifted. */
+            *out = (uint64_t)lapic->apic_id;
+            return 0;
+        case HYPE_GUEST_LAPIC_REG_DFR:
+            return -1; /* DFR does not exist in x2APIC mode -- #GP */
+        case HYPE_GUEST_LAPIC_REG_LDR:
+            *out = (uint64_t)guest_lapic_x2apic_derived_ldr(lapic->apic_id);
+            return 0;
+        case HYPE_GUEST_LAPIC_REG_ICR_HIGH:
+            return -1; /* folded into the 64-bit ICR MSR; not separately addressable */
+        case HYPE_GUEST_LAPIC_REG_ICR_LOW:
+            if (hype_guest_lapic_read(lapic, HYPE_GUEST_LAPIC_REG_ICR_LOW, 4u, &lo) != 0) {
+                return -1;
+            }
+            /* x2APIC's ICR high half is the full 32-bit destination, stored
+             * unshifted in icr_high by hype_guest_lapic_x2apic_write(). */
+            *out = ((uint64_t)lapic->icr_high << 32) | (uint64_t)lo;
+            return 0;
+        default:
+            if (hype_guest_lapic_read(lapic, offset, 4u, &lo) != 0) {
+                return -1;
+            }
+            *out = (uint64_t)lo;
+            return 0;
+    }
+}
+
+int hype_guest_lapic_x2apic_write(hype_guest_lapic_t *lapic, uint32_t msr_number, uint64_t value) {
+    uint32_t offset;
+
+    if (lapic->apic_mode != HYPE_GUEST_LAPIC_MODE_X2APIC) {
+        return -1; /* the MSR range does not exist outside x2APIC mode */
+    }
+    if (msr_number == HYPE_GUEST_LAPIC_X2APIC_MSR_SELF_IPI) {
+        /* SDM 10.12.11: equivalent to a FIXED, shorthand-SELF ICR write, without
+         * the ICR round-trip. Reserved bits above the vector must be 0, and
+         * vectors 0-15 are illegal for the same reason ICR-shorthand-SELF
+         * already rejects them in hype_guest_lapic_write(). */
+        uint32_t vector = (uint32_t)(value & 0xFFu);
+        if ((value & ~(uint64_t)0xFFu) != 0ull || vector < 16u) {
+            return -1;
+        }
+        lapic->self_ipi_pending[vector >> 5] |= 1u << (vector & 31u);
+        lapic->self_ipi_count++;
+        return 0;
+    }
+    if (guest_lapic_x2apic_offset(msr_number, &offset) != 0) {
+        return -1;
+    }
+    switch (offset) {
+        case HYPE_GUEST_LAPIC_REG_ID:
+        case HYPE_GUEST_LAPIC_REG_VERSION:
+        case HYPE_GUEST_LAPIC_REG_PPR:
+        case HYPE_GUEST_LAPIC_REG_LDR:
+            return -1; /* read-only in x2APIC mode -- WRMSR here is #GP */
+        case HYPE_GUEST_LAPIC_REG_DFR:
+            return -1; /* does not exist in x2APIC mode -- #GP */
+        case HYPE_GUEST_LAPIC_REG_ICR_HIGH:
+            return -1; /* folded into the 64-bit ICR MSR; not separately addressable */
+        case HYPE_GUEST_LAPIC_REG_ICR_LOW:
+            /* Latch the full 32-bit destination first (unshifted -- see the
+             * struct field comment), then replay the existing ICR_LOW decode so
+             * both access paths share one send/self-IPI decision. */
+            lapic->icr_high = (uint32_t)(value >> 32);
+            return hype_guest_lapic_write(lapic, HYPE_GUEST_LAPIC_REG_ICR_LOW, 4u, (uint32_t)value);
+        case HYPE_GUEST_LAPIC_REG_EOI:
+            if (value != 0ull) {
+                return -1; /* SDM: x2APIC EOI requires a write of 0 -- #GP otherwise */
+            }
+            return hype_guest_lapic_write(lapic, offset, 4u, 0u);
+        default:
+            return hype_guest_lapic_write(lapic, offset, 4u, (uint32_t)value);
     }
 }
 
