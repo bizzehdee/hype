@@ -325,9 +325,19 @@ void hype_cpuid_emulate_topo(uint32_t eax_in, uint32_t ecx_in, int hv_enabled,
          * was missing here -- so a guest on an Intel host saw VT-x while a guest on an AMD host
          * correctly saw no SVM. Found by the ported CPUMSR microtest asserting, from inside the
          * guest, what #316 says a guest must see.
+         *
+         * #601: X2APIC (21) unmasks ONLY in a build compiled with HYPE_ENABLE_X2APIC -- the x2APIC
+         * MSR range (arch/x86_64/cpu/msr_emulate.c/vmcs_hw.c/svm_vcpu.c) that backs it is gated the
+         * same way, and the default build must keep answering exactly as it did before this bit
+         * existed (the regression bar this ticket set: masked means byte-identical). When the
+         * bit does unmask it is still just a passthrough of the host's own bit -- a host that
+         * cannot do x2APIC never advertises it to the guest either.
          */
         out->ecx = (real->ecx | HYPE_CPUID_HYPERVISOR_PRESENT_BIT) &
-                   ~HYPE_CPUID_LEAF1_ECX_TSC_DEADLINE_BIT & ~HYPE_CPUID_LEAF1_ECX_X2APIC_BIT &
+                   ~HYPE_CPUID_LEAF1_ECX_TSC_DEADLINE_BIT &
+#if !defined(HYPE_ENABLE_X2APIC) || !HYPE_ENABLE_X2APIC
+                   ~HYPE_CPUID_LEAF1_ECX_X2APIC_BIT &
+#endif
                    ~HYPE_CPUID_LEAF1_ECX_MONITOR_BIT & ~HYPE_CPUID_LEAF1_ECX_VMX_BIT;
         /*
          * OSXSAVE (bit 27) is NOT a capability bit. The SDM defines it as a read-only mirror

@@ -1872,13 +1872,60 @@ static void vmx_msr_return(struct hype_vcpu_ctx *real, uint64_t value) {
     real->gprs[2] = (uint64_t)(uint32_t)(value >> 32);
 }
 
-int hype_vmx_vcpu_handle_msr(hype_vcpu_ctx_t *ctx, int is_write) {
+int hype_vmx_vcpu_handle_msr(hype_vcpu_ctx_t *ctx, int is_write, hype_guest_lapic_t *lapic) {
     vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     uint32_t msr_number = (uint32_t)real->gprs[1];
-    hype_msr_action_t action = hype_msr_decide_ex(msr_number, is_write, real->hv_enabled);
+    hype_msr_action_t action;
     int ok;
-    int area_slot = vmx_msr_area_slot(msr_number);
+    int area_slot;
+#if !defined(HYPE_ENABLE_X2APIC) || !HYPE_ENABLE_X2APIC
+    (void)lapic; /* #601: only consulted when the feature is compiled in -- see below */
+#endif
+
+#if defined(HYPE_ENABLE_X2APIC) && HYPE_ENABLE_X2APIC
+    /*
+     * #601: IA32_APIC_BASE mode transitions and the x2APIC MSR range
+     * (0x800-0x8FF), gated on this build flag so the default build's MSR
+     * dispatch is untouched. Handled ahead of everything else (even the
+     * MSR-area-slot check below) because they need this vCPU's own LAPIC
+     * state, which hype_msr_decide_ex() and the area-slot table do not carry.
+     */
+    if (msr_number == HYPE_MSR_NUMBER_APIC_BASE && is_write) {
+        uint64_t requested =
+            ((uint64_t)(uint32_t)real->gprs[2] << 32) | (uint64_t)(uint32_t)real->gprs[0];
+        int want_en = (requested & (1ULL << 11)) != 0;
+        int want_extd = (requested & (1ULL << 10)) != 0;
+        int next_mode;
+        if (hype_apic_base_mode_transition((int)lapic->apic_mode, want_en, want_extd, &next_mode) !=
+            0) {
+            return 1; /* illegal transition (SDM state machine) -- caller injects #GP(0) */
+        }
+        hype_guest_lapic_set_apic_mode(lapic, (uint32_t)next_mode);
+        vmx_advance_rip();
+        return 0;
+    }
+    if (hype_msr_is_x2apic_range(msr_number)) {
+        if (is_write) {
+            uint64_t value =
+                ((uint64_t)(uint32_t)real->gprs[2] << 32) | (uint64_t)(uint32_t)real->gprs[0];
+            if (hype_guest_lapic_x2apic_write(lapic, msr_number, value) != 0) {
+                return 1; /* not in x2APIC mode, or an illegal register/value -- #GP(0) */
+            }
+        } else {
+            uint64_t value;
+            if (hype_guest_lapic_x2apic_read(lapic, msr_number, &value) != 0) {
+                return 1;
+            }
+            vmx_msr_return(real, value);
+        }
+        vmx_advance_rip();
+        return 0;
+    }
+#endif
+
+    action = hype_msr_decide_ex(msr_number, is_write, real->hv_enabled);
+    area_slot = vmx_msr_area_slot(msr_number);
 
     /*
      * #251 slice 2: MSRs carried in the VM-entry/exit areas are serviced from that
@@ -2012,7 +2059,14 @@ int hype_vmx_vcpu_handle_msr(hype_vcpu_ctx_t *ctx, int is_write) {
                                                             g_vmx_acpi_pm_tsc_hz / 1000u));
         break;
     case HYPE_MSR_ACTION_READ_APIC_BASE: {
+#if defined(HYPE_ENABLE_X2APIC) && HYPE_ENABLE_X2APIC
+        /* #601: report the LAPIC's ACTUAL current mode instead of hardcoding
+         * "always xAPIC-enabled" -- the WRMSR path above is what can now move it. */
+        uint64_t value =
+            hype_msr_apic_base_value_mode(ctx->cpuid_topo.apic_id == 0u, (int)lapic->apic_mode);
+#else
         uint64_t value = hype_msr_apic_base_value(ctx->cpuid_topo.apic_id == 0u);
+#endif
         real->gprs[0] = (uint64_t)(uint32_t)value;
         real->gprs[2] = (uint64_t)(uint32_t)(value >> 32);
         break;

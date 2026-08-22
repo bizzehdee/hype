@@ -108,6 +108,42 @@
 #define HYPE_GUEST_LAPIC_ICR_LEVEL_ASSERT (1u << 14)
 
 /*
+ * #601: this LAPIC's current IA32_APIC_BASE mode -- which of the two register
+ * addressing schemes below is in force. Numerically matches
+ * arch/x86_64/cpu/msr_emulate.h's HYPE_APIC_MODE_* (0/1/2); see that header's
+ * comment for why the two are separate #defines rather than a shared one.
+ * Owned here (not in the arch layer) because this struct is the single
+ * per-vCPU LAPIC model both the xAPIC-MMIO and x2APIC-MSR access paths read
+ * and write -- the mode is part of that same state, not a second copy of it.
+ */
+#define HYPE_GUEST_LAPIC_MODE_DISABLED 0u
+#define HYPE_GUEST_LAPIC_MODE_XAPIC 1u
+#define HYPE_GUEST_LAPIC_MODE_X2APIC 2u
+
+/*
+ * #601: the x2APIC MSR interface (Intel SDM Vol 3A 10.12), MSRs 0x800-0x8FF.
+ * Every register except two lives at 0x800 + (its xAPIC MMIO offset >> 4) --
+ * e.g. ID (MMIO 0x020) is MSR 0x802, SVR (MMIO 0x0F0) is MSR 0x80F. The two
+ * exceptions:
+ *
+ *   - ICR (0x830) folds xAPIC's two 32-bit halves (ICR_LOW 0x300, ICR_HIGH
+ *     0x310) into ONE 64-bit MSR: bits 31:0 are the same ICR_LOW layout
+ *     xAPIC uses, bits 63:32 carry the FULL 32-bit destination APIC ID --
+ *     unlike xAPIC's ICR_HIGH, which shifts an 8-bit ID into bits 31:24.
+ *     There is no destination-shorthand high-half write: one MSR write
+ *     latches and sends, matching xAPIC's "writing ICR_LOW sends" rule but
+ *     with both halves supplied atomically.
+ *   - Self IPI (0x83F) has no xAPIC MMIO counterpart: writing a vector to it
+ *     is architecturally equivalent to an ICR write with shorthand=SELF and
+ *     delivery mode FIXED, just without the ICR round-trip. It is
+ *     write-only; a read is a guest #GP.
+ */
+#define HYPE_GUEST_LAPIC_X2APIC_MSR_BASE 0x800u
+#define HYPE_GUEST_LAPIC_X2APIC_MSR_LAST 0x8FFu
+#define HYPE_GUEST_LAPIC_X2APIC_MSR_ICR 0x830u
+#define HYPE_GUEST_LAPIC_X2APIC_MSR_SELF_IPI 0x83Fu
+
+/*
  * SMP-4/SMP-5 (#188/#189): one IPI this LAPIC has SENT that something other than itself has to
  * act on -- INIT and STARTUP always, and a fixed IPI whose destination includes another vCPU.
  *
@@ -165,6 +201,13 @@ typedef struct {
      * EBX[31:24], both of which report per-vCPU IDs since SMP-2.
      */
     uint32_t apic_id;
+    /*
+     * #601: HYPE_GUEST_LAPIC_MODE_* -- which register interface (xAPIC MMIO or
+     * x2APIC MSR) currently addresses this LAPIC. Defaults to XAPIC on reset,
+     * matching hype's pre-#601 behavior of an always-enabled xAPIC LAPIC: no
+     * caller that never touches this field observes any change.
+     */
+    uint32_t apic_mode;
     uint32_t isr[8];
     uint32_t tpr; /* Task Priority Register (0x080); PPR (0x0A0) is derived from it and isr */
     uint32_t svr;
@@ -241,6 +284,33 @@ int hype_guest_lapic_take_ipi(hype_guest_lapic_t *lapic, hype_guest_lapic_ipi_t 
 /* SMP-3 (#187): set this LAPIC's APIC ID. Called once per vCPU after reset; the ID must match
  * what the MADT and CPUID report for the same vCPU or the guest logs an APIC ID mismatch. */
 void hype_guest_lapic_set_apic_id(hype_guest_lapic_t *lapic, uint32_t apic_id);
+
+/*
+ * #601: set this LAPIC's current mode (HYPE_GUEST_LAPIC_MODE_*). The caller
+ * (the arch-layer IA32_APIC_BASE WRMSR handler) is the one that knows whether
+ * the requested transition is legal -- see
+ * arch/x86_64/cpu/msr_emulate.h's hype_apic_base_mode_transition() -- so this
+ * setter does no legality checking of its own; it just stores the result.
+ */
+void hype_guest_lapic_set_apic_mode(hype_guest_lapic_t *lapic, uint32_t apic_mode);
+
+/*
+ * #601: x2APIC MSR read/write (MSRs 0x800-0x8FF), over the SAME per-vCPU state
+ * hype_guest_lapic_read()/hype_guest_lapic_write() serve over MMIO -- no
+ * separate model, just a second decode of the register number and, for the
+ * handful of registers that differ (ID's width, the ICR's 64-bit shape, LDR
+ * and EOI's x2APIC-specific rules), different rules for the SAME storage.
+ *
+ * Both fail (-1) rather than falling back to a benign default when the LAPIC
+ * is not currently in x2APIC mode (HYPE_GUEST_LAPIC_MODE_X2APIC), or for a
+ * register/value that is architecturally illegal to access this way (DFR and
+ * ICR_HIGH do not exist as separate x2APIC MSRs; ID/VERSION/PPR/LDR are
+ * read-only; EOI must be written 0; Self IPI is write-only and rejects
+ * vectors 0-15). The caller's job on failure is to inject #GP(0), matching
+ * every other synthetic-MSR rejection in this project. Returns 0 on success.
+ */
+int hype_guest_lapic_x2apic_read(hype_guest_lapic_t *lapic, uint32_t msr_number, uint64_t *out);
+int hype_guest_lapic_x2apic_write(hype_guest_lapic_t *lapic, uint32_t msr_number, uint64_t value);
 
 /*
  * MMIO read/write within the 4KB window (offset is relative to

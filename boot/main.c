@@ -4096,7 +4096,8 @@ static int vmm_handle_ps2_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_
                                hype_ps2_mouse_t *mouse, int *out_kbd_wait);
 static int vmm_reason_is_ioio(hype_vmm_kind_t kind, uint64_t reason);
 static void vmm_handle_cpuid(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx);
-static int vmm_handle_msr(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t reason);
+static int vmm_handle_msr(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t reason,
+                          hype_guest_lapic_t *lapic);
 static void vmm_set_rsi(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t rsi);
 static int vmm_handle_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic,
                            hype_pit_emu_t *pit);
@@ -4320,11 +4321,12 @@ static void vmm_handle_cpuid(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
         hype_svm_vcpu_handle_cpuid(ctx);
     }
 }
-static int vmm_handle_msr(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t reason) {
+static int vmm_handle_msr(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t reason,
+                          hype_guest_lapic_t *lapic) {
     if (kind == HYPE_VMM_KIND_VMX) {
-        return hype_vmx_vcpu_handle_msr(ctx, reason == HYPE_VMX_EXIT_REASON_WRMSR);
+        return hype_vmx_vcpu_handle_msr(ctx, reason == HYPE_VMX_EXIT_REASON_WRMSR, lapic);
     }
-    return hype_svm_vcpu_handle_msr(ctx);
+    return hype_svm_vcpu_handle_msr(ctx, lapic);
 }
 static int vmm_handle_hypercall(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
     return kind == HYPE_VMM_KIND_VMX ? hype_vmx_vcpu_handle_hypercall(ctx)
@@ -11722,7 +11724,7 @@ wait_for_sipi:
              * faulted nor had the instruction retired, leaving it to re-execute the same RDMSR
              * or WRMSR and, for a write, to believe a value had been stored that never was.
              */
-            int ap_msr_rc = vmm_handle_msr(kind, ctx, info.reason);
+            int ap_msr_rc = vmm_handle_msr(kind, ctx, info.reason, lapic);
             if (ap_msr_rc > 0) {
                 vmm_reinject_exception(kind, ctx, 13u, 1, 0u);
             } else if (ap_msr_rc != 0) {
@@ -17353,7 +17355,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         }
         if (vmm_reason_is_msr(kind, info.reason)) {
             g_436_loop_section[(unsigned)(vm-g_vms)]=764;
-            int msr_rc = vmm_handle_msr(kind, ctx, info.reason);
+            int msr_rc = vmm_handle_msr(kind, ctx, info.reason, &g_fw_1_lapic);
             if (msr_rc > 0) {
                 /* Invalid synthetic-MSR input is a guest fault, not a host fault. */
                 vmm_reinject_exception(kind, ctx, 13u, 1, 0u);

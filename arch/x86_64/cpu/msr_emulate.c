@@ -59,12 +59,50 @@ hype_msr_action_t hype_msr_decide_ex(uint32_t msr_number, int is_write, int hv_e
 }
 
 uint64_t hype_msr_apic_base_value(int is_bsp) {
-    /* bit 11 = global enable (always), bit 8 = BSP (vCPU 0 only -- see the header). */
-    uint64_t value = HYPE_LAPIC_DEFAULT_BASE | (1ULL << 11);
+    return hype_msr_apic_base_value_mode(is_bsp, HYPE_APIC_MODE_XAPIC);
+}
+
+uint64_t hype_msr_apic_base_value_mode(int is_bsp, int apic_mode) {
+    /* bit 11 = global enable (clear only when fully disabled), bit 10 = EXTD
+     * (x2APIC), bit 8 = BSP (vCPU 0 only -- see the header). */
+    uint64_t value = HYPE_LAPIC_DEFAULT_BASE;
+    if (apic_mode != HYPE_APIC_MODE_DISABLED) {
+        value |= (1ULL << 11);
+    }
+    if (apic_mode == HYPE_APIC_MODE_X2APIC) {
+        value |= (1ULL << 10);
+    }
     if (is_bsp) {
         value |= (1ULL << 8);
     }
     return value;
+}
+
+int hype_msr_is_x2apic_range(uint32_t msr_number) {
+    return msr_number >= HYPE_MSR_X2APIC_RANGE_BASE && msr_number <= HYPE_MSR_X2APIC_RANGE_LAST;
+}
+
+int hype_apic_base_mode_transition(int current, int want_en, int want_extd, int *next_out) {
+    int requested;
+
+    if (!want_en) {
+        if (want_extd) {
+            return -1; /* EN=0,EXTD=1 names no state -- always #GP */
+        }
+        requested = HYPE_APIC_MODE_DISABLED;
+    } else {
+        requested = want_extd ? HYPE_APIC_MODE_X2APIC : HYPE_APIC_MODE_XAPIC;
+    }
+
+    if (requested == current) {
+        *next_out = requested; /* re-writing the current mode is a legal no-op */
+        return 0;
+    }
+    if (current == HYPE_APIC_MODE_X2APIC && requested == HYPE_APIC_MODE_XAPIC) {
+        return -1; /* the one illegal transition: must go through Disabled first */
+    }
+    *next_out = requested;
+    return 0;
 }
 
 uint64_t hype_msr_hv_ref_count_from_tsc(uint64_t tsc_delta, uint64_t tsc_khz) {

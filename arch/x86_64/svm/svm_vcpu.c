@@ -1952,11 +1952,14 @@ static void svm_msr_return(struct hype_vcpu_ctx *real, uint64_t value) {
     real->gprs[2] = (uint64_t)(uint32_t)(value >> 32);
 }
 
-int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx) {
+int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lapic) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     int is_write = (real->vmcb->control.exitinfo1 & 0x1ULL) != 0;
     uint32_t msr_number = (uint32_t)real->gprs[1]; /* RCX */
     hype_msr_action_t action;
+#if !defined(HYPE_ENABLE_X2APIC) || !HYPE_ENABLE_X2APIC
+    (void)lapic; /* #601: only consulted when the feature is compiled in -- see below */
+#endif
 
     spin_mru_bump(g_spin_msr_key, g_spin_msr_cnt, msr_number); /* #92 diag */
     g_spin_msr_rip = real->vmcb->save.rip;
@@ -2113,6 +2116,55 @@ int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx) {
         return 0;
     }
 
+#if defined(HYPE_ENABLE_X2APIC) && HYPE_ENABLE_X2APIC
+    /*
+     * #601: IA32_APIC_BASE mode transitions and the x2APIC MSR range
+     * (0x800-0x8FF), gated on this build flag so the default build's MSR
+     * dispatch is untouched -- APIC_BASE writes still fall through to the
+     * REJECT/absorb action below and 0x800-0x8FF is still unrecognized,
+     * exactly as before #601.
+     *
+     * Both are handled here, ahead of hype_msr_decide_ex(), for the same
+     * reason the MTRR/g_pat/TSC_AUX special cases above are: they need this
+     * vCPU's own state (the guest LAPIC's current mode), which is not the
+     * static, context-free allow-list hype_msr_decide_ex() answers from.
+     */
+    if (msr_number == HYPE_MSR_NUMBER_APIC_BASE && is_write) {
+        uint64_t requested =
+            ((uint64_t)(uint32_t)real->gprs[2] << 32) | (uint64_t)(uint32_t)real->vmcb->save.rax;
+        int want_en = (requested & (1ULL << 11)) != 0;
+        int want_extd = (requested & (1ULL << 10)) != 0;
+        int next_mode;
+        if (hype_apic_base_mode_transition((int)lapic->apic_mode, want_en, want_extd, &next_mode) !=
+            0) {
+            return 1; /* illegal transition (SDM state machine) -- caller injects #GP(0) */
+        }
+        hype_guest_lapic_set_apic_mode(lapic, (uint32_t)next_mode);
+        real->vmcb->save.rip += 2;
+        return 0;
+    }
+    if (hype_msr_is_x2apic_range(msr_number)) {
+        /* #601: HYPE_GUEST_LAPIC_MODE_X2APIC and HYPE_APIC_MODE_X2APIC are the
+         * same numeric value by construction (see msr_emulate.h) -- the LAPIC
+         * model is asked directly rather than duplicating the mode here. */
+        if (is_write) {
+            uint64_t value =
+                ((uint64_t)(uint32_t)real->gprs[2] << 32) | (uint64_t)(uint32_t)real->vmcb->save.rax;
+            if (hype_guest_lapic_x2apic_write(lapic, msr_number, value) != 0) {
+                return 1; /* not in x2APIC mode, or an illegal register/value -- #GP(0) */
+            }
+        } else {
+            uint64_t value;
+            if (hype_guest_lapic_x2apic_read(lapic, msr_number, &value) != 0) {
+                return 1;
+            }
+            svm_msr_return(real, value);
+        }
+        real->vmcb->save.rip += 2;
+        return 0;
+    }
+#endif
+
     action = hype_msr_decide_ex(msr_number, is_write, real->hv_enabled);
 
     switch (action) {
@@ -2195,7 +2247,14 @@ int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx) {
     }
 
     case HYPE_MSR_ACTION_READ_APIC_BASE: {
+#if defined(HYPE_ENABLE_X2APIC) && HYPE_ENABLE_X2APIC
+        /* #601: report the LAPIC's ACTUAL current mode instead of hardcoding
+         * "always xAPIC-enabled" -- the WRMSR path above is what can now move it. */
+        uint64_t value =
+            hype_msr_apic_base_value_mode(real->cpuid_topo.apic_id == 0u, (int)lapic->apic_mode);
+#else
         uint64_t value = hype_msr_apic_base_value(real->cpuid_topo.apic_id == 0u);
+#endif
         real->vmcb->save.rax = (uint64_t)(uint32_t)value;
         real->gprs[2] = (uint64_t)(uint32_t)(value >> 32); /* RDX */
         break;
