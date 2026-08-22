@@ -39,9 +39,29 @@
 # file; a host read at 512 MiB returned zeros while hype's own bytes were
 # provably present on disk.)
 #
+# ext2/ext3/ext4 are excluded from the fast paths for the SAME underlying
+# reason, discovered the hard way on real hardware (#696): fallocate() on ext4
+# marks the reserved blocks as an UNWRITTEN extent, not a written one. The
+# host kernel's ext4 driver hides this from every normal reader by returning
+# zeros for reads that land in an unwritten extent -- so probe_tail_valid()
+# below, which reads back through that same driver, sees zeros and reports
+# the image fine. hype does not go through the host's ext4 driver: its
+# resolver walks the on-disk extent tree directly and maps the file to raw
+# physical sectors for the hypervisor to read straight off the medium. Under
+# that contract an unwritten extent cannot be trusted to read as zero (the
+# physical bytes may be leftover data from whatever last used that block), so
+# hype's ext resolver correctly REFUSES a file with any unwritten extent
+# rather than risk handing a guest garbage. A fallocate-made ext4 image is
+# therefore invisible to hype even though every host tool calls it fine. The
+# fix is the same as exFAT's: only the dd path leaves every extent genuinely
+# written, so ext2/3/4 take it unconditionally too.
+#
 # Whichever path runs, the result is VERIFIED below rather than trusted --
 # including an end-of-file read-back probe that catches exactly this class of
-# "allocated but not valid" image on ANY filesystem.
+# "allocated but not valid" image on ANY filesystem (though see the ext note
+# above: that probe reads through the host driver and cannot itself detect an
+# unwritten-extent image -- it is the FAST_OK exclusion that prevents one from
+# ever being created in the first place).
 # Note also FAT32's 4 GiB-minus-1-byte per-file ceiling, checked separately.
 #
 # Usage:
@@ -210,6 +230,7 @@ rm -f "$IMG"
 FAST_OK=1
 case "$FSTYPE" in
     exfat) FAST_OK=0 ;; # ValidDataLength, see the header comment
+    ext2|ext3|ext4|ext2/ext3) FAST_OK=0 ;; # unwritten extents, see the header comment (#696)
 esac
 if [ "$FAST_OK" -eq 1 ] && command -v fallocate > /dev/null 2>&1 &&
    fallocate -l "$WANT_BYTES" "$IMG" 2>/dev/null; then
