@@ -2558,16 +2558,29 @@ hype_cfg_serialize_result_t hype_cfg_serialize(const hype_cfg_t *cfg, char *out,
                 serialize_hype(&w, &cfg->hype);
                 break;
             case HYPE_CFG_SECTION_VM:
-                serialize_vm(&w, &cfg->vms[sec->index]);
+                /* #673: a VM dropped as malformed (§4.3) leaves its section's index remapped to
+                 * -1 by the compaction above -- indexing vms[]/disks[]/nics[]/switches[] with that
+                 * sentinel would read out of bounds (found by the #602 fuzz harness). Emitting
+                 * nothing for it is correct: the section header line is still written above, but a
+                 * dropped device has no live struct left to serialize. */
+                if (sec->index >= 0) {
+                    serialize_vm(&w, &cfg->vms[sec->index]);
+                }
                 break;
             case HYPE_CFG_SECTION_DISK:
-                serialize_disk(&w, &cfg->disks[sec->index]);
+                if (sec->index >= 0) {
+                    serialize_disk(&w, &cfg->disks[sec->index]);
+                }
                 break;
             case HYPE_CFG_SECTION_NIC: /* #583 */
-                serialize_nic(&w, &cfg->nics[sec->index]);
+                if (sec->index >= 0) {
+                    serialize_nic(&w, &cfg->nics[sec->index]);
+                }
                 break;
             case HYPE_CFG_SECTION_SWITCH:
-                serialize_switch(&w, &cfg->switches[sec->index]);
+                if (sec->index >= 0) {
+                    serialize_switch(&w, &cfg->switches[sec->index]);
+                }
                 break;
             case HYPE_CFG_SECTION_UNKNOWN:
             default:

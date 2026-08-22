@@ -3065,14 +3065,27 @@ int hype_svm_vcpu_handle_ahci_npf_map(hype_vcpu_ctx_t *ctx, hype_ahci_t *ahci, h
  * 0 -- shared tail shape between the ATAPI and plain-ATA command
  * paths, byte-for-byte the same fields process_ahci_command_slot0()
  * already builds for ATAPI. */
-static void complete_ahci_command_slot(hype_ahci_t *ahci, uint64_t rx_fis_phys, uint8_t status_reg,
-                                       uint8_t error_reg, const hype_gpa_map_t *dma_map,
-                                       unsigned slot, uint32_t pis_bit, uint32_t xfer_bytes,
-                                       uint8_t *cmd_hdr_bytes) {
+static int complete_ahci_command_slot(hype_ahci_t *ahci, uint64_t rx_fis_phys, uint8_t status_reg,
+                                      uint8_t error_reg, const hype_gpa_map_t *dma_map,
+                                      unsigned slot, uint32_t pis_bit, uint32_t xfer_bytes,
+                                      uint8_t *cmd_hdr_bytes) {
     /* #262 slice 3: rx_fis_phys is GUEST-physical. Identity holds for M5-2's
      * microtest (dma_map == 0) but not for the FW-1 guest, which remaps its RAM. */
     uint64_t rx_fis_host = guest_dma_xlate(dma_map, rx_fis_phys, 0x40u + 20u);
-    uint8_t *d2h_fis = (uint8_t *)(uintptr_t)(rx_fis_host + 0x40);
+    uint8_t *d2h_fis;
+    /*
+     * #677: a rejected translation (guest PxFB/PxFBU pointing outside its own mapped
+     * range) was being used unchecked below -- every other Received-FIS-area
+     * translation in this file already refuses a 0 result (see
+     * process_ahci_command_slot()'s own rx_fis_host check); this completion path,
+     * shared by every plain-ATA command, did not. Found by the #602 fuzz harness.
+     */
+    if (rx_fis_host == 0) {
+        hype_debug_print("ahci: slot %u refused -- received-FIS area gpa 0x%llx out of bounds\n",
+                         slot, (unsigned long long)rx_fis_phys);
+        return -1;
+    }
+    d2h_fis = (uint8_t *)(uintptr_t)(rx_fis_host + 0x40);
 
     /*
      * #262 slice 4: a PIO data-in command must also deliver a PIO Setup FIS at
@@ -3134,6 +3147,7 @@ static void complete_ahci_command_slot(hype_ahci_t *ahci, uint64_t rx_fis_phys, 
     if ((ahci->p_is & ahci->p_ie) != 0) {
         ahci->is |= HYPE_AHCI_IS_PORT0;
     }
+    return 0;
 }
 
 /* M5-2's plain-ATA command dispatch, the H2D-FIS-command-byte-driven
@@ -3545,11 +3559,25 @@ int process_ahci_ata_command_slot(hype_ahci_t *ahci, hype_ata_disk_t *disk,
         } else if (is_write_direction) {
             const uint8_t *guest_src =
                 (const uint8_t *)(uintptr_t)guest_dma_xlate(dma_map, prd.data_phys, chunk);
+            /* #675: a rejected translation (guest PRD pointing outside its own mapped range)
+             * was being dereferenced unchecked -- found by the #602 fuzz harness. Every other
+             * guest_dma_xlate() call site in this function already refuses a 0 translation;
+             * this pair of flat-media branches did not. */
+            if (guest_src == 0) {
+                status_reg = (uint8_t)(HYPE_ATA_STATUS_DRDY | HYPE_ATA_STATUS_ERR);
+                error_reg = 0x10u;
+                break;
+            }
             ahci_copy_fast(dst_media, guest_src, chunk);
             dst_media += chunk;
         } else {
             uint8_t *guest_dst =
                 (uint8_t *)(uintptr_t)guest_dma_xlate(dma_map, prd.data_phys, chunk);
+            if (guest_dst == 0) {
+                status_reg = (uint8_t)(HYPE_ATA_STATUS_DRDY | HYPE_ATA_STATUS_ERR);
+                error_reg = 0x10u;
+                break;
+            }
             ahci_copy_fast(guest_dst, src, chunk);
             src += chunk;
         }
@@ -3571,9 +3599,8 @@ int process_ahci_ata_command_slot(hype_ahci_t *ahci, hype_ata_disk_t *disk,
                              (unsigned)hdr.prdtl, is_write_direction);
         }
     }
-    complete_ahci_command_slot(ahci, rx_fis_phys, status_reg, error_reg, dma_map, slot, pis_bit,
-                               (uint32_t)transferred, cmd_hdr_bytes);
-    return 0;
+    return complete_ahci_command_slot(ahci, rx_fis_phys, status_reg, error_reg, dma_map, slot,
+                                      pis_bit, (uint32_t)transferred, cmd_hdr_bytes);
 }
 
 /*

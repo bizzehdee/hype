@@ -42,6 +42,19 @@ gdb.log
 core/tests/test_*
 !core/tests/test_*.c
 
+# #602: fuzz harness build products and the coverage-guided corpus libFuzzer grows at
+# runtime. Source (fuzz_*.c/.h, build.sh, gen_seeds.py, run_fuzzers.sh) and the hand-
+# authored seed_*/regression_*.bin corpus files stay; compiled binaries and the live,
+# ever-growing mutated corpus/crash-log scratch space do not.
+tools/602/fuzz_ahci
+tools/602/fuzz_cfg
+tools/602/fuzz_mmio_regs
+tools/602/fuzz_nvme
+tools/602/fuzz_virtio_blk
+tools/602/fuzz_virtio_net
+tools/602/corpus_grown/
+tools/602/crashes/
+
 # Editor/OS cruft
 .vscode/
 .idea/
