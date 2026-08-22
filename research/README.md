@@ -44,6 +44,7 @@ not treat them as project-licensed material.
 | `linux-ext4-group-descriptors-2026-08-11.html` | Linux kernel ext4 block group descriptors | kernel documentation snapshot, 11 August 2026 | https://www.kernel.org/doc/html/latest/filesystems/ext4/group_descr.html |
 | `linux-ext4-inodes-2026-08-11.html` | Linux kernel ext4 inode structure | kernel documentation snapshot, 11 August 2026 | https://www.kernel.org/doc/html/latest/filesystems/ext4/inodes.html |
 | `linux-ext4-journal-2026-08-11.html` | Linux kernel ext4 jbd2 journal format | kernel documentation snapshot, 11 August 2026 | https://www.kernel.org/doc/html/latest/filesystems/ext4/journal.html |
+| `linux-ext4-directory-2026-08-22.html` | Linux kernel ext4 directory entry format, checksum tail, htree/dx_root layout | kernel documentation snapshot, 22 August 2026 | https://www.kernel.org/doc/html/latest/filesystems/ext4/directory.html |
 | `microsoft-hyper-v-tlfs-hypercall-interface-94373af.md` | Microsoft Hyper-V TLFS Hypercall Interface | commit `94373af`, 15 December 2025 | https://github.com/MicrosoftDocs/Virtualization-Documentation/blob/94373af503f83b800ac002911f5d137a53392656/virtualization/hyper-v-on-windows/tlfs/hypercall-interface.md |
 
 ## Archived wiki exports
@@ -87,6 +88,20 @@ not treat them as project-licensed material.
   `inodes` for mappings, sizes and inode checksums, and `journal` for jbd2
   metadata transactions. Allocation changes metadata and therefore cannot use
   #204's journal-bypass reasoning, which applies only to in-place data writes.
+- **Linux ext4 directory documentation (`linux-ext4-directory-2026-08-22.html`).**
+  #498 (namespace mutation) uses `struct ext4_dir_entry_2` (inode/rec_len/
+  name_len/file_type/name, 8-byte header) and the `struct ext4_dir_entry_tail`
+  checksum fake-entry every leaf directory block carries under
+  RO_COMPAT_METADATA_CSUM: 12 bytes, `det_reserved_zero1`(inode)=0,
+  `det_rec_len`=12, `det_reserved_zero2`(name_len)=0, `det_reserved_ft`
+  (file_type)=0xDE, `det_checksum` = crc32c seeded with the SAME i_csum_seed
+  #495 already computes per-inode (fs seed chained with the directory's own
+  inode number + generation), hashed over the block up to but excluding the
+  tail. Confirms `EXT4_INDEX_FL` = 0x1000 (already used by core/tests/test_ext.c's
+  htree fixture) and that an htree directory's root block starts with real
+  '.'/'..' entries followed by a `dx_root_info` header masquerading as more
+  directory entries -- exactly why a linear insertion into an htree directory
+  corrupts the index instead of merely being suboptimal.
 - **Hyper-V TLFS (`microsoft-hyper-v-tlfs-hypercall-interface-94373af.md`).** #300
   uses "Hypercall Inputs", "Hypercall Outputs", "Hypercall Status Codes", and
   "Establishing the Hypercall Interface (x86/x64)". The call code is input bits
@@ -153,3 +168,41 @@ documentation:
   last LCN (ntfs-3g decompresses each extent from zero and merges by VCN).
 - **$VOLUME_INFORMATION's flags** live at value offset 10 (8 reserved bytes,
   then major/minor version bytes), not offset 8.
+
+## NTFS $LogFile / USN journal (#416)
+
+#416 (plan.md §10 decision 64) descoped `$LogFile` replay entirely: Microsoft's LFS (Log File
+Service) format is undocumented outside their own driver source, and ntfs-3g -- this project's
+own reference -- does not implement replay either, it refuses a dirty volume exactly like hype's
+existing `#337` mount check already does. No document was archived for `$LogFile` because none
+was used: the decision is to keep refusing, not to parse it.
+
+The USN change journal is different: `USN_RECORD_V2` is a **public, stable Win32 API structure**
+(`winioctl.h`, used by `FSCTL_READ_USN_JOURNAL`/`FSCTL_ENUM_USN_DATA` and documented on Microsoft
+Learn), not an internal format, so it has genuine ground truth. Field layout used by
+`core/ntfs_journal.c`, all `little-endian`, all well-known/stable since Windows 2000 and unchanged
+through USN_RECORD_V2 (V3/V4 add 128-bit file IDs for ReFS and are out of scope -- NTFS always
+uses V2's 64-bit `MFT_SEGMENT_REFERENCE` file IDs):
+
+| Offset | Size | Field |
+|---|---|---|
+| 0x00 | 4 | RecordLength (total record size, DWORD-aligned) |
+| 0x04 | 2 | MajorVersion (2) |
+| 0x06 | 2 | MinorVersion (0) |
+| 0x08 | 8 | FileReferenceNumber (MFT record# in low 48 bits + sequence# in high 16) |
+| 0x10 | 8 | ParentFileReferenceNumber (same shape, for the containing directory) |
+| 0x18 | 8 | Usn (this record's own journal-relative byte offset) |
+| 0x20 | 8 | TimeStamp (FILETIME) |
+| 0x28 | 4 | Reason (USN_REASON_* bitmask -- FILE_CREATE 0x100, DATA_EXTEND 0x2, RENAME_NEW_NAME 0x2000, FILE_DELETE 0x200, etc.) |
+| 0x2C | 4 | SourceInfo |
+| 0x30 | 4 | SecurityId |
+| 0x34 | 4 | FileAttributes |
+| 0x38 | 2 | FileNameLength (bytes, UTF-16) |
+| 0x3A | 2 | FileNameOffset (from record start; 0x3C for V2) |
+| 0x3C | var | FileName (UTF-16LE, no NUL terminator) |
+
+`$Extend\$UsnJrnl`'s `$J` (unnamed on some volumes, `$J` alternate stream in the common case)
+data stream is a sparse, ever-growing sequence of these records; `$Max` holds the journal's
+configured MaximumSize/AllocationDelta. hype only ever APPENDS a record when it is already
+present and active (never creates/enables a journal itself) -- matching #416's scope of
+maintaining an existing journal, not establishing one.

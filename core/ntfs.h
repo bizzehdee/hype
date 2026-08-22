@@ -84,4 +84,15 @@ int hype_ntfs_mount(hype_blk_read_fn read, void *ctx, hype_ntfs_t *out);
  */
 int hype_ntfs_resolve(hype_ntfs_t *fs, const char *path, hype_file_rmap_t *out);
 
+/*
+ * #416: write-side record access, for core/ntfs_journal.c and later NTFS
+ * writer slices (#417+). See core/ntfs.c for the full contract of each.
+ */
+int hype_ntfs_record_read(hype_ntfs_t *fs, uint64_t n, uint8_t *rec);
+void hype_ntfs_fixup_stamp(uint8_t *rec, uint32_t rec_bytes, uint16_t usn);
+int hype_ntfs_record_write(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t n, uint8_t *rec,
+                           uint16_t usn);
+int hype_ntfs_volume_dirty_get(hype_ntfs_t *fs);
+int hype_ntfs_volume_dirty_set(hype_ntfs_t *fs, hype_blk_write_fn write, int dirty, uint16_t usn);
+
 #endif /* HYPE_CORE_NTFS_H */

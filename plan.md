@@ -3131,45 +3131,58 @@ isn't lost.
     cost of one more sector write per FAT update. The sync-both-copies fix is also a direct,
     already-proven port of FAT32's existing mechanism, not new design.
 
-63. **ext namespace mutation: htree insertion is refused, not guessed at; directory growth is
-    bounded to what this slice can address -- decided (2026-08-22).** #498 gave ext2/3/4
-    `create`/`unlink`/`mkdir`/`rmdir`/`rename`, journaled (jbd2, checksummed per decision 29/#495)
-    on ext3/4 and direct-ordered on ext2 (`core/extj_namespace.c` / `core/ext2_namespace.c`,
-    sharing directory-block content logic in `core/ext_dirent.c`). Two scope questions came up
-    that decision 29 did not already answer:
+64. **#416 descoped: NTFS `$LogFile` replay is refused, not attempted; hype's own writes get an
+    internal dirty-flag bracket instead of a from-scratch LFS journal -- decided (2026-08-22).**
+    #416 as filed asked for parsing `$LogFile`'s restart areas and log-record pages, and replaying
+    committed / rolling back uncommitted transactions on a dirty volume. That format (Microsoft's
+    LFS -- Log File Service) is undocumented outside Microsoft's own driver source. The project's
+    own stated reference implementation, **ntfs-3g, does not implement `$LogFile` replay either** --
+    it refuses a dirty volume and tells the operator to boot Windows to clean it, which is exactly
+    what hype's existing `#337` read-side mount already does (the `$VOLUME_INFORMATION` dirty-flag
+    check in `hype_ntfs_mount`). A from-scratch redo/undo engine reverse-engineered from partial
+    community notes, with no independent tool to validate it against, risks the worst outcome this
+    project can produce: a replay that LOOKS successful but silently corrupts a real Windows volume.
 
-    **Htree (`dir_index`) directories.** An htree-indexed directory's interior index blocks are
-    disguised as ordinary (inode-0) entries at fixed offsets a linear insert has no way to avoid
-    disturbing. **Decided:** refuse (-1) any INSERT (`create`, `mkdir`, and `rename`'s
-    destination side) into a directory carrying `EXT4_INDEX_FL`, cleanly, before touching
-    anything -- this slice has no htree-aware insertion, and a corrupted index is far worse than
-    a refusal. REMOVAL (`unlink`, `rmdir`, and `rename`'s source side) is NOT refused: it only
-    ever tombstones a real, named leaf entry found by linear scan, which never touches the
-    disguised interior blocks -- the same property that already lets `core/ext.c`'s read-only
-    resolver walk an htree directory without understanding htree at all.
+    **Decided.** Keep detect-and-refuse as the mount gate for a genuinely dirty volume, matching
+    ntfs-3g's own behaviour -- no replay is attempted, ever. What #416 delivers instead, for hype's
+    OWN future writes (#417 onward):
+    - A dirty-flag BRACKET around a writable session: set `$VOLUME_INFORMATION`'s dirty bit before
+      the first mutation, clear it only after every pending write has reached the medium and the
+      session closes cleanly. This is the same contract Windows's own driver gives an external
+      tool -- an interrupted hype session leaves the bit set, and any conforming NTFS driver
+      (Windows or ntfs-3g) that mounts it afterward correctly demands a `chkdsk` rather than
+      trusting metadata a crash may have left inconsistent. hype does not need to write genuine
+      LFS records for this guarantee to hold; the dirty bit is the interop signal, not `$LogFile`'s
+      own content.
+    - hype's own write-ordering discipline (data before metadata, leaf before parent) inside that
+      bracket, the same crash-safety shape decision 29 already established for FAT32/ext -- "the
+      journal transaction primitive" from #416's original wording is this ordering discipline plus
+      the dirty-flag bracket, not a generic undo/redo log of arbitrary NTFS operations.
+    - Fixup STAMPING (the write-side counterpart of the fixup verify `core/ntfs.c` already has) for
+      any MFT record or INDX block hype itself writes.
+    - USN journal (`$Extend\$UsnJrnl`) maintenance IS implemented for real: `USN_RECORD_V2` is a
+      **public, Microsoft-documented** Win32 structure (unlike `$LogFile`'s internal format), so
+      there is genuine ground truth to build and validate against.
 
-    **Directory content growth.** A directory's own data is enumerated and grown through direct
-    block pointers (classic) or the in-inode extent root only (ext4) -- never single/double/
-    triple indirect or a multi-level extent tree. **Decided:** refuse rather than guess when a
-    directory needs more reach than that to accept a new entry. Every directory this slice
-    itself creates, and every real mkfs.ext2/3/4 root directory validated against (#498's
-    `tools/498/run-498.sh`), stays well inside this. `unlink`/`rmdir` must still accept ANY
-    existing regular file or directory by that name, though -- including one the #384/#385/#497
-    write path grew past direct+single-indirect (classic) or a depth-0 extent root on a real,
-    heavily used volume, which this slice's own writes never produce but cannot assume don't
-    exist. **Decided:** the SAME refuse-rather-than-guess rule applies there too -- `free_all_blocks`
-    only ever enumerates a classic direct+single-indirect map or a depth-0 extent root (an interior
-    extent index entry is the identical 12 bytes as a leaf entry with different field meanings, so
-    misreading one as the other would free garbage block numbers, not merely leak space); a
-    deletion whose target's blocks run deeper than that is refused UP FRONT, before any mutation,
-    leaving the volume exactly as it was.
+    **The #596 lesson, applied from the start rather than retrofitted.** #596 (plan.md decision 57)
+    found that hype's host filesystem writers hold shared, unlocked state (FAT32's FAT cache,
+    allocation cursor, per-file size) where ownership IS the lock -- and that a missing guard at a
+    new call site let up to four cores run the same writer concurrently, corrupting a cluster chain.
+    NTFS's dirty-flag bracket and USN sequence counter are the same shape of shared, unlocked state.
+    Rather than wait for hardware to find the same bug again, the dirty-flag/USN entry points
+    (`core/ntfs_journal.c`) take a `hype_fs_owner_guard_t` (`core/fs_owner_guard.{c,h}`, new,
+    generalizing #239/decision-57's ad hoc `usb_log_this_core_owns_usb()` pattern into a reusable
+    primitive) and refuse -- never silently proceed -- when the executing core is not the bound
+    owner. The existing FAT32/log-sink guard in `boot/main.c` is left as-is: it is mature,
+    hardware-validated code, and unifying it onto the new shared primitive is a separate, lower-risk
+    cleanup, not a prerequisite for NTFS's own writer to get this right on day one.
 
-    **Alternatives considered.** Implementing real htree insertion -- rejected as disproportionate
-    to this ticket's scope; htree only matters once a directory is large enough that a linear
-    scan gets slow, which is not a shape this slice's own writes, or the validated bar, produce.
-    Silently falling back to appending past the htree-disguised region -- rejected outright: the
-    ticket calls this exact shortcut out as the one most likely to be attempted and the most
-    damaging, since it corrupts the index while looking like it worked.
+    **Alternatives considered.** Full LFS redo/undo replay -- rejected above (no ground truth, real
+    reference implementation doesn't do it either; user-confirmed 2026-08-22: "do what ntfs-3g
+    does"). An fs-level lock so any core may write to the dirty flag/USN state -- rejected for the
+    same reason decision 57 rejected it for FAT32: it converts guest-dispatch latency into I/O
+    waits on every mutation, and single-owner is already the working shape everywhere else in this
+    codebase.
 
 ## 11. Pre-M0 readiness checklist
 

@@ -29,6 +29,7 @@
 
 /* well-known MFT record numbers */
 #define REC_MFT 0u
+#define REC_MFTMIRR 1u
 #define REC_VOLUME 3u
 #define REC_ROOT 5u
 #define REC_UPCASE 10u
@@ -690,4 +691,135 @@ int hype_ntfs_resolve(hype_ntfs_t *fs, const char *path, hype_file_rmap_t *out) 
     out->size_bytes = real;
     map_trim(out);
     return hype_file_rmap_validate(out, fs->total_sectors);
+}
+
+/* ---- write-side record access (#416, exported for core/ntfs_journal.c) - */
+
+/*
+ * Stamp the update sequence array before writing `rec` to the medium: pick
+ * `usn`, write it into the last 2 bytes of every sector the header's
+ * usa_off/usa_count already describe, and save each sector's TRUE tail bytes
+ * into the USA -- the exact inverse of fixup_apply() above. The header must
+ * already be valid (usa_off/usa_count set), which holds for any record this
+ * module first read (and therefore fixup_apply'd) through hype_ntfs_record_read().
+ * `usn` must never be 0 or 0xFFFF: 0 means "never fixed up" and some readers
+ * treat 0xFFFF as a sentinel; callers cycle through 1..0xFFFE.
+ */
+void hype_ntfs_fixup_stamp(uint8_t *rec, uint32_t rec_bytes, uint16_t usn) {
+    uint32_t usa_off = hype_rd16(rec + 4);
+    uint32_t usa_count = hype_rd16(rec + 6);
+    uint32_t sectors = rec_bytes / SECSZ;
+    uint32_t s;
+
+    hype_wr16(rec + usa_off, usn);
+    for (s = 0; s < sectors && s + 1u < usa_count; s++) {
+        uint8_t *tail = rec + (s + 1u) * SECSZ - 2u;
+        hype_wr16(rec + usa_off + (s + 1u) * 2u, hype_rd16(tail));
+        hype_wr16(tail, usn);
+    }
+}
+
+/* Public wrapper over the existing static record_read(): read + fixup-verify
+ * MFT record `n` into `rec` (caller-sized to fs->mft_record_size). */
+int hype_ntfs_record_read(hype_ntfs_t *fs, uint64_t n, uint8_t *rec) {
+    return record_read(fs, n, rec);
+}
+
+/*
+ * Write MFT record `n` back to the medium: re-stamp its fixups with `usn`
+ * (see hype_ntfs_fixup_stamp) and write the WHOLE record through fs->mft's
+ * range map -- always record-aligned, so hype_file_rmap_write_at never hits
+ * a ragged edge here. `rec` must already hold the record's live bytes
+ * (typically: hype_ntfs_record_read() this same record, mutate it, then
+ * call this) -- this function does not merge partial changes for you.
+ */
+/*
+ * #416: reads $VOLUME_INFORMATION's dirty bit (the same field hype_ntfs_mount
+ * already refuses read-only mounts on). Returns 1 (dirty), 0 (clean), or -1
+ * on a structural failure (record 3 missing, no $VOLUME_INFORMATION, etc.).
+ */
+int hype_ntfs_volume_dirty_get(hype_ntfs_t *fs) {
+    uint8_t rec[HYPE_NTFS_MAX_RECORD];
+    ntfs_attr_t a;
+    uint32_t cur = 0;
+
+    if (record_read(fs, REC_VOLUME, rec) != 0) return -1;
+    if (attr_find(rec, fs->mft_record_size, AT_VOLUME_INFORMATION, &cur, &a) != 0) return -1;
+    if (a.non_resident || a.val_len < 12u) return -1;
+    return (hype_rd16(rec + (cur - a.length) + a.val_off + 10) & VOLUME_IS_DIRTY) ? 1 : 0;
+}
+
+/*
+ * #416: sets or clears $VOLUME_INFORMATION's dirty bit and writes record 3
+ * back through hype_ntfs_record_write(). This is the whole of #416's
+ * "journal" contract with the rest of the world (plan.md §10 decision 64):
+ * setting it before a writable session's first mutation, and clearing it
+ * only after every pending write from that session has reached the medium,
+ * is what tells any conforming NTFS driver (Windows or ntfs-3g) whether the
+ * volume needs a chkdsk after an interrupted hype session -- without hype
+ * ever writing a genuine $LogFile transaction record.
+ */
+int hype_ntfs_volume_dirty_set(hype_ntfs_t *fs, hype_blk_write_fn write, int dirty,
+                               uint16_t usn) {
+    uint8_t rec[HYPE_NTFS_MAX_RECORD];
+    ntfs_attr_t a;
+    uint32_t cur = 0;
+    uint16_t flags;
+    uint32_t val_off;
+
+    if (record_read(fs, REC_VOLUME, rec) != 0) return -1;
+    if (attr_find(rec, fs->mft_record_size, AT_VOLUME_INFORMATION, &cur, &a) != 0) return -1;
+    if (a.non_resident || a.val_len < 12u) return -1;
+
+    val_off = (cur - a.length) + a.val_off;
+    flags = hype_rd16(rec + val_off + 10);
+    if (dirty) {
+        flags |= VOLUME_IS_DIRTY;
+    } else {
+        flags &= (uint16_t)~VOLUME_IS_DIRTY;
+    }
+    hype_wr16(rec + val_off + 10, flags);
+    return hype_ntfs_record_write(fs, write, REC_VOLUME, rec, usn);
+}
+
+/*
+ * $MFTMirr (record 1) holds a byte-identical backup of the low-numbered
+ * "system file" records -- real ntfs-3g and chkdsk both refuse the WHOLE
+ * volume outright if $MFTMirr disagrees with $MFT ("$MFTMirr does not match
+ * $MFT (record N)"), discovered empirically running tools/416 against a real
+ * mkntfs volume: writing record 3 ($Volume) through $MFT alone, with no
+ * mirror update, corrupted the volume by that measure even though the
+ * primary $MFT copy was perfectly self-consistent. Every write in the
+ * mirrored range must land in both copies, or not at all.
+ */
+static int mirror_record_if_needed(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t n,
+                                   const uint8_t *rec) {
+    hype_file_rmap_t mirr;
+    uint64_t real = 0, init = 0;
+    uint64_t mirrored_records;
+
+    if (stream_map(fs, REC_MFTMIRR, AT_DATA, &mirr, &real, &init) != 0) {
+        return -1; /* no $MFTMirr at all is a structural problem, not "nothing to mirror" */
+    }
+    mirr.size_bytes = real;
+    mirrored_records = real / fs->mft_record_size;
+    if (n >= mirrored_records) {
+        return 0; /* this record isn't one $MFTMirr backs up -- nothing to do */
+    }
+    return hype_file_rmap_write_at(&mirr, fs->read, write, fs->ctx, n * fs->mft_record_size, rec,
+                                   fs->mft_record_size);
+}
+
+int hype_ntfs_record_write(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t n, uint8_t *rec,
+                           uint16_t usn) {
+    uint64_t off = n * fs->mft_record_size;
+    if (usn == 0u || usn == 0xFFFFu) {
+        return -1;
+    }
+    hype_ntfs_fixup_stamp(rec, fs->mft_record_size, usn);
+    if (hype_file_rmap_write_at(&fs->mft, fs->read, write, fs->ctx, off, rec,
+                                fs->mft_record_size) != 0) {
+        return -1;
+    }
+    return mirror_record_if_needed(fs, write, n, rec);
 }
