@@ -384,19 +384,40 @@ static uint64_t exfat_cluster_lba(const exfat_vol_t *v, uint32_t cl) {
     return hype_exfat_cluster_lba(v->cluster_heap, v->sec_per_cluster, cl);
 }
 
-/* Next cluster in a chain, or >= HYPE_EXFAT_EOC on end-of-chain / error. */
-static uint32_t exfat_next(const exfat_vol_t *v, uint32_t cl) {
+/*
+ * #650: one cached FAT sector, owned by the CALLER's stack -- the same
+ * multi-VM singleton hazard #347 documents above for fat32_cache_t applies
+ * here identically, so this must never move to a file-global. A chain walk
+ * visits FAT entries nearly sequentially, so caching the last sector read
+ * turns one read per CLUSTER into roughly one per 128 (the entries a 512-byte
+ * FAT sector holds).
+ */
+typedef struct {
+    uint32_t lba;
+    int valid;
     uint8_t sec[HYPE_BLK_SECTOR_SIZE];
+} exfat_cache_t;
+
+/* Next cluster in a chain, or >= HYPE_EXFAT_EOC on end-of-chain / error. A
+ * failed read invalidates the cache rather than leaving it serving a stale
+ * entry for a sector that no longer reflects what was just (unsuccessfully)
+ * requested. */
+static uint32_t exfat_next_cached(const exfat_vol_t *v, uint32_t cl, exfat_cache_t *c) {
     uint32_t byte = cl * 4u;
     uint32_t fat_sec = v->fat_lba + byte / HYPE_BLK_SECTOR_SIZE;
     uint32_t within = byte % HYPE_BLK_SECTOR_SIZE;
     if (!exfat_cluster_ok(v, cl)) {
         return HYPE_EXFAT_EOC;
     }
-    if (v->read(v->ctx, fat_sec, 1u, sec) != 0) {
-        return HYPE_EXFAT_EOC;
+    if (!c->valid || c->lba != fat_sec) {
+        if (v->read(v->ctx, fat_sec, 1u, c->sec) != 0) {
+            c->valid = 0;
+            return HYPE_EXFAT_EOC;
+        }
+        c->lba = fat_sec;
+        c->valid = 1;
     }
-    return hype_rd32(sec + within);
+    return hype_rd32(c->sec + within);
 }
 
 /*
@@ -423,9 +444,14 @@ static int exfat_read_entry(const exfat_vol_t *v, uint32_t dir_cl, int dir_conti
             return -1;
         }
     } else {
+        /* #650: this call's own cluster walk shares one FAT-sector cache --
+         * cluster_index steps nearly always land in the same or the next FAT
+         * sector, so this alone turns most of them into cache hits. */
+        exfat_cache_t c;
         unsigned guard = 0;
+        c.valid = 0;
         while (cluster_index-- > 0u) {
-            cl = exfat_next(v, cl);
+            cl = exfat_next_cached(v, cl, &c);
             if (!exfat_cluster_ok(v, cl) || guard++ > (1u << 20)) {
                 return -1;
             }
@@ -489,6 +515,10 @@ static int exfat_build_extents(const exfat_vol_t *v, const hype_exfat_set_t *set
     uint64_t acc = 0;
     uint32_t cl = set->first_cluster;
     unsigned guard = 0;
+    /* #650: one cache threaded through the WHOLE chain walk below -- the fix
+     * this function exists to carry (see exfat_next_cached's comment). */
+    exfat_cache_t fc;
+    fc.valid = 0;
 
     out->count = 0;
     out->size_bytes = set->data_length;
@@ -511,7 +541,7 @@ static int exfat_build_extents(const exfat_vol_t *v, const hype_exfat_set_t *set
             if (last->start_lba + last->sector_count == lba) {
                 last->sector_count += this_sectors; /* on-disk consecutive: extend */
                 acc += this_sectors;
-                cl = exfat_next(v, cl);
+                cl = exfat_next_cached(v, cl, &fc);
                 continue;
             }
         }
@@ -525,7 +555,7 @@ static int exfat_build_extents(const exfat_vol_t *v, const hype_exfat_set_t *set
         out->extents[out->count].sector_count = this_sectors;
         out->count++;
         acc += this_sectors;
-        cl = exfat_next(v, cl);
+        cl = exfat_next_cached(v, cl, &fc);
     }
     if (acc < total_sectors) {
         return -1; /* the chain is shorter than DataLength claims: refuse it rather

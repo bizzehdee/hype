@@ -35,10 +35,32 @@ static uint8_t g_vol[VOL_SECTORS * HYPE_BLK_SECTOR_SIZE];
 
 static uint64_t g_fail_lba = (uint64_t)-1; /* inject a read failure at this LBA */
 
+/* #650: read-call accounting for the FAT-sector-cache tests below. g_fat_lba/
+ * g_fat_len bound the region counted as "FAT reads" -- every fixture in this
+ * file places its FAT at EX_FAT_LBA/EX_FAT_LEN, so the default matches; a
+ * fixture with a different FAT region (there are none among the counting
+ * tests) would update these before resolving. */
+static unsigned int g_read_calls;
+static uint64_t g_fat_lba = EX_FAT_LBA;
+static uint32_t g_fat_len = EX_FAT_LEN;
+static unsigned int g_fat_read_calls;
+/* Fails exactly the Nth read of g_countdown_lba (0 == the very next one), then
+ * lets every later read of it succeed -- a TRANSIENT failure, unlike the
+ * permanent g_fail_lba above. */
+static uint64_t g_countdown_lba = (uint64_t)-1;
+static long g_fail_lba_countdown = -1;
+
 static int vol_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
     (void)ctx;
     if (count != 1u || lba >= VOL_SECTORS || lba == g_fail_lba) {
         return -1;
+    }
+    if (lba == g_countdown_lba && g_fail_lba_countdown >= 0 && g_fail_lba_countdown-- == 0) {
+        return -1;
+    }
+    g_read_calls++;
+    if (lba >= g_fat_lba && lba < g_fat_lba + g_fat_len) {
+        g_fat_read_calls++;
     }
     memcpy(dst, g_vol + lba * HYPE_BLK_SECTOR_SIZE, HYPE_BLK_SECTOR_SIZE);
     return 0;
@@ -898,7 +920,92 @@ static void test_exfat_geometry_guards(void) {
     }
 }
 
+/*
+ * #650: a FAT-chained file long enough that an uncached walk would issue one FAT
+ * read per cluster. Clusters 3..302 (300 of them) chain in order, so their FAT
+ * entries (byte cl*4, EX_FAT_LEN==4 sectors == 512 entries) span exactly the
+ * first 3 FAT sectors -- matching the ticket's "FAT entries live in 3 sectors".
+ */
+#define LONGCHAIN_FIRST_CL 3u
+#define LONGCHAIN_CLUSTERS 300u
+#define LONGCHAIN_LAST_CL (LONGCHAIN_FIRST_CL + LONGCHAIN_CLUSTERS - 1u)
+
+static void build_exfat_longchain(void) {
+    uint32_t c;
+    memset(g_vol, 0, sizeof(g_vol));
+    exfat_boot(g_vol, EX_HEAP_LBA, EX_CLUSTERS, 0u);
+    exfat_file_set(exfat_cluster(2) + 0, "longchain", 0, 0, LONGCHAIN_FIRST_CL,
+                   (uint64_t)LONGCHAIN_CLUSTERS * HYPE_BLK_SECTOR_SIZE);
+    for (c = LONGCHAIN_FIRST_CL; c < LONGCHAIN_LAST_CL; c++) {
+        put32(exfat_fat_entry(c), c + 1u);
+    }
+    put32(exfat_fat_entry(LONGCHAIN_LAST_CL), 0xFFFFFFFFu);
+}
+
+/*
+ * #650: the FAT-sector-read count for resolving a 300-cluster chain must be
+ * bounded by the number of DISTINCT FAT sectors the chain touches (3, here),
+ * not by the cluster count -- the whole point of exfat_next_cached(). The
+ * uncached implementation this replaces would have issued one FAT read per
+ * cluster (300), so any bound comfortably under that proves the cache is
+ * doing its job; single digits is the number the ticket asks for.
+ */
+static void test_exfat_fat_chain_cache_bounds_reads(void) {
+    hype_file_map_t f;
+
+    build_exfat_longchain();
+    g_fat_lba = EX_FAT_LBA;
+    g_fat_len = EX_FAT_LEN;
+    g_fat_read_calls = 0u;
+    g_read_calls = 0u;
+    CHECK_HEX("longchain resolves", 0, hype_exfat_resolve(vol_read, 0, "\\longchain", &f));
+    CHECK_HEX("longchain size", (unsigned long long)LONGCHAIN_CLUSTERS * HYPE_BLK_SECTOR_SIZE,
+              f.size_bytes);
+    /* The chain is physically contiguous (cluster N+1 always follows N on
+     * disk), so the extent builder coalesces it into exactly one extent --
+     * this is the correctness check the cached and uncached walks must agree
+     * on ("byte-identical to the uncached result"), computed here from the
+     * fixture's own geometry rather than re-run through a second code path. */
+    CHECK_HEX("longchain coalesces to one extent", 1u, f.count);
+    CHECK_HEX("longchain extent start", EX_HEAP_LBA + (LONGCHAIN_FIRST_CL - 2u),
+              f.extents[0].start_lba);
+    CHECK_HEX("longchain extent sectors", LONGCHAIN_CLUSTERS, f.extents[0].sector_count);
+    CHECK_HEX("FAT reads bounded by distinct sectors touched, not cluster count", 1u,
+              (unsigned)(g_fat_read_calls <= 9u));
+}
+
+/*
+ * #650: a transient FAT-sector read failure partway through the walk must fail
+ * the whole resolve outright (never a short/garbled extent map reported as
+ * success), AND must not leave anything behind that corrupts a later, healthy
+ * resolve of the same chain -- the cache is a stack-local struct created fresh
+ * by every call, so there is nothing TO leave behind, but this is the
+ * black-box proof of that from the exported API.
+ */
+static void test_exfat_fat_chain_cache_failure_not_stale(void) {
+    hype_file_map_t f;
+
+    build_exfat_longchain();
+    g_countdown_lba = EX_FAT_LBA + 2u; /* the third FAT sector: reached partway through the walk */
+    g_fail_lba_countdown = 0;          /* fail the very first read of it */
+    CHECK_HEX("a transient FAT-sector failure fails the whole resolve",
+              (unsigned long long)(-1),
+              (unsigned long long)hype_exfat_resolve(vol_read, 0, "\\longchain", &f));
+    g_countdown_lba = (uint64_t)-1;
+    g_fail_lba_countdown = -1;
+
+    /* Same fixture, same chain, no injected failure this time: must succeed
+     * with correct data. */
+    CHECK_HEX("a later healthy resolve of the same chain is unaffected", 0,
+              hype_exfat_resolve(vol_read, 0, "\\longchain", &f));
+    CHECK_HEX("recovered size correct",
+              (unsigned long long)LONGCHAIN_CLUSTERS * HYPE_BLK_SECTOR_SIZE, f.size_bytes);
+    CHECK_HEX("recovered extent count correct", 1u, f.count);
+}
+
 int main(void) {
+    test_exfat_fat_chain_cache_bounds_reads();
+    test_exfat_fat_chain_cache_failure_not_stale();
     test_exfat_contiguous_directory();
     test_exfat_set_checksum_enforced();
     test_exfat_name_length_guard();
