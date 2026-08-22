@@ -1,6 +1,7 @@
 #include "xhci.h"
 #include "usb_msc.h"
 #include "fatal.h" /* hype_debug_print -- hub-descent diagnostics (real HW visibility) */
+#include "host_pci_dma.h" /* #426: shared ring-advance math (see ring_enqueue below) */
 
 /*
  * Hardware shim for the xHCI host driver: real MMIO bring-up + port reset.
@@ -291,24 +292,33 @@ static uint32_t trb_dw(const uint8_t *ring, unsigned int idx, unsigned int dw) {
 }
 
 /* Enqueue a fully-built TRB (cycle already = *cyc) onto any producer ring,
- * handling the Link-TRB wrap + producer-cycle toggle. */
+ * handling the Link-TRB wrap + producer-cycle toggle.
+ *
+ * #426: the wrap/cycle-toggle DECISION now goes through core/host_pci_dma.c's
+ * hype_dma_link_ring_advance() -- the same index arithmetic this function
+ * always did (`*enq == RING_TRBS - 1u` after incrementing is exactly
+ * `old_enq + 1 >= capacity - 1` for capacity == RING_TRBS), just shared with
+ * other producer rings instead of re-derived per driver. The Link-TRB MEMORY
+ * WRITE itself stays here: it is real MMIO-visible DMA memory, ring-specific
+ * (needs `ring`'s own base address for the link target), and out of scope for
+ * a pure-logic helper. Nothing about when the wrap happens or which cycle
+ * value the Link TRB is stamped with changes. */
 static void ring_enqueue(uint8_t *ring, unsigned int *enq, unsigned int *cyc,
                          const uint32_t trb[4]) {
     uint8_t *slot = ring + (*enq) * HYPE_XHCI_TRB_BYTES;
+    uint32_t cyc_before_wrap = *cyc; /* the Link TRB must match the cycle the wrap is leaving */
     put_le32(slot + 0, trb[0]);
     put_le32(slot + 4, trb[1]);
     put_le32(slot + 8, trb[2]);
     put_le32(slot + 12, trb[3]);
-    (*enq)++;
-    if (*enq == RING_TRBS - 1u) { /* reached the Link TRB slot */
+    hype_dma_link_ring_advance(enq, cyc, RING_TRBS);
+    if (*enq == 0u) { /* wrapped: the advance reset us to slot 0, install the Link TRB it skipped */
         uint32_t link[4];
-        hype_xhci_trb_link(link, phys(ring), *cyc); /* match current producer cycle */
+        hype_xhci_trb_link(link, phys(ring), cyc_before_wrap);
         put_le32(ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 0, link[0]);
         put_le32(ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 4, link[1]);
         put_le32(ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 8, link[2]);
         put_le32(ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 12, link[3]);
-        *enq = 0;
-        *cyc ^= 1u;
     }
 }
 
@@ -361,8 +371,7 @@ static int next_event_budget(xhci_hw_t *hw, volatile uint8_t *bar, uint32_t rtso
             out[1] = trb_dw(hw->evt_ring, hw->evt_deq, 1);
             out[2] = trb_dw(hw->evt_ring, hw->evt_deq, 2);
             out[3] = d3;
-            hw->evt_deq++;
-            if (hw->evt_deq >= RING_TRBS) { hw->evt_deq = 0; hw->evt_cyc ^= 1u; }
+            hype_dma_cqueue_advance(&hw->evt_deq, &hw->evt_cyc, RING_TRBS);
             /* ERDP = address of the new dequeue slot, with EHB (bit3) written 1 to clear. */
             wr64(bar, hype_xhci_ir0_offset(rtsoff, HYPE_XHCI_IR_ERDP),
                  (phys(hw->evt_ring) + (uint64_t)hw->evt_deq * HYPE_XHCI_TRB_BYTES) | (1u << 3));
@@ -1037,8 +1046,7 @@ static unsigned int drain_events(xhci_hw_t *hw, volatile uint8_t *bar, uint32_t 
         if ((int)(d3 & 1u) != (int)hw->evt_cyc) {
             break; /* ring empty: cycle bit says the controller has not written here */
         }
-        hw->evt_deq++;
-        if (hw->evt_deq >= RING_TRBS) { hw->evt_deq = 0; hw->evt_cyc ^= 1u; }
+        hype_dma_cqueue_advance(&hw->evt_deq, &hw->evt_cyc, RING_TRBS);
         drained++;
         if (drained > RING_TRBS) break; /* paranoia: never spin forever on a wedged ring */
     }

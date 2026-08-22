@@ -1692,12 +1692,24 @@ isn't lost.
       NICs would re-implement it again. Build it ONCE, as the NET epic's
       DMA-ring and IRQ/poll slices, framed as a general host-PCI-device
       facility rather than NIC-only.
-    - **Storage HBAs migrate opportunistically, never big-bang.** The working
-      AHCI/NVMe/xHCI drivers are already unified where callers care (block I/O,
-      via `hype_blk_backend_t`); they adopt the shared PCI/DMA/IRQ facility one
-      at a time, only after it is proven on NICs and only where it comes out
-      cleaner. A refactor of working storage drivers purely for symmetry is not
-      a win (decision #17 / the §6j "one place to forget the check" reasoning).
+    - ~~Storage HBAs migrate opportunistically, never big-bang.~~ **REVERSED
+      2026-08-22 (#426):** the working AHCI/NVMe/xHCI drivers migrate onto the
+      shared PCI/DMA/IRQ facility as a single tracked ticket covering all
+      three, not one-at-a-time as each is separately judged worth it. The
+      reasoning below for staying mechanical does not vanish — it becomes a
+      constraint on how the full migration is done: each HBA's protocol-
+      specific structures (AHCI command tables/FIS, NVMe SQE/CQE, xHCI TRBs)
+      are untouched; only the generic index/wrap/phase math and the buffer-
+      slot bookkeeping move onto `core/host_pci_dma.c`/`host_pci_irq.c`, as a
+      mechanical, behaviour-preserving extraction verified against the
+      existing unit suite and a full `hype.efi` link, not a rewrite. Where an
+      HBA's shape does not reduce to the shared primitives without distorting
+      it (AHCI's single-outstanding-command-per-port model has no ring to
+      migrate), the ticket documents that explicitly rather than forcing a fit.
+      What stays true: a refactor purely for symmetry, with no unit-test/link
+      verification backing it, is still not a win (decision #17 / the §6j "one
+      place to forget the check" reasoning) — the full-migration scope changes
+      *when* all three move, not the discipline used while moving each one.
     - **Rejected: a single universal driver interface** spanning fs + block +
       net + transport. Filesystems, block backends and packet NICs do not
       share a callable shape; forcing one vtable over them would be lossy
@@ -3118,6 +3130,46 @@ isn't lost.
     every other volume shape, and narrowing it here is a worse surprise than the small fixed
     cost of one more sector write per FAT update. The sync-both-copies fix is also a direct,
     already-proven port of FAT32's existing mechanism, not new design.
+
+63. **ext namespace mutation: htree insertion is refused, not guessed at; directory growth is
+    bounded to what this slice can address -- decided (2026-08-22).** #498 gave ext2/3/4
+    `create`/`unlink`/`mkdir`/`rmdir`/`rename`, journaled (jbd2, checksummed per decision 29/#495)
+    on ext3/4 and direct-ordered on ext2 (`core/extj_namespace.c` / `core/ext2_namespace.c`,
+    sharing directory-block content logic in `core/ext_dirent.c`). Two scope questions came up
+    that decision 29 did not already answer:
+
+    **Htree (`dir_index`) directories.** An htree-indexed directory's interior index blocks are
+    disguised as ordinary (inode-0) entries at fixed offsets a linear insert has no way to avoid
+    disturbing. **Decided:** refuse (-1) any INSERT (`create`, `mkdir`, and `rename`'s
+    destination side) into a directory carrying `EXT4_INDEX_FL`, cleanly, before touching
+    anything -- this slice has no htree-aware insertion, and a corrupted index is far worse than
+    a refusal. REMOVAL (`unlink`, `rmdir`, and `rename`'s source side) is NOT refused: it only
+    ever tombstones a real, named leaf entry found by linear scan, which never touches the
+    disguised interior blocks -- the same property that already lets `core/ext.c`'s read-only
+    resolver walk an htree directory without understanding htree at all.
+
+    **Directory content growth.** A directory's own data is enumerated and grown through direct
+    block pointers (classic) or the in-inode extent root only (ext4) -- never single/double/
+    triple indirect or a multi-level extent tree. **Decided:** refuse rather than guess when a
+    directory needs more reach than that to accept a new entry. Every directory this slice
+    itself creates, and every real mkfs.ext2/3/4 root directory validated against (#498's
+    `tools/498/run-498.sh`), stays well inside this. `unlink`/`rmdir` must still accept ANY
+    existing regular file or directory by that name, though -- including one the #384/#385/#497
+    write path grew past direct+single-indirect (classic) or a depth-0 extent root on a real,
+    heavily used volume, which this slice's own writes never produce but cannot assume don't
+    exist. **Decided:** the SAME refuse-rather-than-guess rule applies there too -- `free_all_blocks`
+    only ever enumerates a classic direct+single-indirect map or a depth-0 extent root (an interior
+    extent index entry is the identical 12 bytes as a leaf entry with different field meanings, so
+    misreading one as the other would free garbage block numbers, not merely leak space); a
+    deletion whose target's blocks run deeper than that is refused UP FRONT, before any mutation,
+    leaving the volume exactly as it was.
+
+    **Alternatives considered.** Implementing real htree insertion -- rejected as disproportionate
+    to this ticket's scope; htree only matters once a directory is large enough that a linear
+    scan gets slow, which is not a shape this slice's own writes, or the validated bar, produce.
+    Silently falling back to appending past the htree-disguised region -- rejected outright: the
+    ticket calls this exact shortcut out as the one most likely to be attempted and the most
+    damaging, since it corrupts the index while looking like it worked.
 
 ## 11. Pre-M0 readiness checklist
 

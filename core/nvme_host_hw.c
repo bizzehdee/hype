@@ -1,10 +1,17 @@
 #include "nvme_host.h"
+#include "host_pci_dma.h"
 
 /*
  * Hardware shim for the host NVMe driver: real MMIO + DMA against the physical
  * controller. Coverage-exempt (like ahci_host_hw.c / host_pci_hw.c) since it
  * pokes device registers and rings doorbells. The pure command/completion
  * encode-decode it builds on lives in nvme_host.c and is unit-tested.
+ *
+ * #426: SQ-tail advance and CQ-head/phase-flip-on-wrap now go through
+ * core/host_pci_dma.c's shared ring helpers instead of hand-rolled `%
+ * Q_ENTRIES` arithmetic -- same math, moved so xHCI/AHCI/future NIC drivers
+ * share it instead of re-deriving it. Nothing about queue depth, doorbell
+ * offsets or the phase-tag protocol itself changes.
  *
  * Identity-mapped physical == pointer, per hype's flat map. All DMA-visible
  * structures live in hype's own .bss. NVMe transfers are page/PRP based, so a
@@ -68,7 +75,7 @@ static int submit_and_poll(volatile uint8_t *bar, uint8_t *sq, uint8_t *cq, unsi
     for (i = 0; i < HYPE_NVME_SQE_SIZE; i++) {
         slot[i] = sqe[i];
     }
-    *sq_tail = (*sq_tail + 1u) % Q_ENTRIES;
+    *sq_tail = hype_dma_ring_advance(*sq_tail, Q_ENTRIES);
     wr32(bar, hype_nvme_doorbell_offset(qid, 0, g_dstrd), *sq_tail);
 
     centry = cq + (*cq_head) * HYPE_NVME_CQE_SIZE;
@@ -82,10 +89,7 @@ static int submit_and_poll(volatile uint8_t *bar, uint8_t *sq, uint8_t *cq, unsi
         __asm__ volatile("pause");
         if (hype_nvme_cqe_phase(centry) == (int)(*phase)) {
             int ok = hype_nvme_cqe_success(centry);
-            *cq_head = (*cq_head + 1u) % Q_ENTRIES;
-            if (*cq_head == 0u) {
-                *phase ^= 1u; /* phase flips each time the CQ wraps */
-            }
+            hype_dma_cqueue_advance(cq_head, phase, Q_ENTRIES); /* flips *phase on wrap */
             wr32(bar, hype_nvme_doorbell_offset(qid, 1, g_dstrd), *cq_head);
             if (!ok) {
                 extern void hype_debug_print(const char *fmt, ...);
