@@ -266,6 +266,80 @@ static void test_address_device_bad_slot(void) {
     CHECK_INT("slot not enabled error", HYPE_GXHCI_CC_SLOT_NOT_ENABLED, (status >> 24) & 0xFFu);
 }
 
+/*
+ * #665: every guest-programmed ring base / context pointer is routed through gmem_read/gmem_write
+ * -> hype_gpa_to_host() (VALID-1), which rejects on an out-of-range access. These four cases
+ * point a command-ring base, a DCBAAP, an Address Device input context, and a DCBAA-resolved
+ * device-context pointer outside the rig's mapped IMG_SIZE region and confirm the model degrades
+ * safely -- no crash, no garbage read/written, an explicit error completion where one is due --
+ * rather than dereferencing whatever hype_gpa_to_host's rejection (0) would otherwise become.
+ */
+static void test_command_ring_base_outside_map_is_inert(void) {
+    rig_t r;
+    uint64_t bad_ptr = GBASE + IMG_SIZE + 0x1000u; /* just past the rig's one mapped region */
+    rig_init(&r);
+    /* Override rig_init's own (valid) CRCR with one pointing outside the map. */
+    wr32(&r, HYPE_GXHCI_OP_CRCR_LO, (uint32_t)bad_ptr | HYPE_GXHCI_CRCR_RCS);
+    wr32(&r, HYPE_GXHCI_OP_CRCR_HI, (uint32_t)(bad_ptr >> 32));
+    push_cmd(&r, 0, 0, HYPE_GXHCI_TRB_ENABLE_SLOT, 0); /* written to OFF_CMD -- CRCR no longer points there */
+    hype_xhci_dev_doorbell(&r.dev, HYPE_GXHCI_DB_COMMAND, 0u, &r.map);
+    CHECK_INT("no command processed off an out-of-map ring base", 0, r.dev.commands_processed);
+    CHECK_INT("no event posted", 0, r.dev.events_posted);
+    CHECK_INT("no slot allocated", 0, r.dev.slots_enabled);
+}
+
+static void test_address_device_dcbaap_outside_map_is_rejected(void) {
+    rig_t r;
+    uint64_t bad_dcbaap = GBASE + IMG_SIZE + 0x1000u;
+    uint64_t param;
+    uint32_t status, control;
+    rig_init(&r);
+    wr32(&r, HYPE_GXHCI_OP_DCBAAP_LO, (uint32_t)bad_dcbaap);
+    wr32(&r, HYPE_GXHCI_OP_DCBAAP_HI, (uint32_t)(bad_dcbaap >> 32));
+    push_cmd(&r, 0, 0, HYPE_GXHCI_TRB_ENABLE_SLOT, 0);
+    push_cmd(&r, GBASE + OFF_INCTX, 0, HYPE_GXHCI_TRB_ADDRESS_DEVICE, 1);
+    hype_xhci_dev_doorbell(&r.dev, HYPE_GXHCI_DB_COMMAND, 0u, &r.map);
+    read_event(&r, 1, &param, &status, &control);
+    CHECK_INT("out-of-map DCBAAP rejected as a parameter error", HYPE_GXHCI_CC_PARAMETER_ERROR,
+             (status >> 24) & 0xFFu);
+    CHECK_INT("slot stays enabled, never reaches addressed", HYPE_GXHCI_SLOT_ENABLED,
+             r.dev.slots[1].state);
+}
+
+static void test_address_device_input_context_outside_map_is_rejected(void) {
+    rig_t r;
+    uint64_t bad_inctx = GBASE + IMG_SIZE + 0x1000u;
+    uint64_t param;
+    uint32_t status, control;
+    rig_init(&r);
+    push_cmd(&r, 0, 0, HYPE_GXHCI_TRB_ENABLE_SLOT, 0);
+    push_cmd(&r, bad_inctx, 0, HYPE_GXHCI_TRB_ADDRESS_DEVICE, 1);
+    hype_xhci_dev_doorbell(&r.dev, HYPE_GXHCI_DB_COMMAND, 0u, &r.map);
+    read_event(&r, 1, &param, &status, &control);
+    CHECK_INT("out-of-map input context rejected as a parameter error", HYPE_GXHCI_CC_PARAMETER_ERROR,
+             (status >> 24) & 0xFFu);
+    CHECK_INT("slot stays enabled", HYPE_GXHCI_SLOT_ENABLED, r.dev.slots[1].state);
+}
+
+static void test_address_device_dcbaa_entry_outside_map_is_rejected(void) {
+    rig_t r;
+    uint64_t bad_dev_ctx = GBASE + IMG_SIZE + 0x1000u;
+    uint64_t param;
+    uint32_t status, control;
+    rig_init(&r);
+    /* DCBAAP itself is fine (rig_init's default), but the entry it names for slot 1 (the
+     * per-device output context pointer, guest-writable) points outside the map. */
+    put64(&r, OFF_DCBAA + 8 * 1, bad_dev_ctx);
+    put64(&r, OFF_INCTX + 32u + 32u + 8u, (GBASE + 0x6000u) | 1u); /* valid EP0 TR ptr */
+    push_cmd(&r, 0, 0, HYPE_GXHCI_TRB_ENABLE_SLOT, 0);
+    push_cmd(&r, GBASE + OFF_INCTX, 0, HYPE_GXHCI_TRB_ADDRESS_DEVICE, 1);
+    hype_xhci_dev_doorbell(&r.dev, HYPE_GXHCI_DB_COMMAND, 0u, &r.map);
+    read_event(&r, 1, &param, &status, &control);
+    CHECK_INT("out-of-map device-context pointer rejected as a TRB error", HYPE_GXHCI_CC_TRB_ERROR,
+             (status >> 24) & 0xFFu);
+    CHECK_INT("slot stays enabled", HYPE_GXHCI_SLOT_ENABLED, r.dev.slots[1].state);
+}
+
 static void test_hcreset_clears_state(void) {
     rig_t r;
     rig_init(&r);
@@ -372,6 +446,10 @@ int main(void) {
     test_bringup_sequence();
     test_link_trb_and_noop();
     test_address_device_bad_slot();
+    test_command_ring_base_outside_map_is_inert();
+    test_address_device_dcbaap_outside_map_is_rejected();
+    test_address_device_input_context_outside_map_is_rejected();
+    test_address_device_dcbaa_entry_outside_map_is_rejected();
     test_hcreset_clears_state();
     test_mmio_access_widths();
     test_usbsts_and_iman_rw1c();
