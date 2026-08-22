@@ -9,6 +9,7 @@
 #include "../core/vt_screen.h"
 #include "../core/vt_render.h"
 #include "../core/dashboard.h"
+#include "../core/dump_fmt.h" /* #611 */
 #include "../core/input_runner.h"
 #include "../core/input_script.h"
 #include "../core/vm_isolation.h"
@@ -1249,6 +1250,20 @@ typedef struct hype_fw_vm {
     char media_buf[32];
     volatile uint64_t stat_total_exits;
     volatile uint64_t stat_hlt_exits;
+    /*
+     * #611: the rest of the EXHIST buckets, published the same way as the two above -- plain
+     * volatile counters, written only by this VM's owning core (inside fw_1_publish_and_render(),
+     * same cadence as stat_total_exits) and safe for any core to read (decision 43: ordinary
+     * memory, not VMCS/VMCB state). `dump <vm>` reads these instead of re-deriving them.
+     */
+    volatile uint64_t stat_ex_npf;
+    volatile uint64_t stat_ex_ioio;
+    volatile uint64_t stat_ex_msr;
+    volatile uint64_t stat_ex_cpuid;
+    volatile uint64_t stat_ex_vintr;
+    volatile uint64_t stat_ex_pause;
+    volatile uint64_t stat_ex_intr;
+    volatile uint64_t stat_ex_other;
     volatile uint64_t stat_uptime_ms; /* #263: accumulated RUNNING time, not wall-clock */
     hype_vm_uptime_t uptime_acc;      /* #263: the accumulator behind it */
     hype_vm_cpu_t cpu_acc;            /* #264: sliding-window busy-time CPU% */
@@ -2460,6 +2475,8 @@ static void load_input_script(hype_fw_vm_t *vm, unsigned vm_index);
 /* TERM-6 (#444): needs g_hype_cfg, hence the forward declaration. `idx` is
  * the VM index term_run_cmdline already resolved from the command's arg. */
 static void term_config_cmd(int idx, const char *nm);
+/* #611: same placement reason -- needs g_fw_1_kind and the vmm_get_* shims below it. */
+static void term_dump_cmd(int idx, const char *nm);
 /* TERM-14 (#490): same placement reason -- needs g_hype_cfg + the serializer + #447. */
 static void term_set_cmd(int idx, const char *nm, const char *key, const char *value);
 static void term_attach_cmd(int idx, const char *nm, const char *spec); /* TERM-12 (#488) */
@@ -2678,6 +2695,13 @@ static void term_run_cmdline(void) {
             /* #568: the same capture the hotkey performs. term_take_screenshot() reports its own
              * outcome on every path, including where it saved to, so nothing is needed here. */
             term_take_screenshot();
+            break;
+        case HYPE_CMD_DUMP:
+            if (idx < 0) {
+                term_resultf("dump: unknown vm '%s'", nm);
+            } else {
+                term_dump_cmd(idx, nm);
+            }
             break;
         case HYPE_CMD_UNKNOWN:
             /*
@@ -4696,6 +4720,18 @@ static int vmm_get_debug_state(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
     }
     hype_svm_vcpu_get_debug_state(ctx, out);
     return 1;
+}
+/*
+ * #611: GPRs are plain memory in both backends' ctx (never a VMCS/VMCB field), so
+ * hype_{vmx,svm}_vcpu_get_gpr() already read them directly with no owner-core gating -- see
+ * their definitions in vmcs_hw.c/svm_vcpu.c. This is only the vendor dispatch, matching the
+ * other vmm_get_* shims.
+ */
+static uint64_t vmm_get_gpr(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, unsigned idx) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        return hype_vmx_vcpu_get_gpr(ctx, idx);
+    }
+    return hype_svm_vcpu_get_gpr(ctx, idx);
 }
 /*
  * #563: takes a ctx now, because the counters are per-vCPU. As file-globals they summed every vCPU
@@ -7666,10 +7702,18 @@ static void fw_1_load_saved_vars(hype_fw_vm_t *vm);
 static void fw_1_vars_request(hype_fw_vm_t *vm, uint32_t kind, int wait);
 static void fw_1_vars_service(void);
 
+/*
+ * #611: the EXHIST buckets besides hlt (which already had its own stat_hlt_exits), bundled so
+ * fw_1_publish_and_render() takes one extra pointer instead of eight extra scalars.
+ */
+typedef struct {
+    unsigned long long npf, ioio, msr, cpuid, vintr, pause, intr, other;
+} hype_fw_exit_buckets_t;
+
 static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_tsc,
                                     uint64_t perf_boot_start_tsc,
                                     uint64_t perf_hlt_wait_tsc, uint64_t total_exits,
-                                    uint64_t hlt_exits) {
+                                    uint64_t hlt_exits, const hype_fw_exit_buckets_t *buckets) {
     if (g_fw_1_host_tsc_hz == 0) {
         return;
     }
@@ -7690,6 +7734,16 @@ static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_t
         vm->stat_idle_ms = idle_ms;
         vm->stat_total_exits = total_exits;
         vm->stat_hlt_exits = hlt_exits;
+        if (buckets != 0) {
+            vm->stat_ex_npf = buckets->npf;
+            vm->stat_ex_ioio = buckets->ioio;
+            vm->stat_ex_msr = buckets->msr;
+            vm->stat_ex_cpuid = buckets->cpuid;
+            vm->stat_ex_vintr = buckets->vintr;
+            vm->stat_ex_pause = buckets->pause;
+            vm->stat_ex_intr = buckets->intr;
+            vm->stat_ex_other = buckets->other;
+        }
         /*
          * #264: CPU% is now MEASURED -- time actually spent executing the guest
          * (g_fw_1_vmrun_tsc, which the exit-cost instrumentation already accumulates)
@@ -14090,8 +14144,12 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     #if !HYPE_RUN_GUEST_ON_AP
         fw_1_render_console();
 #endif
-        fw_1_publish_and_render(vm, &last_gop_flush_tsc,
-                                    perf_boot_start_tsc, perf_hlt_wait_tsc, total_exits, ex_hlt);
+        {
+            hype_fw_exit_buckets_t eb = {ex_npf, ex_ioio, ex_msr, ex_cpuid, ex_vintr, ex_pause,
+                                          ex_intr, ex_other};
+            fw_1_publish_and_render(vm, &last_gop_flush_tsc,
+                                    perf_boot_start_tsc, perf_hlt_wait_tsc, total_exits, ex_hlt, &eb);
+        }
             {
                 uint64_t t0 = fb_tsc_begin();
                 while (g_fw_1_host_tsc_hz != 0 && hype_rdtsc() - t0 < g_fw_1_host_tsc_hz / 1000u) {
@@ -17163,8 +17221,12 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * this is the ONE framebuffer memcpy that pays the uncached-VRAM cost,
          * instead of one per printed line. */
         g_436_loop_section[(unsigned)(vm-g_vms)]=73;
-        fw_1_publish_and_render(vm, &last_gop_flush_tsc,
-                                perf_boot_start_tsc, perf_hlt_wait_tsc, total_exits, ex_hlt);
+        {
+            hype_fw_exit_buckets_t eb = {ex_npf, ex_ioio, ex_msr, ex_cpuid, ex_vintr, ex_pause,
+                                          ex_intr, ex_other};
+            fw_1_publish_and_render(vm, &last_gop_flush_tsc,
+                                perf_boot_start_tsc, perf_hlt_wait_tsc, total_exits, ex_hlt, &eb);
+        }
         g_436_loop_section[(unsigned)(vm-g_vms)]=74;
 
         /* M4-6d3: flush a buffered partial line that looks like an
@@ -21662,6 +21724,75 @@ static void term_config_cmd(int idx, const char *nm) {
                      (g_vms[idx].cfg_pending_bits & HYPE_CFG_F_OS_HINT) ? "os_hint " : "",
                      (g_vms[idx].cfg_pending_bits & HYPE_CFG_F_NET_MODE) ? "net_mode " : "");
     }
+}
+
+/*
+ * #611: `dump <vm>` -- a bounded per-vCPU snapshot for a running/halted/stopped guest.
+ *
+ * plan.md decision 43: this runs on the BSP (term_run_cmdline's own core), never the AP that
+ * owns the vCPU being inspected, so every field gathered here goes through the published-snapshot
+ * accessors -- vmm_get_gpr() (plain ctx memory, always safe), vmm_get_debug_state() and
+ * vmm_get_intr_state() (VMCS-derived on VMX, gated on owner_apic; direct VMCB reads on SVM,
+ * which has no current-pointer hazard to gate against -- see #523's own comments in
+ * arch/x86_64/vmx/vmcs_hw.c). None of these ever call vmx_ensure_current() on this vCPU's behalf,
+ * so g_vmx_vmcs_steal_count cannot move because of this command.
+ */
+static void term_dump_cmd(int idx, const char *nm) {
+    hype_fw_vm_t *vm;
+    hype_dump_snapshot_t snap;
+    unsigned i, n;
+
+    vm = &g_vms[idx];
+    snap.vm_name = nm;
+    snap.lifecycle = hype_vm_lifecycle_name(vm->lifecycle);
+    n = vm->vcpu_count ? vm->vcpu_count : 1u;
+    if (n > HYPE_MAX_VCPUS_PER_VM) n = HYPE_MAX_VCPUS_PER_VM;
+    if (n > HYPE_DUMP_MAX_VCPUS) n = HYPE_DUMP_MAX_VCPUS;
+    snap.n_vcpus = n;
+
+    for (i = 0; i < n; i++) {
+        hype_vcpu_ctx_t *ctx = vm->vcpu[i];
+        hype_dump_vcpu_t *dv = &snap.vcpu[i];
+
+        if (ctx == 0) {
+            dv->present = 0;
+            continue;
+        }
+        {
+            hype_svm_debug_state_t dbg;
+            hype_vmm_intr_state_t is;
+            unsigned r;
+
+            dv->present = 1;
+            for (r = 0; r < 16u; r++) {
+                dv->gprs[r] = vmm_get_gpr(g_fw_1_kind, ctx, r);
+            }
+            (void)vmm_get_debug_state(g_fw_1_kind, ctx, &dbg);
+            dv->rip = dbg.rip;
+            dv->cr3 = dbg.cr3;
+
+            vmm_get_intr_state(g_fw_1_kind, ctx, &is);
+            dv->can_accept = is.can_accept;
+            dv->eventinj = is.eventinj;
+            dv->vintr_armed = (is.vintr != 0);
+            dv->pending_valid = is.pending_valid;
+            dv->pending_count = (unsigned)is.pending_count;
+            dv->pending_vector = is.pending_vector;
+        }
+    }
+
+    snap.ex_total = vm->stat_total_exits;
+    snap.ex_hlt = vm->stat_hlt_exits;
+    snap.ex_npf = vm->stat_ex_npf;
+    snap.ex_ioio = vm->stat_ex_ioio;
+    snap.ex_msr = vm->stat_ex_msr;
+    snap.ex_cpuid = vm->stat_ex_cpuid;
+    snap.ex_vintr = vm->stat_ex_vintr;
+    snap.ex_pause = vm->stat_ex_pause;
+    snap.ex_intr = vm->stat_ex_intr;
+    snap.ex_other = vm->stat_ex_other;
+
+    hype_dump_format(&snap, &g_cmd_text);
 }
 
 /*

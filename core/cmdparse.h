@@ -46,6 +46,12 @@ typedef enum {
      * fired. A verb works on any keyboard that can type.
      */
     HYPE_CMD_SCREENSHOT,
+    /*
+     * #611: bounded per-vCPU diagnostic snapshot (GPRs/RIP/CR3, lifecycle, exit-reason history,
+     * pending/injected event state) of a running/halted/stopped guest. Reads only the
+     * published-snapshot side of plan.md decision 43 -- never a live VMCS/VMCB.
+     */
+    HYPE_CMD_DUMP,
     HYPE_CMD_UNKNOWN,
 } hype_cmd_verb_t;
 

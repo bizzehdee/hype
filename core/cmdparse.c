@@ -35,6 +35,7 @@ static hype_cmd_verb_t verb_of(const char *tok, unsigned len) {
     if (tok_eq(tok, len, "attach")) return HYPE_CMD_ATTACH; /* TERM-12 (#488) */
     if (tok_eq(tok, len, "detach")) return HYPE_CMD_DETACH; /* TERM-12 (#488) */
     if (tok_eq(tok, len, "screenshot")) return HYPE_CMD_SCREENSHOT; /* #568 */
+    if (tok_eq(tok, len, "dump")) return HYPE_CMD_DUMP; /* #611 */
     if (tok_eq(tok, len, "config") || tok_eq(tok, len, "cfg")) return HYPE_CMD_CONFIG;
     if (tok_eq(tok, len, "host")) return HYPE_CMD_HOST; /* M9-2 (#175): host reboot|off */
     if (tok_eq(tok, len, "set")) return HYPE_CMD_SET;   /* TERM-14 (#490) */
@@ -110,6 +111,7 @@ static const char *const g_cmd_usage[] = {
     "host <reboot|off>",
     "set <vm> <key> <value>",
     "screenshot",
+    "dump <vm>",
 };
 
 unsigned hype_cmd_usage_count(void) {
