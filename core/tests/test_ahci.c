@@ -1,5 +1,7 @@
 #include <stdio.h>
+#include <string.h>
 #include "../../devices/ahci.h"
+#include "../fatal.h"
 
 static int failures = 0;
 
@@ -11,6 +13,45 @@ static int failures = 0;
             failures++; \
         } \
     } while (0)
+
+/*
+ * #672: process_ahci_ata_command_slot() (arch/x86_64/svm/svm_vcpu.c, shared verbatim by the
+ * VMX MMIO handler) translates the guest-programmed command-list pointer (PxCLB/PxCLBU, fully
+ * guest-controlled) through the VM's gpa map and used to dereference it with NO null check --
+ * unlike its ATAPI sibling process_ahci_command_slot(), which has always had one. A guest
+ * pointing PxCLB/PxCLBU outside its own mapped range crashed the host. This pins the fix: the
+ * function must refuse (return -1) rather than dereference NULL.
+ */
+static void test_ata_command_slot_refuses_out_of_range_command_list(void) {
+    hype_ahci_t ahci;
+    hype_ata_disk_t disk;
+    hype_gpa_map_t map;
+    uint8_t backing[4096];
+    int rc;
+
+    hype_ahci_reset(&ahci);
+    memset(&disk, 0, sizeof(disk));
+    /* One small mapped region, [0, 0x1000). PxCLB/PxCLBU below point well outside it. */
+    hype_gpa_map_reset(&map);
+    hype_gpa_map_add(&map, 0x0ull, (uint64_t)(uintptr_t)backing, sizeof(backing));
+    ahci.p_clb = 0xFFFF0000u;
+    ahci.p_clbu = 0u;
+    ahci.p_fb = 0u;
+    ahci.p_fbu = 0u;
+
+    /*
+     * The refusal path logs via hype_debug_print(), which is level-filtered but NOT
+     * host-safe below that filter -- it falls through to real UART port I/O
+     * (core/serial_hw.c), exempt from unit testing per AGENTS.md because outb/inb only
+     * make sense with a real device. Raising the level requirement above DEBUG makes the
+     * call a no-op short-circuit, so this test proves the null check without touching
+     * hardware. Restored unconditionally so a later test in this binary is unaffected.
+     */
+    hype_debug_set_level(HYPE_LOG_ERROR);
+    rc = process_ahci_ata_command_slot(&ahci, &disk, &map, 0u);
+    hype_debug_set_level(HYPE_LOG_DEBUG);
+    CHECK_HEX("out-of-range command list is refused, not dereferenced", (unsigned)-1, (unsigned)rc);
+}
 
 static void test_reset_state(void) {
     hype_ahci_t ahci;
@@ -737,6 +778,7 @@ int main(void) {
     test_hotplug_capable_at_reset();
     test_hotplug_attach_raises_connect_change();
     test_hotplug_detach_clears_det();
+    test_ata_command_slot_refuses_out_of_range_command_list();
 
     if (failures == 0) {
         printf("all tests passed\n");
