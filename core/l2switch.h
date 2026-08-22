@@ -24,7 +24,10 @@
  * is the semantics they asked for.
  */
 
-#define HYPE_L2SW_MAX_MEMBERS 16u /* = HYPE_CFG_MAX_VMS; one NIC per VM in v1 (#583 warns above) */
+/* Was chosen to match HYPE_CFG_MAX_VMS back when that was also 16 (one NIC per VM in v1, #583
+ * warns above); #606 re-derived HYPE_CFG_MAX_VMS from decision 33's own physical-core reasoning,
+ * which a shared L2 segment's useful member count has no reason to track -- left independent. */
+#define HYPE_L2SW_MAX_MEMBERS 16u
 #define HYPE_L2SW_MAC_TABLE 32u
 
 typedef struct {

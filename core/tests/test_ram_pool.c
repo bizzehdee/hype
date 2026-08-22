@@ -108,6 +108,26 @@ static void test_carve_table_is_bounded(void) {
           hype_ram_pool_carve(&p, MB, 999u, 0u, &base, 0) == HYPE_RAM_POOL_ERR_TOO_MANY);
 }
 
+/*
+ * #606 (plan.md §10 decision 33): HYPE_RAM_POOL_MAX_CARVES used to be a hardcoded 64, which
+ * refused every 65th carve regardless of how much pool memory or how many cores the host had.
+ * Pinned here by the historical number, not the macro, so this test still means something once
+ * the macro's derivation changes again.
+ */
+static void test_65th_carve_no_longer_refused(void) {
+    hype_ram_pool_t p;
+    unsigned i;
+    uint64_t base = 0;
+    CHECK("today's derived bound comfortably exceeds the old hardcoded 64",
+          HYPE_RAM_POOL_MAX_CARVES > 64u);
+    init_ok(&p, 4096ull * MB);
+    for (i = 0; i < 65u; i++) {
+        CHECK("carve fits (including the 65th, once refused unconditionally)",
+              hype_ram_pool_carve(&p, MB, i, 0u, &base, 0) == HYPE_RAM_POOL_OK);
+    }
+    CHECK("65 carves were actually made", p.carve_count == 65u);
+}
+
 static void test_find_returns_a_vms_existing_carve(void) {
     hype_ram_pool_t p;
     uint64_t a = 0, b = 0;
@@ -202,6 +222,7 @@ int main(void) {
     test_exhaustion_reports_the_shortfall();
     test_zero_and_uninitialised_are_errors();
     test_carve_table_is_bounded();
+    test_65th_carve_no_longer_refused();
     test_find_returns_a_vms_existing_carve();
     test_range_ownership_is_checkable();
     test_optional_out_params_may_be_null();

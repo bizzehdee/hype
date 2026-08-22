@@ -722,6 +722,32 @@ static void test_too_many_vms(void) {
     CHECK_INT("the extra VM is reported, not dropped silently", 1, (int)out.skipped_vms);
 }
 
+/*
+ * #606 (plan.md §10 decision 33): HYPE_CFG_MAX_VMS used to be a hardcoded 16, which refused a
+ * 17th [vm.*] section on any host regardless of its real core count. Pinned to the literal 17,
+ * not the macro, so this test still proves the historical defect stays fixed even if the macro's
+ * derivation changes again.
+ */
+static void test_seventeenth_vm_now_parses_and_admits(void) {
+    char cfg[8192] = "";
+    char section[128];
+    int i;
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+
+    CHECK_INT("today's derived bound comfortably exceeds the old hardcoded 16", 1,
+              HYPE_CFG_MAX_VMS > 16 ? 1 : 0);
+    for (i = 0; i < 17; i++) {
+        snprintf(section, sizeof(section),
+                 "[vm.v%d]\nvcpus=1\nmem_mb=1\nboot=disk\ntarget_disk=file:x\nfirmware=uefi\nos_hint=none\n", i);
+        strncat(cfg, section, sizeof(cfg) - strlen(cfg) - 1);
+    }
+    res = parse_copy(cfg, &out);
+    CHECK_INT("a 17-VM config parses cleanly", HYPE_CFG_OK, res.status);
+    CHECK_INT("all 17 VMs are kept, none skipped as over capacity", 17, (int)out.vm_count);
+    CHECK_INT("none reported as skipped", 0, (int)out.skipped_vms);
+}
+
 static void test_net_peers_multiple_unique(void) {
     const char *cfg =
         "[vm.a]\n"
@@ -3149,6 +3175,7 @@ int main(void) {
     test_cmdline_write_back();
     test_error_cases();
     test_too_many_vms();
+    test_seventeenth_vm_now_parses_and_admits();
     test_value_too_long();
     test_vm_name_too_long();
     test_net_peers_multiple_unique();

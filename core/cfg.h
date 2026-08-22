@@ -2,6 +2,7 @@
 #define HYPE_CFG_H
 
 #include <stdint.h>
+#include "cpu_topology.h"
 #include "log_level.h"
 
 /*
@@ -37,7 +38,26 @@
  * internally well-formed and each VM's own fields are in-domain.
  */
 
-#define HYPE_CFG_MAX_VMS 16
+/*
+ * #606 (plan.md §10 decision 33): sized from decision 33's own reasoning, not an arbitrary
+ * constant, because the parser cannot truly "size from the machine at boot" the way per-VM
+ * runtime state does -- hype.cfg is only read POST-ExitBootServices (decision 37: Phase 1, through
+ * hype's own storage stack), by which point UEFI's AllocatePool is gone, so `vms_default` below
+ * has to be a fixed-size array chosen ahead of time, not a pool allocation sized by
+ * hype_cfg_count_vms()'s pre-pass (that pre-pass still runs -- see boot/main.c's load_hype_cfg()
+ * -- and reports a config that outgrows this array by name, never by silent truncation).
+ *
+ * Decision 33 itself gives the bound to pick: the dedicated tier admits at most
+ * (usable cores - 1) VMs, because the BSP keeps console/log duty. hype can never enumerate more
+ * usable cores than HYPE_CPU_TOPOLOGY_MAX (core/cpu_topology.h) -- that is the ceiling its own
+ * EFI_MP_SERVICES_PROTOCOL enumeration is built to hold -- so no config, on any host this build
+ * can run on, is ever admissible past HYPE_CPU_TOPOLOGY_MAX - 1 VMs regardless of how large the
+ * parser's own array is. Tying HYPE_CFG_MAX_VMS to that existing, already-real bound (rather than
+ * a second, independently-chosen number) is decision 33's "the only real bounds are physical"
+ * applied here: raising HYPE_CPU_TOPOLOGY_MAX in the future raises this automatically, and no
+ * config can be silently worse off than the topology hype can actually see.
+ */
+#define HYPE_CFG_MAX_VMS (HYPE_CPU_TOPOLOGY_MAX - 1u)
 /* Longer than NAME_MAX because a label is prose ("Windows 11 Workstation"), not an identifier. */
 #define HYPE_CFG_LABEL_MAX 64
 
@@ -65,8 +85,10 @@
  * HYPE_CFG_LINE_MAX cannot be retained verbatim, so it is treated as an overflow
  * (see retained_overflow) rather than silently truncated -- a truncated line
  * written back would corrupt the operator's file. */
-/* #222: named [disk.<id>] devices. 16 matches HYPE_CFG_MAX_VMS -- a one-disk-per-VM floor
- * with room for the mixed-bus multi-disk case §5.3 exists for. */
+/* #222: named [disk.<id>] devices. 16 was chosen to match HYPE_CFG_MAX_VMS back when that was
+ * also 16 (a one-disk-per-VM floor with room for the mixed-bus multi-disk case §5.3 exists for);
+ * #606 re-derived HYPE_CFG_MAX_VMS from decision 33's own reasoning, but this stayed independent
+ * -- one physical disk per VM is not a decision-33 physical bound the way core count is. */
 #define HYPE_CFG_MAX_DISKS 16
 
 /*
@@ -85,7 +107,28 @@
 #define HYPE_CFG_MAX_SWITCHES 8
 #define HYPE_CFG_MAX_VM_NICS 4
 
-#define HYPE_CFG_MAX_SECTIONS 32
+/*
+ * #606 (plan.md §10 decision 33): re-derived from HYPE_CFG_MAX_VMS, not left at its old
+ * independent 32.
+ *
+ * Parsing and admission (the property #606 is about) never consult section_count -- the [vm.*]
+ * handler in cfg.c increments vm_count unconditionally and only VOIDs add_section()'s result, so
+ * every VM up to HYPE_CFG_MAX_VMS parses and is admitted regardless of this constant. What DOES
+ * depend on it is write-back: past HYPE_CFG_MAX_SECTIONS total sections, `retained_overflow` is
+ * set and hype_cfg_serialize() must not be trusted (both already refuse cleanly, per their own doc
+ * comments, rather than corrupt the file) -- and a config using decision 33's newly-real VM count
+ * must still be the kind of config an operator can edit and save, not just boot once.
+ *
+ * The *2 keeps the SAME ratio this constant already had to HYPE_CFG_MAX_VMS before #606 (32 = 2 *
+ * the old 16) -- also the ratio HYPE_CFG_MAX_DISKS's own comment describes ("16 matches
+ * HYPE_CFG_MAX_VMS -- a one-disk-per-VM floor"): room for every VM's own section plus one more
+ * section each (a disk, a nic, ...), which is what "one-disk-per-VM" actually costs in section
+ * slots. Not a guarantee that HYPE_CFG_MAX_VMS VMs and HYPE_CFG_MAX_DISKS disks and
+ * HYPE_CFG_MAX_NICS nics and HYPE_CFG_MAX_SWITCHES switches all at once always fit -- that never
+ * held even before #606 (16+16+16+8+1 already exceeded the old 32) -- only that raising the VM
+ * ceiling does not shrink the non-VM headroom that ratio already implied.
+ */
+#define HYPE_CFG_MAX_SECTIONS (HYPE_CFG_MAX_VMS * 2u)
 /*
  * #567: 256, raised from 64, and the number is CHOSEN rather than doubled by reflex.
  *
