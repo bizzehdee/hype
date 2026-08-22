@@ -11708,6 +11708,17 @@ wait_for_sipi:
                 }
             }
         }
+        /*
+         * #641: set below instead of retiring the HLT immediately -- the AP twin of #580.
+         * Unconditionally calling vmm_wake_hlt() here (the old code) answered every AP halt
+         * with a wake no interrupt caused, so the guest's idle loop re-halted on its very next
+         * instruction: 187M HLT exits in 26 minutes on one AP, at 118k/s, starving the BSP of
+         * the shared device lock it needs for real work (TMRLATE showed 1.5-4.2s of timer
+         * lateness). The retire has to be coupled to an actual injection, decided once the
+         * epilogue below has drained this vCPU's timer/IPI/NMI sources -- exactly the BSP's
+         * `at_hlt`-gated shape, just applied here for the first time.
+         */
+        int ap_at_hlt = 0;
         if (vmm_reason_is_cpuid(kind, info.reason)) {
             vmm_handle_cpuid(kind, ctx);
         } else if (vmm_reason_is_cr_access(kind, info.reason)) {
@@ -11915,9 +11926,14 @@ wait_for_sipi:
                 g_ap_vcpu_unhandled[vm_idx][vi]++;
             }
         } else if (vmm_reason_is_hlt(kind, info.reason)) {
-            /* Idle until something is queued for this vCPU. SMP-5 puts cross-vCPU IPIs
-             * straight into its pending set, so the wake condition is that set. */
-            vmm_wake_hlt(kind, ctx);
+            /*
+             * #641: do NOT retire here. Whether this halt should wake is exactly what the
+             * epilogue below is about to determine by draining this vCPU's own interrupt
+             * sources (NMI, LAPIC timer, self-IPI, cross-vCPU IPI, and anything already
+             * deferred in pending_irr) -- retiring unconditionally, as this branch used to,
+             * answered every halt with a wake nothing caused.
+             */
+            ap_at_hlt = 1;
         } else if (vmm_reason_is_intr_window(kind, info.reason)) {
             vmm_handle_intr_window(kind, ctx, lapic);
         } else if (vmm_reason_is_intr(kind, info.reason)) {
@@ -12399,36 +12415,70 @@ wait_for_sipi:
          * an AP was generated and never injected. Together with the missing advance() above,
          * that left an AP which HLTs waiting on its LAPIC timer unable to ever wake: hype
          * resumed the HLT without delivering anything, 3.4M times.
+         *
+         * #641: `ap_hlt_if_set` gates whether the maskable sources below (timer/self-IPI/
+         * cross-vCPU IPI) are even DRAINED while ap_at_hlt is true. A HLT with IF=0 is a dead
+         * halt (#436) -- real hardware would not wake it for a maskable interrupt either, and
+         * draining these queues without delivering would just discard them, since there is no
+         * "put it back" once hype_guest_lapic_take_*() has popped it. NMI is unconditional
+         * (never gated by IF, matching hardware), and an already-staged EVENTINJ (a cross-core
+         * write straight into this vCPU's context, e.g. fw_1_route_ipi_from targeting it from
+         * another core) always retires regardless of IF for the same reason the BSP's #318
+         * comment gives.
          */
+        int ap_injected_something = 0;
+        int ap_hlt_if_set = 1;
+        int ap_hlt_eventinj_staged = 0;
+        if (ap_at_hlt) {
+            hype_vmm_intr_state_t ap_hs;
+            vmm_get_intr_state(kind, ctx, &ap_hs);
+            ap_hlt_if_set = (int)((ap_hs.rflags >> 9) & 1u);
+            ap_hlt_eventinj_staged = (int)((ap_hs.eventinj >> 31) & 1u);
+        }
         /* #484: an NMI pended for this vCPU by another core, delivered here on its own. */
         if (vm->nmi_pending[vi]) {
             vm->nmi_pending[vi] = 0u;
             (void)vmm_inject_nmi(kind, ctx);
+            ap_injected_something = 1;
         }
-        {
+        if (!ap_at_hlt || ap_hlt_if_set) {
             uint8_t ap_timer_vector;
             if (hype_guest_lapic_take_timer_irq(lapic, &ap_timer_vector)) {
                 vmm_request_interrupt(kind, ctx, lapic, ap_timer_vector);
                 g_ap_timer_injected[vm_idx][vi]++;
                 fw_1_timer_latency_note(vm_idx, vi, lapic, vm->host_tsc_hz);
+                ap_injected_something = 1;
+            }
+            /* Deliver anything queued for THIS vCPU -- its own LAPIC timer self-IPIs and the
+             * cross-vCPU IPIs SMP-5 routes here. */
+            {
+                uint8_t v;
+                while (hype_guest_lapic_take_self_ipi(lapic, &v)) {
+                    vmm_request_interrupt(kind, ctx, lapic, v);
+                    g_ap_ipi_drained[vm_idx][vi]++; /* #512 */
+                    ap_injected_something = 1;
+                }
+            }
+            {
+                hype_guest_lapic_ipi_t ipi;
+                while (hype_guest_lapic_take_ipi(lapic, &ipi)) {
+                    (void)fw_1_route_ipi_from(vm, vi, kind, &ipi, vm->used_root, 0u);
+                    ap_injected_something = 1;
+                }
+            }
+            if (vmm_deliver_pending_if_ready(kind, ctx, lapic)) {
+                ap_injected_something = 1;
             }
         }
-        /* Deliver anything queued for THIS vCPU -- its own LAPIC timer self-IPIs and the
-         * cross-vCPU IPIs SMP-5 routes here. */
-        {
-            uint8_t v;
-            while (hype_guest_lapic_take_self_ipi(lapic, &v)) {
-                vmm_request_interrupt(kind, ctx, lapic, v);
-                g_ap_ipi_drained[vm_idx][vi]++; /* #512 */
-            }
+        /*
+         * #641: THE RETIRE, coupled to whatever actually got injected above -- the AP twin of
+         * #580's BSP fix. Nothing injected and no pre-existing EVENTINJ means genuinely nothing
+         * to wake for, so the halt is left un-retired and this vCPU re-enters the SAME HLT next
+         * iteration, exactly like the BSP's "fall through and keep re-halting" path.
+         */
+        if (ap_at_hlt && (ap_injected_something || ap_hlt_eventinj_staged)) {
+            vmm_wake_hlt(kind, ctx);
         }
-        {
-            hype_guest_lapic_ipi_t ipi;
-            while (hype_guest_lapic_take_ipi(lapic, &ipi)) {
-                (void)fw_1_route_ipi_from(vm, vi, kind, &ipi, vm->used_root, 0u);
-            }
-        }
-        (void)vmm_deliver_pending_if_ready(kind, ctx, lapic);
     }
     if (ap_locked) { /* #484: only unlock if this AP actually holds it */
         fw_1_dev_unlock(vm);
