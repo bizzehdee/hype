@@ -2055,25 +2055,45 @@ static int file_rw_at(hype_exfat_wfile_t *f, uint64_t offset, uint8_t *rbuf, con
         if (n > len) {
             n = len;
         }
-        if (!writing) {
+        if (bis == 0u && n >= SECSZ) {
+            /*
+             * #649: bulk full sectors, bounded by this cluster -- the same
+             * coalescing core/fat_write_fs.c's span_io does for FAT32
+             * (#374). A read transfers straight into the caller's buffer;
+             * a write transfers straight out of it. Only the ragged head/
+             * tail below bounces through a single sector.
+             */
+            unsigned int sectors = len / SECSZ;
+            unsigned int in_cluster = fs->spc - sic;
+            if (sectors > in_cluster) {
+                sectors = in_cluster;
+            }
+            n = sectors * SECSZ;
+            if (!writing) {
+                if (fs->read(fs->ctx, lba, sectors, rbuf) != 0) {
+                    return -1;
+                }
+                rbuf += n;
+            } else {
+                if (fs->write(fs->ctx, lba, sectors, wbuf) != 0) {
+                    return -1;
+                }
+                wbuf += n;
+            }
+        } else if (!writing) {
             uint8_t sec[SECSZ];
             if (fs->read(fs->ctx, lba, 1u, sec) != 0) {
                 return -1;
             }
             bcopy(rbuf, sec + bis, n);
             rbuf += n;
-        } else if (bis != 0u || n < SECSZ) {
+        } else {
             uint8_t sec[SECSZ];
             if (fs->read(fs->ctx, lba, 1u, sec) != 0) {
                 return -1;
             }
             bcopy(sec + bis, wbuf, n);
             if (fs->write(fs->ctx, lba, 1u, sec) != 0) {
-                return -1;
-            }
-            wbuf += n;
-        } else {
-            if (fs->write(fs->ctx, lba, 1u, wbuf) != 0) {
                 return -1;
             }
             wbuf += n;
@@ -2461,8 +2481,30 @@ int hype_exfat_append(hype_exfat_wfile_t *f, const void *data, unsigned int len)
             if (fs->write(fs->ctx, lba, 1u, sec) != 0) {
                 return -1;
             }
-        } else if (fs->write(fs->ctx, lba, 1u, src) != 0) {
-            return -1;
+        } else {
+            /*
+             * #649: the block callbacks accept a sector count, and the USB
+             * backend can transfer up to 64 KiB per command -- sending every
+             * full sector separately forced one command per 512 bytes.
+             * Coalesce the contiguous full sectors left in THIS cluster,
+             * mirroring core/fat_write_fs.c's hype_fat32_append exactly. The
+             * outer while loop still returns to the top -- via `within == 0u`
+             * above -- once this cluster is exhausted, so the next cluster's
+             * FAT link is allocated and committed before any data write can
+             * reach it.
+             */
+            unsigned int sectors = len / SECSZ;
+            unsigned int in_cluster = fs->spc - sic;
+            if (sectors > in_cluster) {
+                sectors = in_cluster;
+            }
+            if (sectors == 0u) {
+                sectors = 1u;
+            }
+            n = sectors * SECSZ;
+            if (fs->write(fs->ctx, lba, sectors, src) != 0) {
+                return -1;
+            }
         }
         src += n;
         len -= n;

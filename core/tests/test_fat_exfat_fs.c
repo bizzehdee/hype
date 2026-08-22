@@ -97,6 +97,14 @@ static long g_lba_reads_seen;
 
 /* #651: total vol_read invocations, for the directory-cursor call-count tests. */
 static unsigned int g_read_calls;
+/* #649: the largest single sector count any one vol_read call carried. */
+static unsigned int g_max_read_count;
+/* #649: when set, every vol_write call's LBA is appended to g_order_log --
+ * used to prove a FAT-link write commits before data reaches the cluster it
+ * names. */
+static int g_log_writes;
+static uint64_t g_order_log[64];
+static unsigned int g_order_log_count;
 
 static int vol_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
     (void)ctx;
@@ -108,6 +116,7 @@ static int vol_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
         return -1;
     }
     g_read_calls++;
+    if (count > g_max_read_count) g_max_read_count = count;
     if (g_stale_reads && count == 1u) {
         if (lba == FAT_LBA) {
             memcpy(dst, g_stale_fat_sector, SECSZ);
@@ -121,6 +130,11 @@ static int vol_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
     memcpy(dst, g_vol + lba * SECSZ, (size_t)count * SECSZ);
     return 0;
 }
+/* #649: total vol_write calls and the largest single sector count any one of
+ * them carried, for the coalescing tests. */
+static unsigned int g_write_calls;
+static unsigned int g_max_write_count;
+
 static int vol_write(void *ctx, uint64_t lba, uint32_t count, const void *src) {
     (void)ctx;
     if (lba + count > VOL_SECTORS) return -1;
@@ -129,6 +143,11 @@ static int vol_write(void *ctx, uint64_t lba, uint32_t count, const void *src) {
     if (g_dir_writes_allowed >= 0 && lba == g_dir_write_lba) {
         if (g_dir_writes_seen >= g_dir_writes_allowed) return -1;
         g_dir_writes_seen++;
+    }
+    g_write_calls++;
+    if (count > g_max_write_count) g_max_write_count = count;
+    if (g_log_writes && g_order_log_count < (sizeof g_order_log / sizeof g_order_log[0])) {
+        g_order_log[g_order_log_count++] = lba;
     }
     memcpy(g_vol + lba * SECSZ, src, (size_t)count * SECSZ);
     return 0;
@@ -2875,7 +2894,204 @@ static void test_exfat_dir_find_slots_cursor_survives_growth(void) {
     }
 }
 
+/*
+ * #649: a dedicated spc == 8 (4 KiB cluster) volume for the sector-coalescing
+ * tests. The shared build_vol() fixture is spc == 1 throughout -- its
+ * cluster()/clba() helpers hardcode that (see their own comments) -- so
+ * coalescing across several sectors of ONE cluster needs its own small,
+ * self-contained geometry instead of stretching those shared assumptions.
+ */
+#define COAL_SPC_SHIFT 3u
+#define COAL_SPC 8u
+#define COAL_FAT_LBA 24u
+#define COAL_FAT_LEN 4u
+#define COAL_HEAP_LBA 32u
+#define COAL_BITMAP_CL 2u
+#define COAL_UPCASE_CL 3u
+#define COAL_ROOT_CL 4u
+#define COAL_CLUSTERS 8u /* valid clusters 2..9: bitmap, up-case, root, + up to 5 data clusters */
+
+static uint64_t coal_clba(uint32_t cl) {
+    return COAL_HEAP_LBA + (uint64_t)(cl - 2u) * COAL_SPC;
+}
+static uint8_t *coal_cluster(uint32_t cl) { return g_vol + coal_clba(cl) * SECSZ; }
+static uint8_t *coal_fat_ent(uint32_t cl) { return g_vol + COAL_FAT_LBA * SECSZ + cl * 4u; }
+
+static void build_vol_coalesce(void) {
+    uint8_t table[512];
+    unsigned tlen;
+
+    memset(g_vol, 0, sizeof g_vol);
+    g_vol[3] = 'E'; g_vol[4] = 'X'; g_vol[5] = 'F'; g_vol[6] = 'A'; g_vol[7] = 'T';
+    g_vol[8] = ' '; g_vol[9] = ' '; g_vol[10] = ' ';
+    put64(g_vol + 0x48, (uint64_t)COAL_HEAP_LBA + (uint64_t)COAL_CLUSTERS * COAL_SPC);
+    put32(g_vol + 0x50, COAL_FAT_LBA);
+    put32(g_vol + 0x54, COAL_FAT_LEN);
+    put32(g_vol + 0x58, COAL_HEAP_LBA);
+    put32(g_vol + 0x5C, COAL_CLUSTERS);
+    put32(g_vol + 0x60, COAL_ROOT_CL);
+    g_vol[0x6C] = 9u;
+    g_vol[0x6D] = COAL_SPC_SHIFT;
+    g_vol[0x6E] = 1u;
+    put16(g_vol + 0x1FE, 0xAA55u);
+
+    put32(coal_fat_ent(0), 0xFFFFFFF8u);
+    put32(coal_fat_ent(1), 0xFFFFFFFFu);
+    put32(coal_fat_ent(COAL_BITMAP_CL), 0xFFFFFFFFu);
+    put32(coal_fat_ent(COAL_UPCASE_CL), 0xFFFFFFFFu);
+    put32(coal_fat_ent(COAL_ROOT_CL), 0xFFFFFFFFu);
+
+    /* One byte of bitmap covers 8 clusters; clusters 2, 3, 4 (bitmap, up-case,
+     * root) start out used. */
+    coal_cluster(COAL_BITMAP_CL)[0] = 0x07u;
+
+    tlen = build_upcase_table(table);
+    memcpy(coal_cluster(COAL_UPCASE_CL), table, tlen);
+
+    {
+        uint8_t *root = coal_cluster(COAL_ROOT_CL);
+        uint8_t *label = root;
+        uint8_t *bmp = root + 32;
+        uint8_t *upc = root + 64;
+        label[0] = HYPE_EXFAT_ENT_LABEL;
+        label[1] = 4u;
+        put16(label + 2, 'T'); put16(label + 4, 'E'); put16(label + 6, 'S'); put16(label + 8, 'T');
+        bmp[0] = HYPE_EXFAT_ENT_BITMAP;
+        put32(bmp + 20, COAL_BITMAP_CL);
+        put64(bmp + 24, 1u);
+        upc[0] = HYPE_EXFAT_ENT_UPCASE;
+        put32(upc + 4, ref_table_checksum(table, tlen));
+        put32(upc + 20, COAL_UPCASE_CL);
+        put64(upc + 24, tlen);
+    }
+}
+
+/*
+ * #649 acceptance criterion 5: an append of exactly one cluster's worth of
+ * data on an spc == 8 volume must reach the block backend as ONE transfer
+ * covering all 8 sectors, not eight separate 512-byte ones. Mirrors
+ * core/tests/test_fat_write_fs.c's test_append_coalesces_contiguous_sectors.
+ */
+static void test_exfat_append_coalesces_contiguous_sectors(void) {
+    hype_exfat_wfile_t f;
+    static uint8_t data[COAL_SPC * SECSZ];
+    unsigned i;
+
+    for (i = 0; i < sizeof data; i++) data[i] = pat(i);
+
+    build_vol_coalesce();
+    CHECK_HEX("mount coalescing volume", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("create coalescing file", 0, hype_exfat_create(&g_fs, "coal.bin", &f));
+
+    g_max_write_count = 0u;
+    CHECK_HEX("append one cluster's worth of data", 0,
+              hype_exfat_append(&f, data, (unsigned)sizeof data));
+    CHECK_HEX("one backend transfer covers all data sectors, not one per sector", COAL_SPC,
+              g_max_write_count);
+}
+
+/* #649 criterion 5, hype_exfat_write_at's in-place path. */
+static void test_exfat_write_at_coalesces_contiguous_sectors(void) {
+    hype_exfat_wfile_t f;
+    static uint8_t data[COAL_SPC * SECSZ];
+    static uint8_t back[COAL_SPC * SECSZ];
+    unsigned i;
+
+    for (i = 0; i < sizeof data; i++) data[i] = pat(i);
+
+    build_vol_coalesce();
+    CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("create ok", 0, hype_exfat_create(&g_fs, "coal2.bin", &f));
+    CHECK_HEX("seed the allocation via append", 0,
+              hype_exfat_append(&f, data, (unsigned)sizeof data));
+
+    for (i = 0; i < sizeof data; i++) data[i] = pat(i + 100u);
+    g_max_write_count = 0u;
+    CHECK_HEX("in-place write of one whole cluster", 0,
+              hype_exfat_write_at(&f, 0, data, (unsigned)sizeof data));
+    CHECK_HEX("one backend transfer covers the whole in-place write", COAL_SPC,
+              g_max_write_count);
+
+    CHECK_HEX("read back ok", 0, hype_exfat_read_at(&f, 0, back, (unsigned)sizeof back));
+    CHECK_HEX("data round-trips byte-exact", 0, memcmp(data, back, sizeof data));
+}
+
+/* #649 criterion 5, hype_exfat_read_at. */
+static void test_exfat_read_at_coalesces_contiguous_sectors(void) {
+    hype_exfat_wfile_t f;
+    static uint8_t data[COAL_SPC * SECSZ];
+    static uint8_t back[COAL_SPC * SECSZ];
+    unsigned i;
+
+    for (i = 0; i < sizeof data; i++) data[i] = pat(i);
+
+    build_vol_coalesce();
+    CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("create ok", 0, hype_exfat_create(&g_fs, "coal3.bin", &f));
+    CHECK_HEX("seed the allocation via append", 0,
+              hype_exfat_append(&f, data, (unsigned)sizeof data));
+
+    g_max_read_count = 0u;
+    CHECK_HEX("read one whole cluster", 0,
+              hype_exfat_read_at(&f, 0, back, (unsigned)sizeof back));
+    CHECK_HEX("one backend transfer covers the whole read, not one per sector", COAL_SPC,
+              g_max_read_count);
+    CHECK_HEX("data byte-exact", 0, memcmp(data, back, sizeof data));
+}
+
+/*
+ * #649 acceptance criterion 4: coalescing full sectors within a cluster must
+ * not disturb the ordering a growing append relies on -- a cluster boundary
+ * still returns to the allocation logic, so the new cluster's FAT link
+ * commits before any data write can reach it.
+ */
+static void test_exfat_append_orders_fat_link_before_new_cluster_data(void) {
+    hype_exfat_wfile_t f;
+    static uint8_t data1[COAL_SPC * SECSZ - 100u];
+    static uint8_t data2[500];
+    unsigned i;
+    uint64_t cluster2_lba;
+    unsigned fat_idx = (unsigned)-1, data_idx = (unsigned)-1;
+
+    for (i = 0; i < sizeof data1; i++) data1[i] = pat(i);
+    for (i = 0; i < sizeof data2; i++) data2[i] = pat(i + 50u);
+
+    build_vol_coalesce();
+    CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("create ok", 0, hype_exfat_create(&g_fs, "order.bin", &f));
+    CHECK_HEX("fill the first data cluster short of full", 0,
+              hype_exfat_append(&f, data1, (unsigned)sizeof data1));
+    CHECK_HEX("first data cluster is the one right after bitmap/up-case/root",
+              COAL_ROOT_CL + 1u, f.first_cluster);
+
+    g_order_log_count = 0u;
+    g_log_writes = 1;
+    CHECK_HEX("append crossing into a new cluster", 0,
+              hype_exfat_append(&f, data2, (unsigned)sizeof data2));
+    g_log_writes = 0;
+
+    cluster2_lba = coal_clba(COAL_ROOT_CL + 2u);
+    for (i = 0; i < g_order_log_count; i++) {
+        if (fat_idx == (unsigned)-1 && g_order_log[i] >= COAL_FAT_LBA &&
+            g_order_log[i] < COAL_FAT_LBA + COAL_FAT_LEN) {
+            fat_idx = i;
+        }
+        if (data_idx == (unsigned)-1 && g_order_log[i] >= cluster2_lba &&
+            g_order_log[i] < cluster2_lba + COAL_SPC) {
+            data_idx = i;
+        }
+    }
+    CHECK("a FAT-sector write happened during the crossing append", fat_idx != (unsigned)-1);
+    CHECK("a data write into the new cluster happened", data_idx != (unsigned)-1);
+    CHECK_HEX("the FAT link commits before data reaches the new cluster", 1u,
+              (unsigned)(fat_idx < data_idx));
+}
+
 int main(void) {
+    test_exfat_append_coalesces_contiguous_sectors();              /* #649 */
+    test_exfat_write_at_coalesces_contiguous_sectors();            /* #649 */
+    test_exfat_read_at_coalesces_contiguous_sectors();             /* #649 */
+    test_exfat_append_orders_fat_link_before_new_cluster_data();   /* #649 */
     test_exfat_lookup_directory_cursor_scales_linearly();          /* #651 */
     test_exfat_dir_find_slots_cursor_survives_growth();            /* #651 */
     test_rollback_never_frees_under_a_published_larger_size(); /* #517 */
