@@ -4399,6 +4399,16 @@ static int vmm_reason_is_npf(hype_vmm_kind_t kind, uint64_t reason) {
     return kind == HYPE_VMM_KIND_VMX ? (reason == HYPE_VMX_EXIT_REASON_EPT_VIOLATION)
                                      : (reason == HYPE_SVM_EXITCODE_NPF);
 }
+/*
+ * #676: an architectural SHUTDOWN (triple fault) is unrecoverable by re-entry -- there is no
+ * guest state re-VMRUN could fix, unlike an unimplemented port/MSR the guest might route around.
+ * Named so both the BSP idle-check (which already special-cases SVM's 0x7f, see #538) and the AP
+ * dispatch loop can recognise it on either VMM kind instead of only SVM's numeric code.
+ */
+static int vmm_reason_is_shutdown(hype_vmm_kind_t kind, uint64_t reason) {
+    return kind == HYPE_VMM_KIND_VMX ? (reason == HYPE_VMX_EXIT_REASON_TRIPLE_FAULT)
+                                     : (reason == HYPE_SVM_EXITCODE_SHUTDOWN);
+}
 /* #457: the FW-1-grade variant -- takes fetched instruction bytes because a live guest's RIP is
  * not a host pointer (the handlers above are the M4-3 identity-map microtest's). */
 static int vmm_handle_pflash_npf_insn(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_pflash_t *pf,
@@ -5283,7 +5293,13 @@ static void fw_1_dev_unlock(hype_fw_vm_t *vm) {
  * Returning is already a supported outcome: run_fw_1_test() returns on the booted-and-idle path
  * too, and its caller parks the core (cli;hlt). A stopped VM's dedicated core stops with it.
  */
-static void fw_1_guest_fault_stop(hype_fw_vm_t *vm, const char *what) {
+/*
+ * #676: the lock-agnostic half of the stop -- lifecycle flip, verdict log, and forcing the GOP
+ * flush. Split out so an AP-hosted vCPU (which holds the shared device lock only conditionally,
+ * per #484's ap_locked) can reach the same verdict and lifecycle change without the unconditional
+ * fw_1_dev_unlock() below, which would release a lock this core might not hold.
+ */
+static void fw_1_mark_vm_stopped(hype_fw_vm_t *vm, const char *what) {
     unsigned vi = (unsigned)(vm - g_vms);
     const char *who = (vm->label != 0 && vm->label[0] != '\0')
                           ? vm->label
@@ -5296,11 +5312,14 @@ static void fw_1_guest_fault_stop(hype_fw_vm_t *vm, const char *what) {
               vi, who, what,
               vm->kernel_boot ? "Restart it from the terminal to re-read its kernel image."
                               : "Restart it from the terminal to boot it again.");
-    fw_1_dev_unlock(vm);
     /* The give-up diagnostics and this verdict must reach the screen, not sit in the deferred
      * GOP buffer -- on a serial-less host that screen is the only channel there is. */
     hype_debug_set_gop_deferred(0);
     hype_debug_flush_gop();
+}
+static void fw_1_guest_fault_stop(hype_fw_vm_t *vm, const char *what) {
+    fw_1_mark_vm_stopped(vm, what);
+    fw_1_dev_unlock(vm);
 }
 
 /* SMP-6: set by an AP vCPU loop while it owns its vCPU; read by the BSP's INIT/SIPI path. */
@@ -12340,6 +12359,24 @@ wait_for_sipi:
             }
             vmm_reinject_exception(kind, ctx, (uint8_t)vec, has_ec,
                                    has_ec ? vmm_exception_error_code(kind, ctx, &info) : 0u);
+        } else if (vmm_reason_is_shutdown(kind, info.reason)) {
+            /*
+             * #676: an architectural SHUTDOWN (triple fault) is not something re-entering VMRUN
+             * can recover from -- unlike the unhandled-exit branch below, which at least gives
+             * the guest another instruction to try, looping here just re-runs the same dead
+             * VMCB/VMCS forever, freezing this physical core. The BSP already has an equivalent
+             * (fw_1_guest_fault_stop, driven off its own exit-budget check); this is that stop
+             * for an AP-hosted vCPU, which must NOT call fw_1_guest_fault_stop directly since
+             * that unconditionally drops the shared device lock and this core may not hold it
+             * (#484's ap_locked tracks that per-core, not per-VM).
+             */
+            HYPE_LOGF(HYPE_LOG_ERROR,
+                      "fw-1 vm%u vCPU %u: architectural SHUTDOWN (triple fault) at rip 0x%llx "
+                      "-- stopping this VM, not re-entering [#676]\n",
+                      vm_idx, vi, (unsigned long long)info.guest_rip);
+            fw_1_mark_vm_stopped(vm, "an AP-hosted vCPU took an architectural SHUTDOWN (triple "
+                                     "fault)");
+            break;
         } else {
             if (g_ap_vcpu_unhandled[vm_idx][vi] < 8ull) {
                 /* SVM EXITINFO1 for an IOIO exit carries the port in [31:16] and the
@@ -14448,6 +14485,25 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                  (unsigned long long)info.guest_rip);
             }
             prev_cost_bucket = 8;
+        } else if (vmm_reason_is_shutdown(kind, info.reason)) {
+            /*
+             * #676: this BSP path's only other safety net is the HYPE_FW_1_MAX_EXITS budget
+             * check further down (fw_1_guest_fault_stop(vm, "...exit budget")) -- 200,000,000
+             * exits. A guest that re-triple-faults on every VMRUN never advances past SHUTDOWN,
+             * so that budget is not a bound in wall-clock terms, it is close to never: measured
+             * under this same suite (tests/micro/suite-603.cfg's vmexit probe, which ends every
+             * run with a deliberate triple fault) the loop was still spinning tens of thousands
+             * of exits and many seconds in with no end in sight. SHUTDOWN is architecturally
+             * unrecoverable by re-entry -- there is no guest state left for another VMRUN to act
+             * on -- so, like the AP-hosted equivalent above, stop immediately rather than wait
+             * for a budget that in practice never arrives.
+             */
+            HYPE_LOGF(HYPE_LOG_ERROR,
+                      "fw-1 vm%u: architectural SHUTDOWN (triple fault) at rip 0x%llx -- "
+                      "stopping this VM, not re-entering [#676]\n",
+                      (unsigned)(vm - g_vms), (unsigned long long)info.guest_rip);
+            fw_1_guest_fault_stop(vm, "its guest took an architectural SHUTDOWN (triple fault)");
+            return;
         } else {
             ex_other++;
             prev_cost_bucket = 8;
