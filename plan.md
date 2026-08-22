@@ -3056,6 +3056,43 @@ isn't lost.
     already left UEFI's boot services by the time USB enumeration runs (#447's own comment),
     so no firmware boot-device handle survives to consult.
 
+61. **A boot's log survives the next boot -- bounded generation rotation, not truncation --
+    decided (2026-08-22).** Several validation protocols need two consecutive boots compared
+    against each other (a marker written on boot 1, read back on boot 2: #119/#120/#178, #211,
+    #600). `HYPE.LOG` and every per-VM log were truncated at each boot, so boot 1's own evidence
+    -- whether it wrote the marker, what its own diagnostics said -- was gone by the time boot 2's
+    log could be read, with nothing in the surviving log even saying a prior one existed.
+
+    **Decided.** `sink_start()` (`core/log_sink.c`) rotates existing generations of a filename up
+    by one (oldest evicted) immediately before creating a fresh file, for every sink this
+    function serves -- `\HYPE.LOG` and every per-VM log alike, since both funnel through the same
+    function. Four generations are kept (`HYPE_LOG_SINK_MAX_GENERATIONS`): not unbounded growth,
+    a small fixed window is what the two-boot protocol needs. `HYPE.LOG` -> `HYPE.1.LOG` ->
+    `HYPE.2.LOG` -> ... -> evicted past 4, matching FAT32/exFAT naming so a directory listing
+    still groups a log's generations visually. The rotation runs inside `sink_start()`, under the
+    same #239/decision-57 guard its own `hype_fs_create()` call already requires -- a rename is a
+    filesystem mutation exactly like the create it precedes.
+
+    A small persisted counter (`HYPE.BOOTCOUNT`, plain decimal text, read-increment-written back
+    on the SAME volume the log lives on) gives each boot a monotonic number, printed as `fw-1:
+    boot #N on this volume [#643]` immediately after the sink opens -- as close to "this
+    generation's first line" as hype's actual boot order allows (the true first buffered line,
+    the build banner from TSC=0, is flushed a few lines earlier in the same initial batch). Two
+    logs pulled off one stick can now be ordered correctly without trusting FAT timestamps, which
+    a battery-less RTC or a host's own copy tooling may not have preserved (#556).
+
+    QEMU rig `tools/643/run-643-qemu.sh`: boots the SAME media twice without wiping it between
+    boots. Verdict: both `HYPE.LOG` (boot 2) and `HYPE.1.LOG` (boot 1, rotated not truncated)
+    exist afterward, their boot-counter lines read 1 and 2 respectively, and boot 1's actual
+    content (not just its banner) is intact in `HYPE.1.LOG`.
+
+    **Alternatives considered.** (i) Unbounded per-boot filenames (timestamp- or counter-named
+    logs, never overwritten) -- rejected: the volume is finite and #596's writer is the
+    constrained, single-owner path; an operator who leaves a stick running for weeks would fill
+    it. (ii) A separate "previous boot" marker file instead of true rotation -- rejected: only
+    preserves one prior boot, and the two-boot validation protocol sometimes needs to look back
+    further (a soak run followed by two short re-checks, for instance).
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what

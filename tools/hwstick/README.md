@@ -91,8 +91,13 @@ media, one from its own disk) plus the microtest suite. Each guest gets one phys
 1. Boot the laptop from this stick (Secure Boot off).
 2. Let it run **at least 12 minutes**. Ten of those are a deliberate `delay` in vm1's script that
    banks #527's window before the reboot arm fires; a shorter run loses #525 and weakens #527.
-3. Power off. **Copy `HYPE.LOG`, `VM0.LOG` and `VM1.LOG` off the stick, or rename them** — boot 2
-   overwrites them.
+3. Power off. **Copying logs off between boots is no longer required** (#643): each boot rotates
+   the previous one's `HYPE.LOG`/`VM0.LOG`/`VM1.LOG` to a `.1` generation (`HYPE.1.LOG`, and so on)
+   instead of truncating it, keeping the **last 4 boots'** worth of history per name before the
+   oldest is evicted. Copy logs off only when you need more than 4 boots of history preserved, or
+   want them off the stick for archiving. Each log's first line after the build banner reads
+   `fw-1: boot #N on this volume` — a monotonic counter that survives across boots, so two logs
+   pulled off the same stick can always be ordered correctly without trusting FAT timestamps.
 
 **Boot 2 (about 1 minute, optional)** — the suite alone, one VM. Use it when the Alpine guests are
 not the point, e.g. re-checking #557 after a fix.

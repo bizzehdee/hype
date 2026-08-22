@@ -23201,6 +23201,43 @@ static void fw_1_read_run_state(void) {
 /* #638: returns 1 if this backend was accepted as hype's log volume, 0 otherwise -- so a
  * caller sweeping several MSCs (the boot ESP is not always the first one found) knows to keep
  * trying the next candidate rather than assuming the very first stick took the role. */
+/*
+ * #643: a small persisted counter, monotonic across boots, so two logs on a drive can be
+ * ordered without relying on FAT timestamps (which the operator's own host may not preserve
+ * on copy, and which a battery-less RTC never had right in the first place -- #556). Lives on
+ * the SAME volume as the log sink -- by #638, that is always the volume hype booted from --
+ * read once per boot and written back immediately, before this boot's first #643 line.
+ * Best-effort: a read/write failure just returns 0 (unknown), same shape as every other
+ * best-effort persistence path in this file (#441's VARS save/restore).
+ */
+static unsigned long long fw_1_boot_counter_next(hype_fs_t *fs) {
+    static const char path[] = "HYPE.BOOTCOUNT";
+    hype_fs_file_t f;
+    char b[24];
+    unsigned int n, i;
+    unsigned long long v = 0ull;
+    int len;
+    if (hype_fs_lookup(fs, path, &f) == 0) {
+        n = (f.size < (uint64_t)(sizeof(b) - 1u)) ? (unsigned int)f.size
+                                                   : (unsigned int)(sizeof(b) - 1u);
+        if (n != 0u && hype_fs_read_at(&f, 0, b, n) == 0) {
+            for (i = 0; i < n; i++) {
+                if (b[i] >= '0' && b[i] <= '9') {
+                    v = v * 10ull + (unsigned long long)(b[i] - '0');
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    v++;
+    len = hype_snprintf(b, sizeof(b), "%llu\n", v);
+    if (len > 0 && hype_fs_create(fs, path, &f) == 0) {
+        (void)hype_fs_append(&f, b, (unsigned int)len);
+    }
+    return v;
+}
+
 static int usb_log_setup(const hype_blk_backend_t *be) {
     uint64_t bases[8];
     unsigned int nb = 0, i;
@@ -23265,9 +23302,16 @@ static int usb_log_setup(const hype_blk_backend_t *be) {
             &g_hype_log, usblog_read, usblog_write, usblog_sync, &g_usb_log_ctx, "HYPE.LOG",
             g_host_time_valid ? &g_host_time : 0, HYPE_LOG_SINK_HYPE);
         if (rc == HYPE_LOG_SINK_OK) {
+            unsigned long long boot_n;
             g_hype_log_ready = 1;
             g_usb_log_ready = 1; /* "a log sink is up", the gate the flush path uses */
             hype_fatal_set_flush_hook(usb_log_fatal_flush); /* #513: a panic must reach the stick */
+            /* #643: as close to this generation's first line as the boot order allows -- the
+             * flush a few lines up already carried anything buffered since TSC=0 (the build
+             * banner among it), and this is the very next thing printed. Two logs pulled off
+             * the same stick can now be ordered by this number alone. */
+            boot_n = fw_1_boot_counter_next(&g_hype_log.fs);
+            hype_debug_print("fw-1: boot #%llu on this volume [#643]\n", boot_n);
             hype_debug_print("usb-log: \\HYPE.LOG + per-VM logs on FAT32 at disk LBA %llu; "
                              "\\HYPEFULL.LOG is retired -- merge the split files by their "
                              "[offset] prefix to recover the combined stream [#338]\n",

@@ -1,9 +1,66 @@
 #include "log_sink.h"
 #include "log_split.h"
 #include "logbuf.h"
+#include "format.h"
 
 void hype_log_sink_set_ordered(hype_log_sink_t *s, int ordered) {
     if (s != 0) s->ordered = ordered;
+}
+
+/*
+ * #643: HYPE.LOG (and every per-VM log) was truncated at each boot. Several validation
+ * protocols need two consecutive boots compared against each other -- a marker written on
+ * boot 1, read back on boot 2 -- and a truncating sink destroys boot 1's own evidence with
+ * nothing in the surviving log saying so. Keep a small bounded window of prior boots instead:
+ * not unbounded growth, the volume is finite and this is #596's writer, the constrained path.
+ */
+#define HYPE_LOG_SINK_MAX_GENERATIONS 4u
+
+/* "HYPE.LOG" -> "HYPE.<gen>.LOG": the generation number goes before the final extension, not
+ * appended after it, so a directory listing still groups a log's generations by name and an
+ * operator can tell HYPE.1.LOG is an older HYPE.LOG at a glance. A name with no extension just
+ * gets the suffix appended. */
+static void gen_filename(char *out, unsigned out_sz, const char *filename, unsigned gen) {
+    const char *dot = 0;
+    const char *p;
+    unsigned prefix_len;
+    char prefix[40];
+    for (p = filename; *p != '\0'; p++) {
+        if (*p == '.') dot = p;
+    }
+    if (dot == 0) {
+        hype_snprintf(out, out_sz, "%s.%u", filename, gen);
+        return;
+    }
+    prefix_len = (unsigned)(dot - filename);
+    if (prefix_len >= sizeof(prefix)) prefix_len = sizeof(prefix) - 1u;
+    for (p = filename; (unsigned)(p - filename) < prefix_len; p++) {
+        prefix[p - filename] = *p;
+    }
+    prefix[prefix_len] = '\0';
+    hype_snprintf(out, out_sz, "%s.%u%s", prefix, gen, dot);
+}
+
+/*
+ * Shift existing generations up by one and evict the oldest, so the about-to-be-created
+ * `filename` never destroys what a prior boot wrote. Processed from the oldest slot down to
+ * the newest: hype_fat32_rename() (and exFAT's equivalent) never replaces an existing
+ * destination, so each rename's target must already be vacant -- evicting the oldest first,
+ * then working downward, guarantees that by construction. A missing source at any step
+ * fails harmlessly (there simply aren't that many prior boots yet) and rotation continues.
+ */
+static void rotate_generations(hype_fs_t *fs, const char *filename) {
+    char from[48], to[48];
+    unsigned gen;
+    gen_filename(to, sizeof(to), filename, HYPE_LOG_SINK_MAX_GENERATIONS);
+    (void)hype_fs_unlink(fs, to);
+    for (gen = HYPE_LOG_SINK_MAX_GENERATIONS - 1u; gen >= 1u; gen--) {
+        gen_filename(from, sizeof(from), filename, gen);
+        gen_filename(to, sizeof(to), filename, gen + 1u);
+        (void)hype_fs_rename(fs, from, to);
+    }
+    gen_filename(to, sizeof(to), filename, 1u);
+    (void)hype_fs_rename(fs, filename, to);
 }
 
 /* "[00012345] " -- fixed width so the files sort lexically as well as numerically,
@@ -50,6 +107,11 @@ static int sink_start(hype_log_sink_t *s, hype_fs_t *fs, const char *filename,
     /* Before create(), so the new file's directory entry carries a real date
      * rather than the zeroes that made hype's log show as the Unix epoch. */
     hype_fs_set_time(fs, now);
+    /* #643: age out any prior boot's log under this name before creating a fresh one, so a
+     * two-boot validation protocol has both boots' evidence to read. Runs under the same
+     * caller-held guard as create() itself -- a rename is a filesystem mutation exactly like
+     * the append it precedes (decision 57). */
+    rotate_generations(fs, filename);
     if (hype_fs_create(fs, filename, &s->file) != 0) return HYPE_LOG_SINK_ERR_CREATE;
     s->active = 1;
     if (hype_log_sink_flush(s) != 0) {
