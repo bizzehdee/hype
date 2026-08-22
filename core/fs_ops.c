@@ -351,6 +351,9 @@ static int exfat_sync(hype_fs_t *fs) {
 static void exfat_set_time(hype_fs_t *fs, const hype_rtc_time_t *now) {
     hype_exfat_fs_set_time(&fs->u.exfat, now);
 }
+static void exfat_set_barrier(hype_fs_t *fs, hype_blk_sync_fn sync) {
+    hype_exfat_fs_set_sync(&fs->u.exfat, sync);
+}
 
 static const hype_fs_ops_t exfat_ops = {
     "exfat",
@@ -370,7 +373,7 @@ static const hype_fs_ops_t exfat_ops = {
     exfat_rename,
     exfat_sync,
     exfat_set_time,
-    0, /* set_barrier: the exFAT writer orders its own commits */
+    exfat_set_barrier, /* #648: exFAT publishes DataLength durably too */
 };
 
 /* ---------------- ext2/3/4 ---------------- */
@@ -724,8 +727,17 @@ void hype_fs_set_barrier(hype_fs_t *fs, hype_blk_sync_fn sync) {
 }
 
 int hype_fs_file_identity_error(const hype_fs_file_t *f) {
-    if (f == 0 || f->fs == 0 || f->fs->ops != &fat32_ops || f->tag != TAG_NATIVE) {
+    if (f == 0 || f->fs == 0 || f->tag != TAG_NATIVE) {
         return 0;
     }
-    return f->u.fat32.last_error == HYPE_FAT32_WFILE_ERR_IDENTITY;
+    if (f->fs->ops == &fat32_ops) {
+        return f->u.fat32.last_error == HYPE_FAT32_WFILE_ERR_IDENTITY;
+    }
+    /* #646: exFAT's set_flush() carries the same identity discipline FAT32's
+     * flush_metadata does; this diagnostic must not stay structurally
+     * FAT32-only now that there is something for it to report on exFAT. */
+    if (f->fs->ops == &exfat_ops) {
+        return f->u.exfat.last_error == HYPE_EXFAT_WFILE_ERR_IDENTITY;
+    }
+    return 0;
 }

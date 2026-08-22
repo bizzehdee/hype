@@ -52,47 +52,99 @@ static uint64_t clusters_for(const hype_exfat_fs_t *fs, uint64_t bytes) {
     return (bytes + cb - 1u) / cb;
 }
 
-static int fat_get(hype_exfat_fs_t *fs, uint32_t cl, uint32_t *out) {
-    uint8_t sec[SECSZ];
-    uint64_t slba = (uint64_t)fs->fat_lba + cl / FAT_ENTRIES_PER_SECTOR;
-    if (!cluster_valid(fs, cl)) {
+/*
+ * #645: load this mount's authoritative view of FAT sector `off` (the FAT-LBA-
+ * relative sector index), re-reading from the medium only when a different
+ * sector is wanted. Every fat_get/fat_set on one mounted volume goes through
+ * this one cached image, exactly as core/fat_write_fs.c's fat_cache_load does
+ * for FAT32 -- so a cluster this mount has already written can never read back
+ * as something else because the medium served a stale copy.
+ */
+static int fat_cache_load(hype_exfat_fs_t *fs, uint32_t off) {
+    uint64_t slba;
+    if (fs->fat_cache_valid && fs->fat_cache_off == off) {
+        return 0;
+    }
+    slba = (uint64_t)fs->fat_lba + off;
+    if (fs->read(fs->ctx, slba, 1u, fs->fat_cache) != 0) {
+        fs->fat_cache_valid = 0;
         return -1;
     }
-    if (fs->read(fs->ctx, slba, 1u, sec) != 0) {
-        return -1;
-    }
-    *out = hype_rd32(sec + (cl % FAT_ENTRIES_PER_SECTOR) * 4u);
+    fs->fat_cache_off = off;
+    fs->fat_cache_valid = 1;
     return 0;
 }
 
-/* `cl` is always a cluster the caller has already validated -- either freshly
- * allocated or reached through a chain walk that range-checked it -- and only the
- * mutating entry points, which require a write callback, get here. */
-static int fat_set(hype_exfat_fs_t *fs, uint32_t cl, uint32_t val) {
-    uint8_t sec[SECSZ];
-    uint64_t slba = (uint64_t)fs->fat_lba + cl / FAT_ENTRIES_PER_SECTOR;
-    if (fs->read(fs->ctx, slba, 1u, sec) != 0) {
+static int fat_get(hype_exfat_fs_t *fs, uint32_t cl, uint32_t *out) {
+    uint32_t off = cl / FAT_ENTRIES_PER_SECTOR;
+    if (!cluster_valid(fs, cl)) {
         return -1;
     }
-    hype_wr32(sec + (cl % FAT_ENTRIES_PER_SECTOR) * 4u, val);
-    return fs->write(fs->ctx, slba, 1u, sec);
+    if (fat_cache_load(fs, off) != 0) {
+        return -1;
+    }
+    *out = hype_rd32(fs->fat_cache + (cl % FAT_ENTRIES_PER_SECTOR) * 4u);
+    return 0;
+}
+
+/*
+ * `cl` is always a cluster the caller has already validated -- either freshly
+ * allocated or reached through a chain walk that range-checked it -- and only the
+ * mutating entry points, which require a write callback, get here.
+ *
+ * #645: the cache is updated in place and the SAME image is what the next
+ * fat_get() reads back, so a stale medium read can never resurrect an older
+ * FAT entry within this mount. A write failure invalidates the cache instead
+ * of leaving it holding a value that never reached the medium.
+ */
+static int fat_set(hype_exfat_fs_t *fs, uint32_t cl, uint32_t val) {
+    uint32_t off = cl / FAT_ENTRIES_PER_SECTOR;
+    if (fat_cache_load(fs, off) != 0) {
+        return -1;
+    }
+    hype_wr32(fs->fat_cache + (cl % FAT_ENTRIES_PER_SECTOR) * 4u, val);
+    if (fs->write(fs->ctx, (uint64_t)fs->fat_lba + off, 1u, fs->fat_cache) != 0) {
+        fs->fat_cache_valid = 0;
+        return -1;
+    }
+    return 0;
 }
 
 /* ---- allocation bitmap ---- */
+
+/* #645: the bitmap's counterpart to fat_cache_load -- `lba` is the absolute
+ * sector LBA (the bitmap, unlike the FAT, is addressed by plain sector
+ * arithmetic off bitmap_lba, per decision #24), so it is used as the cache key
+ * directly. */
+static int bitmap_cache_load(hype_exfat_fs_t *fs, uint64_t lba) {
+    if (fs->bitmap_cache_valid && fs->bitmap_cache_off == lba) {
+        return 0;
+    }
+    if (fs->read(fs->ctx, lba, 1u, fs->bitmap_cache) != 0) {
+        fs->bitmap_cache_valid = 0;
+        return -1;
+    }
+    fs->bitmap_cache_off = lba;
+    fs->bitmap_cache_valid = 1;
+    return 0;
+}
 
 /* Clears one cluster's bitmap bit (allocation goes through alloc_cluster, which
  * already has the right bitmap sector in hand). As with fat_set, `cl` has been
  * range-checked by the caller. */
 static int bitmap_release(hype_exfat_fs_t *fs, uint32_t cl) {
-    uint8_t sec[SECSZ];
     uint64_t lba;
     unsigned int bit;
     hype_exfat_bitmap_location(cl, fs->bitmap_lba, &lba, &bit);
-    if (fs->read(fs->ctx, lba, 1u, sec) != 0) {
+    if (bitmap_cache_load(fs, lba) != 0) {
         return -1;
     }
-    hype_exfat_bitmap_set(sec, bit, 0);
-    return fs->write(fs->ctx, lba, 1u, sec);
+    hype_exfat_bitmap_set(fs->bitmap_cache, bit, 0);
+    if (fs->write(fs->ctx, lba, 1u, fs->bitmap_cache) != 0) {
+        fs->bitmap_cache_valid = 0;
+        return -1;
+    }
+    return 0;
 }
 
 /* "EXFAT   " -- all eight bytes, so a volume whose name merely starts with those
@@ -171,6 +223,12 @@ int hype_exfat_fs_sync(hype_exfat_fs_t *fs) {
     return 0;
 }
 
+void hype_exfat_fs_set_sync(hype_exfat_fs_t *fs, hype_blk_sync_fn sync) {
+    if (fs != (hype_exfat_fs_t *)0) {
+        fs->sync = sync;
+    }
+}
+
 /*
  * Allocates one free cluster: claims its bitmap bit, marks its FAT entry
  * end-of-chain, and advances the search hint. Scans the bitmap a sector at a
@@ -186,26 +244,44 @@ static int alloc_cluster(hype_exfat_fs_t *fs, uint32_t *out) {
     uint32_t pass;
 
     for (pass = 0; pass <= sectors; pass++) {
-        uint8_t sec[SECSZ];
         uint32_t s = (start_bit / BITMAP_BITS_PER_SECTOR + pass) % sectors;
         unsigned int from = (pass == 0u) ? (start_bit % BITMAP_BITS_PER_SECTOR) : 0u;
         unsigned int limit = BITMAP_BITS_PER_SECTOR;
-        unsigned int bit;
+        uint64_t lba = fs->bitmap_lba + s;
         if (s == sectors - 1u) {
             limit = fs->cluster_count - s * BITMAP_BITS_PER_SECTOR;
         }
         /* `from` is always inside `limit`: next_free never exceeds the last valid
          * cluster, so its bit index never reaches the end of its own sector. */
-        if (fs->read(fs->ctx, fs->bitmap_lba + s, 1u, sec) != 0) {
+        if (bitmap_cache_load(fs, lba) != 0) {
             return -1;
         }
-        if (hype_exfat_bitmap_find_free(sec, from, limit, &bit) != 0) {
-            continue;
-        }
-        {
-            uint32_t cl = 2u + s * BITMAP_BITS_PER_SECTOR + bit;
-            hype_exfat_bitmap_set(sec, bit, 1);
-            if (fs->write(fs->ctx, fs->bitmap_lba + s, 1u, sec) != 0) {
+        for (;;) {
+            unsigned int bit;
+            uint32_t cl, fv;
+            if (hype_exfat_bitmap_find_free(fs->bitmap_cache, from, limit, &bit) != 0) {
+                break; /* no more clear bits in this sector */
+            }
+            cl = 2u + s * BITMAP_BITS_PER_SECTOR + bit;
+            /*
+             * #645: the bitmap used to be the ONLY source of truth an allocation
+             * consulted. A bitmap that has drifted from the FAT -- its
+             * chain-of-record -- because of a stale medium read, or simple
+             * corruption, would then hand out a cluster something else still
+             * chains through. Cross-check the FAT before committing to this
+             * cluster; a non-zero entry means fail CLOSED (skip it and keep
+             * scanning), never hand it out anyway.
+             */
+            if (fat_get(fs, cl, &fv) != 0) {
+                return -1;
+            }
+            if (fv != 0u) {
+                from = bit + 1u;
+                continue;
+            }
+            hype_exfat_bitmap_set(fs->bitmap_cache, bit, 1);
+            if (fs->write(fs->ctx, lba, 1u, fs->bitmap_cache) != 0) {
+                fs->bitmap_cache_valid = 0;
                 return -1;
             }
             if (fat_set(fs, cl, EOC_MARK) != 0) {
@@ -306,6 +382,83 @@ static int chain_cluster_at(hype_exfat_fs_t *fs, uint32_t first, int contiguous,
     }
 }
 
+/*
+ * #647: walks and validates a FAT-chained allocation against `size` -- the DataLength rule: a
+ * chain shorter than ceil(size / cluster_bytes) is corruption (exFAT has no representation for an
+ * internal hole either, same as FAT32), and a chain longer than that is a loop, a cross-link, or
+ * slack clusters. Bounded by the size-derived need, not WALK_GUARD, so a corrupt chain fails after
+ * `need` steps rather than iterating up to WALK_GUARD times -- no visited set required, since a
+ * loop or a cross-link back into any chain simply never reaches end-of-chain within `need` steps.
+ * Refuses a free (0), reserved (1), bad (0xFFFFFFF7) or out-of-heap cluster mid-chain via the same
+ * cluster_valid() range check chain_cluster_at() uses. Returns the tail cluster in *out_tail.
+ * Mirrors FAT32's chain_measure (core/fat_write_fs.c).
+ */
+static int chain_measure(hype_exfat_fs_t *fs, uint32_t first, uint64_t size, uint32_t *out_tail) {
+    uint64_t need = clusters_for(fs, size);
+    uint32_t cl = first;
+    uint32_t tail = 0u;
+    uint64_t count = 0u;
+
+    if (first == 0u) {
+        if (size != 0u) {
+            return -1; /* a non-empty file must have a chain */
+        }
+        *out_tail = 0u;
+        return 0;
+    }
+    if (!cluster_valid(fs, cl)) {
+        return -1;
+    }
+    for (;;) {
+        uint32_t next;
+        count++;
+        if (count > need) {
+            return -1; /* loop, cross-link, or slack clusters */
+        }
+        tail = cl;
+        if (fat_get(fs, cl, &next) != 0) {
+            return -1;
+        }
+        if (next >= HYPE_EXFAT_EOC) {
+            break;
+        }
+        if (!cluster_valid(fs, next)) {
+            return -1; /* free, reserved, bad, or out of the heap */
+        }
+        cl = next;
+    }
+    if (count < need) {
+        return -1; /* shorter than the recorded size */
+    }
+    *out_tail = tail;
+    return 0;
+}
+
+/*
+ * #647: the contiguous (NoFatChain) counterpart of chain_measure. set_read() already range-checks
+ * the whole run against the heap; this additionally refuses a run where any cluster's allocation-
+ * bitmap bit reads clear, so a contiguous stream this mount never actually allocated (or one whose
+ * bitmap has drifted, the #645 class of disagreement) is not accepted as this file's data.
+ */
+static int contiguous_run_all_used(hype_exfat_fs_t *fs, uint32_t first, uint64_t size) {
+    uint64_t n = clusters_for(fs, size);
+    uint64_t i;
+
+    for (i = 0; i < n; i++) {
+        uint32_t cl = first + (uint32_t)i;
+        uint64_t lba;
+        unsigned int bit;
+        hype_exfat_bitmap_location(cl, fs->bitmap_lba, &lba, &bit);
+        if (bitmap_cache_load(fs, lba) != 0) {
+            return -1;
+        }
+        if (!hype_exfat_bitmap_get(fs->bitmap_cache, bit)) {
+            return -1; /* marked free: not a genuine allocation */
+        }
+    }
+    return 0;
+}
+
 static int entry_lba(hype_exfat_fs_t *fs, uint32_t dir_first, int dir_contig, uint32_t ei,
                      uint64_t *out_lba, unsigned int *out_off) {
     uint32_t ci, sic, cl;
@@ -398,16 +551,103 @@ static int set_read(hype_exfat_fs_t *fs, uint32_t dir_first, int dir_contig, uin
     return 0;
 }
 
-/* Rewrites the stream entry's allocation fields and the set's checksum. */
-static int set_flush(hype_exfat_wfile_t *f) {
+/*
+ * #646: the entry set a handle names is identified by (dir_cluster, set_index, name_hash,
+ * name_length) -- everything set_flush() needs to prove, at flush time, that the slot it is
+ * about to publish into still belongs to THIS file. `identity_guard` is a tamper-evident hash of
+ * those fields over the handle itself, checked before every flush: a mismatch means something
+ * changed dir_cluster/set_index/name_hash/name_length without going through identity_set(), which
+ * must never happen. This is a guard, not the source of truth -- the on-disk entry is checked
+ * independently in set_flush(), exactly as FAT32's first_cluster_guard documents for the chain
+ * root.
+ */
+#define HYPE_EXFAT_IDENTITY_GUARD_SEED 0xB4D9F2E7u
+
+static uint32_t identity_guard_compute(uint32_t dir_cluster, uint32_t set_index,
+                                       uint16_t name_hash, uint8_t name_length) {
+    uint32_t v = HYPE_EXFAT_IDENTITY_GUARD_SEED ^ dir_cluster;
+    v = (v << 5) ^ (v >> 27) ^ set_index;
+    v = (v << 5) ^ (v >> 27) ^ name_hash;
+    v = (v << 5) ^ (v >> 27) ^ name_length;
+    return v;
+}
+
+static void identity_set(hype_exfat_wfile_t *f, uint16_t name_hash, uint8_t name_length) {
+    f->name_hash = name_hash;
+    f->name_length = name_length;
+    f->identity_guard = identity_guard_compute(f->dir_cluster, f->set_index, name_hash, name_length);
+}
+
+static int identity_valid(const hype_exfat_wfile_t *f) {
+    return f->identity_guard ==
+           identity_guard_compute(f->dir_cluster, f->set_index, f->name_hash, f->name_length);
+}
+
+/*
+ * Rewrites the stream entry's allocation fields and the set's checksum.
+ *
+ * #648: `durable` is set by the caller exactly when this call extended the
+ * allocation -- a new cluster's FAT link must be durable BEFORE the entry set
+ * that exposes it commits (plan.md decision 56, the same ordering #377 gave
+ * FAT32's flush_metadata). The barrier brackets the whole entry-set update:
+ * once before the first write, once after the last, matching
+ * core/fat_write_fs.c:405-408 and :439. A call that only advances
+ * ValidDataLength inside an already-published allocation stays non-durable.
+ */
+static int set_flush(hype_exfat_wfile_t *f, int durable) {
     hype_exfat_fs_t *fs = f->fs;
     uint8_t ent[ENTSZ];
     uint16_t sum = 0u;
     unsigned int k;
+    uint32_t disk_first;
+
+    f->last_error = HYPE_EXFAT_WFILE_ERR_NONE;
+    /* #646: the handle's own identity fields must be exactly what identity_set() last put
+     * there -- a defensive check independent of the medium, mirroring FAT32's
+     * first_cluster_valid(). */
+    if (!identity_valid(f)) {
+        f->last_error = HYPE_EXFAT_WFILE_ERR_IDENTITY;
+        return -1;
+    }
+
+    if (durable && fs->sync != (hype_blk_sync_fn)0 && fs->sync(fs->ctx) != 0) {
+        return -1;
+    }
+
+    /*
+     * #646: the primary File entry at set_index must still be an in-use File entry. A
+     * rename/unlink that retired this slot (or handed it to a different entry set) clears the
+     * InUse bit or changes the type byte; either way this handle no longer owns it.
+     */
+    if (entry_read(fs, f->dir_cluster, f->dir_contiguous, f->set_index, ent) != 0) {
+        return -1;
+    }
+    if (ent[0] != HYPE_EXFAT_ENT_FILE) {
+        f->last_error = HYPE_EXFAT_WFILE_ERR_IDENTITY;
+        return -1;
+    }
 
     /* set_read (via lookup) and create both establish that set_index + 1 is this
      * set's Stream Extension entry before a handle exists at all. */
     if (entry_read(fs, f->dir_cluster, f->dir_contiguous, f->set_index + 1u, ent) != 0) {
+        return -1;
+    }
+    /*
+     * #646: the Stream entry must still carry THIS handle's name -- a stale index left behind by
+     * rename/retire almost always now names a DIFFERENT file, and its NameHash/NameLength say so
+     * even though the slot's type byte alone would not. The already-published FirstCluster (if
+     * any) is PRESERVED and VERIFIED, never blindly overwritten from RAM, exactly as FAT32's
+     * flush_metadata treats the chain root: a stray write of this handle's first_cluster into a
+     * neighbouring file's Stream entry is refused, not silently accepted.
+     */
+    if (ent[0] != HYPE_EXFAT_ENT_STREAM || hype_rd16(ent + 4) != f->name_hash ||
+        ent[3] != f->name_length) {
+        f->last_error = HYPE_EXFAT_WFILE_ERR_IDENTITY;
+        return -1;
+    }
+    disk_first = hype_rd32(ent + 20);
+    if (disk_first != 0u && disk_first != f->first_cluster) {
+        f->last_error = HYPE_EXFAT_WFILE_ERR_IDENTITY;
         return -1;
     }
     ent[1] = (uint8_t)(HYPE_EXFAT_FLAG_ALLOC_POSSIBLE |
@@ -431,7 +671,13 @@ static int set_flush(hype_exfat_wfile_t *f) {
         return -1;
     }
     hype_exfat_file_entry_set_checksum(ent, sum);
-    return entry_write(fs, f->dir_cluster, f->dir_contiguous, f->set_index, ent);
+    if (entry_write(fs, f->dir_cluster, f->dir_contiguous, f->set_index, ent) != 0) {
+        return -1;
+    }
+    if (durable && fs->sync != (hype_blk_sync_fn)0 && fs->sync(fs->ctx) != 0) {
+        return -1;
+    }
+    return 0;
 }
 
 /* ---- mount ---- */
@@ -550,6 +796,7 @@ int hype_exfat_fs_mount(hype_blk_read_fn read, hype_blk_write_fn write, void *ct
 
     out->read = read;
     out->write = write;
+    out->sync = (hype_blk_sync_fn)0;
     out->ctx = ctx;
     out->volume_length = hype_rd64(boot + 0x48);
     out->fat_length = hype_rd32(boot + 0x54);
@@ -560,6 +807,10 @@ int hype_exfat_fs_mount(hype_blk_read_fn read, hype_blk_write_fn write, void *ct
     out->next_free = 2u;
     out->used_clusters = HYPE_EXFAT_USED_UNKNOWN;
     out->dirty = (uint8_t)((volume_flags & HYPE_EXFAT_VOLUME_DIRTY) ? 1u : 0u);
+    out->fat_cache_valid = 0;
+    out->fat_cache_off = 0u;
+    out->bitmap_cache_valid = 0;
+    out->bitmap_cache_off = 0u;
     hype_exfat_upcase_reset(&out->upcase);
 
     /* With two FATs, VolumeFlags bit 0 selects the live one; reading the stale
@@ -692,20 +943,73 @@ static int name_eq(const hype_exfat_fs_t *fs, const uint16_t *a, const uint16_t 
 }
 
 /*
+ * #644: entries a NON-CONTIGUOUS (FAT-chained) directory's current allocation actually holds,
+ * computed by walking its FAT chain to end-of-chain -- exFAT's counterpart of FAT32's
+ * dir_capacity (core/fat_write_fs.c:483). Every chained-directory walk below is bounded by this
+ * FIRST, so an entry_read() failure inside that bound can only be a genuine medium failure --
+ * "the allocation ends here" has already been accounted for by the bound itself, exactly the
+ * split dir_capacity gives the FAT32 walks. Returns -1 on an I/O error walking the chain, or a
+ * corrupt (looping / free / reserved / out-of-heap) chain.
+ */
+static int dir_capacity(hype_exfat_fs_t *fs, uint32_t first, uint64_t *out_entries) {
+    uint32_t entries_per_cluster = fs->spc * HYPE_EXFAT_ENTRIES_PER_SECTOR;
+    uint32_t cl = first;
+    uint64_t clusters = 0;
+    unsigned int guard = 0;
+
+    if (!cluster_valid(fs, cl)) {
+        return -1;
+    }
+    while (guard++ < WALK_GUARD) {
+        uint32_t next;
+        clusters++;
+        if (fat_get(fs, cl, &next) != 0) {
+            return -1; /* real I/O error */
+        }
+        if (next >= HYPE_EXFAT_EOC) {
+            *out_entries = clusters * (uint64_t)entries_per_cluster;
+            return 0;
+        }
+        if (!cluster_valid(fs, next)) {
+            return -1; /* free, reserved, bad, or out of the heap mid-chain */
+        }
+        cl = next;
+    }
+    return -1; /* the chain loops */
+}
+
+/*
  * Finds `name` in the directory starting at `dir_first`. Returns 1 and fills
  * *out_index / *set on a match, 0 if the directory ends without one, -1 on a
  * read error. Entry sets that fail validation are skipped -- a single corrupt
  * set must not hide the rest of the directory.
+ *
+ * #644: a NON-CONTIGUOUS directory's walk is bounded by dir_capacity() up front, so an
+ * entry_read() failure within that bound is unambiguously a real I/O error, never "ran off the
+ * end" -- the same conflation #390 fixed for FAT32's dir_find. A CONTIGUOUS directory has no
+ * chain to pre-measure; its terminator is always the 0x00 marker every mkdir()-created cluster is
+ * zeroed to carry (a run that ends by leaving the cluster heap is corruption, caught the same
+ * way). Either way, a read failure before that terminator is a real failure, not an empty
+ * directory or a missing name -- so create()/mkdir() cannot place a duplicate entry set, and
+ * rmdir() (via dir_is_empty, the same discipline) cannot free a directory that still has entries.
  */
 static int dir_find(hype_exfat_fs_t *fs, uint32_t dir_first, int dir_contig, const uint16_t *name,
                     unsigned int nlen, uint32_t *out_index, hype_exfat_set_t *set) {
     uint32_t ei = 0;
     unsigned int guard = 0;
+    uint64_t cap = 0;
+
+    if (!dir_contig && dir_capacity(fs, dir_first, &cap) != 0) {
+        return -1;
+    }
 
     while (guard++ < WALK_GUARD) {
         uint8_t ent[ENTSZ];
+        if (!dir_contig && (uint64_t)ei >= cap) {
+            return 0; /* legitimately past the end of a bounded, healthy chain */
+        }
         if (entry_read(fs, dir_first, dir_contig, ei, ent) != 0) {
-            return 0; /* ran off the end of the directory's allocation */
+            return -1; /* real I/O error: never "not found" */
         }
         if (ent[0] == 0x00u) {
             return 0;
@@ -743,6 +1047,8 @@ static void wfile_from_set(hype_exfat_wfile_t *f, hype_exfat_fs_t *fs, uint32_t 
     f->is_dir = (uint8_t)((set->attributes & HYPE_EXFAT_ATTR_DIRECTORY) ? 1 : 0);
     f->seek_index = 0u;
     f->seek_cluster = set->first_cluster;
+    f->last_error = HYPE_EXFAT_WFILE_ERR_NONE;
+    identity_set(f, set->name_hash, set->name_length);
 }
 
 int hype_exfat_lookup(hype_exfat_fs_t *fs, const char *path, int want_dir,
@@ -779,10 +1085,36 @@ int hype_exfat_lookup(hype_exfat_fs_t *fs, const char *path, int want_dir,
         }
         if (last) {
             int is_dir = (set.attributes & HYPE_EXFAT_ATTR_DIRECTORY) ? 1 : 0;
+            uint32_t tail = 0u;
             if (is_dir != (want_dir ? 1 : 0)) {
                 return -1;
             }
+            /*
+             * #647: a FILE handle is writable random-I/O, exactly like FAT32's hype_fat32_open, so
+             * its complete chain is validated against DataLength before a handle is returned --
+             * refusing a short chain (would fail mid-read/write at an arbitrary offset instead of
+             * at open), a long chain (a loop or cross-link, walked to WALK_GUARD otherwise), and a
+             * contiguous run with a cluster the bitmap says is not actually allocated. Directories
+             * are addressed through their own already-bounded walks (dir_find, dir_scan_slots,
+             * dir_is_empty), so this does not apply to them.
+             */
+            if (!is_dir) {
+                if (set.contiguous) {
+                    if (contiguous_run_all_used(fs, set.first_cluster, set.data_length) != 0) {
+                        return -1;
+                    }
+                    tail = (set.first_cluster == 0u)
+                               ? 0u
+                               : set.first_cluster +
+                                     (uint32_t)(clusters_for(fs, set.data_length) - 1u);
+                } else if (chain_measure(fs, set.first_cluster, set.data_length, &tail) != 0) {
+                    return -1;
+                }
+            }
             wfile_from_set(out, fs, dir_first, dir_contig, ei, &set);
+            if (!is_dir) {
+                out->tail_cluster = tail; /* already resolved: no lazy walk needed */
+            }
             return 0;
         }
         if ((set.attributes & HYPE_EXFAT_ATTR_DIRECTORY) == 0u) {
@@ -812,6 +1144,11 @@ typedef struct {
     uint8_t owner_contig;
     uint32_t owner_set; /* entry index of its File entry there */
     uint8_t owner_secondary;
+    /* #646: this directory's OWN identity within owner_dir, so dirref_flush() can prove
+     * owner_set still names it before publishing into that slot -- captured by resolve_parent()
+     * from the entry set it just matched. */
+    uint16_t owner_name_hash;
+    uint8_t owner_name_length;
 } dirref_t;
 
 static void dirref_root(const hype_exfat_fs_t *fs, dirref_t *d) {
@@ -823,10 +1160,16 @@ static void dirref_root(const hype_exfat_fs_t *fs, dirref_t *d) {
     d->owner_contig = 0u;
     d->owner_set = 0u;
     d->owner_secondary = 0u;
+    d->owner_name_hash = 0u;
+    d->owner_name_length = 0u;
 }
 
-/* Writes the directory's current allocation back into its own entry set (a
- * no-op for the root, which has none). */
+/*
+ * Writes the directory's current allocation back into its own entry set (a no-op for the root,
+ * which has none). #646: verifies, via set_flush()'s identity check, that owner_set still names
+ * THIS directory before publishing -- a dirref_t captured before some other change retired or
+ * reused that slot must fail closed, not overwrite whatever entry set is there now.
+ */
 static int dirref_flush(hype_exfat_fs_t *fs, const dirref_t *d) {
     hype_exfat_wfile_t f;
     if (!d->has_owner) {
@@ -839,8 +1182,16 @@ static int dirref_flush(hype_exfat_fs_t *fs, const dirref_t *d) {
     f.secondary = d->owner_secondary;
     f.first_cluster = d->first;
     f.size = d->size;
+    /* A directory has no ValidDataLength concept of its own -- every byte of
+     * its allocation is meaningful -- so this is always the whole size. Left
+     * unset, set_flush()'s `valid > size` guard reads uninitialised stack. */
+    f.valid = d->size;
     f.contiguous = d->contiguous;
-    return set_flush(&f);
+    identity_set(&f, d->owner_name_hash, d->owner_name_length);
+    /* A directory's own allocation growth is out of #648's scope (the ticket
+     * covers file DataLength publication); non-durable preserves prior
+     * behaviour here. */
+    return set_flush(&f, 0);
 }
 
 /* ---- path handling ----
@@ -945,6 +1296,8 @@ static int resolve_parent(hype_exfat_fs_t *fs, const char *path, unsigned int le
             dir->owner_contig = dir->contiguous;
             dir->owner_set = ei;
             dir->owner_secondary = set.secondary;
+            dir->owner_name_hash = set.name_hash;
+            dir->owner_name_length = set.name_length;
             dir->has_owner = 1u;
             dir->first = set.first_cluster;
             dir->size = set.data_length;
@@ -1254,6 +1607,8 @@ int hype_exfat_create(hype_exfat_fs_t *fs, const char *path, hype_exfat_wfile_t 
     out->is_dir = 0u;
     out->seek_index = 0u;
     out->seek_cluster = 0u;
+    out->last_error = HYPE_EXFAT_WFILE_ERR_NONE;
+    identity_set(out, hash, (uint8_t)nlen);
     return 0;
 }
 
@@ -1355,20 +1710,31 @@ int hype_exfat_mkdir(hype_exfat_fs_t *fs, const char *path) {
  * 1 == the directory holds no in-use entry of any type, 0 == something is
  * still there, -1 on a sector-read failure (which must not read as "empty":
  * removing a directory that still has entries orphans them). Bounded by the
- * allocation itself: DataLength for a NoFatChain directory, the FAT chain (with
- * the usual loop guard) otherwise.
+ * allocation itself: DataLength for a NoFatChain directory, the FAT chain
+ * (via dir_capacity(), #644) otherwise.
+ *
+ * #644: for a FAT-chained directory, `cap` used to be plain WALK_GUARD -- an arbitrary large
+ * bound, not the directory's real extent -- so an entry_lba() failure inside it could be either a
+ * genuine medium failure OR simply the point where fat_get() legitimately reached end-of-chain
+ * while walking towards an `ei` past the real capacity. Both read as "past the end of the
+ * allocation" (empty). Bounding by dir_capacity()'s WALKED chain length first removes the
+ * ambiguity: an entry_lba() failure inside that real bound can only be a genuine failure.
  */
 static int dir_is_empty(hype_exfat_fs_t *fs, uint32_t first, int contiguous, uint64_t size) {
-    uint64_t cap = contiguous
-                       ? clusters_for(fs, size) * (uint64_t)(fs->spc * HYPE_EXFAT_ENTRIES_PER_SECTOR)
-                       : (uint64_t)WALK_GUARD;
+    uint64_t cap;
     uint64_t ei;
+
+    if (contiguous) {
+        cap = clusters_for(fs, size) * (uint64_t)(fs->spc * HYPE_EXFAT_ENTRIES_PER_SECTOR);
+    } else if (dir_capacity(fs, first, &cap) != 0) {
+        return -1; /* #644: a real I/O error or a corrupt chain must never read as "empty" */
+    }
     for (ei = 0; ei < cap; ei++) {
         uint8_t sec[SECSZ];
         uint64_t lba;
         unsigned int off;
         if (entry_lba(fs, first, contiguous, (uint32_t)ei, &lba, &off) != 0) {
-            return 1; /* past the end of the allocation */
+            return -1; /* inside a validated bound, this can only be a real I/O error */
         }
         if (fs->read(fs->ctx, lba, 1u, sec) != 0) {
             return -1;
@@ -1380,7 +1746,7 @@ static int dir_is_empty(hype_exfat_fs_t *fs, uint32_t first, int contiguous, uin
             return 0;
         }
     }
-    return -1; /* the walk guard tripped: never treat a looping chain as empty */
+    return 1; /* the whole (correctly bounded) allocation is deleted slots: empty */
 }
 
 int hype_exfat_rmdir(hype_exfat_fs_t *fs, const char *path) {
@@ -1674,6 +2040,24 @@ int hype_exfat_write_at(hype_exfat_wfile_t *f, uint64_t offset, const void *data
         uint64_t have = (f->first_cluster == 0u) ? 0u : clusters_for(fs, f->size);
 
         if (have > 0u) {
+            /*
+             * #647: re-validate before trusting the chain enough to extend it. hype_exfat_lookup
+             * validated once, at open; another writer sharing this mount (or corruption) could
+             * have moved the allocation since -- exactly the reason core/fat_write_fs.c:1446
+             * re-runs chain_measure at the top of FAT32's growth path rather than trusting
+             * open-time state.
+             */
+            if (f->contiguous) {
+                if (contiguous_run_all_used(fs, f->first_cluster, f->size) != 0) {
+                    return -1;
+                }
+            } else {
+                uint32_t measured_tail;
+                if (chain_measure(fs, f->first_cluster, f->size, &measured_tail) != 0) {
+                    return -1;
+                }
+                f->tail_cluster = measured_tail;
+            }
             if (chain_materialise(f) != 0) {
                 return -1;
             }
@@ -1720,9 +2104,12 @@ int hype_exfat_write_at(hype_exfat_wfile_t *f, uint64_t offset, const void *data
     }
 
     /* 4. Publish: DataLength + ValidDataLength + first cluster + checksum in
-     *    one entry-set update, after the bytes are on the medium. */
+     *    one entry-set update, after the bytes are on the medium. #648:
+     *    durable exactly when this call allocated a cluster (first_new != 0) --
+     *    a call that only advances ValidDataLength inside the existing
+     *    allocation needs no barrier. */
     f->valid = end;
-    if (set_flush(f) != 0) {
+    if (set_flush(f, first_new != 0u) != 0) {
         goto rollback;
     }
     return 0;
@@ -1751,7 +2138,13 @@ rollback:
     f->contiguous = (old_contig && first_new == 0u) ? old_contig : f->contiguous;
     f->seek_index = 0u;
     f->seek_cluster = f->first_cluster;
-    if (set_flush(f) != 0) {
+    /*
+     * #648/#517 (mirrors core/fat_write_fs.c:1366-1374's growth_rollback): the restore must not
+     * depend on the barrier. A persistently failing barrier must not stop the entry set from being
+     * pushed back to its old, safe shape -- shrinking never reaches a cluster the medium has not
+     * already linked, so it needs no preceding barrier.
+     */
+    if (set_flush(f, 0) != 0) {
         g_exfat_rollback_failures++;
     }
     /*
@@ -1894,6 +2287,8 @@ int hype_exfat_append(hype_exfat_wfile_t *f, const void *data, unsigned int len)
     hype_exfat_fs_t *fs = f->fs;
     const uint8_t *src = (const uint8_t *)data;
     uint64_t cb = cluster_bytes(fs);
+    int grew = 0; /* #648: did THIS call allocate a cluster? -> the entry-set
+                   * publication that follows needs a durability barrier. */
 
     if (fs->write == 0 || f->is_dir) {
         return -1;
@@ -1919,6 +2314,7 @@ int hype_exfat_append(hype_exfat_wfile_t *f, const void *data, unsigned int len)
             f->contiguous = 0u;
             f->seek_index = 0u;
             f->seek_cluster = cl;
+            grew = 1;
         } else if (within == 0u) {
             /* The last cluster is exactly full: extend the chain. */
             uint32_t cl;
@@ -1935,6 +2331,7 @@ int hype_exfat_append(hype_exfat_wfile_t *f, const void *data, unsigned int len)
                 return -1;
             }
             f->tail_cluster = cl;
+            grew = 1;
         } else if (resolve_tail(f) != 0) {
             return -1;
         }
@@ -1963,7 +2360,7 @@ int hype_exfat_append(hype_exfat_wfile_t *f, const void *data, unsigned int len)
         f->size += n;
     }
     f->valid = f->size; /* an append writes every byte through the new end */
-    return set_flush(f);
+    return set_flush(f, grew);
 }
 
 void hype_exfat_fs_set_time(hype_exfat_fs_t *fs, const hype_rtc_time_t *now) {

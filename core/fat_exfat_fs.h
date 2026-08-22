@@ -66,6 +66,7 @@
 typedef struct {
     hype_blk_read_fn read;
     hype_blk_write_fn write;
+    hype_blk_sync_fn sync; /* optional persistence barrier (#648) */
     void *ctx;
     uint64_t volume_length; /* total sectors, from the boot sector */
     uint32_t fat_lba;       /* first sector of the ACTIVE FAT */
@@ -81,6 +82,20 @@ typedef struct {
     uint32_t next_free;       /* allocation search hint */
     uint32_t used_clusters;   /* allocated clusters, or HYPE_EXFAT_USED_UNKNOWN */
     uint8_t dirty;            /* 1 == VolumeDirty has been set on the medium */
+    /*
+     * #645: authoritative write-through view of the most recently used FAT
+     * sector and the most recently used allocation-bitmap sector. Every
+     * writer on one mounted volume must share this fs object -- exactly the
+     * FAT32 discipline at core/fat_write_fs.h's fat_cache_* fields. Without
+     * it, a medium that serves stale read-after-write data can make a
+     * cluster this mount already handed out read back as free.
+     */
+    uint32_t fat_cache_off;
+    int fat_cache_valid;
+    uint8_t fat_cache[HYPE_BLK_SECTOR_SIZE];
+    uint64_t bitmap_cache_off; /* absolute LBA, not sector-relative (unlike the FAT cache) */
+    int bitmap_cache_valid;
+    uint8_t bitmap_cache[HYPE_BLK_SECTOR_SIZE];
     hype_exfat_upcase_t upcase;
     /* Wall-clock snapshot for directory entries; zeroed (invalid) by mount so
      * the 1980 epoch is used until hype_exfat_fs_set_time() supplies one. */
@@ -88,6 +103,11 @@ typedef struct {
 } hype_exfat_fs_t;
 
 #define HYPE_EXFAT_USED_UNKNOWN 0xFFFFFFFFu
+
+/* #646: diagnostic codes for hype_exfat_wfile_t::last_error, mirroring
+ * HYPE_FAT32_WFILE_ERR_* (core/fat_write_fs.h). */
+#define HYPE_EXFAT_WFILE_ERR_NONE 0
+#define HYPE_EXFAT_WFILE_ERR_IDENTITY 1
 
 typedef struct {
     hype_exfat_fs_t *fs;
@@ -105,6 +125,19 @@ typedef struct {
      * sequential access does not re-walk the chain from the start each call. */
     uint32_t seek_index;
     uint32_t seek_cluster;
+    /*
+     * #646: identity binding, captured once at open/create and never touched again by this
+     * handle. NameHash/NameLength are the Stream Extension entry's own identifying fields, read
+     * back and compared at every flush so a set_index a rename/retire has handed to a DIFFERENT
+     * entry set is detected before this handle can publish over it. `identity_guard` is a
+     * tamper-evident hash over (dir_cluster, set_index, name_hash, name_length) -- a defensive
+     * check on the HANDLE's own fields, independent of the on-disk read-back, mirroring FAT32's
+     * first_cluster_guard.
+     */
+    uint16_t name_hash;
+    uint8_t name_length;
+    uint32_t identity_guard;
+    int last_error; /* HYPE_EXFAT_WFILE_ERR_* diagnostic for the last flush */
 } hype_exfat_wfile_t;
 
 /*
@@ -117,6 +150,10 @@ typedef struct {
  */
 int hype_exfat_fs_mount(hype_blk_read_fn read, hype_blk_write_fn write, void *ctx,
                         hype_exfat_fs_t *out);
+
+/* Install an optional persistence barrier (#648). The exFAT writer invokes it
+ * around an entry-set commit only when that call extended the allocation. */
+void hype_exfat_fs_set_sync(hype_exfat_fs_t *fs, hype_blk_sync_fn sync);
 
 /*
  * Resolves `path` ('\\' or '/' separated, case-insensitive via the volume's

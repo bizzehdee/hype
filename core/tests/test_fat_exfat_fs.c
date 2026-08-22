@@ -69,12 +69,51 @@ static long g_write_countdown = -1;
 static long g_dir_writes_allowed = -1;
 static uint64_t g_dir_write_lba;
 static long g_dir_writes_seen;
+/* #648: durability-barrier instrumentation, mirroring test_fat_write_fs.c's vol_sync. */
+static unsigned int g_sync_calls;
+static long g_sync_countdown = -1;
+static int g_sync_hardfail; /* once the countdown fires, every later barrier fails too */
+/*
+ * #645: mirrors test_fat_write_fs.c's g_stale_fat0_reads -- once armed, reads of the FAT's first
+ * sector and the allocation bitmap's first sector are answered from a PRE-WRITE snapshot instead
+ * of the medium, exactly as a device that serves stale read-after-write data would. Every cluster
+ * this test's volumes ever allocate falls inside these two sectors, so this alone is enough to
+ * prove a writer with no authoritative cached view would resurrect a cluster it already handed out.
+ */
+static int g_stale_reads;
+static uint8_t g_stale_fat_sector[SECSZ];
+static uint8_t g_stale_bitmap_sector[SECSZ];
+/*
+ * #644: fail only the FIRST `g_lba_reads_to_fail` reads of one specific LBA, then let every
+ * later read of it (and everything else) succeed normally -- the mirror image of
+ * g_dir_writes_allowed/g_dir_write_lba below (which allows N then fails the rest). Needed to
+ * distinguish "the ONE call that determines dir_is_empty()'s answer failed" from "a later,
+ * unrelated call to the same LBA (e.g. free_allocation() re-walking the same chain) also fails,"
+ * which would make a bug and its fix look identical from the outside.
+ */
+static uint64_t g_lba_read_target = (uint64_t)-1;
+static long g_lba_reads_to_fail;
+static long g_lba_reads_seen;
 
 static int vol_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
     (void)ctx;
     if (lba + count > VOL_SECTORS) return -1;
     if (lba == g_fail_read_lba) return -1;
     if (g_read_countdown >= 0 && g_read_countdown-- == 0) return -1;
+    if (lba == g_lba_read_target && g_lba_reads_seen < g_lba_reads_to_fail) {
+        g_lba_reads_seen++;
+        return -1;
+    }
+    if (g_stale_reads && count == 1u) {
+        if (lba == FAT_LBA) {
+            memcpy(dst, g_stale_fat_sector, SECSZ);
+            return 0;
+        }
+        if (lba == (uint64_t)g_heap + (g_bitmap_cl - 2u)) { /* clba(g_bitmap_cl); spc == 1 */
+            memcpy(dst, g_stale_bitmap_sector, SECSZ);
+            return 0;
+        }
+    }
     memcpy(dst, g_vol + lba * SECSZ, (size_t)count * SECSZ);
     return 0;
 }
@@ -88,6 +127,15 @@ static int vol_write(void *ctx, uint64_t lba, uint32_t count, const void *src) {
         g_dir_writes_seen++;
     }
     memcpy(g_vol + lba * SECSZ, src, (size_t)count * SECSZ);
+    return 0;
+}
+static int vol_sync(void *ctx) {
+    (void)ctx;
+    g_sync_calls++;
+    if (g_sync_countdown >= 0 && g_sync_countdown-- == 0) {
+        if (g_sync_hardfail) g_sync_countdown = 0; /* stay failing */
+        return -1;
+    }
     return 0;
 }
 
@@ -1508,26 +1556,27 @@ static void test_bad_allocations(void) {
  */
 static void test_corrupt_chains(void) {
     hype_exfat_wfile_t f;
-    static uint8_t back[16];
     unsigned i;
 
-    /* A file whose chain points outside the heap partway along. */
+    /*
+     * #647: a file whose chain points outside the heap partway along used to resolve fine at
+     * lookup and only fail later, at an arbitrary byte offset, when read_at/append actually
+     * walked into the broken link. hype_exfat_lookup now validates the complete chain against
+     * DataLength up front (chain_measure), so the corruption is refused at open instead.
+     */
     build_vol_with_files();
     put32(fat_ent(30u), CLUSTERS + 9u); /* deep.bin: 30 -> out of range */
     CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
-    CHECK_HEX("lookup ok", 0, hype_exfat_lookup(&g_fs, "\\subdir\\deep.bin", 0, &f));
-    CHECK_HEX("reading into the broken link refused", -1,
-              hype_exfat_read_at(&f, 512u, back, 4u));
-    CHECK_HEX("appending onto a broken chain refused", -1, hype_exfat_append(&f, back, 4u));
+    CHECK_HEX("lookup refuses a chain leaving the heap", -1,
+              hype_exfat_lookup(&g_fs, "\\subdir\\deep.bin", 0, &f));
 
     /* A chain that ends before the recorded size: the cluster after the first is
-     * simply not there. */
+     * simply not there. Also now refused at lookup, not at the first out-of-chain read. */
     build_vol_with_files();
     put32(fat_ent(30u), 0xFFFFFFFFu);
     CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
-    CHECK_HEX("lookup ok", 0, hype_exfat_lookup(&g_fs, "\\subdir\\deep.bin", 0, &f));
-    CHECK_HEX("reading past the real end of the chain refused", -1,
-              hype_exfat_read_at(&f, 512u, back, 4u));
+    CHECK_HEX("lookup refuses a chain shorter than DataLength", -1,
+              hype_exfat_lookup(&g_fs, "\\subdir\\deep.bin", 0, &f));
 
     /* Truncating a file whose chain loops must terminate and report failure
      * rather than freeing clusters round and round. */
@@ -1806,6 +1855,30 @@ static void test_fs_ops_exfat(void) {
     CHECK("append bogus tag", hype_fs_append(&f, buf, 1) != 0);
 }
 
+/*
+ * #646 (criterion 3): hype_fs_file_identity_error() must cover exFAT, not just FAT32 -- the
+ * whole point of a fs-agnostic diagnostic is that a caller does not need to know which driver it
+ * is talking to. Reproduces the reused-slot scenario through the fs_ops interface end to end.
+ */
+static void test_fs_ops_exfat_identity_error(void) {
+    hype_fs_t fs;
+    hype_fs_file_t a, b;
+
+    build_vol();
+    CHECK_HEX("auto-mount", 0, hype_fs_mount_auto(&fs, vol_read, vol_write, 0));
+    CHECK_HEX("create A", 0, hype_fs_create(&fs, "A.LOG", &a));
+    CHECK_HEX("seed A", 0, hype_fs_append(&a, "hello", 5));
+    CHECK("no identity error yet", hype_fs_file_identity_error(&a) == 0);
+
+    CHECK_HEX("rename A away", 0, hype_fs_rename(&fs, "A.LOG", "RENAMED.LOG"));
+    CHECK_HEX("create B (reuses A's old slot)", 0, hype_fs_create(&fs, "B.LOG", &b));
+    CHECK_HEX("seed B", 0, hype_fs_append(&b, "world", 5));
+
+    CHECK("append on the stale handle is refused", hype_fs_append(&a, "MORE", 4) != 0);
+    CHECK("hype_fs_file_identity_error reports it for exFAT", hype_fs_file_identity_error(&a) != 0);
+    CHECK("B is unaffected", b.size == 5);
+}
+
 
 /* ---- #383: ValidDataLength + random-write growth ---- */
 
@@ -2043,9 +2116,652 @@ static void test_rollback_never_frees_under_a_published_larger_size(void) {
               (unsigned)(claimed <= (uint64_t)walked * SECSZ));
 }
 
+/*
+ * #648: exFAT had no durability barrier at all -- set_flush() published DataLength straight after
+ * the data write returned, with no ordering guarantee that the preceding FAT link (or the data
+ * itself) reached the medium first. plan.md decision 56 requires that ordering; FAT32 already has
+ * it (core/fat_write_fs.c:405-408, :439). This checks the barrier is issued exactly where it
+ * should be -- bracketing an entry-set publish that extended the allocation -- and nowhere else.
+ */
+static void test_cluster_growth_uses_durability_barriers(void) {
+    hype_exfat_wfile_t f;
+    uint8_t data[700];
+    unsigned int i;
+
+    for (i = 0; i < sizeof data; i++) data[i] = pat(i);
+
+    build_vol();
+    CHECK_HEX("durable mount", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    hype_exfat_fs_set_sync(&g_fs, vol_sync);
+    g_sync_calls = 0u;
+
+    /* create() never allocates a data cluster (empty files start at first_cluster
+     * == 0), so it must not touch the barrier at all. */
+    CHECK_HEX("durable create", 0, hype_exfat_create(&g_fs, "DUR.LOG", &f));
+    CHECK_HEX("create issues no barrier", 0u, g_sync_calls);
+
+    /* First append allocates the file's first cluster: durable publish, two
+     * barrier calls (before the entry-set update, and after it). */
+    CHECK_HEX("first append allocates the initial cluster", 0, hype_exfat_append(&f, data, 400u));
+    CHECK_HEX("initial cluster publication is bracketed", 2u, g_sync_calls);
+
+    /* Second append stays inside the already-allocated cluster (400+100 < 512):
+     * no new allocation, so no barrier. */
+    CHECK_HEX("append inside the same cluster", 0, hype_exfat_append(&f, data + 400u, 100u));
+    CHECK_HEX("no new allocation, no barrier", 2u, g_sync_calls);
+
+    /* Third append crosses the cluster boundary (500 + 200 > 512): a new
+     * cluster is linked, so the publish is durable again. */
+    CHECK_HEX("append across cluster boundary", 0, hype_exfat_append(&f, data + 500u, 200u));
+    CHECK_HEX("cluster extension brackets the publish", 4u, g_sync_calls);
+    CHECK_HEX("extended file size committed", 700u, f.size);
+
+    /* An in-place write wholly inside ValidDataLength never reaches set_flush
+     * at all (file_rw_at only) -- confirm it therefore never reaches the
+     * barrier either. */
+    CHECK_HEX("in-place write inside VDL", 0, hype_exfat_write_at(&f, 0, data, 10u));
+    CHECK_HEX("in-place write issues no barrier", 4u, g_sync_calls);
+
+    /*
+     * A failed PRE-publish barrier must leave the on-disk DataLength inside the
+     * already-durable allocation: set_flush() checks the barrier before it writes
+     * anything, so a failure there must not touch the medium at all.
+     */
+    build_vol();
+    CHECK_HEX("remount barrier-failure volume", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    hype_exfat_fs_set_sync(&g_fs, vol_sync);
+    CHECK_HEX("create before barrier failure", 0, hype_exfat_create(&g_fs, "FAIL.LOG", &f));
+    CHECK_HEX("seed within one cluster", 0, hype_exfat_append(&f, data, 400u));
+    g_sync_countdown = 0;
+    CHECK("extension surfaces failed persistence barrier",
+          hype_exfat_append(&f, data + 400u, 200u) != 0);
+    g_sync_countdown = -1;
+    {
+        const uint8_t *root = cluster(g_root);
+        unsigned int e;
+        uint64_t claimed = (uint64_t)-1;
+        for (e = 0; e < SECSZ / 32u; e++) {
+            if (root[e * 32u] == HYPE_EXFAT_ENT_STREAM) {
+                claimed = get64(root + e * 32u + 24);
+                break;
+            }
+        }
+        CHECK_HEX("failed barrier did not publish a larger size", 1u,
+                  (unsigned)(claimed <= 400u));
+    }
+    hype_exfat_fs_set_sync(&g_fs, 0); /* NULL sync is safe */
+}
+
+/*
+ * #648: the harder case -- the barrier that PRECEDES the entry-set write succeeds (so the bigger
+ * DataLength really does reach the medium), and every barrier after it fails and keeps failing,
+ * exactly as #516 found a real stick do. write_at's rollback must still leave the on-disk entry
+ * set claiming no more than its chain holds; and when the restore write ITSELF cannot land either
+ * (the directory sector is out of allowed writes), hype_exfat_write_rollback_failures() must say so
+ * rather than the volume silently looking clean.
+ */
+static void test_persistent_barrier_failure_never_leaves_entry_past_chain(void) {
+    hype_exfat_wfile_t f;
+    static uint8_t data[900];
+    unsigned int i;
+    unsigned long long before;
+    uint64_t claimed;
+    uint32_t cl, walked;
+
+    for (i = 0; i < sizeof data; i++) data[i] = pat(i);
+
+    build_vol();
+    CHECK_HEX("hardfail mount", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    hype_exfat_fs_set_sync(&g_fs, vol_sync);
+    CHECK_HEX("hardfail create", 0, hype_exfat_create(&g_fs, "SYNCDEAD.BIN", &f));
+    CHECK_HEX("seed 400 while barriers work", 0, hype_exfat_write_at(&f, 0, data, 400u));
+
+    /*
+     * Allow exactly the two directory writes the growing publish itself makes (the Stream entry,
+     * then the File entry carrying the checksum) -- the SAME window #517's test uses -- and let the
+     * barrier succeed once (so those writes are the ones that land) and fail forever after,
+     * covering the restore too.
+     */
+    g_dir_write_lba = clba(g_root);
+    g_dir_writes_seen = 0;
+    g_dir_writes_allowed = 2;
+    g_sync_countdown = 1;
+    g_sync_hardfail = 1;
+    before = hype_exfat_write_rollback_failures();
+    CHECK("growing write reports failure", hype_exfat_write_at(&f, 0, data, sizeof data) != 0);
+    g_sync_countdown = -1;
+    g_sync_hardfail = 0;
+    g_dir_writes_allowed = -1;
+
+    CHECK("a restore that cannot reach the medium is counted, not hidden",
+          hype_exfat_write_rollback_failures() > before);
+
+    claimed = 0;
+    cl = 0;
+    {
+        const uint8_t *root = cluster(g_root);
+        unsigned int e;
+        for (e = 0; e < SECSZ / 32u; e++) {
+            if (root[e * 32u] == HYPE_EXFAT_ENT_STREAM) {
+                claimed = get64(root + e * 32u + 24);
+                cl = get32(root + e * 32u + 20);
+                break;
+            }
+        }
+    }
+    CHECK("hardfail found the stream extension entry", cl != 0u);
+    walked = 0;
+    while (cl >= 2u && cl < 0xFFFFFFF7u && walked < 64u) {
+        uint32_t next = fat_get(cl);
+        walked++;
+        if (next >= 0xFFFFFFF7u || next < 2u) break;
+        cl = next;
+    }
+    CHECK("hardfail chain terminates", walked < 64u);
+    CHECK_HEX("entry never claims more than the chain holds", 1u,
+              (unsigned)(claimed <= (uint64_t)walked * SECSZ));
+}
+
+/*
+ * #645: exFAT's counterpart of test_fat_write_fs.c's test_shared_mount_survives_stale_fat_reads.
+ * Without an authoritative write-through view of the FAT and the allocation bitmap, a medium that
+ * keeps answering with a PRE-WRITE snapshot lets a second allocation land on a cluster the first
+ * one already claimed, because the second alloc_cluster() scan never sees the first one's write.
+ * Two files, grown alternately so each allocation interleaves with the other's, must end up with
+ * completely disjoint cluster sets.
+ */
+static void test_shared_mount_survives_stale_fat_and_bitmap_reads(void) {
+    hype_exfat_wfile_t a, b;
+    uint8_t full[SECSZ];
+    uint32_t a_clusters[8], b_clusters[8];
+    unsigned int na = 0, nb = 0, i, k;
+
+    for (i = 0; i < sizeof full; i++) full[i] = pat(i);
+
+    build_vol();
+    memcpy(g_stale_fat_sector, g_vol + FAT_LBA * SECSZ, SECSZ);
+    memcpy(g_stale_bitmap_sector, g_vol + clba(BITMAP_CL) * SECSZ, SECSZ);
+    g_stale_reads = 1;
+    CHECK_HEX("stale-read mount", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("stale-read create A", 0, hype_exfat_create(&g_fs, "A.LOG", &a));
+    /* A fills its whole first cluster, exactly as the combined log does before any per-VM
+     * sink exists. */
+    CHECK_HEX("A claims and fills its first cluster", 0, hype_exfat_append(&a, full, sizeof full));
+    CHECK_HEX("stale-read create B", 0, hype_exfat_create(&g_fs, "B.LOG", &b));
+    CHECK_HEX("B claims its own first cluster", 0, hype_exfat_append(&b, "V", 1u));
+    CHECK("initial clusters differ", a.first_cluster != b.first_cluster);
+
+    /*
+     * A extends past its first cluster: this is exactly the read-modify-write that, without an
+     * authoritative cached view, reads the FROZEN pre-allocation snapshot of the shared FAT
+     * sector, patches only A's own entry, and writes the WHOLE sector back -- silently reverting
+     * B's chain terminator (set moments ago) to whatever that snapshot said, i.e. free.
+     */
+    CHECK_HEX("A extends despite stale medium reads", 0, hype_exfat_append(&a, "x", 1u));
+    CHECK("A's extension does not link to B's cluster", fat_get(a.first_cluster) != b.first_cluster);
+    CHECK_HEX("B's cluster remains end-of-chain, not reverted to free", 0xFFFFFFFFu,
+              fat_get(b.first_cluster));
+    g_stale_reads = 0;
+
+    /* And, as test_two_files_never_share_a_cluster checks for FAT32: collect both complete
+     * chains and confirm they share nothing. */
+    {
+        uint32_t cl = a.first_cluster;
+        unsigned int guard = 0;
+        while (cl >= 2u && cl < 0xFFFFFFF7u && na < 8u && guard++ < 64u) {
+            a_clusters[na++] = cl;
+            cl = fat_get(cl);
+        }
+    }
+    {
+        uint32_t cl = b.first_cluster;
+        unsigned int guard = 0;
+        while (cl >= 2u && cl < 0xFFFFFFF7u && nb < 8u && guard++ < 64u) {
+            b_clusters[nb++] = cl;
+            cl = fat_get(cl);
+        }
+    }
+    CHECK("A actually got clusters", na > 0u);
+    CHECK("B actually got clusters", nb > 0u);
+    for (i = 0; i < na; i++) {
+        for (k = 0; k < nb; k++) {
+            CHECK("A and B never share a cluster", a_clusters[i] != b_clusters[k]);
+        }
+    }
+}
+
+/*
+ * #645 (criterion 3): a fat_set() whose write fails must invalidate the cached view, so the next
+ * fat_get() re-reads the medium rather than serving a value that never reached it -- the FAT32
+ * writer's fat_set() has carried this discipline from the start (core/fat_write_fs.c:238).
+ *
+ * Without it, a later, unrelated write to the SAME FAT sector would flush the stale in-memory
+ * value as a side effect, publishing a link to a cluster the medium never actually recorded.
+ */
+static void test_fat_set_failure_invalidates_cache(void) {
+    hype_exfat_wfile_t f, fresh;
+    uint8_t full[SECSZ];
+    uint32_t leaked = 0, cl, after;
+    unsigned int i;
+
+    for (i = 0; i < sizeof full; i++) full[i] = 'H';
+
+    build_vol();
+    CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("create A", 0, hype_exfat_create(&g_fs, "A.LOG", &f));
+    CHECK_HEX("fill the first cluster exactly", 0, hype_exfat_append(&f, full, sizeof full));
+
+    /*
+     * Allow exactly ONE write to the FAT sector from here -- the new cluster's own EOC mark,
+     * inside alloc_cluster -- and fail the next one, which is the link that would attach it to
+     * the file's tail. The candidate cluster is allocated (bitmap bit set, FAT[cl] = EOC) but
+     * never linked in: a leak, not corruption, and out of THIS ticket's scope to recover.
+     */
+    g_dir_write_lba = FAT_LBA;
+    g_dir_writes_seen = 0;
+    g_dir_writes_allowed = 1;
+    CHECK("extension surfaces the forced FAT write failure", hype_exfat_append(&f, "x", 1u) != 0);
+    g_dir_writes_allowed = -1;
+
+    CHECK_HEX("the original tail is untouched on the medium", 0xFFFFFFFFu,
+              fat_get(f.first_cluster));
+    for (cl = 2u; cl < g_clusters; cl++) {
+        if (bit_used(cl) && cl != g_bitmap_cl && cl != g_upcase_cl && cl != g_root &&
+            cl != f.first_cluster) {
+            leaked = cl;
+            break;
+        }
+    }
+    CHECK("the failed attempt's candidate cluster is allocated but orphaned", leaked != 0u);
+
+    /*
+     * A FRESH handle resolves its tail from scratch (tail_cluster starts at 0), so its very first
+     * fat_get() on the file's only cluster is exactly the read that would serve the unlanded
+     * cache entry if fat_set() had not invalidated it above.
+     */
+    CHECK_HEX("fresh lookup", 0, hype_exfat_lookup(&g_fs, "A.LOG", 0, &fresh));
+    CHECK_HEX("append reads medium truth, not an unlanded cache entry", 0,
+              hype_exfat_append(&fresh, "y", 1u));
+
+    after = fat_get(f.first_cluster);
+    CHECK("the original tail links to a real, valid cluster",
+          after >= 2u && after < 0xFFFFFFF7u);
+    CHECK("it is NOT the failed attempt's orphaned cluster", after != leaked);
+}
+
+/*
+ * #645 (criterion 4): the allocator must not trust the bitmap alone. A bitmap bit reading clear
+ * while the FAT still describes that cluster as chained is exactly the disagreement a stale
+ * medium read (or plain corruption) produces -- the allocator must fail CLOSED on that candidate
+ * and keep scanning, never hand out a cluster something else still chains through.
+ */
+static void test_alloc_refuses_a_cluster_the_fat_still_chains(void) {
+    hype_exfat_wfile_t f;
+
+    build_vol();
+    /* Cluster 5 is the very first candidate alloc_cluster tries on a fresh volume. Its bitmap
+     * bit is (correctly) clear, but give it a FAT entry as if some other chain already claims
+     * it -- the disagreement this test exists to catch. */
+    put32(fat_ent(5u), 0xFFFFFFFFu);
+
+    CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("create ok", 0, hype_exfat_create(&g_fs, "SAFE.LOG", &f));
+    CHECK_HEX("append allocates a cluster", 0, hype_exfat_append(&f, "x", 1u));
+
+    CHECK("the disagreeing candidate was skipped", f.first_cluster != 5u);
+    CHECK("a genuinely free cluster was used instead",
+          f.first_cluster >= 2u && f.first_cluster < 0xFFFFFFF7u);
+    CHECK_HEX("the skipped cluster's bitmap bit is untouched", 0u, bit_used(5u));
+    CHECK_HEX("the skipped cluster's FAT entry is untouched", 0xFFFFFFFFu, fat_get(5u));
+}
+
+/*
+ * #647: hype_exfat_lookup's chain validator (chain_measure / contiguous_run_all_used), the exFAT
+ * counterpart of FAT32's #382 chain_measure. Each corrupt-chain case must be refused AT LOOKUP,
+ * with nothing on the volume changed, and a valid chain must open with its tail already resolved.
+ */
+static void test_lookup_chain_validation(void) {
+    hype_exfat_wfile_t f;
+
+    /* A chain one cluster LONGER than DataLength justifies (30 -> 32 -> 33 -> EOC, but
+     * DataLength=700 only needs 2 clusters). */
+    build_vol_with_files();
+    put32(fat_ent(32u), 33u);
+    put32(fat_ent(33u), 0xFFFFFFFFu);
+    bit_mark(33u, 1);
+    CHECK_HEX("mount ok (long chain)", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("lookup refuses a chain longer than DataLength justifies", -1,
+              hype_exfat_lookup(&g_fs, "\\subdir\\deep.bin", 0, &f));
+
+    /* A chain that enters a cluster belonging to a second file: deep.bin's second link
+     * redirects into image.img's (contiguous) first cluster, which the FAT says nothing about
+     * (0, i.e. free) -- neither a valid continuation nor a legitimate end-of-chain. */
+    build_vol_with_files();
+    put32(fat_ent(32u), 10u); /* image.img's first cluster */
+    CHECK_HEX("mount ok (cross-link)", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("lookup refuses a chain that enters another file's cluster", -1,
+              hype_exfat_lookup(&g_fs, "\\subdir\\deep.bin", 0, &f));
+
+    /* A chain that loops back on itself (30 -> 32 -> 30 -> ...), bounded by DataLength's
+     * cluster count rather than WALK_GUARD. */
+    build_vol_with_files();
+    put32(fat_ent(32u), 30u);
+    CHECK_HEX("mount ok (loop)", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("lookup refuses a looping chain", -1,
+              hype_exfat_lookup(&g_fs, "\\subdir\\deep.bin", 0, &f));
+
+    /* A free (0) cluster mid-chain. */
+    build_vol_with_files();
+    put32(fat_ent(32u), 0u);
+    CHECK_HEX("mount ok (free mid-chain)", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("lookup refuses a free cluster mid-chain", -1,
+              hype_exfat_lookup(&g_fs, "\\subdir\\deep.bin", 0, &f));
+
+    /* A contiguous stream with one cluster of its run marked free in the bitmap: in range
+     * (set_read already checks that), but not a genuine allocation. */
+    build_vol_with_files();
+    bit_mark(11u, 0); /* image.img: clusters 10,11,12; clear the middle one */
+    CHECK_HEX("mount ok (contiguous gap)", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("lookup refuses a contiguous run with a free cluster", -1,
+              hype_exfat_lookup(&g_fs, "\\image.img", 0, &f));
+
+    /* A genuinely valid multi-cluster chained file still opens, and its tail is already
+     * resolved -- no lazy walk needed on the lookup path. */
+    build_vol_with_files();
+    CHECK_HEX("mount ok (valid chain)", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("a valid chained file still opens", 0,
+              hype_exfat_lookup(&g_fs, "\\subdir\\deep.bin", 0, &f));
+    CHECK_HEX("its tail is resolved immediately", 32u, f.tail_cluster);
+}
+
+/*
+ * #647 (criterion 3): hype_exfat_write_at's growth path must re-validate the chain against the
+ * handle's OWN recorded size before trusting it enough to extend -- state can have moved since
+ * open, on a mount another writer shares. Mirrors core/fat_write_fs.c:1446.
+ */
+static void test_write_at_revalidates_chain_before_growing(void) {
+    hype_exfat_fs_t fs2;
+    hype_exfat_wfile_t f;
+    uint8_t full[SECSZ];
+    unsigned int i;
+
+    for (i = 0; i < sizeof full; i++) full[i] = pat(i);
+
+    build_vol();
+    CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("create", 0, hype_exfat_create(&g_fs, "A.LOG", &f));
+    CHECK_HEX("fill the first cluster exactly", 0, hype_exfat_append(&f, full, sizeof full));
+
+    /* Corrupt the chain on the medium AFTER the handle was opened -- something write_at must
+     * not simply trust because open validated it once. A fresh mount (rather than poking
+     * g_fs's own FAT cache, which #645 keeps authoritative and would simply hide this) is what
+     * makes the corruption visible the way a second writer sharing the medium would see it. */
+    put32(fat_ent(f.first_cluster), CLUSTERS + 9u);
+    CHECK_HEX("remount sees the corrupted chain", 0,
+              hype_exfat_fs_mount(vol_read, vol_write, 0, &fs2));
+    f.fs = &fs2;
+
+    /* Past the current size, so this takes the GROWTH path (the one under test) rather than
+     * the in-place path, which never re-measures the chain. */
+    CHECK("growth refuses a chain that changed since open",
+          hype_exfat_write_at(&f, sizeof full, "x", 1u) != 0);
+}
+
+/*
+ * #646: the #377 cross-link shape, exFAT flavour. A handle holds a stale (dir_cluster, set_index)
+ * after the entry set it named was retired and its slot handed to a DIFFERENT file by rename --
+ * the exact shape #338's single shared hype_fs_t makes reachable (one handle held across another
+ * writer's rename). Without an identity check, set_flush() publishes this handle's data straight
+ * into whatever now occupies that slot.
+ */
+static void test_set_flush_refuses_a_reused_slot(void) {
+    hype_exfat_wfile_t a, b;
+    uint8_t before[32], after[32];
+    uint32_t reused_index;
+
+    build_vol();
+    CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("create A", 0, hype_exfat_create(&g_fs, "A.LOG", &a));
+    CHECK_HEX("seed A", 0, hype_exfat_append(&a, "hello", 5u));
+    reused_index = a.set_index;
+
+    /* Retire A's slot by renaming it elsewhere -- the new entry set lands further into the
+     * directory, and A's old slot is freed. */
+    CHECK_HEX("rename A away", 0, hype_exfat_rename(&g_fs, "A.LOG", "RENAMED.LOG"));
+
+    /* B lands in the very slot the stale handle `a` still remembers: dir_scan_slots finds the
+     * first free run, which is now A's old, just-retired slot. */
+    CHECK_HEX("create B", 0, hype_exfat_create(&g_fs, "B.LOG", &b));
+    CHECK_HEX("B did reuse A's old slot (the scenario this test needs)", reused_index,
+              b.set_index);
+    CHECK_HEX("seed B", 0, hype_exfat_append(&b, "world", 5u));
+    memcpy(before, cluster(ROOT_CL) + (b.set_index + 1u) * 32u, sizeof before);
+
+    /* The stale handle `a` still has set_index == reused_index, and A's OWN NameHash. An append
+     * on it must be refused -- it is not B's data, and the slot is not A's anymore. */
+    CHECK("append on the stale handle is refused", hype_exfat_append(&a, "MORE", 4u) != 0);
+    CHECK_HEX("the identity error is reported", HYPE_EXFAT_WFILE_ERR_IDENTITY, a.last_error);
+
+    /* B's Stream entry must be byte-identical to what it was before the stale append attempt. */
+    memcpy(after, cluster(ROOT_CL) + (b.set_index + 1u) * 32u, sizeof after);
+    CHECK("B's entry set is untouched by the stale append", memcmp(before, after, sizeof before) == 0);
+
+    /* B itself is still perfectly readable under its own name. */
+    {
+        hype_exfat_wfile_t check;
+        uint8_t buf[10];
+        CHECK_HEX("B still resolves", 0, hype_exfat_lookup(&g_fs, "B.LOG", 0, &check));
+        CHECK_HEX("B's size is untouched", 5ull, check.size);
+        CHECK_HEX("B's content is untouched", 0, hype_exfat_read_at(&check, 0u, buf, 5u));
+        CHECK("B's content bytes", memcmp(buf, "world", 5u) == 0);
+    }
+}
+
+/*
+ * #646 (criterion 5): dirref_flush() carries the same identity check set_flush() does (wired via
+ * identity_set()/identity_valid() on the same local hype_exfat_wfile_t machinery), so a growing
+ * directory's own DataLength commit into its parent is guarded exactly like a file's.
+ *
+ * NOTE on coverage: dirref_t is a file-scope type in fat_exfat_fs.c that never crosses the public
+ * API -- resolve_parent() always resolves it FRESH, from the current on-disk state, at the start
+ * of the one synchronous create/mkdir/append call that goes on to use it, and it does not survive
+ * past that call. There is therefore no way to construct a genuinely STALE dirref_t through the
+ * public API the way test_set_flush_refuses_a_reused_slot does for a file handle (which the
+ * caller legitimately holds across separate calls). This test instead exercises the realistic
+ * adjacent case reachable black-box: an UNRELATED directory reuses the exact root slot a renamed
+ * directory used to occupy, and growing the renamed directory (a fresh, correct dirref_t,
+ * resolved after the reuse) must publish into ITS OWN current slot and never disturb the
+ * coincidentally same-numbered old one.
+ */
+static void test_dirref_flush_refuses_a_reused_owner_slot(void) {
+    hype_exfat_wfile_t f;
+    uint32_t d1_root_index;
+
+    build_vol();
+    CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("mkdir d1", 0, hype_exfat_mkdir(&g_fs, "\\d1"));
+    CHECK_HEX("lookup d1", 0, hype_exfat_lookup(&g_fs, "\\d1", 1, &f));
+    d1_root_index = f.set_index;
+
+    /* Retire d1's OWN entry set (in the root) by renaming it elsewhere. */
+    CHECK_HEX("rename d1 away", 0, hype_exfat_rename(&g_fs, "\\d1", "\\d1-renamed"));
+
+    /* A second, unrelated directory ends up in d1's old root slot. */
+    CHECK_HEX("mkdir d2", 0, hype_exfat_mkdir(&g_fs, "\\d2"));
+    {
+        hype_exfat_wfile_t check;
+        CHECK_HEX("lookup d2", 0, hype_exfat_lookup(&g_fs, "\\d2", 1, &check));
+        CHECK_HEX("d2 did reuse d1's old root slot (the scenario this test needs)", d1_root_index,
+                  check.set_index);
+    }
+
+    /* Force d1-renamed to grow: its OWN (freshly resolved) dirref_t names its actual, current
+     * root slot, well past d2's. Sixteen entries fill one cluster (16 * 32 = 512 bytes); nine
+     * 3-slot files force a grow. */
+    {
+        char path[40];
+        hype_exfat_wfile_t inner;
+        unsigned int i;
+        for (i = 0; i < 9u; i++) {
+            snprintf(path, sizeof path, "\\d1-renamed\\f%u.dat", i);
+            CHECK_HEX("create in d1-renamed", 0, hype_exfat_create(&g_fs, path, &inner));
+            CHECK_HEX("append in d1-renamed", 0,
+                      hype_exfat_append(&inner, path, (unsigned)strlen(path)));
+        }
+    }
+
+    /* d2 must be completely unaffected: still a directory, still exactly its original one-cluster
+     * DataLength (every exFAT directory starts at a whole cluster, per hype_exfat_mkdir). */
+    {
+        hype_exfat_wfile_t check;
+        CHECK_HEX("d2 still resolves as a directory", 0,
+                  hype_exfat_lookup(&g_fs, "\\d2", 1, &check));
+        CHECK_HEX("d2's DataLength is untouched", (uint64_t)SECSZ, check.size);
+    }
+}
+
+/*
+ * A root directory spanning TWO clusters: ROOT_CL (label/bitmap/upcase, then 13 free slots -- more
+ * than enough for a fresh 3-slot entry) chained to `second`, which holds ONE named entry set at
+ * its very first slot. Built so a name search reaching `second` needs a read the FAT chain-walk
+ * itself does not, and so placing a NEW entry never has to touch `second` at all: cluster ROOT_CL
+ * alone has plenty of room. That is what makes the two outcomes (dir_find failing vs. dir_find_
+ * slots succeeding) actually diverge, instead of both failing for the same underlying reason.
+ */
+static void build_vol_two_cluster_root(uint32_t second, const char *name) {
+    unsigned int i;
+
+    build_vol();
+    put32(fat_ent(ROOT_CL), second);
+    put32(fat_ent(second), 0xFFFFFFFFu);
+    bit_mark(second, 1);
+    /*
+     * exFAT's 0x00 (never-used) marker means "nothing valid anywhere after this either" -- real
+     * formatters only grow a directory once its current cluster is fully consumed. So the first
+     * cluster's remaining slots (after label/bitmap/upcase) are filled with 0x05 (deleted: InUse
+     * clear, type byte non-zero), which dir_find() steps over but which also reads as free room
+     * for a fresh entry -- exactly the room a duplicate-placing bug would use.
+     */
+    for (i = 3u; i < 16u; i++) {
+        cluster(ROOT_CL)[i * 32u] = 0x05u;
+    }
+    place_set(cluster(second) + 0, name, HYPE_EXFAT_ATTR_ARCHIVE, 0u, 0u, 0);
+}
+
+/*
+ * #644: a directory-walk I/O error must read as a distinct failure, never as "not found" or
+ * "empty" -- dir_find()/dir_is_empty() used to collapse a genuine dir_capacity()/fat_get() read
+ * failure into exactly those answers.
+ */
+static void test_dir_walk_io_error_is_distinct_from_not_found(void) {
+    hype_exfat_wfile_t f;
+    uint8_t before[2u * SECSZ], after[2u * SECSZ];
+
+    /*
+     * Criterion 1: create() on an EXISTING file ("target.bin", placed alone in the SECOND root
+     * cluster) must refuse when the sector holding its entry set fails to read -- and must NOT
+     * duplicate it into the free room in the FIRST cluster. Without the #644 fix, dir_find()
+     * reads that failure as "not found", and create() places a second "target.bin" entry set
+     * right there, since dir_find_slots() never needs to touch the failing cluster at all.
+     */
+    build_vol_two_cluster_root(200u, "target.bin");
+    CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    memcpy(before, cluster(ROOT_CL), SECSZ);
+    memcpy(before + SECSZ, cluster(200u), SECSZ);
+    g_fail_read_lba = clba(200u);
+    CHECK("create on an existing file surfaces the directory-walk I/O error",
+          hype_exfat_create(&g_fs, "target.bin", &f) != 0);
+    g_fail_read_lba = (uint64_t)-1;
+    memcpy(after, cluster(ROOT_CL), SECSZ);
+    memcpy(after + SECSZ, cluster(200u), SECSZ);
+    CHECK("no second entry set was placed", memcmp(before, after, sizeof before) == 0);
+    CHECK_HEX("target.bin is still findable, unduplicated", 0,
+              hype_exfat_lookup(&g_fs, "target.bin", 0, &f));
+
+    /*
+     * Criterion 2: mkdir() with the same shape must refuse and create nothing. dir_find() is
+     * called first to refuse an existing name of EITHER kind; the same conflation would let
+     * mkdir() past it into dir_find_slots(), placing a duplicate the same way.
+     */
+    build_vol_two_cluster_root(201u, "target.bin");
+    CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    memcpy(before, cluster(ROOT_CL), SECSZ);
+    memcpy(before + SECSZ, cluster(201u), SECSZ);
+    g_fail_read_lba = clba(201u);
+    CHECK("mkdir surfaces the directory-walk I/O error",
+          hype_exfat_mkdir(&g_fs, "target.bin") != 0);
+    g_fail_read_lba = (uint64_t)-1;
+    memcpy(after, cluster(ROOT_CL), SECSZ);
+    memcpy(after + SECSZ, cluster(201u), SECSZ);
+    CHECK("nothing new was placed in the root", memcmp(before, after, sizeof before) == 0);
+
+    /*
+     * Criterion 3: rmdir() on a NON-empty FAT-chained directory. "target" spans two clusters:
+     * the first is full of 0x05 filler (in-use bit clear, but NOT the 0x00 terminator -- the
+     * same technique build_vol_with_files() uses for "cdir"), so the scan keeps going instead of
+     * reading it as end-of-directory; the second holds the one real, in-use entry that makes the
+     * directory non-empty. dir_is_empty() needs exactly ONE fat_get() to walk from the first
+     * cluster to the second (cluster 210's own FAT entry, in the FAT's SECOND sector since
+     * FAT_ENTRIES_PER_SECTOR is 128); failing only THAT one read (via g_lba_read_target, not the
+     * blanket g_fail_read_lba) isolates dir_is_empty()'s own answer from free_allocation()'s
+     * LATER, separate walk of the same chain -- which would also fail (masking the bug) under a
+     * blanket failure, since both need the identical fat_get(). A buggy dir_is_empty() reads that
+     * one failure as "empty," so rmdir proceeds into a free_allocation() that this time succeeds
+     * (the induced failure was one-shot) and actually frees a directory that still holds an entry.
+     */
+    {
+        uint32_t dir_cl = 210u, dir_cl2 = 211u;
+        unsigned int i;
+
+        build_vol();
+        place_set(cluster(ROOT_CL) + 96, "target", HYPE_EXFAT_ATTR_DIRECTORY, dir_cl,
+                  2u * SECSZ, 0);
+        put32(fat_ent(dir_cl), dir_cl2);
+        put32(fat_ent(dir_cl2), 0xFFFFFFFFu);
+        bit_mark(dir_cl, 1);
+        bit_mark(dir_cl2, 1);
+        for (i = 0; i < 16u; i++) {
+            cluster(dir_cl)[i * 32u] = 0x05u; /* in-use bit clear, not the 0x00 terminator */
+        }
+        place_set(cluster(dir_cl2) + 0, "inner.bin", HYPE_EXFAT_ATTR_ARCHIVE, 0u, 0u, 0);
+        CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+        CHECK_HEX("target's clusters are allocated before", 1u,
+                  (unsigned)(bit_used(dir_cl) && bit_used(dir_cl2)));
+        g_lba_read_target = FAT_LBA + dir_cl / 128u;
+        g_lba_reads_to_fail = 1;
+        g_lba_reads_seen = 0;
+        CHECK("rmdir on a non-empty directory surfaces the I/O error",
+              hype_exfat_rmdir(&g_fs, "target") != 0);
+        g_lba_reads_to_fail = 0;
+        g_lba_read_target = (uint64_t)-1;
+        CHECK_HEX("target's clusters are still allocated", 1u,
+                  (unsigned)(bit_used(dir_cl) && bit_used(dir_cl2)));
+        CHECK_HEX("target still resolves", 0, hype_exfat_lookup(&g_fs, "target", 1, &f));
+    }
+
+    /* Criterion 4: lookup() on a path whose directory read fails must return -1 -- already true
+     * via the rc<=0 check, and this locks it in against a regression. */
+    build_vol_two_cluster_root(200u, "target.bin");
+    CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    g_fail_read_lba = clba(200u);
+    CHECK("lookup surfaces the directory-walk I/O error",
+          hype_exfat_lookup(&g_fs, "target.bin", 0, &f) != 0);
+    g_fail_read_lba = (uint64_t)-1;
+}
+
 int main(void) {
     test_rollback_never_frees_under_a_published_larger_size(); /* #517 */
+    test_cluster_growth_uses_durability_barriers();               /* #648 */
+    test_persistent_barrier_failure_never_leaves_entry_past_chain(); /* #648 */
+    test_shared_mount_survives_stale_fat_and_bitmap_reads(); /* #645 */
+    test_fat_set_failure_invalidates_cache();                /* #645 */
+    test_alloc_refuses_a_cluster_the_fat_still_chains();     /* #645 */
+    test_lookup_chain_validation();                    /* #647 */
+    test_write_at_revalidates_chain_before_growing();   /* #647 */
+    test_set_flush_refuses_a_reused_slot();             /* #646 */
+    test_dirref_flush_refuses_a_reused_owner_slot();    /* #646 */
     test_fs_ops_exfat();
+    test_fs_ops_exfat_identity_error();                 /* #646 */
     test_383_vdl();
     test_383_rollback_and_faults();
     test_exfat_set_time();
@@ -2081,6 +2797,7 @@ int main(void) {
     test_contiguous_subdir_growth();
     test_dir_ops_read_only();
     test_io_failures();
+    test_dir_walk_io_error_is_distinct_from_not_found(); /* #644 */
     test_fault_sweep();
     if (failures == 0) { printf("all tests passed\n"); return 0; }
     printf("%d test(s) failed\n", failures);

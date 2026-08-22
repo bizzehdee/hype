@@ -342,6 +342,10 @@ static void test_exfat_is_a_growing_writer(void) {
     CHECK("exfat wires append", exfat->append != 0);
     CHECK("exfat wires rename", exfat->rename != 0);
     CHECK("exfat wires sync", exfat->sync != 0);
+    /* #648: exFAT orders a growing publish behind a durability barrier exactly
+     * as FAT32 does; a NULL slot here would make hype_fs_set_barrier() a
+     * silent no-op on any exFAT-formatted stick. */
+    CHECK("exfat wires set_barrier", exfat->set_barrier != 0);
 }
 
 int main(void) {
