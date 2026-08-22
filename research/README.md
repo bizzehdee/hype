@@ -44,6 +44,7 @@ not treat them as project-licensed material.
 | `linux-ext4-group-descriptors-2026-08-11.html` | Linux kernel ext4 block group descriptors | kernel documentation snapshot, 11 August 2026 | https://www.kernel.org/doc/html/latest/filesystems/ext4/group_descr.html |
 | `linux-ext4-inodes-2026-08-11.html` | Linux kernel ext4 inode structure | kernel documentation snapshot, 11 August 2026 | https://www.kernel.org/doc/html/latest/filesystems/ext4/inodes.html |
 | `linux-ext4-journal-2026-08-11.html` | Linux kernel ext4 jbd2 journal format | kernel documentation snapshot, 11 August 2026 | https://www.kernel.org/doc/html/latest/filesystems/ext4/journal.html |
+| `linux-ext4-directory-2026-08-22.html` | Linux kernel ext4 directory entry format, checksum tail, htree/dx_root layout | kernel documentation snapshot, 22 August 2026 | https://www.kernel.org/doc/html/latest/filesystems/ext4/directory.html |
 | `microsoft-hyper-v-tlfs-hypercall-interface-94373af.md` | Microsoft Hyper-V TLFS Hypercall Interface | commit `94373af`, 15 December 2025 | https://github.com/MicrosoftDocs/Virtualization-Documentation/blob/94373af503f83b800ac002911f5d137a53392656/virtualization/hyper-v-on-windows/tlfs/hypercall-interface.md |
 
 ## Archived wiki exports
@@ -87,6 +88,20 @@ not treat them as project-licensed material.
   `inodes` for mappings, sizes and inode checksums, and `journal` for jbd2
   metadata transactions. Allocation changes metadata and therefore cannot use
   #204's journal-bypass reasoning, which applies only to in-place data writes.
+- **Linux ext4 directory documentation (`linux-ext4-directory-2026-08-22.html`).**
+  #498 (namespace mutation) uses `struct ext4_dir_entry_2` (inode/rec_len/
+  name_len/file_type/name, 8-byte header) and the `struct ext4_dir_entry_tail`
+  checksum fake-entry every leaf directory block carries under
+  RO_COMPAT_METADATA_CSUM: 12 bytes, `det_reserved_zero1`(inode)=0,
+  `det_rec_len`=12, `det_reserved_zero2`(name_len)=0, `det_reserved_ft`
+  (file_type)=0xDE, `det_checksum` = crc32c seeded with the SAME i_csum_seed
+  #495 already computes per-inode (fs seed chained with the directory's own
+  inode number + generation), hashed over the block up to but excluding the
+  tail. Confirms `EXT4_INDEX_FL` = 0x1000 (already used by core/tests/test_ext.c's
+  htree fixture) and that an htree directory's root block starts with real
+  '.'/'..' entries followed by a `dx_root_info` header masquerading as more
+  directory entries -- exactly why a linear insertion into an htree directory
+  corrupts the index instead of merely being suboptimal.
 - **Hyper-V TLFS (`microsoft-hyper-v-tlfs-hypercall-interface-94373af.md`).** #300
   uses "Hypercall Inputs", "Hypercall Outputs", "Hypercall Status Codes", and
   "Establishing the Hypercall Interface (x86/x64)". The call code is input bits

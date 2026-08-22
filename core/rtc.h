@@ -101,6 +101,19 @@ uint8_t hype_fat_encode_time_tenths(const hype_rtc_time_t *t);
 uint32_t hype_exfat_encode_timestamp(const hype_rtc_time_t *t);
 
 /*
+ * #498: Unix epoch seconds (1970-01-01 00:00:00 UTC), for writers whose
+ * on-disk timestamp IS a raw epoch count (ext2/3/4's i_atime/i_ctime/i_mtime),
+ * unlike FAT32/exFAT's packed field encodings above. Civil-calendar to
+ * days-since-epoch via the standard proleptic-Gregorian formula (Howard
+ * Hinnant's days_from_civil); safe here because hype_rtc_time_t's floor is
+ * 1980, well clear of the y<0 special case that formula needs elsewhere.
+ * Returns 0 for an invalid time -- the Unix epoch itself, which is what an
+ * ext inode's timestamp fields already read as when never set, so this
+ * matches the "unset" convention rather than inventing a new one. Pure.
+ */
+uint32_t hype_rtc_to_unix(const hype_rtc_time_t *t);
+
+/*
  * exFAT's Create/LastModified10msIncrement byte: the timestamp field holds
  * second/2, and this carries the odd second back as 100 x 10ms (the RTC has no
  * sub-second resolution). 0 for an invalid time. Pure.
