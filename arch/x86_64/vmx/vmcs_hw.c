@@ -3328,6 +3328,29 @@ void hype_vmx_apicv_sync_timer(hype_vcpu_ctx_t *ctx, uint32_t current_count) {
     *(volatile uint32_t *)(real->vapic + 0x390u) = current_count;
 }
 
+/* #599 bring-up probe: one line of APICv state -- the nonzero vIRR words and RVI/SVI --
+ * printable from the owner's loop on the TIMERHIST cadence. Answers "is a posted vector
+ * stuck in the page while RVI reads zero" without another blind run. */
+void hype_vmx_apicv_dump(hype_vcpu_ctx_t *ctx) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    int ok = 0;
+    unsigned w;
+    uint64_t gis;
+    if (real == 0 || !real->apicv) return;
+    gis = vmread(HYPE_VMCS_GUEST_INTERRUPT_STATUS, &ok);
+    hype_debug_print("vmx apicv-state: gis=0x%llx virr:", (unsigned long long)gis);
+    for (w = 0; w < 8u; w++) {
+        uint32_t v = *(volatile uint32_t *)(real->vapic + 0x200u + w * 0x10u);
+        if (v != 0u) hype_debug_print(" [%u]=0x%x", w, v);
+    }
+    hype_debug_print(" isr:");
+    for (w = 0; w < 8u; w++) {
+        uint32_t v = *(volatile uint32_t *)(real->vapic + 0x100u + w * 0x10u);
+        if (v != 0u) hype_debug_print(" [%u]=0x%x", w, v);
+    }
+    hype_debug_print("\n");
+}
+
 /* #599: the reason-45 (virtualized EOI) exit names the completed vector; run
  * the same delivered-vector notification the event-injection path records at
  * injection time (#456), so the trap path's consumers keep working. */

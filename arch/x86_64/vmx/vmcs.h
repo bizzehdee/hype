@@ -240,6 +240,7 @@ void hype_vmx_apicv_set_id(hype_vcpu_ctx_t *ctx, uint32_t apic_id);
 uint32_t hype_vmx_apicv_read32(hype_vcpu_ctx_t *ctx, uint32_t offset);
 void hype_vmx_apicv_note_delivered(hype_vcpu_ctx_t *ctx, uint8_t vector);
 void hype_vmx_apicv_sync_timer(hype_vcpu_ctx_t *ctx, uint32_t current_count);
+void hype_vmx_apicv_dump(hype_vcpu_ctx_t *ctx);
 int hype_vmx_vcpu_handle_lapic_access(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lapic,
                                       const uint8_t *guest_insn_bytes);
 void hype_vmx_vcpu_wake_hlt(hype_vcpu_ctx_t *ctx);
