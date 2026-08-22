@@ -70,7 +70,16 @@ typedef struct {
     void *ctx;
     uint64_t volume_length; /* total sectors, from the boot sector */
     uint32_t fat_lba;       /* first sector of the ACTIVE FAT */
+    uint32_t fat_base;      /* first sector of FAT COPY 0 (== fat_lba when num_fats == 1) */
     uint32_t fat_length;    /* sectors per FAT */
+    /*
+     * plan.md decision 62: a NumberOfFats == 2 volume gets both FAT copies kept
+     * in sync, matching FAT32's fat_set discipline (core/fat_write_fs.c) --
+     * fat_set() writes the same authoritative sector to every copy from
+     * `fat_base`. Reads still go through the ACTIVE copy only (`fat_lba`), so
+     * this field exists purely to know how many copies a write must reach.
+     */
+    uint32_t num_fats;
     uint32_t heap_lba;      /* first sector of the cluster heap (cluster 2) */
     uint32_t cluster_count; /* clusters in the heap; valid clusters are 2..count+1 */
     uint32_t root_cluster;
