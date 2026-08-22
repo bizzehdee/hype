@@ -732,6 +732,13 @@ typedef struct hype_fw_diag {
     unsigned long long rtc_last_irqs;
     int ata_undelivered_reported;
     uint8_t snap[HYPE_VT_MAX_ROWS * (HYPE_VT_MAX_COLS + 1u)]; /* terminal surface, frame to frame */
+    /* #642: the last vt_screen generation this VM's on-screen terminal was dumped at (0 =
+     * never dumped). vt_screen.h's `generation` field exists precisely so a renderer can tell
+     * "did anything change since I last drew" without diffing the grid -- the periodic screen
+     * dump below never consulted it, so it re-emitted the ENTIRE grid every ~30s regardless of
+     * whether the guest had printed anything new, and a guest idling at a static prompt for
+     * most of a run made one real boot read as a loop of many identical reboots. */
+    unsigned screen_dump_gen;
     uint64_t dr_last;
     uint64_t dr_n;
     uint64_t kbd_rte1_last;
@@ -14424,10 +14431,19 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * test instrumentation. The VT grid already holds the characters; writing them
                  * out makes any guest console readable in the log, on a machine with no serial
                  * port at all. Blank-trimmed, and only rows with content.
+                 *
+                 * #642: skipped entirely when nothing has changed since the last dump. This
+                 * used to re-emit the WHOLE grid every ~30s unconditionally, so a guest that
+                 * reached a static prompt and stayed there emitted the same boot transcript
+                 * over and over for the rest of the run -- one real boot read as a loop of many
+                 * identical reboots (17 in one 26-minute run). vt_screen.h's `generation`
+                 * counter is bumped on every mutation to the grid for exactly this check; a
+                 * dump this VM already took at the current generation has nothing new to say.
                  */
-                {
+                if (vm->diag.screen_dump_gen != vm->term.generation) {
                     unsigned tr, tc;
                     char line[HYPE_VT_MAX_COLS + 1];
+                    vm->diag.screen_dump_gen = vm->term.generation;
                     for (tr = 0; tr < vm->term.rows && tr < HYPE_VT_MAX_ROWS; tr++) {
                         unsigned last = 0;
                         for (tc = 0; tc < vm->term.cols && tc < HYPE_VT_MAX_COLS; tc++) {
