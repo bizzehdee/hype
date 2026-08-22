@@ -396,10 +396,15 @@ fi
 #   netgoal  the same, and it is the whole-goal config: two VMs each pinging www.google.com and each
 #            other. `--suite tests/micro/suite-goal.cfg`.
 #
+#   vmexit       #603: ends in a deliberate triple fault, exactly like faulter, for the same reason.
+#                Run it: `--suite tests/micro/suite-603.cfg` (paired with hello, faulter-538-style).
+#   vmexitstorm  #603 item 4: deliberately trips the #171 per-vCPU watchdog and expects hype to
+#                force THIS VM off. Same config as vmexit -- `suite-603.cfg` runs all three.
+#
 # Both are EXCLUDED RATHER THAN LEFT TO FAIL, because a test that cannot pass in the default run is
 # noise that trains a reader to ignore the run -- and they are named here with how to run them, so
 # the exclusion does not hide them either.
-MICRO_EXCLUDE_DEFAULT="faulter netpeer netgoal"
+MICRO_EXCLUDE_DEFAULT="faulter netpeer netgoal vmexit vmexitstorm"
 
 if [ $# -eq 0 ]; then
     all=$(sed -n 's/^MICRO_NAMES := //p' Makefile | tr ' ' '\n' | grep -v '^$')
