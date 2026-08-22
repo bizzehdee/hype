@@ -3137,6 +3137,70 @@ static void test_attach_detach_disk(void) {
     CHECK_INT("detach missing refused", -1, hype_cfg_detach_disk(&out, "k", "stick"));
 }
 
+/*
+ * #673: a malformed [disk.*] is dropped (§4.3 -- skipped, not fatal), but its SECTION entry
+ * kept `kind == HYPE_CFG_SECTION_DISK` with `index` remapped to -1 by compaction.
+ * hype_cfg_serialize() indexed disks[-1] unconditionally -- an OOB read UBSan's array-bounds
+ * instrumentation catches on this fixed-size array (found by the #602 fuzz harness with zero
+ * mutation, on the very first malformed seed it tried).
+ */
+static void test_serialize_skips_a_section_whose_disk_was_dropped(void) {
+    const char *cfg = "[disk.bad]\n"; /* missing every required field -- dropped at validation */
+    hype_cfg_t out;
+    static char written[4096];
+    hype_cfg_serialize_result_t ser;
+
+    CHECK_INT("parse still OK (S4.3: malformed is skipped, not fatal)", HYPE_CFG_OK,
+             parse_copy(cfg, &out).status);
+    CHECK_INT("the disk was dropped", 1, out.skipped_disks);
+
+    /* The crash was in serialize itself; reaching this line without a sanitizer abort or a
+     * segfault already proves the fix on a debug/ASan build. */
+    ser = hype_cfg_serialize(&out, written, sizeof(written));
+    CHECK_INT("serialize did not truncate", 0, ser.truncated || ser.refused_overflow);
+    CHECK_INT("no synthesized disk content for the dropped section", 0,
+             strstr(written, "type =") != 0 || strstr(written, "backing =") != 0);
+}
+
+/*
+ * #673: the VM-side twin. cfg->vms is a caller-owned pointer (decision 33), not a fixed-size
+ * array, so UBSan's array-bounds check has no compile-time bound here -- vms[-1] silently read
+ * whatever host memory sat immediately before VM storage and serialize_vm() wrote it into the
+ * OUTPUT TEXT as if it were a real VM section: an information leak into a saved config, not
+ * merely a crash. A second, valid VM keeps vm_count nonzero so the "every VM was skipped"
+ * early return isn't what's being tested here -- this exercises the per-section guard.
+ */
+static void test_serialize_skips_a_section_whose_vm_was_dropped(void) {
+    const char *cfg =
+        "[vm.good]\n"
+        "vcpus = 1\n"
+        "mem_mb = 512\n"
+        "boot = disk\n"
+        "firmware = uefi\n"
+        "os_hint = linux\n"
+        "target_disk = file:\\hype\\disks\\a.img\n"
+        "\n"
+        "[vm.bad]\n"; /* missing every required field -- dropped at validation */
+    hype_cfg_t out;
+    static char written[4096];
+    hype_cfg_serialize_result_t ser;
+
+    CHECK_INT("parse still OK", HYPE_CFG_OK, parse_copy(cfg, &out).status);
+    CHECK_INT("one VM survived", 1, out.vm_count);
+    CHECK_INT("one VM was dropped", 1, out.skipped_vms);
+
+    ser = hype_cfg_serialize(&out, written, sizeof(written));
+    CHECK_INT("serialize did not truncate", 0, ser.truncated || ser.refused_overflow);
+    CHECK_INT("the surviving VM is present", 1, strstr(written, "[vm.good]") != 0);
+    /* No synthesized "vcpus ="/"mem_mb =" line belongs to the dropped VM. The surviving VM
+     * legitimately has its own "vcpus = 1", so absence of a SECOND one is what's checked. */
+    {
+        const char *first = strstr(written, "vcpus =");
+        CHECK_INT("exactly one synthesized vcpus= line (the surviving VM's)", 0,
+                 first != 0 && strstr(first + 1, "vcpus =") != 0);
+    }
+}
+
 int main(void) {
     test_bus_usb_msc();
     test_attach_detach_disk();
@@ -3271,6 +3335,8 @@ int main(void) {
     test_a_documented_config_round_trips();                  /* #567 */
     test_appending_a_vm_to_a_documented_config_writes_back(); /* #567 */
     test_worst_case_config_fits_the_documented_buffer();      /* #567 */
+    test_serialize_skips_a_section_whose_disk_was_dropped();  /* #673 */
+    test_serialize_skips_a_section_whose_vm_was_dropped();    /* #673 */
 
     if (failures == 0) {
         printf("all tests passed\n");

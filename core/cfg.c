@@ -2557,17 +2557,36 @@ hype_cfg_serialize_result_t hype_cfg_serialize(const hype_cfg_t *cfg, char *out,
             case HYPE_CFG_SECTION_HYPE:
                 serialize_hype(&w, &cfg->hype);
                 break;
+            /*
+             * #673: a section whose VM/disk was dropped as malformed (§4.3 -- a malformed
+             * section is skipped, not fatal) keeps its `kind` but has its `index` remapped to
+             * -1 by the compaction pass in load_hype_cfg(). Indexing straight through was an
+             * OOB read: on the fixed-size `disks[HYPE_CFG_MAX_DISKS]` array it is a crash
+             * (UBSan array-bounds); on the caller-owned `vms` pointer (decision 33, no
+             * compile-time bound for a sanitizer to check) it silently read whatever host
+             * memory sits before the VM storage and serialized it into the output as if it
+             * were a real section -- an information leak into the saved config, not a crash.
+             * A dropped section emits nothing beyond its already-preserved raw/retained lines.
+             */
             case HYPE_CFG_SECTION_VM:
-                serialize_vm(&w, &cfg->vms[sec->index]);
+                if (sec->index >= 0) {
+                    serialize_vm(&w, &cfg->vms[sec->index]);
+                }
                 break;
             case HYPE_CFG_SECTION_DISK:
-                serialize_disk(&w, &cfg->disks[sec->index]);
+                if (sec->index >= 0) {
+                    serialize_disk(&w, &cfg->disks[sec->index]);
+                }
                 break;
             case HYPE_CFG_SECTION_NIC: /* #583 */
-                serialize_nic(&w, &cfg->nics[sec->index]);
+                if (sec->index >= 0) {
+                    serialize_nic(&w, &cfg->nics[sec->index]);
+                }
                 break;
             case HYPE_CFG_SECTION_SWITCH:
-                serialize_switch(&w, &cfg->switches[sec->index]);
+                if (sec->index >= 0) {
+                    serialize_switch(&w, &cfg->switches[sec->index]);
+                }
                 break;
             case HYPE_CFG_SECTION_UNKNOWN:
             default:
