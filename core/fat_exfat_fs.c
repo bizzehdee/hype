@@ -382,6 +382,83 @@ static int chain_cluster_at(hype_exfat_fs_t *fs, uint32_t first, int contiguous,
     }
 }
 
+/*
+ * #647: walks and validates a FAT-chained allocation against `size` -- the DataLength rule: a
+ * chain shorter than ceil(size / cluster_bytes) is corruption (exFAT has no representation for an
+ * internal hole either, same as FAT32), and a chain longer than that is a loop, a cross-link, or
+ * slack clusters. Bounded by the size-derived need, not WALK_GUARD, so a corrupt chain fails after
+ * `need` steps rather than iterating up to WALK_GUARD times -- no visited set required, since a
+ * loop or a cross-link back into any chain simply never reaches end-of-chain within `need` steps.
+ * Refuses a free (0), reserved (1), bad (0xFFFFFFF7) or out-of-heap cluster mid-chain via the same
+ * cluster_valid() range check chain_cluster_at() uses. Returns the tail cluster in *out_tail.
+ * Mirrors FAT32's chain_measure (core/fat_write_fs.c).
+ */
+static int chain_measure(hype_exfat_fs_t *fs, uint32_t first, uint64_t size, uint32_t *out_tail) {
+    uint64_t need = clusters_for(fs, size);
+    uint32_t cl = first;
+    uint32_t tail = 0u;
+    uint64_t count = 0u;
+
+    if (first == 0u) {
+        if (size != 0u) {
+            return -1; /* a non-empty file must have a chain */
+        }
+        *out_tail = 0u;
+        return 0;
+    }
+    if (!cluster_valid(fs, cl)) {
+        return -1;
+    }
+    for (;;) {
+        uint32_t next;
+        count++;
+        if (count > need) {
+            return -1; /* loop, cross-link, or slack clusters */
+        }
+        tail = cl;
+        if (fat_get(fs, cl, &next) != 0) {
+            return -1;
+        }
+        if (next >= HYPE_EXFAT_EOC) {
+            break;
+        }
+        if (!cluster_valid(fs, next)) {
+            return -1; /* free, reserved, bad, or out of the heap */
+        }
+        cl = next;
+    }
+    if (count < need) {
+        return -1; /* shorter than the recorded size */
+    }
+    *out_tail = tail;
+    return 0;
+}
+
+/*
+ * #647: the contiguous (NoFatChain) counterpart of chain_measure. set_read() already range-checks
+ * the whole run against the heap; this additionally refuses a run where any cluster's allocation-
+ * bitmap bit reads clear, so a contiguous stream this mount never actually allocated (or one whose
+ * bitmap has drifted, the #645 class of disagreement) is not accepted as this file's data.
+ */
+static int contiguous_run_all_used(hype_exfat_fs_t *fs, uint32_t first, uint64_t size) {
+    uint64_t n = clusters_for(fs, size);
+    uint64_t i;
+
+    for (i = 0; i < n; i++) {
+        uint32_t cl = first + (uint32_t)i;
+        uint64_t lba;
+        unsigned int bit;
+        hype_exfat_bitmap_location(cl, fs->bitmap_lba, &lba, &bit);
+        if (bitmap_cache_load(fs, lba) != 0) {
+            return -1;
+        }
+        if (!hype_exfat_bitmap_get(fs->bitmap_cache, bit)) {
+            return -1; /* marked free: not a genuine allocation */
+        }
+    }
+    return 0;
+}
+
 static int entry_lba(hype_exfat_fs_t *fs, uint32_t dir_first, int dir_contig, uint32_t ei,
                      uint64_t *out_lba, unsigned int *out_off) {
     uint32_t ci, sic, cl;
@@ -880,10 +957,36 @@ int hype_exfat_lookup(hype_exfat_fs_t *fs, const char *path, int want_dir,
         }
         if (last) {
             int is_dir = (set.attributes & HYPE_EXFAT_ATTR_DIRECTORY) ? 1 : 0;
+            uint32_t tail = 0u;
             if (is_dir != (want_dir ? 1 : 0)) {
                 return -1;
             }
+            /*
+             * #647: a FILE handle is writable random-I/O, exactly like FAT32's hype_fat32_open, so
+             * its complete chain is validated against DataLength before a handle is returned --
+             * refusing a short chain (would fail mid-read/write at an arbitrary offset instead of
+             * at open), a long chain (a loop or cross-link, walked to WALK_GUARD otherwise), and a
+             * contiguous run with a cluster the bitmap says is not actually allocated. Directories
+             * are addressed through their own already-bounded walks (dir_find, dir_scan_slots,
+             * dir_is_empty), so this does not apply to them.
+             */
+            if (!is_dir) {
+                if (set.contiguous) {
+                    if (contiguous_run_all_used(fs, set.first_cluster, set.data_length) != 0) {
+                        return -1;
+                    }
+                    tail = (set.first_cluster == 0u)
+                               ? 0u
+                               : set.first_cluster +
+                                     (uint32_t)(clusters_for(fs, set.data_length) - 1u);
+                } else if (chain_measure(fs, set.first_cluster, set.data_length, &tail) != 0) {
+                    return -1;
+                }
+            }
             wfile_from_set(out, fs, dir_first, dir_contig, ei, &set);
+            if (!is_dir) {
+                out->tail_cluster = tail; /* already resolved: no lazy walk needed */
+            }
             return 0;
         }
         if ((set.attributes & HYPE_EXFAT_ATTR_DIRECTORY) == 0u) {
@@ -1782,6 +1885,24 @@ int hype_exfat_write_at(hype_exfat_wfile_t *f, uint64_t offset, const void *data
         uint64_t have = (f->first_cluster == 0u) ? 0u : clusters_for(fs, f->size);
 
         if (have > 0u) {
+            /*
+             * #647: re-validate before trusting the chain enough to extend it. hype_exfat_lookup
+             * validated once, at open; another writer sharing this mount (or corruption) could
+             * have moved the allocation since -- exactly the reason core/fat_write_fs.c:1446
+             * re-runs chain_measure at the top of FAT32's growth path rather than trusting
+             * open-time state.
+             */
+            if (f->contiguous) {
+                if (contiguous_run_all_used(fs, f->first_cluster, f->size) != 0) {
+                    return -1;
+                }
+            } else {
+                uint32_t measured_tail;
+                if (chain_measure(fs, f->first_cluster, f->size, &measured_tail) != 0) {
+                    return -1;
+                }
+                f->tail_cluster = measured_tail;
+            }
             if (chain_materialise(f) != 0) {
                 return -1;
             }

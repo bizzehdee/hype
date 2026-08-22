@@ -1541,26 +1541,27 @@ static void test_bad_allocations(void) {
  */
 static void test_corrupt_chains(void) {
     hype_exfat_wfile_t f;
-    static uint8_t back[16];
     unsigned i;
 
-    /* A file whose chain points outside the heap partway along. */
+    /*
+     * #647: a file whose chain points outside the heap partway along used to resolve fine at
+     * lookup and only fail later, at an arbitrary byte offset, when read_at/append actually
+     * walked into the broken link. hype_exfat_lookup now validates the complete chain against
+     * DataLength up front (chain_measure), so the corruption is refused at open instead.
+     */
     build_vol_with_files();
     put32(fat_ent(30u), CLUSTERS + 9u); /* deep.bin: 30 -> out of range */
     CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
-    CHECK_HEX("lookup ok", 0, hype_exfat_lookup(&g_fs, "\\subdir\\deep.bin", 0, &f));
-    CHECK_HEX("reading into the broken link refused", -1,
-              hype_exfat_read_at(&f, 512u, back, 4u));
-    CHECK_HEX("appending onto a broken chain refused", -1, hype_exfat_append(&f, back, 4u));
+    CHECK_HEX("lookup refuses a chain leaving the heap", -1,
+              hype_exfat_lookup(&g_fs, "\\subdir\\deep.bin", 0, &f));
 
     /* A chain that ends before the recorded size: the cluster after the first is
-     * simply not there. */
+     * simply not there. Also now refused at lookup, not at the first out-of-chain read. */
     build_vol_with_files();
     put32(fat_ent(30u), 0xFFFFFFFFu);
     CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
-    CHECK_HEX("lookup ok", 0, hype_exfat_lookup(&g_fs, "\\subdir\\deep.bin", 0, &f));
-    CHECK_HEX("reading past the real end of the chain refused", -1,
-              hype_exfat_read_at(&f, 512u, back, 4u));
+    CHECK_HEX("lookup refuses a chain shorter than DataLength", -1,
+              hype_exfat_lookup(&g_fs, "\\subdir\\deep.bin", 0, &f));
 
     /* Truncating a file whose chain loops must terminate and report failure
      * rather than freeing clusters round and round. */
@@ -2375,6 +2376,98 @@ static void test_alloc_refuses_a_cluster_the_fat_still_chains(void) {
     CHECK_HEX("the skipped cluster's FAT entry is untouched", 0xFFFFFFFFu, fat_get(5u));
 }
 
+/*
+ * #647: hype_exfat_lookup's chain validator (chain_measure / contiguous_run_all_used), the exFAT
+ * counterpart of FAT32's #382 chain_measure. Each corrupt-chain case must be refused AT LOOKUP,
+ * with nothing on the volume changed, and a valid chain must open with its tail already resolved.
+ */
+static void test_lookup_chain_validation(void) {
+    hype_exfat_wfile_t f;
+
+    /* A chain one cluster LONGER than DataLength justifies (30 -> 32 -> 33 -> EOC, but
+     * DataLength=700 only needs 2 clusters). */
+    build_vol_with_files();
+    put32(fat_ent(32u), 33u);
+    put32(fat_ent(33u), 0xFFFFFFFFu);
+    bit_mark(33u, 1);
+    CHECK_HEX("mount ok (long chain)", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("lookup refuses a chain longer than DataLength justifies", -1,
+              hype_exfat_lookup(&g_fs, "\\subdir\\deep.bin", 0, &f));
+
+    /* A chain that enters a cluster belonging to a second file: deep.bin's second link
+     * redirects into image.img's (contiguous) first cluster, which the FAT says nothing about
+     * (0, i.e. free) -- neither a valid continuation nor a legitimate end-of-chain. */
+    build_vol_with_files();
+    put32(fat_ent(32u), 10u); /* image.img's first cluster */
+    CHECK_HEX("mount ok (cross-link)", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("lookup refuses a chain that enters another file's cluster", -1,
+              hype_exfat_lookup(&g_fs, "\\subdir\\deep.bin", 0, &f));
+
+    /* A chain that loops back on itself (30 -> 32 -> 30 -> ...), bounded by DataLength's
+     * cluster count rather than WALK_GUARD. */
+    build_vol_with_files();
+    put32(fat_ent(32u), 30u);
+    CHECK_HEX("mount ok (loop)", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("lookup refuses a looping chain", -1,
+              hype_exfat_lookup(&g_fs, "\\subdir\\deep.bin", 0, &f));
+
+    /* A free (0) cluster mid-chain. */
+    build_vol_with_files();
+    put32(fat_ent(32u), 0u);
+    CHECK_HEX("mount ok (free mid-chain)", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("lookup refuses a free cluster mid-chain", -1,
+              hype_exfat_lookup(&g_fs, "\\subdir\\deep.bin", 0, &f));
+
+    /* A contiguous stream with one cluster of its run marked free in the bitmap: in range
+     * (set_read already checks that), but not a genuine allocation. */
+    build_vol_with_files();
+    bit_mark(11u, 0); /* image.img: clusters 10,11,12; clear the middle one */
+    CHECK_HEX("mount ok (contiguous gap)", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("lookup refuses a contiguous run with a free cluster", -1,
+              hype_exfat_lookup(&g_fs, "\\image.img", 0, &f));
+
+    /* A genuinely valid multi-cluster chained file still opens, and its tail is already
+     * resolved -- no lazy walk needed on the lookup path. */
+    build_vol_with_files();
+    CHECK_HEX("mount ok (valid chain)", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("a valid chained file still opens", 0,
+              hype_exfat_lookup(&g_fs, "\\subdir\\deep.bin", 0, &f));
+    CHECK_HEX("its tail is resolved immediately", 32u, f.tail_cluster);
+}
+
+/*
+ * #647 (criterion 3): hype_exfat_write_at's growth path must re-validate the chain against the
+ * handle's OWN recorded size before trusting it enough to extend -- state can have moved since
+ * open, on a mount another writer shares. Mirrors core/fat_write_fs.c:1446.
+ */
+static void test_write_at_revalidates_chain_before_growing(void) {
+    hype_exfat_fs_t fs2;
+    hype_exfat_wfile_t f;
+    uint8_t full[SECSZ];
+    unsigned int i;
+
+    for (i = 0; i < sizeof full; i++) full[i] = pat(i);
+
+    build_vol();
+    CHECK_HEX("mount ok", 0, hype_exfat_fs_mount(vol_read, vol_write, 0, &g_fs));
+    CHECK_HEX("create", 0, hype_exfat_create(&g_fs, "A.LOG", &f));
+    CHECK_HEX("fill the first cluster exactly", 0, hype_exfat_append(&f, full, sizeof full));
+
+    /* Corrupt the chain on the medium AFTER the handle was opened -- something write_at must
+     * not simply trust because open validated it once. A fresh mount (rather than poking
+     * g_fs's own FAT cache, which #645 keeps authoritative and would simply hide this) is what
+     * makes the corruption visible the way a second writer sharing the medium would see it. */
+    put32(fat_ent(f.first_cluster), CLUSTERS + 9u);
+    CHECK_HEX("remount sees the corrupted chain", 0,
+              hype_exfat_fs_mount(vol_read, vol_write, 0, &fs2));
+    f.fs = &fs2;
+
+    /* Past the current size, so this takes the GROWTH path (the one under test) rather than
+     * the in-place path, which never re-measures the chain. */
+    CHECK("growth refuses a chain that changed since open",
+          hype_exfat_write_at(&f, sizeof full, "x", 1u) != 0);
+}
+
 int main(void) {
     test_rollback_never_frees_under_a_published_larger_size(); /* #517 */
     test_cluster_growth_uses_durability_barriers();               /* #648 */
@@ -2382,6 +2475,8 @@ int main(void) {
     test_shared_mount_survives_stale_fat_and_bitmap_reads(); /* #645 */
     test_fat_set_failure_invalidates_cache();                /* #645 */
     test_alloc_refuses_a_cluster_the_fat_still_chains();     /* #645 */
+    test_lookup_chain_validation();                    /* #647 */
+    test_write_at_revalidates_chain_before_growing();   /* #647 */
     test_fs_ops_exfat();
     test_383_vdl();
     test_383_rollback_and_faults();
