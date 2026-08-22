@@ -113,27 +113,30 @@ instead of a read.
 | kvmclock per-vCPU system-time page | `MSR_KVM_SYSTEM_TIME`/`_OLD` value = page GPA \| enable bit | `arch/x86_64/svm/svm_vcpu.c:hype_svm_pvclock_arm_system_time` (VMX mirror `vmx_pvclock_arm_system_time` in `vmcs_hw.c`) — `hype_gpa_to_host(pvclock_map, gpa, sizeof(time_info))`, returns early (no write) on 0 | **GAP → [#667](https://github.com/bizzehdee/hype/issues/667)** |
 | kvmclock wall-clock page | `MSR_KVM_WALL_CLOCK` = page GPA | `arch/x86_64/svm/svm_vcpu.c:hype_svm_pvclock_arm_wall_clock` (VMX mirror `vmx_pvclock_arm_wall_clock`) — same pattern | **GAP → [#667](https://github.com/bizzehdee/hype/issues/667)** (same finding); pure write-and-versioning logic (`devices/pvclock.c:hype_pvclock_write_time_info/write_wall_clock`) is PASS-tested in `core/tests/test_pvclock.c` |
 | Hyper-V hypercall page | `HV_X64_MSR_HYPERCALL` = page GPA \| enable \| locked | `arch/x86_64/cpu/hyperv.c:hype_hv_hypercall_page_write` — `hype_gpa_to_host(map, gpa, HYPE_HV_HYPERCALL_PAGE_SIZE)`, `-1` (no state change) on failure; locked-MSR and missing-Guest-OS-ID cases also guarded | PASS — `core/tests/test_hyperv.c` (`test_invalid_full_page_is_rejected_without_changes`: short page, NULL map, NULL output all covered) |
-| Hyper-V reference-TSC page | `HV_X64_MSR_REFERENCE_TSC` = page GPA \| enable | `arch/x86_64/cpu/hyperv.c:hype_hv_reference_tsc_write` — same `hype_gpa_to_host` pattern, page zeroed only after a successful translate | PASS — `core/tests/test_hyperv.c` |
+| Hyper-V reference-TSC page | `HV_X64_MSR_REFERENCE_TSC` = page GPA \| enable | `arch/x86_64/cpu/hyperv.c:hype_hv_reference_tsc_write` — same `hype_gpa_to_host` pattern, page zeroed only after a successful translate | **GAP → [#670](https://github.com/bizzehdee/hype/issues/670)** — `core/tests/test_hyperv.c` covers only the sibling `hype_hv_hypercall_page_write`; nothing in the file references `reference_tsc` at all, not even a happy-path case |
 
 ## Summary
 
 - **Surfaces enumerated: 33** (rows across the six tables above; each row is
   one distinct guest-writable field/structure, even where several rows share
   one underlying check function, e.g. the three AHCI DMA structures).
-- **Check + test already proven: 22.**
-- **Check present, test missing → defect ticket filed: 10 rows**, covering 4
+- **Check + test already proven: 21.**
+- **Check present, test missing → defect ticket filed: 11 rows**, covering 5
   tickets (each ticket bundles the rows that share one root cause — the same
   untested function, or the same "lives in an unlinked file" structural gap):
   - [#663](https://github.com/bizzehdee/hype/issues/663) — AHCI command-list/command-table+PRDT/received-FIS (3 rows)
   - [#665](https://github.com/bizzehdee/hype/issues/665) — xHCI rings/DCBAA (1 row)
   - [#667](https://github.com/bizzehdee/hype/issues/667) — fw_cfg DMA access-struct+data-buffer, kvmclock system-time+wall-clock MSR writes (4 rows)
   - [#669](https://github.com/bizzehdee/hype/issues/669) — NVMe guest-memory callback, ramfb GPA translation (2 rows)
+  - [#670](https://github.com/bizzehdee/hype/issues/670) — Hyper-V reference-TSC page write (1 row) — the one row in this table that
+    turned out, on a second independent pass, to be miscited as PASS against
+    its sibling's test file rather than its own; corrected here
 - **No check needed (no guest-memory access at all): 1** — ACPI PM1a_CNT.
 
 Every gap above is a *missing regression test* for a check that already
 looks correct by inspection, not a known-broken bounds check. #602's
 fuzz harness, once built, should be pointed at exactly this table's rows —
-particularly the four GAP tickets, since a directed test and a fuzz corpus
+particularly the five GAP tickets, since a directed test and a fuzz corpus
 answer different questions (a fuzz run finds a shape nobody thought of; a
 directed test proves the one shape we already know matters is actually
 rejected).
