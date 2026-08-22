@@ -82,3 +82,33 @@ int hype_gpa_range_valid(const hype_gpa_map_t *map, uint64_t gpa, uint64_t len) 
     uint64_t host = 0;
     return lookup(map, gpa, len, &host);
 }
+
+int hype_gpa_read(const hype_gpa_map_t *map, uint64_t gpa, uint32_t len, void *dst) {
+    uint64_t host = hype_gpa_to_host(map, gpa, len);
+    const uint8_t *src;
+    uint32_t i;
+
+    if (host == 0u) {
+        return -1;
+    }
+    src = (const uint8_t *)(uintptr_t)host;
+    for (i = 0; i < len; i++) {
+        ((uint8_t *)dst)[i] = src[i];
+    }
+    return 0;
+}
+
+int hype_gpa_write(const hype_gpa_map_t *map, uint64_t gpa, uint32_t len, const void *src) {
+    uint64_t host = hype_gpa_to_host(map, gpa, len);
+    uint8_t *dst;
+    uint32_t i;
+
+    if (host == 0u) {
+        return -1;
+    }
+    dst = (uint8_t *)(uintptr_t)host;
+    for (i = 0; i < len; i++) {
+        dst[i] = ((const uint8_t *)src)[i];
+    }
+    return 0;
+}

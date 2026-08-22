@@ -77,4 +77,15 @@ uint64_t hype_gpa_to_host(const hype_gpa_map_t *map, uint64_t gpa, uint64_t len)
  */
 int hype_gpa_range_valid(const hype_gpa_map_t *map, uint64_t gpa, uint64_t len);
 
+/*
+ * #669: translate-then-copy, in each direction -- the shape every "read/write callback" device
+ * model call site (e.g. devices/nvme.c's injected gread/gwrite) hand-rolls around
+ * hype_gpa_to_host() at its own call site. Extracted so that logic is independently testable
+ * (linked into core/tests/ already; the call sites themselves often are not, e.g. boot/main.c's
+ * nvme_guest_read/write) rather than only provable by inspection or a live guest run. Returns 0
+ * on success, -1 if [gpa, gpa+len) does not translate -- nothing is read/written in that case.
+ */
+int hype_gpa_read(const hype_gpa_map_t *map, uint64_t gpa, uint32_t len, void *dst);
+int hype_gpa_write(const hype_gpa_map_t *map, uint64_t gpa, uint32_t len, const void *src);
+
 #endif /* HYPE_CORE_GUEST_MEM_H */

@@ -9000,35 +9000,16 @@ static unsigned int fw_1_slot_gsi(unsigned int slot, hype_cfg_bus_t bus) {
  * makes a guest unable to point the controller at hype or at another VM.
  */
 static int nvme_guest_read(void *ctx, uint64_t gpa, uint32_t len, void *dst) {
+    /* #669: the translate-then-copy logic itself now lives in hype_gpa_read() (core/guest_mem.c),
+     * which core/tests/ already links and exercises directly -- this wrapper is the only part
+     * that stays unreachable from a host unit test, and it is now too thin to hide a bug. */
     hype_fw_vm_t *vm = (hype_fw_vm_t *)ctx;
-    uint64_t host = hype_gpa_to_host(&vm->dma_map, gpa, len);
-    const uint8_t *src;
-    uint32_t i;
-
-    if (host == 0) {
-        return -1; /* outside this VM: refuse rather than translate to something else */
-    }
-    src = (const uint8_t *)(uintptr_t)host;
-    for (i = 0; i < len; i++) {
-        ((uint8_t *)dst)[i] = src[i];
-    }
-    return 0;
+    return hype_gpa_read(&vm->dma_map, gpa, len, dst);
 }
 
 static int nvme_guest_write(void *ctx, uint64_t gpa, uint32_t len, const void *src) {
     hype_fw_vm_t *vm = (hype_fw_vm_t *)ctx;
-    uint64_t host = hype_gpa_to_host(&vm->dma_map, gpa, len);
-    uint8_t *dst;
-    uint32_t i;
-
-    if (host == 0) {
-        return -1;
-    }
-    dst = (uint8_t *)(uintptr_t)host;
-    for (i = 0; i < len; i++) {
-        dst[i] = ((const uint8_t *)src)[i];
-    }
-    return 0;
+    return hype_gpa_write(&vm->dma_map, gpa, len, src);
 }
 
 /* Fills the context devices/nvme.c needs. Kept in one place so a new field cannot be forgotten at one

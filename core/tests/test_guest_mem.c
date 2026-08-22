@@ -141,6 +141,71 @@ static void test_high_region_no_overflow(void) {
               hype_gpa_map_add(&m, UINT64_MAX - 0xFFFULL, 0x2000, 0x1000));
 }
 
+/*
+ * #669: hype_gpa_read()/hype_gpa_write() are the translate-then-copy helpers extracted from
+ * boot/main.c's nvme_guest_read/write (unreachable from core/tests -- boot/main.c is never
+ * linked into a test binary) so this VALID-3 shape is directly testable.
+ */
+static void test_gpa_read_legitimate_range_copies_bytes(void) {
+    uint8_t ram[64];
+    uint8_t dst[4] = {0, 0, 0, 0};
+    hype_gpa_map_t m;
+    int rc;
+    unsigned i;
+    for (i = 0; i < sizeof(ram); i++) ram[i] = (uint8_t)(0x10u + i);
+    hype_gpa_map_reset(&m);
+    hype_gpa_map_add(&m, 0x1000, (uint64_t)(uintptr_t)ram, sizeof(ram));
+
+    rc = hype_gpa_read(&m, 0x1004, 4u, dst);
+    CHECK_HEX("in-range read succeeds", 0, rc);
+    CHECK_HEX("byte 0", 0x14u, dst[0]);
+    CHECK_HEX("byte 3", 0x17u, dst[3]);
+}
+
+static void test_gpa_read_out_of_range_refuses_without_touching_dst(void) {
+    uint8_t ram[64];
+    uint8_t dst[4] = {0xAA, 0xAA, 0xAA, 0xAA};
+    hype_gpa_map_t m;
+    int rc;
+    hype_gpa_map_reset(&m);
+    hype_gpa_map_add(&m, 0x1000, (uint64_t)(uintptr_t)ram, sizeof(ram));
+
+    rc = hype_gpa_read(&m, 0x9000, 4u, dst);
+    CHECK_HEX("out-of-range read is refused", (unsigned)-1, (unsigned)rc);
+    CHECK_HEX("dst untouched on refusal", 0xAAu, dst[0]);
+}
+
+static void test_gpa_write_legitimate_range_copies_bytes(void) {
+    uint8_t ram[64];
+    uint8_t src[4] = {0x11, 0x22, 0x33, 0x44};
+    hype_gpa_map_t m;
+    int rc;
+    unsigned i;
+    for (i = 0; i < sizeof(ram); i++) ram[i] = 0;
+    hype_gpa_map_reset(&m);
+    hype_gpa_map_add(&m, 0x2000, (uint64_t)(uintptr_t)ram, sizeof(ram));
+
+    rc = hype_gpa_write(&m, 0x2008, 4u, src);
+    CHECK_HEX("in-range write succeeds", 0, rc);
+    CHECK_HEX("ram[8]", 0x11u, ram[8]);
+    CHECK_HEX("ram[11]", 0x44u, ram[11]);
+}
+
+static void test_gpa_write_out_of_range_refuses_without_touching_ram(void) {
+    uint8_t ram[64];
+    uint8_t src[4] = {0x11, 0x22, 0x33, 0x44};
+    hype_gpa_map_t m;
+    int rc;
+    unsigned i;
+    for (i = 0; i < sizeof(ram); i++) ram[i] = 0xEEu;
+    hype_gpa_map_reset(&m);
+    hype_gpa_map_add(&m, 0x2000, (uint64_t)(uintptr_t)ram, sizeof(ram));
+
+    rc = hype_gpa_write(&m, 0x9000, 4u, src);
+    CHECK_HEX("out-of-range write is refused", (unsigned)-1, (unsigned)rc);
+    CHECK_HEX("ram untouched on refusal", 0xEEu, ram[0]);
+}
+
 int main(void) {
     test_translate_inside_ram();
     test_translate_inside_flash();
@@ -152,6 +217,10 @@ int main(void) {
     test_empty_map_rejects_everything();
     test_add_rejects_malformed();
     test_high_region_no_overflow();
+    test_gpa_read_legitimate_range_copies_bytes();
+    test_gpa_read_out_of_range_refuses_without_touching_dst();
+    test_gpa_write_legitimate_range_copies_bytes();
+    test_gpa_write_out_of_range_refuses_without_touching_ram();
 
     if (failures == 0) {
         printf("all tests passed\n");
