@@ -69,6 +69,8 @@
 #include "../core/blk_image.h"
 #include "../core/blk_qcow2.h"
 #include "../core/ext.h"
+#include "../core/ntfs.h"
+#include "../core/file_range.h"
 
 /* #229 debug: read the active host CR3 (which page-table root this core runs under). */
 static inline uint64_t hype_dbg_read_cr3(void) {
@@ -8789,6 +8791,27 @@ static const char *fw_1_resolve_on_any_fs(const char *path, hype_file_map_t *out
         return "ext";
     }
     *frag |= out->too_fragmented;
+    /*
+     * #697: NTFS was never attempted here -- resolve() speaks the #381
+     * sparse-aware range contract (hype_file_rmap_t), not this function's
+     * physical-only hype_file_map_t, so it needs mounting and lowering like
+     * every other consumer of a sparse-capable resolver. Lowering refuses
+     * (rather than invents sectors for) any HOLE/UNWRITTEN range, same as
+     * the ext4 unwritten-extent refusal this shares its reasoning with
+     * (#696): raw sector passthrough cannot honor the "reads as zero"
+     * guarantee those ranges carry.
+     */
+    if (hype_ntfs_probe(fatvol_read, 0) == 0) {
+        hype_ntfs_t ntfs;
+        hype_file_rmap_t rmap;
+        rmap.too_fragmented = 0;
+        if (hype_ntfs_mount(fatvol_read, 0, &ntfs) == 0 &&
+            hype_ntfs_resolve(&ntfs, path, &rmap) == 0 &&
+            hype_file_map_from_rmap(&rmap, out) == 0) {
+            return "NTFS";
+        }
+        *frag |= rmap.too_fragmented;
+    }
     return 0;
 }
 static void scan_budget_arm(unsigned secs);   /* #346 */

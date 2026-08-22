@@ -112,6 +112,22 @@ int hype_file_rmap_validate(const hype_file_rmap_t *m, uint64_t media_sectors);
 int hype_file_rmap_from_extents(const hype_file_map_t *src, hype_file_rmap_t *out);
 
 /*
+ * The reverse of hype_file_rmap_from_extents(): lowers a #381 logical range
+ * map into a physical-only extent map, for callers that only ever consume
+ * hype_file_map_t (raw-sector passthrough with no hole/zero-fill machinery,
+ * e.g. a file-backed guest disk read straight off the host medium).
+ *
+ * Refuses (-1) on ANY HOLE or UNWRITTEN range rather than inventing physical
+ * sectors for one: a HOLE has no sectors to hand back, and an UNWRITTEN
+ * range's sectors are allocated but their contents are unspecified until a
+ * filesystem read synthesizes the zero -- exactly the guarantee raw sector
+ * passthrough cannot make (#696). Only an all-DATA map -- what NTFS/ext
+ * resolve to when nothing in the file is sparse or preallocated-but-unwritten
+ * -- lowers successfully. Carries too_fragmented through.
+ */
+int hype_file_map_from_rmap(const hype_file_rmap_t *src, hype_file_map_t *out);
+
+/*
  * Maps logical byte offset `off` to what covers it. Returns 0 and fills:
  *   *out_kind -- the covering range's kind;
  *   *out_lba  -- the LBA of the sector holding `off` (DATA/UNWRITTEN; 0 for HOLE);

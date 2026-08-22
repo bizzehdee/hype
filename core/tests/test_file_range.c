@@ -205,6 +205,46 @@ static void test_from_extents(void) {
     CHECK("overlarge extent count refused", hype_file_rmap_from_extents(&x, &m) == -1);
 }
 
+static void test_lower_to_extents(void) {
+    hype_file_rmap_t m;
+    hype_file_map_t x;
+
+    /* all-DATA map lowers cleanly */
+    hype_file_rmap_init(&m, 6 * SECSZ);
+    CHECK("append data 1", hype_file_rmap_append(&m, HYPE_RANGE_DATA, 10, 4) == 0);
+    CHECK("append data 2", hype_file_rmap_append(&m, HYPE_RANGE_DATA, 20, 2) == 0);
+    memset(&x, 0xAA, sizeof(x));
+    CHECK("lower ok", hype_file_map_from_rmap(&m, &x) == 0);
+    CHECK_HEX("lower count", 2, x.count);
+    CHECK_HEX("lower lba0", 10, x.extents[0].start_lba);
+    CHECK_HEX("lower size", m.size_bytes, x.size_bytes);
+
+    /* a HOLE cannot be lowered -- no physical sectors to hand back */
+    hype_file_rmap_init(&m, 6 * SECSZ);
+    CHECK("append hole", hype_file_rmap_append(&m, HYPE_RANGE_HOLE, 0, 6) == 0);
+    CHECK("hole refused", hype_file_map_from_rmap(&m, &x) == -1);
+
+    /* an UNWRITTEN range cannot be lowered either -- #696: raw sector
+     * passthrough cannot honor its "reads as zero" guarantee */
+    hype_file_rmap_init(&m, 6 * SECSZ);
+    CHECK("append unwritten", hype_file_rmap_append(&m, HYPE_RANGE_UNWRITTEN, 10, 6) == 0);
+    CHECK("unwritten refused", hype_file_map_from_rmap(&m, &x) == -1);
+
+    /* empty file lowers to zero extents */
+    hype_file_rmap_init(&m, 0);
+    CHECK("empty lower ok", hype_file_map_from_rmap(&m, &x) == 0 && x.count == 0);
+
+    /* too_fragmented carries through */
+    hype_file_rmap_init(&m, 0);
+    m.too_fragmented = 1;
+    CHECK("frag flag carried", hype_file_map_from_rmap(&m, &x) == 0 && x.too_fragmented == 1);
+
+    /* count past HYPE_FILE_MAX_RANGES is refused outright */
+    hype_file_rmap_init(&m, 0);
+    m.count = HYPE_FILE_MAX_RANGES + 1;
+    CHECK("overlarge range count refused", hype_file_map_from_rmap(&m, &x) == -1);
+}
+
 static void test_locate(void) {
     hype_file_rmap_t m;
     hype_range_kind_t kind;
@@ -408,6 +448,7 @@ int main(void) {
     test_append_cap();
     test_validate();
     test_from_extents();
+    test_lower_to_extents();
     test_locate();
     test_read_at();
     test_write_at();

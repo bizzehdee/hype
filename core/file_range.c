@@ -123,6 +123,31 @@ int hype_file_rmap_from_extents(const hype_file_map_t *src, hype_file_rmap_t *ou
     return 0;
 }
 
+int hype_file_map_from_rmap(const hype_file_rmap_t *src, hype_file_map_t *out) {
+    unsigned i;
+
+    out->count = 0;
+    out->size_bytes = src->size_bytes;
+    out->too_fragmented = src->too_fragmented;
+    if (src->count > HYPE_FILE_MAX_RANGES) {
+        return -1;
+    }
+    for (i = 0; i < src->count; i++) {
+        const hype_file_range_t *r = &src->ranges[i];
+        if (r->kind != HYPE_RANGE_DATA) {
+            return -1;
+        }
+        if (out->count >= HYPE_FILE_MAX_EXTENTS) {
+            out->too_fragmented = 1;
+            return -1;
+        }
+        out->extents[out->count].start_lba = r->start_lba;
+        out->extents[out->count].sector_count = r->sector_count;
+        out->count++;
+    }
+    return 0;
+}
+
 int hype_file_rmap_locate(const hype_file_rmap_t *m, uint64_t off, hype_range_kind_t *out_kind,
                           uint64_t *out_lba, uint32_t *out_head, uint64_t *out_run) {
     uint64_t base = 0; /* logical byte offset where the current range starts */
