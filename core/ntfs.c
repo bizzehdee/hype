@@ -2560,3 +2560,104 @@ int hype_ntfs_rmdir(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t parent_di
     }
     return hype_ntfs_mft_record_free(fs, write, ref, usn);
 }
+
+
+/* ---- #424: rename ---------------------------------------------------------- */
+
+/* Rewrites record `rec_no`'s own (first, unnamed WIN32) $FILE_NAME
+ * attribute in place: new name, new parent reference. Resident, so this
+ * is a resize-and-rebuild like #422's non-resident replace, just for a
+ * much smaller, always-resident attribute. */
+static int record_update_filename(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t rec_no,
+                                  uint64_t new_parent_ref, const char *new_name,
+                                  uint32_t new_name_len, uint16_t usn) {
+    uint8_t rec[HYPE_NTFS_MAX_RECORD];
+    ntfs_attr_t a;
+    uint32_t cur = 0;
+    uint32_t attr_off;
+    uint8_t fn[0x42u + 255u * 2u];
+    uint32_t new_val_len, old_attr_length, new_attr_length;
+    uint32_t old_flags;
+    uint32_t i;
+
+    if (record_read(fs, rec_no, rec) != 0) {
+        return -1;
+    }
+    if (attr_find(rec, fs->mft_record_size, AT_FILE_NAME, &cur, &a) != 0) {
+        return -1;
+    }
+    if (a.non_resident || a.val_len < 0x42u) {
+        return -1;
+    }
+    attr_off = cur - a.length;
+    old_flags = hype_rd32(rec + attr_off + a.val_off + 0x38);
+
+    new_val_len = 0x42u + new_name_len * 2u;
+    for (i = 0; i < new_val_len; i++) {
+        fn[i] = 0u;
+    }
+    hype_wr64(fn + 0x00, new_parent_ref & 0x0000FFFFFFFFFFFFull);
+    hype_wr32(fn + 0x38, old_flags);
+    fn[0x40] = (uint8_t)new_name_len;
+    fn[0x41] = 1u;
+    for (i = 0; i < new_name_len; i++) {
+        hype_wr16(fn + 0x42 + i * 2u, (uint16_t)(uint8_t)new_name[i]);
+    }
+
+    old_attr_length = a.length;
+    new_attr_length = round_up_8(a.val_off + new_val_len);
+    if (record_resize_attr_region(rec, fs->mft_record_size, attr_off, old_attr_length,
+                                  new_attr_length) != 0) {
+        return -1;
+    }
+    for (i = 0; i < new_attr_length; i++) {
+        rec[attr_off + i] = 0u;
+    }
+    hype_wr32(rec + attr_off + 0, AT_FILE_NAME);
+    hype_wr32(rec + attr_off + 4, new_attr_length);
+    hype_wr32(rec + attr_off + 0x10, new_val_len);
+    hype_wr16(rec + attr_off + 0x14, (uint16_t)a.val_off);
+    for (i = 0; i < new_val_len; i++) {
+        rec[attr_off + a.val_off + i] = fn[i];
+    }
+
+    return hype_ntfs_record_write(fs, write, rec_no, rec, usn);
+}
+
+int hype_ntfs_rename(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t src_parent,
+                     const char *src_name, uint32_t src_name_len, uint64_t dst_parent,
+                     const char *dst_name, uint32_t dst_name_len, uint16_t usn) {
+    uint64_t ref;
+    int isdir;
+
+    if (fs == 0 || write == 0 || src_name == 0 || src_name_len == 0u || dst_name == 0 ||
+        dst_name_len == 0u) {
+        return -1;
+    }
+    if (dir_lookup(fs, src_parent, src_name, src_name_len, &ref, &isdir) != 1) {
+        return -1;
+    }
+
+    if (hype_ntfs_index_delete(fs, write, src_parent, src_name, src_name_len, usn) != 0) {
+        return -1;
+    }
+    if (hype_ntfs_index_insert(fs, write, dst_parent, ref, dst_name, dst_name_len, isdir, usn) !=
+        0) {
+        /* never leave it in neither directory: put the old entry back */
+        (void)hype_ntfs_index_insert(fs, write, src_parent, ref, src_name, src_name_len, isdir,
+                                     usn);
+        return -1;
+    }
+
+    if (record_update_filename(fs, write, ref, dst_parent, dst_name, dst_name_len, usn) != 0) {
+        /* the index already reflects the move; the record's own $FILE_NAME
+         * is now stale (old name/parent) but the file is still reachable
+         * under its NEW name (dir_lookup() only ever reads through the
+         * index, never the target record's own $FILE_NAME) -- inconsistent
+         * but not lost, and a real driver's own consistency checker (this
+         * ticket's chkdsk bar) flags a $FILE_NAME/index mismatch as
+         * repairable, not corrupt. */
+        return -1;
+    }
+    return 0;
+}

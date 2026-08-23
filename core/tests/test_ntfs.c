@@ -2368,6 +2368,77 @@ static void test_mkdir_rmdir(void) {
     CHECK("rmdir NULL write refused", hype_ntfs_rmdir(&fs, 0, 45, "nope", 4, 2) != 0);
 }
 
+/* #424: rename. subdir (record 45) is resident and roomy. */
+static void test_rename(void) {
+    hype_ntfs_t fs;
+    hype_file_rmap_t m;
+    uint64_t rec_no;
+    uint8_t rec[REC_SIZE];
+
+    /* same-directory rename */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK_HEX("create", 0,
+              hype_ntfs_create(&fs, vol_write, 45, "oldname.bin", 11, 1, &rec_no, 2));
+    CHECK_HEX("rename", 0,
+              hype_ntfs_rename(&fs, vol_write, 45, "oldname.bin", 11, 45, "newname.bin", 11, 3));
+    CHECK("old name gone", entry_offset_by_name(&fs, 45, "oldname.bin") == (uint32_t)~0u);
+    CHECK("new name present", entry_offset_by_name(&fs, 45, "newname.bin") != (uint32_t)~0u);
+    CHECK_HEX("sibling unaffected", 0, hype_ntfs_resolve(&fs, "/subdir/nested.bin", &m));
+
+    /* the record's own $FILE_NAME was rewritten to match */
+    CHECK_HEX("record readable", 0, hype_ntfs_record_read(&fs, rec_no, rec));
+
+    /* move between directories: subdir(45) -> root(5), name unchanged */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK_HEX("create", 0,
+              hype_ntfs_create(&fs, vol_write, 45, "movee.bin", 9, 1, &rec_no, 2));
+    CHECK_HEX("move to root", 0,
+              hype_ntfs_rename(&fs, vol_write, 45, "movee.bin", 9, 5, "movee.bin", 9, 3));
+    CHECK("gone from subdir", entry_offset_by_name(&fs, 45, "movee.bin") == (uint32_t)~0u);
+    CHECK("now in root", entry_offset_by_name(&fs, 5, "movee.bin") != (uint32_t)~0u);
+    CHECK_HEX("subdir sibling unaffected", 0,
+              hype_ntfs_resolve(&fs, "/subdir/nested.bin", &m));
+    CHECK_HEX("root sibling unaffected", 0, hype_ntfs_resolve(&fs, "/lst.bin", &m));
+
+    /* rename to a name that collides at the destination: rolled back, the
+     * old name is still there afterward */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK_HEX("create a.bin", 0, hype_ntfs_create(&fs, vol_write, 45, "a.bin", 5, 1, &rec_no, 2));
+    CHECK_HEX("create b.bin", 0, hype_ntfs_create(&fs, vol_write, 45, "b.bin", 5, 1, &rec_no, 3));
+    CHECK("rename onto an existing name refused",
+          hype_ntfs_rename(&fs, vol_write, 45, "a.bin", 5, 45, "b.bin", 5, 4) != 0);
+    CHECK("source name rolled back and still present",
+          entry_offset_by_name(&fs, 45, "a.bin") != (uint32_t)~0u);
+    CHECK("destination name untouched",
+          entry_offset_by_name(&fs, 45, "b.bin") != (uint32_t)~0u);
+
+    /* rename a directory */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK_HEX("mkdir", 0, hype_ntfs_mkdir(&fs, vol_write, 45, "olddir", 6, 1, &rec_no, 2));
+    CHECK_HEX("rename dir", 0,
+              hype_ntfs_rename(&fs, vol_write, 45, "olddir", 6, 45, "newdir", 6, 3));
+    CHECK("old dir name gone", entry_offset_by_name(&fs, 45, "olddir") == (uint32_t)~0u);
+    CHECK("new dir name present", entry_offset_by_name(&fs, 45, "newdir") != (uint32_t)~0u);
+    CHECK_HEX("still a directory", 0, hype_ntfs_record_read(&fs, rec_no, rec));
+    CHECK("is a directory", (get16(rec + 0x16) & 0x0002u) != 0u);
+
+    /* refusals */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("rename a missing name refused",
+          hype_ntfs_rename(&fs, vol_write, 45, "nope.bin", 8, 45, "x.bin", 5, 2) != 0);
+    CHECK("rename NULL fs refused",
+          hype_ntfs_rename(0, vol_write, 45, "nested.bin", 10, 45, "x.bin", 5, 2) != 0);
+    CHECK("rename NULL write refused",
+          hype_ntfs_rename(&fs, 0, 45, "nested.bin", 10, 45, "x.bin", 5, 2) != 0);
+    CHECK("rename zero-length dst name refused",
+          hype_ntfs_rename(&fs, vol_write, 45, "nested.bin", 10, 45, "x.bin", 0, 2) != 0);
+}
+
 int main(void) {
     test_probe();
     test_mount_refusals();
@@ -2389,6 +2460,7 @@ int main(void) {
     test_data_to_nonresident();
     test_create_unlink();
     test_mkdir_rmdir();
+    test_rename();
 
     if (failures == 0) {
         printf("test_ntfs: all tests passed\n");

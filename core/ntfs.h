@@ -330,4 +330,33 @@ int hype_ntfs_mkdir(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t parent_di
 int hype_ntfs_rmdir(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t parent_dir_rec,
                     const char *name, uint32_t name_len, uint16_t usn);
 
+/*
+ * #424: rename (and/or move) a file or directory. Removes the old $I30
+ * entry from `src_parent`, inserts a new one into `dst_parent` (which may
+ * equal src_parent -- a same-directory rename), and rewrites the target
+ * record's own $FILE_NAME attribute (new name, new parent reference) to
+ * match. If the insert into `dst_parent` fails (e.g. a name collision),
+ * the removed entry is RE-INSERTED into `src_parent` before returning
+ * -1 -- the entry is never left in neither directory, matching the
+ * "never lose it from both, never leave it in both" ordering the ticket
+ * requires; the reverse (present in both at once) cannot happen because
+ * the insert is attempted before anything about the target record is
+ * touched.
+ *
+ * Only ever updates the file's WIN32-namespace $FILE_NAME (the one
+ * #423/#425 create) -- a file with more than one $FILE_NAME (an alias
+ * inserted directly via hype_ntfs_index_insert()) has the others left
+ * exactly as they were, same as a real hard link surviving a rename of
+ * one name.
+ *
+ * Known, deliberate simplification: does not adjust either parent's own
+ * link/subdirectory-count bookkeeping when moving a directory between
+ * parents -- a cosmetic Explorer/`stat` nicety, not something a
+ * conformant reader needs to open, list, or otherwise use the moved
+ * directory correctly.
+ */
+int hype_ntfs_rename(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t src_parent,
+                     const char *src_name, uint32_t src_name_len, uint64_t dst_parent,
+                     const char *dst_name, uint32_t dst_name_len, uint16_t usn);
+
 #endif /* HYPE_CORE_NTFS_H */
