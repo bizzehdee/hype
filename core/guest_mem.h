@@ -88,4 +88,23 @@ int hype_gpa_range_valid(const hype_gpa_map_t *map, uint64_t gpa, uint64_t len);
 int hype_gpa_read(const hype_gpa_map_t *map, uint64_t gpa, uint32_t len, void *dst);
 int hype_gpa_write(const hype_gpa_map_t *map, uint64_t gpa, uint32_t len, const void *src);
 
+/*
+ * #693/#694: the "NULL map means trusted identity-mapped guest" wrapper around hype_gpa_to_host()
+ * that arch/x86_64/svm/svm_vcpu.c's own guest_dma_xlate() used to define privately (and
+ * arch/x86_64/vmx/vmcs_hw.c relied on transitively, through the shared virtio-blk/AHCI functions
+ * that lived in svm_vcpu.c and called it internally). Extracted here, shared by both backends and
+ * by the vendor-neutral virtio-blk/AHCI modules the two tickets above moved out of svm_vcpu.c, so
+ * there is exactly one definition of "what NULL means" rather than one per file that happens to
+ * need it.
+ *
+ * A NULL map means "trusted identity-mapped guest" (the M4-5/ISO-2/PCI-2/M5-2/M4-4/VIDEO-2
+ * cooperating test guests, whose NPT identity-maps RAM so guest-physical == host and whose DMA
+ * addresses this project itself wrote) -- returns gpa unchecked, preserving that exact prior
+ * behavior. A non-NULL map (FW-1's real OVMF/OS guest, whose RAM is NPT-remapped so
+ * guest-physical != host) routes the address through the bounds-checked hype_gpa_to_host() lookup;
+ * a 0 return (out of range / straddling / overrun / overflow) propagates as "reject" to the
+ * caller, which must never fall back to a raw dereference.
+ */
+uint64_t hype_guest_dma_xlate(const hype_gpa_map_t *map, uint64_t gpa, uint64_t len);
+
 #endif /* HYPE_CORE_GUEST_MEM_H */

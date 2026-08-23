@@ -112,3 +112,10 @@ int hype_gpa_write(const hype_gpa_map_t *map, uint64_t gpa, uint32_t len, const 
     }
     return 0;
 }
+
+uint64_t hype_guest_dma_xlate(const hype_gpa_map_t *map, uint64_t gpa, uint64_t len) {
+    if (map == 0) {
+        return gpa;
+    }
+    return hype_gpa_to_host(map, gpa, len);
+}

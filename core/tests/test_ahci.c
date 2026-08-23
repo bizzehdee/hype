@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include "../../devices/ahci.h"
+#include "../../arch/x86_64/svm/svm.h" /* hype_svm_vcpu_get_atapi_diag() */
 #include "../fatal.h"
 
 static int failures = 0;
@@ -744,6 +745,815 @@ static void test_hotplug_detach_clears_det(void) {
     CHECK_HEX("irq pending after detach", 1, hype_ahci_irq_pending(&a) != 0);
 }
 
+/*
+ * #694: process_ahci_ata_command_slot()/ahci_backend_rw_prdt()/complete_ahci_soft_reset()
+ * (moved to arch/x86_64/vmm_device_ops.c) full-function coverage. #672's regression test
+ * above only exercised the command-list bounds check; this rig drives every command branch,
+ * both storage paths (disk->media RAM and a real hype_blk_backend_t), and the PRDT
+ * aligned/straddling/refused/backend-failure cases -- mirroring test_ahci_dma.c's rig for
+ * process_ahci_command_slot()'s own ATAPI side.
+ */
+
+#define ATA_RIG_BASE 0x9000000000ull
+
+typedef struct {
+    uint8_t cmd_list[32];
+    uint8_t cmd_table[0x80 + 64]; /* room for up to 4 PRD entries */
+    uint8_t data[8192];
+    uint8_t rx_fis[0x40 + 20];
+    hype_gpa_map_t map;
+} ata_rig_t;
+
+static uint64_t ata_rig_gpa(const ata_rig_t *r, const void *host_ptr) {
+    return ATA_RIG_BASE + (uint64_t)((const uint8_t *)host_ptr - (const uint8_t *)r);
+}
+
+static void ata_put32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)v;
+    p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16);
+    p[3] = (uint8_t)(v >> 24);
+}
+
+/* Builds slot 0: command header (opts carries prdtl, ATAPI bit clear) -> command
+ * table (Register H2D FIS, C bit set: a command, not a Control-register write)
+ * carrying `cmd`/`lba`/`count` -> `nprd` PRD entries at prd_gpa[i]/prd_len[i]. */
+static void ata_build_slot0(ata_rig_t *r, uint8_t cmd, uint64_t lba, uint16_t count,
+                            const uint64_t *prd_gpa, const uint32_t *prd_len, unsigned nprd) {
+    uint32_t opts;
+    unsigned i;
+
+    memset(r->cmd_list, 0, sizeof(r->cmd_list));
+    opts = 5u | ((uint32_t)nprd << 16);
+    ata_put32(r->cmd_list + 0, opts);
+    ata_put32(r->cmd_list + 8, (uint32_t)ata_rig_gpa(r, r->cmd_table));
+    ata_put32(r->cmd_list + 12, (uint32_t)(ata_rig_gpa(r, r->cmd_table) >> 32));
+
+    memset(r->cmd_table, 0, sizeof(r->cmd_table));
+    r->cmd_table[0] = 0x27u;
+    r->cmd_table[1] = HYPE_AHCI_FIS_H2D_FLAG_C;
+    r->cmd_table[2] = cmd;
+    r->cmd_table[4] = (uint8_t)(lba & 0xFFu);
+    r->cmd_table[5] = (uint8_t)((lba >> 8) & 0xFFu);
+    r->cmd_table[6] = (uint8_t)((lba >> 16) & 0xFFu);
+    r->cmd_table[8] = (uint8_t)((lba >> 24) & 0xFFu);
+    r->cmd_table[9] = (uint8_t)((lba >> 32) & 0xFFu);
+    r->cmd_table[10] = (uint8_t)((lba >> 40) & 0xFFu);
+    r->cmd_table[12] = (uint8_t)(count & 0xFFu);
+    r->cmd_table[13] = (uint8_t)((count >> 8) & 0xFFu);
+
+    for (i = 0; i < nprd; i++) {
+        uint8_t *p = r->cmd_table + 0x80 + i * 16u;
+        ata_put32(p + 0, (uint32_t)prd_gpa[i]);
+        ata_put32(p + 4, (uint32_t)(prd_gpa[i] >> 32));
+        ata_put32(p + 12, prd_len[i] - 1u); /* DBC = byte_count - 1 */
+    }
+}
+
+static void ata_setup_rig(ata_rig_t *r, hype_ahci_t *ahci) {
+    memset(r, 0, sizeof(*r));
+    hype_gpa_map_reset(&r->map);
+    hype_gpa_map_add(&r->map, ATA_RIG_BASE, (uint64_t)(uintptr_t)r, sizeof(*r));
+
+    hype_ahci_reset(ahci); /* bus_master defaults enabled */
+    ahci->p_clb = (uint32_t)ata_rig_gpa(r, r->cmd_list);
+    ahci->p_clbu = (uint32_t)(ata_rig_gpa(r, r->cmd_list) >> 32);
+    ahci->p_fb = (uint32_t)ata_rig_gpa(r, r->rx_fis);
+    ahci->p_fbu = (uint32_t)(ata_rig_gpa(r, r->rx_fis) >> 32);
+}
+
+static void test_ata_identify_device_completes(void) {
+    ata_rig_t r;
+    hype_ahci_t ahci;
+    hype_ata_disk_t disk;
+    uint8_t media[4096];
+    uint64_t prd_gpa;
+    uint32_t prd_len = 512u;
+    int rc;
+
+    ata_setup_rig(&r, &ahci);
+    hype_ata_disk_reset(&disk, media, sizeof(media));
+    prd_gpa = ata_rig_gpa(&r, r.data);
+    ata_build_slot0(&r, HYPE_ATA_CMD_IDENTIFY_DEVICE, 0, 0, &prd_gpa, &prd_len, 1);
+
+    rc = process_ahci_ata_command_slot(&ahci, &disk, &r.map, 0u);
+    CHECK_HEX("IDENTIFY completes", 0, rc);
+    CHECK_HEX("status DRDY|DSC", (unsigned)(HYPE_ATA_STATUS_DRDY | HYPE_ATA_STATUS_DSC),
+              ahci.p_tfd & 0xFFu);
+    CHECK_HEX("PSS latched (PIO data-in)", HYPE_AHCI_PIS_PSS, ahci.p_is & HYPE_AHCI_PIS_PSS);
+    CHECK_HEX("DHRS latched too", HYPE_AHCI_PIS_DHRS, ahci.p_is & HYPE_AHCI_PIS_DHRS);
+    CHECK_HEX("slot completed", 0u, ahci.p_ci);
+}
+
+static void test_ata_read_dma_ram_media(void) {
+    ata_rig_t r;
+    hype_ahci_t ahci;
+    hype_ata_disk_t disk;
+    uint8_t media[4096];
+    uint64_t prd_gpa;
+    uint32_t prd_len = 512u;
+    int rc;
+
+    ata_setup_rig(&r, &ahci);
+    memset(media, 0xAB, sizeof(media));
+    hype_ata_disk_reset(&disk, media, sizeof(media));
+    prd_gpa = ata_rig_gpa(&r, r.data);
+    ata_build_slot0(&r, HYPE_ATA_CMD_READ_DMA_EXT, 0u, 1u, &prd_gpa, &prd_len, 1);
+
+    rc = process_ahci_ata_command_slot(&ahci, &disk, &r.map, 0u);
+    CHECK_HEX("READ DMA completes", 0, rc);
+    CHECK_HEX("media content delivered to the PRD buffer", 0xABu, r.data[0]);
+    CHECK_HEX("status DRDY|DSC, no error", (unsigned)(HYPE_ATA_STATUS_DRDY | HYPE_ATA_STATUS_DSC),
+              ahci.p_tfd & 0xFFu);
+}
+
+static void test_ata_write_dma_ram_media(void) {
+    ata_rig_t r;
+    hype_ahci_t ahci;
+    hype_ata_disk_t disk;
+    uint8_t media[4096];
+    uint64_t prd_gpa;
+    uint32_t prd_len = 512u;
+    int rc;
+
+    ata_setup_rig(&r, &ahci);
+    memset(media, 0, sizeof(media));
+    hype_ata_disk_reset(&disk, media, sizeof(media));
+    memset(r.data, 0xCDu, 512u);
+    prd_gpa = ata_rig_gpa(&r, r.data);
+    ata_build_slot0(&r, HYPE_ATA_CMD_WRITE_DMA_EXT, 0u, 1u, &prd_gpa, &prd_len, 1);
+
+    rc = process_ahci_ata_command_slot(&ahci, &disk, &r.map, 0u);
+    CHECK_HEX("WRITE DMA completes", 0, rc);
+    CHECK_HEX("PRD content landed in media", 0xCDu, media[0]);
+}
+
+static void test_ata_read_dma_backend_aligned(void) {
+    ata_rig_t r;
+    hype_ahci_t ahci;
+    hype_ata_disk_t disk;
+    hype_blk_file_t f;
+    hype_blk_backend_t be;
+    uint8_t img[4096];
+    uint64_t prd_gpa;
+    uint32_t prd_len = 1024u; /* two whole sectors: the aligned fast path */
+    int rc;
+
+    ata_setup_rig(&r, &ahci);
+    memset(img, 0x5Au, sizeof(img));
+    hype_blk_file_init(&f, &be, img, sizeof(img));
+    hype_ata_disk_reset(&disk, 0, 0);
+    hype_ata_disk_set_backend(&disk, &be);
+    prd_gpa = ata_rig_gpa(&r, r.data);
+    ata_build_slot0(&r, HYPE_ATA_CMD_READ_DMA_EXT, 0u, 2u, &prd_gpa, &prd_len, 1);
+
+    rc = process_ahci_ata_command_slot(&ahci, &disk, &r.map, 0u);
+    CHECK_HEX("backend-aligned READ DMA completes", 0, rc);
+    CHECK_HEX("backend content delivered", 0x5Au, r.data[0]);
+    CHECK_HEX("delivered through the whole aligned span", 0x5Au, r.data[1023]);
+}
+
+static void test_ata_write_dma_backend_straddling_prd(void) {
+    ata_rig_t r;
+    hype_ahci_t ahci;
+    hype_ata_disk_t disk;
+    hype_blk_file_t f;
+    hype_blk_backend_t be;
+    uint8_t img[4096];
+    uint64_t prd_gpa[2];
+    uint32_t prd_len[2];
+    int rc;
+
+    ata_setup_rig(&r, &ahci);
+    memset(img, 0, sizeof(img));
+    hype_blk_file_init(&f, &be, img, sizeof(img));
+    hype_ata_disk_reset(&disk, 0, 0);
+    hype_ata_disk_set_backend(&disk, &be);
+
+    /* One 512-byte sector split across two PRDs (200 + 312 bytes): neither PRD
+     * alone is a whole sector, forcing ahci_backend_rw_prdt's staging path. */
+    memset(r.data, 0x11u, 200u);
+    memset(r.data + 200, 0x22u, 312u);
+    prd_gpa[0] = ata_rig_gpa(&r, r.data);
+    prd_gpa[1] = ata_rig_gpa(&r, r.data + 200);
+    prd_len[0] = 200u;
+    prd_len[1] = 312u;
+    ata_build_slot0(&r, HYPE_ATA_CMD_WRITE_DMA_EXT, 0u, 1u, prd_gpa, prd_len, 2);
+
+    rc = process_ahci_ata_command_slot(&ahci, &disk, &r.map, 0u);
+    CHECK_HEX("straddling-PRD WRITE DMA completes", 0, rc);
+    CHECK_HEX("first half landed", 0x11u, img[0]);
+    CHECK_HEX("second half landed", 0x22u, img[200]);
+    CHECK_HEX("last byte of the sector landed", 0x22u, img[511]);
+}
+
+static void test_ata_short_inside_a_sector(void) {
+    /* A PRDT that runs out mid-sector on the straddling path: ahci_backend_rw_prdt
+     * must report the short byte count rather than reading/writing past its PRDT. */
+    ata_rig_t r;
+    hype_ahci_t ahci;
+    hype_ata_disk_t disk;
+    hype_blk_file_t f;
+    hype_blk_backend_t be;
+    uint8_t img[4096];
+    uint64_t prd_gpa[1];
+    uint32_t prd_len[1];
+    int rc;
+
+    ata_setup_rig(&r, &ahci);
+    memset(img, 0, sizeof(img));
+    hype_blk_file_init(&f, &be, img, sizeof(img));
+    hype_ata_disk_reset(&disk, 0, 0);
+    hype_ata_disk_set_backend(&disk, &be);
+
+    /* Only 100 bytes of PRD offered for a 1-sector (512-byte) write -- the PRDT
+     * is exhausted mid-sector, so the write never lands. */
+    memset(r.data, 0x33u, 100u);
+    prd_gpa[0] = ata_rig_gpa(&r, r.data);
+    prd_len[0] = 100u;
+    ata_build_slot0(&r, HYPE_ATA_CMD_WRITE_DMA_EXT, 0u, 1u, prd_gpa, prd_len, 1);
+
+    rc = process_ahci_ata_command_slot(&ahci, &disk, &r.map, 0u);
+    CHECK_HEX("short transfer still completes the slot", 0, rc);
+}
+
+static void test_ata_flush_cache_completes(void) {
+    ata_rig_t r;
+    hype_ahci_t ahci;
+    hype_ata_disk_t disk;
+    int rc;
+
+    ata_setup_rig(&r, &ahci);
+    hype_ata_disk_reset(&disk, 0, 0);
+    ata_build_slot0(&r, HYPE_ATA_CMD_FLUSH_CACHE_EXT, 0u, 0u, 0, 0, 0);
+
+    rc = process_ahci_ata_command_slot(&ahci, &disk, &r.map, 0u);
+    CHECK_HEX("FLUSH completes", 0, rc);
+    CHECK_HEX("status DRDY|DSC, no error", (unsigned)(HYPE_ATA_STATUS_DRDY | HYPE_ATA_STATUS_DSC),
+              ahci.p_tfd & 0xFFu);
+    CHECK_HEX("DHRS only, no PSS (no data phase)", 0u, ahci.p_is & HYPE_AHCI_PIS_PSS);
+}
+
+static void test_ata_set_features_completes(void) {
+    ata_rig_t r;
+    hype_ahci_t ahci;
+    hype_ata_disk_t disk;
+    int rc;
+
+    ata_setup_rig(&r, &ahci);
+    hype_ata_disk_reset(&disk, 0, 0);
+    ata_build_slot0(&r, HYPE_ATA_CMD_SET_FEATURES, 0u, 0u, 0, 0, 0);
+
+    rc = process_ahci_ata_command_slot(&ahci, &disk, &r.map, 0u);
+    CHECK_HEX("SET FEATURES completes", 0, rc);
+    CHECK_HEX("DHRS latched", HYPE_AHCI_PIS_DHRS, ahci.p_is & HYPE_AHCI_PIS_DHRS);
+}
+
+static void test_ata_unmodelled_command_aborts(void) {
+    ata_rig_t r;
+    hype_ahci_t ahci;
+    hype_ata_disk_t disk;
+    int rc;
+
+    ata_setup_rig(&r, &ahci);
+    hype_ata_disk_reset(&disk, 0, 0);
+    ata_build_slot0(&r, 0x00u /* unmodelled */, 0u, 0u, 0, 0, 0);
+
+    rc = process_ahci_ata_command_slot(&ahci, &disk, &r.map, 0u);
+    CHECK_HEX("unmodelled command still completes the slot", 0, rc);
+    CHECK_HEX("status ERR", HYPE_ATA_STATUS_ERR, ahci.p_tfd & HYPE_ATA_STATUS_ERR);
+    CHECK_HEX("error register ABRT", 0x04u, (ahci.p_tfd >> 8) & 0xFFu);
+}
+
+static void test_ata_read_dma_out_of_range_lba_reports_idnf(void) {
+    ata_rig_t r;
+    hype_ahci_t ahci;
+    hype_ata_disk_t disk;
+    uint8_t media[512]; /* one sector total */
+    uint64_t prd_gpa;
+    uint32_t prd_len = 512u;
+    int rc;
+
+    ata_setup_rig(&r, &ahci);
+    hype_ata_disk_reset(&disk, media, sizeof(media));
+    prd_gpa = ata_rig_gpa(&r, r.data);
+    /* LBA 5 is well past this 1-sector disk. */
+    ata_build_slot0(&r, HYPE_ATA_CMD_READ_DMA_EXT, 5u, 1u, &prd_gpa, &prd_len, 1);
+
+    rc = process_ahci_ata_command_slot(&ahci, &disk, &r.map, 0u);
+    CHECK_HEX("out-of-range LBA still completes the slot", 0, rc);
+    CHECK_HEX("status ERR", HYPE_ATA_STATUS_ERR, ahci.p_tfd & HYPE_ATA_STATUS_ERR);
+    CHECK_HEX("error register IDNF", 0x10u, (ahci.p_tfd >> 8) & 0xFFu);
+}
+
+static void test_ata_atapi_header_falls_through(void) {
+    ata_rig_t r;
+    hype_ahci_t ahci;
+    hype_ata_disk_t disk;
+    uint32_t opts;
+    int rc;
+
+    ata_setup_rig(&r, &ahci);
+    hype_ata_disk_reset(&disk, 0, 0);
+    ata_build_slot0(&r, HYPE_ATA_CMD_IDENTIFY_DEVICE, 0u, 0u, 0, 0, 0);
+    opts = 5u | (1u << 5); /* ATAPI bit set: not this handler's command */
+    ata_put32(r.cmd_list + 0, opts);
+
+    rc = process_ahci_ata_command_slot(&ahci, &disk, &r.map, 0u);
+    CHECK_HEX("an ATAPI command header is left for the ATAPI handler", (unsigned)-1, (unsigned)rc);
+}
+
+static void test_ata_bus_master_refused_returns_zero(void) {
+    ata_rig_t r;
+    hype_ahci_t ahci;
+    hype_ata_disk_t disk;
+    uint64_t prd_gpa;
+    uint32_t prd_len = 512u;
+    int rc;
+
+    ata_setup_rig(&r, &ahci);
+    hype_ahci_set_bus_master(&ahci, 0);
+    hype_ata_disk_reset(&disk, 0, 0);
+    prd_gpa = ata_rig_gpa(&r, r.data);
+    ata_build_slot0(&r, HYPE_ATA_CMD_READ_DMA_EXT, 0u, 1u, &prd_gpa, &prd_len, 1);
+
+    rc = process_ahci_ata_command_slot(&ahci, &disk, &r.map, 0u);
+    CHECK_HEX("no bus master: ignored, not an error", 0, rc);
+    CHECK_HEX("slot is left outstanding", 0u, ahci.p_ci);
+}
+
+static void test_ata_out_of_range_command_table_refused(void) {
+    ata_rig_t r;
+    hype_ahci_t ahci;
+    hype_ata_disk_t disk;
+    uint64_t prd_gpa;
+    uint32_t prd_len = 512u;
+    int rc;
+
+    ata_setup_rig(&r, &ahci);
+    hype_ata_disk_reset(&disk, 0, 0);
+    prd_gpa = ata_rig_gpa(&r, r.data);
+    ata_build_slot0(&r, HYPE_ATA_CMD_IDENTIFY_DEVICE, 0u, 0u, &prd_gpa, &prd_len, 1);
+    /* Point the command header at a command table well outside the rig's mapped range. */
+    ata_put32(r.cmd_list + 8, (uint32_t)(ATA_RIG_BASE + 0x10000000ull));
+    ata_put32(r.cmd_list + 12, (uint32_t)((ATA_RIG_BASE + 0x10000000ull) >> 32));
+
+    rc = process_ahci_ata_command_slot(&ahci, &disk, &r.map, 0u);
+    CHECK_HEX("out-of-range command table is refused", (unsigned)-1, (unsigned)rc);
+}
+
+static void test_ata_control_write_triggers_soft_reset(void) {
+    ata_rig_t r;
+    hype_ahci_t ahci;
+    hype_ata_disk_t disk;
+    int rc;
+
+    ata_setup_rig(&r, &ahci);
+    ahci.p_ie = HYPE_AHCI_PIS_DHRS;
+    hype_ata_disk_reset(&disk, 0, 0);
+    ata_build_slot0(&r, 0u, 0u, 0u, 0, 0, 0);
+    r.cmd_table[1] = 0u; /* C bit clear: a Control-register write, not a command */
+    r.cmd_table[15] = HYPE_AHCI_ATA_CONTROL_SRST;
+
+    rc = process_ahci_ata_command_slot(&ahci, &disk, &r.map, 0u);
+    CHECK_HEX("SRST assert posts no FIS", 0, rc);
+    CHECK_HEX("device busy while reset is asserted", 0x80u, ahci.p_tfd & 0xFFu);
+
+    r.cmd_table[15] = 0u; /* release */
+    rc = process_ahci_ata_command_slot(&ahci, &disk, &r.map, 0u);
+    CHECK_HEX("SRST release completes", 0, rc);
+    CHECK_HEX("device ready after release", 0x50u, ahci.p_tfd & 0xFFu);
+    CHECK_HEX("global IS.PORT0 latched (PxIE armed for DHRS)", HYPE_AHCI_IS_PORT0,
+              ahci.is & HYPE_AHCI_IS_PORT0);
+    CHECK_HEX("signature FIS posted into the RX FIS area", HYPE_AHCI_FIS_TYPE_D2H_REGISTER,
+              r.rx_fis[0x40]);
+}
+
+static void test_ata_prd_data_pointer_refused_read(void) {
+    ata_rig_t r;
+    hype_ahci_t ahci;
+    hype_ata_disk_t disk;
+    uint8_t media[4096];
+    uint64_t prd_gpa;
+    uint32_t prd_len = 512u;
+    int rc;
+
+    ata_setup_rig(&r, &ahci);
+    hype_ata_disk_reset(&disk, media, sizeof(media));
+    prd_gpa = ATA_RIG_BASE + 0x20000000ull; /* outside the rig's mapped range */
+    ata_build_slot0(&r, HYPE_ATA_CMD_READ_DMA_EXT, 0u, 1u, &prd_gpa, &prd_len, 1);
+
+    rc = process_ahci_ata_command_slot(&ahci, &disk, &r.map, 0u);
+    CHECK_HEX("refused PRD data pointer still completes the slot with an error", 0, rc);
+    CHECK_HEX("status ERR", HYPE_ATA_STATUS_ERR, ahci.p_tfd & HYPE_ATA_STATUS_ERR);
+}
+
+static void test_ata_prd_data_pointer_refused_write(void) {
+    ata_rig_t r;
+    hype_ahci_t ahci;
+    hype_ata_disk_t disk;
+    uint8_t media[4096];
+    uint64_t prd_gpa;
+    uint32_t prd_len = 512u;
+    int rc;
+
+    ata_setup_rig(&r, &ahci);
+    hype_ata_disk_reset(&disk, media, sizeof(media));
+    prd_gpa = ATA_RIG_BASE + 0x20000000ull;
+    ata_build_slot0(&r, HYPE_ATA_CMD_WRITE_DMA_EXT, 0u, 1u, &prd_gpa, &prd_len, 1);
+
+    rc = process_ahci_ata_command_slot(&ahci, &disk, &r.map, 0u);
+    CHECK_HEX("refused PRD data pointer still completes the slot with an error", 0, rc);
+    CHECK_HEX("status ERR", HYPE_ATA_STATUS_ERR, ahci.p_tfd & HYPE_ATA_STATUS_ERR);
+}
+
+static void test_ata_backend_translation_refused(void) {
+    ata_rig_t r;
+    hype_ahci_t ahci;
+    hype_ata_disk_t disk;
+    hype_blk_file_t f;
+    hype_blk_backend_t be;
+    uint8_t img[4096];
+    uint64_t prd_gpa;
+    uint32_t prd_len = 1024u; /* aligned span, so ahci_backend_rw_prdt's fast path runs */
+    int rc;
+
+    ata_setup_rig(&r, &ahci);
+    memset(img, 0, sizeof(img));
+    hype_blk_file_init(&f, &be, img, sizeof(img));
+    hype_ata_disk_reset(&disk, 0, 0);
+    hype_ata_disk_set_backend(&disk, &be);
+    prd_gpa = ATA_RIG_BASE + 0x20000000ull; /* outside the rig's mapped range */
+    ata_build_slot0(&r, HYPE_ATA_CMD_READ_DMA_EXT, 0u, 2u, &prd_gpa, &prd_len, 1);
+
+    rc = process_ahci_ata_command_slot(&ahci, &disk, &r.map, 0u);
+    CHECK_HEX("a refused backend DMA translation aborts the command", (unsigned)-1, (unsigned)rc);
+}
+
+static void test_ata_backend_write_failure(void) {
+    ata_rig_t r;
+    hype_ahci_t ahci;
+    hype_ata_disk_t disk;
+    hype_blk_backend_t be;
+    uint64_t prd_gpa;
+    uint32_t prd_len = 1024u;
+    int rc;
+
+    ata_setup_rig(&r, &ahci);
+    memset(&be, 0, sizeof(be));
+    be.read = 0;
+    be.write = 0; /* read-only backend: any write fails */
+    be.writev = 0;
+    be.ctx = 0;
+    be.total_sectors = 8;
+    hype_ata_disk_reset(&disk, 0, 0);
+    hype_ata_disk_set_backend(&disk, &be);
+    prd_gpa = ata_rig_gpa(&r, r.data);
+    ata_build_slot0(&r, HYPE_ATA_CMD_WRITE_DMA_EXT, 0u, 2u, &prd_gpa, &prd_len, 1);
+
+    rc = process_ahci_ata_command_slot(&ahci, &disk, &r.map, 0u);
+    CHECK_HEX("a backend write failure still completes the slot with an error", 0, rc);
+    CHECK_HEX("status ERR", HYPE_ATA_STATUS_ERR, ahci.p_tfd & HYPE_ATA_STATUS_ERR);
+    CHECK_HEX("error register IDNF", 0x10u, (ahci.p_tfd >> 8) & 0xFFu);
+}
+
+static int ata_fail_read(void *ctx, uint64_t lba, uint32_t count, void *buf) {
+    (void)ctx; (void)lba; (void)count; (void)buf;
+    return -1;
+}
+
+static void test_ata_backend_read_failure(void) {
+    ata_rig_t r;
+    hype_ahci_t ahci;
+    hype_ata_disk_t disk;
+    hype_blk_backend_t be;
+    uint64_t prd_gpa;
+    uint32_t prd_len = 1024u;
+    int rc;
+
+    ata_setup_rig(&r, &ahci);
+    memset(&be, 0, sizeof(be));
+    be.read = ata_fail_read;
+    be.write = 0;
+    be.writev = 0;
+    be.ctx = 0;
+    be.total_sectors = 8;
+    hype_ata_disk_reset(&disk, 0, 0);
+    hype_ata_disk_set_backend(&disk, &be);
+    prd_gpa = ata_rig_gpa(&r, r.data);
+    ata_build_slot0(&r, HYPE_ATA_CMD_READ_DMA_EXT, 0u, 2u, &prd_gpa, &prd_len, 1);
+
+    rc = process_ahci_ata_command_slot(&ahci, &disk, &r.map, 0u);
+    CHECK_HEX("a backend read failure still completes the slot with an error", 0, rc);
+    CHECK_HEX("status ERR", HYPE_ATA_STATUS_ERR, ahci.p_tfd & HYPE_ATA_STATUS_ERR);
+}
+
+static void test_ata_out_of_range_rx_fis_refused_at_completion(void) {
+    /* complete_ahci_command_slot() re-checks rx_fis_phys itself (#677) -- a valid
+     * command list/table with a bad PxFB/PxFBU is refused only at the very end. */
+    ata_rig_t r;
+    hype_ahci_t ahci;
+    hype_ata_disk_t disk;
+    uint64_t prd_gpa;
+    uint32_t prd_len = 512u;
+    int rc;
+
+    ata_setup_rig(&r, &ahci);
+    hype_ata_disk_reset(&disk, 0, 0);
+    prd_gpa = ata_rig_gpa(&r, r.data);
+    ata_build_slot0(&r, HYPE_ATA_CMD_FLUSH_CACHE_EXT, 0u, 0u, &prd_gpa, &prd_len, 0);
+    ahci.p_fb = 0xFFFF0000u;
+    ahci.p_fbu = 0u;
+
+    rc = process_ahci_ata_command_slot(&ahci, &disk, &r.map, 0u);
+    CHECK_HEX("out-of-range RX FIS is refused at completion", (unsigned)-1, (unsigned)rc);
+}
+
+static void test_ata_soft_reset_release_out_of_range_rx_fis(void) {
+    /* complete_ahci_soft_reset()'s own rx_fis check, on the release half. */
+    ata_rig_t r;
+    hype_ahci_t ahci;
+    hype_ata_disk_t disk;
+    int rc;
+
+    ata_setup_rig(&r, &ahci);
+    hype_ata_disk_reset(&disk, 0, 0);
+    ata_build_slot0(&r, 0u, 0u, 0u, 0, 0, 0);
+    r.cmd_table[1] = 0u;
+    r.cmd_table[15] = HYPE_AHCI_ATA_CONTROL_SRST;
+    (void)process_ahci_ata_command_slot(&ahci, &disk, &r.map, 0u); /* assert half: no FIS yet */
+
+    ahci.p_fb = 0xFFFF0000u;
+    ahci.p_fbu = 0u;
+    r.cmd_table[15] = 0u; /* release */
+    rc = process_ahci_ata_command_slot(&ahci, &disk, &r.map, 0u);
+    CHECK_HEX("out-of-range RX FIS on soft-reset release is refused", (unsigned)-1, (unsigned)rc);
+}
+
+static void test_ata_identify_device_raises_port0_interrupt(void) {
+    /* Exercises the "latch the global IS.PORT0 bit" branch both completion helpers share --
+     * only taken when the guest has already enabled PxIE for the bit(s) just posted. */
+    ata_rig_t r;
+    hype_ahci_t ahci;
+    hype_ata_disk_t disk;
+    uint8_t media[4096];
+    uint64_t prd_gpa;
+    uint32_t prd_len = 512u;
+    int rc;
+
+    ata_setup_rig(&r, &ahci);
+    ahci.p_ie = HYPE_AHCI_PIS_PSS | HYPE_AHCI_PIS_DHRS;
+    hype_ata_disk_reset(&disk, media, sizeof(media));
+    prd_gpa = ata_rig_gpa(&r, r.data);
+    ata_build_slot0(&r, HYPE_ATA_CMD_IDENTIFY_DEVICE, 0u, 0u, &prd_gpa, &prd_len, 1);
+
+    rc = process_ahci_ata_command_slot(&ahci, &disk, &r.map, 0u);
+    CHECK_HEX("IDENTIFY completes", 0, rc);
+    CHECK_HEX("global IS.PORT0 latched", HYPE_AHCI_IS_PORT0, ahci.is & HYPE_AHCI_IS_PORT0);
+}
+
+static void test_ata_backend_aligned_two_prds(void) {
+    /* Two PRDs, each an exact whole number of sectors: after the first is fully
+     * consumed, ahci_backend_rw_prdt's outer loop advances to the second PRD
+     * (the idx++/continue branch) rather than the straddling stage path. */
+    ata_rig_t r;
+    hype_ahci_t ahci;
+    hype_ata_disk_t disk;
+    hype_blk_file_t f;
+    hype_blk_backend_t be;
+    uint8_t img[4096];
+    uint64_t prd_gpa[2];
+    uint32_t prd_len[2];
+    int rc;
+
+    ata_setup_rig(&r, &ahci);
+    memset(img, 0x66u, sizeof(img));
+    hype_blk_file_init(&f, &be, img, sizeof(img));
+    hype_ata_disk_reset(&disk, 0, 0);
+    hype_ata_disk_set_backend(&disk, &be);
+
+    prd_gpa[0] = ata_rig_gpa(&r, r.data);
+    prd_gpa[1] = ata_rig_gpa(&r, r.data + 512);
+    prd_len[0] = 512u;
+    prd_len[1] = 512u;
+    ata_build_slot0(&r, HYPE_ATA_CMD_READ_DMA_EXT, 0u, 2u, prd_gpa, prd_len, 2);
+
+    rc = process_ahci_ata_command_slot(&ahci, &disk, &r.map, 0u);
+    CHECK_HEX("two-aligned-PRD READ DMA completes", 0, rc);
+    CHECK_HEX("second PRD received backend content too", 0x66u, r.data[512]);
+}
+
+static void test_ata_backend_aligned_prd_larger_than_request(void) {
+    /* A single PRD larger than the whole request: the aligned fast path must cap
+     * its span to what remains rather than reading/writing past total_bytes. */
+    ata_rig_t r;
+    hype_ahci_t ahci;
+    hype_ata_disk_t disk;
+    hype_blk_file_t f;
+    hype_blk_backend_t be;
+    uint8_t img[4096];
+    uint64_t prd_gpa;
+    uint32_t prd_len = 2048u; /* PRD offers 4 sectors */
+    int rc;
+
+    ata_setup_rig(&r, &ahci);
+    memset(img, 0x77u, sizeof(img));
+    hype_blk_file_init(&f, &be, img, sizeof(img));
+    hype_ata_disk_reset(&disk, 0, 0);
+    hype_ata_disk_set_backend(&disk, &be);
+    prd_gpa = ata_rig_gpa(&r, r.data);
+    ata_build_slot0(&r, HYPE_ATA_CMD_READ_DMA_EXT, 0u, 1u, &prd_gpa, &prd_len, 1); /* request only 1 sector */
+
+    rc = process_ahci_ata_command_slot(&ahci, &disk, &r.map, 0u);
+    CHECK_HEX("an oversized PRD is capped to the request", 0, rc);
+    CHECK_HEX("only the requested sector was delivered", 0x77u, r.data[0]);
+}
+
+static void test_ata_read_dma_backend_straddling_prd(void) {
+    ata_rig_t r;
+    hype_ahci_t ahci;
+    hype_ata_disk_t disk;
+    hype_blk_file_t f;
+    hype_blk_backend_t be;
+    uint8_t img[4096];
+    uint64_t prd_gpa[2];
+    uint32_t prd_len[2];
+    int rc;
+
+    ata_setup_rig(&r, &ahci);
+    memset(img, 0x99u, sizeof(img));
+    hype_blk_file_init(&f, &be, img, sizeof(img));
+    hype_ata_disk_reset(&disk, 0, 0);
+    hype_ata_disk_set_backend(&disk, &be);
+
+    prd_gpa[0] = ata_rig_gpa(&r, r.data);
+    prd_gpa[1] = ata_rig_gpa(&r, r.data + 200);
+    prd_len[0] = 200u;
+    prd_len[1] = 312u;
+    ata_build_slot0(&r, HYPE_ATA_CMD_READ_DMA_EXT, 0u, 1u, prd_gpa, prd_len, 2);
+
+    rc = process_ahci_ata_command_slot(&ahci, &disk, &r.map, 0u);
+    CHECK_HEX("straddling-PRD READ DMA completes", 0, rc);
+    CHECK_HEX("scattered content delivered", 0x99u, r.data[0]);
+    CHECK_HEX("scattered content delivered past the straddle point", 0x99u, r.data[511]);
+}
+
+static void test_ata_write_dma_backend_straddling_failure(void) {
+    ata_rig_t r;
+    hype_ahci_t ahci;
+    hype_ata_disk_t disk;
+    hype_blk_backend_t be;
+    uint64_t prd_gpa[2];
+    uint32_t prd_len[2];
+    int rc;
+
+    ata_setup_rig(&r, &ahci);
+    memset(&be, 0, sizeof(be));
+    be.read = 0;
+    be.write = 0; /* read-only: the staged write at the end of the sector fails */
+    be.writev = 0;
+    be.ctx = 0;
+    be.total_sectors = 8;
+    hype_ata_disk_reset(&disk, 0, 0);
+    hype_ata_disk_set_backend(&disk, &be);
+
+    prd_gpa[0] = ata_rig_gpa(&r, r.data);
+    prd_gpa[1] = ata_rig_gpa(&r, r.data + 200);
+    prd_len[0] = 200u;
+    prd_len[1] = 312u;
+    ata_build_slot0(&r, HYPE_ATA_CMD_WRITE_DMA_EXT, 0u, 1u, prd_gpa, prd_len, 2);
+
+    rc = process_ahci_ata_command_slot(&ahci, &disk, &r.map, 0u);
+    CHECK_HEX("a staged backend write failure still completes the slot with an error", 0, rc);
+    CHECK_HEX("status ERR", HYPE_ATA_STATUS_ERR, ahci.p_tfd & HYPE_ATA_STATUS_ERR);
+}
+
+static void test_ata_write_dma_backend_straddling_translation_refused(void) {
+    ata_rig_t r;
+    hype_ahci_t ahci;
+    hype_ata_disk_t disk;
+    hype_blk_file_t f;
+    hype_blk_backend_t be;
+    uint8_t img[4096];
+    uint64_t prd_gpa[2];
+    uint32_t prd_len[2];
+    int rc;
+
+    ata_setup_rig(&r, &ahci);
+    memset(img, 0, sizeof(img));
+    hype_blk_file_init(&f, &be, img, sizeof(img));
+    hype_ata_disk_reset(&disk, 0, 0);
+    hype_ata_disk_set_backend(&disk, &be);
+
+    prd_gpa[0] = ata_rig_gpa(&r, r.data);
+    prd_gpa[1] = ATA_RIG_BASE + 0x20000000ull; /* second PRD outside the mapped rig */
+    prd_len[0] = 200u;
+    prd_len[1] = 312u;
+    ata_build_slot0(&r, HYPE_ATA_CMD_WRITE_DMA_EXT, 0u, 1u, prd_gpa, prd_len, 2);
+
+    rc = process_ahci_ata_command_slot(&ahci, &disk, &r.map, 0u);
+    CHECK_HEX("a refused translation mid-straddle aborts the command", (unsigned)-1, (unsigned)rc);
+}
+
+static void test_ata_short_prdt_on_aligned_path(void) {
+    /* The PRDT is exhausted (one aligned 1-sector PRD) before a 2-sector request is
+     * satisfied: ahci_backend_rw_prdt's aligned loop must report the short count. */
+    ata_rig_t r;
+    hype_ahci_t ahci;
+    hype_ata_disk_t disk;
+    hype_blk_file_t f;
+    hype_blk_backend_t be;
+    uint8_t img[4096];
+    uint64_t prd_gpa;
+    uint32_t prd_len = 512u; /* only 1 of the 2 requested sectors */
+    int rc;
+
+    ata_setup_rig(&r, &ahci);
+    memset(img, 0, sizeof(img));
+    hype_blk_file_init(&f, &be, img, sizeof(img));
+    hype_ata_disk_reset(&disk, 0, 0);
+    hype_ata_disk_set_backend(&disk, &be);
+    prd_gpa = ata_rig_gpa(&r, r.data);
+    ata_build_slot0(&r, HYPE_ATA_CMD_WRITE_DMA_EXT, 0u, 2u, &prd_gpa, &prd_len, 1);
+
+    rc = process_ahci_ata_command_slot(&ahci, &disk, &r.map, 0u);
+    CHECK_HEX("a short PRDT on the aligned path still completes the slot", 0, rc);
+}
+
+static void test_ata_not_a_register_h2d_fis_refused(void) {
+    ata_rig_t r;
+    hype_ahci_t ahci;
+    hype_ata_disk_t disk;
+    uint64_t prd_gpa;
+    uint32_t prd_len = 512u;
+    int rc;
+
+    ata_setup_rig(&r, &ahci);
+    hype_ata_disk_reset(&disk, 0, 0);
+    prd_gpa = ata_rig_gpa(&r, r.data);
+    ata_build_slot0(&r, HYPE_ATA_CMD_IDENTIFY_DEVICE, 0u, 0u, &prd_gpa, &prd_len, 1);
+    r.cmd_table[0] = 0x00u; /* not a Register H2D FIS at all */
+
+    rc = process_ahci_ata_command_slot(&ahci, &disk, &r.map, 0u);
+    CHECK_HEX("a command table without a Register H2D FIS is refused", (unsigned)-1, (unsigned)rc);
+}
+
+static int ata_fail_read_once(void *ctx, uint64_t lba, uint32_t count, void *buf) {
+    (void)ctx; (void)lba; (void)count; (void)buf;
+    return -1;
+}
+
+static void test_ata_read_dma_backend_straddling_failure(void) {
+    /* The staged-read half of ahci_backend_rw_prdt's straddle path fetches the sector
+     * from the backend before scattering it into the PRDs; a backend read failure there
+     * must abort with an error, same as the aligned path's own failure. */
+    ata_rig_t r;
+    hype_ahci_t ahci;
+    hype_ata_disk_t disk;
+    hype_blk_backend_t be;
+    uint64_t prd_gpa[2];
+    uint32_t prd_len[2];
+    int rc;
+
+    ata_setup_rig(&r, &ahci);
+    memset(&be, 0, sizeof(be));
+    be.read = ata_fail_read_once;
+    be.write = 0;
+    be.writev = 0;
+    be.ctx = 0;
+    be.total_sectors = 8;
+    hype_ata_disk_reset(&disk, 0, 0);
+    hype_ata_disk_set_backend(&disk, &be);
+
+    prd_gpa[0] = ata_rig_gpa(&r, r.data);
+    prd_gpa[1] = ata_rig_gpa(&r, r.data + 200);
+    prd_len[0] = 200u;
+    prd_len[1] = 312u;
+    ata_build_slot0(&r, HYPE_ATA_CMD_READ_DMA_EXT, 0u, 1u, prd_gpa, prd_len, 2);
+
+    rc = process_ahci_ata_command_slot(&ahci, &disk, &r.map, 0u);
+    CHECK_HEX("a staged backend read failure still completes the slot with an error", 0, rc);
+    CHECK_HEX("status ERR", HYPE_ATA_STATUS_ERR, ahci.p_tfd & HYPE_ATA_STATUS_ERR);
+}
+
+static void test_get_atapi_diag_reads_back_zero_counters(void) {
+    unsigned long long xfers = 99, sx = 99, rb = 99, db = 99, ob = 99;
+    /*
+     * Direct smoke test of the accessor moved alongside process_ahci_command_slot()
+     * (arch/x86_64/vmm_device_ops.c). This binary never calls the ATAPI path (only
+     * process_ahci_ata_command_slot(), above), so the shared counters stay at 0 --
+     * and a NULL out-pointer must be tolerated (every other test binary linking this
+     * module passes a subset of NULLs).
+     */
+    hype_svm_vcpu_get_atapi_diag(&xfers, &sx, &rb, &db, &ob);
+    CHECK_HEX("xfers stays 0 (ATAPI path never ran in this binary)", 0, xfers);
+    CHECK_HEX("short_xfers stays 0", 0, sx);
+    CHECK_HEX("req_bytes stays 0", 0, rb);
+    CHECK_HEX("done_bytes stays 0", 0, db);
+    CHECK_HEX("owed_bytes stays 0", 0, ob);
+    hype_svm_vcpu_get_atapi_diag(0, 0, 0, 0, 0); /* NULL out-pointers tolerated */
+}
+
 int main(void) {
     test_reset_state();
     test_read_write_clb_fb();
@@ -779,6 +1589,46 @@ int main(void) {
     test_hotplug_attach_raises_connect_change();
     test_hotplug_detach_clears_det();
     test_ata_command_slot_refuses_out_of_range_command_list();
+
+    /*
+     * process_ahci_ata_command_slot() unconditionally traces its first 12 commands
+     * (the #262 ATACMD line) regardless of outcome, unlike process_ahci_command_slot()'s
+     * refusal-only logging above -- so every call below needs the host-unsafe DEBUG
+     * sink suppressed, not just the ones expected to refuse.
+     */
+    hype_debug_set_level(HYPE_LOG_ERROR);
+    test_ata_identify_device_completes();
+    test_ata_read_dma_ram_media();
+    test_ata_write_dma_ram_media();
+    test_ata_read_dma_backend_aligned();
+    test_ata_write_dma_backend_straddling_prd();
+    test_ata_short_inside_a_sector();
+    test_ata_flush_cache_completes();
+    test_ata_set_features_completes();
+    test_ata_unmodelled_command_aborts();
+    test_ata_read_dma_out_of_range_lba_reports_idnf();
+    test_ata_atapi_header_falls_through();
+    test_ata_bus_master_refused_returns_zero();
+    test_ata_out_of_range_command_table_refused();
+    test_ata_control_write_triggers_soft_reset();
+    test_ata_prd_data_pointer_refused_read();
+    test_ata_prd_data_pointer_refused_write();
+    test_ata_backend_translation_refused();
+    test_ata_backend_write_failure();
+    test_ata_backend_read_failure();
+    test_ata_out_of_range_rx_fis_refused_at_completion();
+    test_ata_soft_reset_release_out_of_range_rx_fis();
+    test_ata_identify_device_raises_port0_interrupt();
+    test_ata_backend_aligned_two_prds();
+    test_ata_backend_aligned_prd_larger_than_request();
+    test_ata_read_dma_backend_straddling_prd();
+    test_ata_write_dma_backend_straddling_failure();
+    test_ata_write_dma_backend_straddling_translation_refused();
+    test_ata_short_prdt_on_aligned_path();
+    test_ata_not_a_register_h2d_fis_refused();
+    test_ata_read_dma_backend_straddling_failure();
+    test_get_atapi_diag_reads_back_zero_counters();
+    hype_debug_set_level(HYPE_LOG_DEBUG);
 
     if (failures == 0) {
         printf("all tests passed\n");

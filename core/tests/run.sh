@@ -10,7 +10,7 @@
 set -e
 cd "$(dirname "$0")"
 
-LIB_DIRS="../ ../../arch/x86_64/cpu/ ../../arch/x86_64/svm/ ../../arch/x86_64/vmx/ ../../devices/"
+LIB_DIRS="../ ../../arch/x86_64/ ../../arch/x86_64/cpu/ ../../arch/x86_64/svm/ ../../arch/x86_64/vmx/ ../../devices/"
 
 # Files that only make sense with a real CPU privilege transition (hlt,
 # lgdt+segment reload, ...) are exempt from the coverage gate per

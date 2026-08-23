@@ -2,6 +2,7 @@
 #include <string.h>
 #include "../../devices/virtio_blk.h"
 #include "../blk_backend.h"
+#include "../fatal.h"
 
 static int failures = 0;
 
@@ -1380,6 +1381,114 @@ static void test_queue_size_bounds_requests_in_flight(void) {
     }
 }
 
+/*
+ * #693 coverage follow-up: a few branches in process_virtio_blk_queue()/virtq_fetch_desc()
+ * were unreached by the tests above -- the bus-master gate, a GET_ID data descriptor whose
+ * index is itself out of range (virtq_fetch_desc()'s own bounds check, not the chain-shape
+ * check virtq_validate_chain() already covers), a GET_ID data segment failing the real
+ * bounds-checked gpa map, and the default (no sink installed) hype_debug_print() path every
+ * other test's tq_init()/tqm_init() deliberately routes around.
+ */
+
+static void test_bus_master_refused_returns_zero(void) {
+    tq_t q;
+
+    tq_init(&q, HYPE_VIRTIO_BLK_T_IN, 0);
+    hype_virtio_blk_set_bus_master(&q.dev, 0);
+    tq_desc(&q, 0, q.hdr, 16u, HYPE_VIRTQ_DESC_F_NEXT, 1);
+    tq_desc(&q, 1, q.gbuf, 512u, (uint16_t)(HYPE_VIRTQ_DESC_F_NEXT | HYPE_VIRTQ_DESC_F_WRITE), 2);
+    tq_desc(&q, 2, &q.status, 1u, HYPE_VIRTQ_DESC_F_WRITE, 0);
+    tq_submit(&q, 0);
+
+    hype_debug_set_level(HYPE_LOG_ERROR); /* the #372 notice prints unconditionally */
+    CHECK_HEX("no bus master: ignored, not an error", 0, tq_run(&q));
+    hype_debug_set_level(HYPE_LOG_DEBUG);
+    CHECK_HEX("nothing completed", 0u, tq_get16(q.used + 2));
+}
+
+static void test_get_id_data_descriptor_index_out_of_range(void) {
+    /* header.next names a descriptor index >= queue_size -- virtq_fetch_desc()'s own bounds
+     * check, distinct from virtq_validate_chain()'s cycle/shape checks (which this chain
+     * otherwise passes: the header's NEXT points nowhere valid, but validate_chain only
+     * follows it looking for the status descriptor, and TQ_QSZ conveniently is not itself
+     * a valid index). */
+    tq_t q;
+
+    tq_init(&q, HYPE_VIRTIO_BLK_T_GET_ID, 0);
+    tq_desc(&q, 0, q.hdr, 16u, HYPE_VIRTQ_DESC_F_NEXT, (uint16_t)TQ_QSZ);
+    tq_submit(&q, 0);
+
+    CHECK_HEX("an out-of-range chain is rejected before dispatch", (unsigned long long)(-1),
+              (unsigned long long)tq_run(&q));
+}
+
+static void test_get_id_data_segment_outside_mapped_region_is_rejected(void) {
+    tqm_t q;
+
+    tqm_init(&q, HYPE_VIRTIO_BLK_T_GET_ID, 0);
+    tqm_chain_1seg(&q, TQM_GUEST_BASE + 0x1000000ull /* outside the mapped rig */, 20u,
+                  HYPE_VIRTQ_DESC_F_WRITE);
+    tqm_submit(&q, 0);
+
+    CHECK_HEX("does not abort the notify", 0, tqm_run(&q));
+    CHECK_HEX("reported IOERR", HYPE_VIRTIO_BLK_S_IOERR, q.status);
+    CHECK_HEX("named in the log", 1, tq_reject_says("bounds check"));
+}
+
+static void test_reject_without_a_sink_uses_the_default_print(void) {
+    /*
+     * Every other test in this file installs tq_reject_sink() specifically because the
+     * default path below is hype_debug_print(), which reaches real UART port I/O and
+     * faults in a host process (see tq_reject_sink()'s own comment). DEBUG-level logging
+     * is disabled around this one call for exactly that reason -- proving the branch runs
+     * without asking it to touch hardware.
+     */
+    tq_t q;
+
+    tq_init(&q, HYPE_VIRTIO_BLK_T_OUT, 1);
+    hype_virtio_blk_set_reject_sink(0);
+    tq_desc(&q, 0, q.hdr, 16u, HYPE_VIRTQ_DESC_F_NEXT, 1);
+    tq_desc(&q, 1, q.gbuf, 512u, HYPE_VIRTQ_DESC_F_NEXT, 2);
+    tq_desc(&q, 2, q.gbuf, 512u, HYPE_VIRTQ_DESC_F_NEXT, 1); /* 1 -> 2 -> 1: a cycle */
+    tq_submit(&q, 0);
+
+    hype_debug_set_level(HYPE_LOG_ERROR);
+    CHECK_HEX("cyclic chain still rejected without a sink installed", (unsigned long long)(-1),
+              (unsigned long long)tq_run(&q));
+    hype_debug_set_level(HYPE_LOG_DEBUG);
+}
+
+static void test_reject_val_without_a_sink_uses_the_default_print(void) {
+    /* Same reasoning as the plain reject() default-print test above, for the
+     * "names the offending value" variant (an unsupported request type). */
+    tq_t q;
+
+    tq_init(&q, 0xFFFFFFFFu /* not a request type this device models */, 0);
+    hype_virtio_blk_set_reject_sink(0);
+    tq_desc(&q, 0, q.hdr, 16u, HYPE_VIRTQ_DESC_F_NEXT, 1);
+    tq_desc(&q, 1, &q.status, 1u, HYPE_VIRTQ_DESC_F_WRITE, 0);
+    tq_submit(&q, 0);
+
+    hype_debug_set_level(HYPE_LOG_ERROR);
+    CHECK_HEX("unsupported type still completes without a sink installed", 0, tq_run(&q));
+    hype_debug_set_level(HYPE_LOG_DEBUG);
+    CHECK_HEX("reported UNSUPP", HYPE_VIRTIO_BLK_S_UNSUPP, q.status);
+}
+
+static void test_descriptor_table_translation_refused(void) {
+    /* virtq_fetch_desc()'s OWN translation refusal (dma_map rejects an in-range index's
+     * backing address), distinct from virtq_validate_chain()'s index-bound check above:
+     * point the whole descriptor table outside this VM's one mapped region. */
+    tqm_t q;
+
+    tqm_init(&q, HYPE_VIRTIO_BLK_T_IN, 0);
+    q.dev.queue_desc = TQM_GUEST_BASE + 0x1000000ull; /* outside the mapped rig */
+    tqm_submit(&q, 0);
+
+    CHECK_HEX("an untranslatable descriptor table is rejected", (unsigned long long)(-1),
+              (unsigned long long)tqm_run(&q));
+}
+
 int main(void) {
     test_reset_sets_capacity_and_default_queue_size();
     test_feature_negotiation_offers_only_version_1();
@@ -1422,6 +1531,12 @@ int main(void) {
     test_depth_buckets();
     test_depth_record_accumulates();
     test_depth_is_recorded_by_the_drain();
+    test_bus_master_refused_returns_zero();
+    test_get_id_data_descriptor_index_out_of_range();
+    test_get_id_data_segment_outside_mapped_region_is_rejected();
+    test_reject_without_a_sink_uses_the_default_print();
+    test_reject_val_without_a_sink_uses_the_default_print();
+    test_descriptor_table_translation_refused();
 
     if (failures == 0) {
         printf("all tests passed\n");

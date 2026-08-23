@@ -206,6 +206,27 @@ static void test_gpa_write_out_of_range_refuses_without_touching_ram(void) {
     CHECK_HEX("ram untouched on refusal", 0xEEu, ram[0]);
 }
 
+/* #693/#694: NULL map means trusted identity-mapped guest -- returns gpa unchecked. */
+static void test_guest_dma_xlate_null_map_is_identity(void) {
+    CHECK_HEX("NULL map returns gpa unchanged", 0x123456u,
+              hype_guest_dma_xlate(0, 0x123456u, 64u));
+}
+
+static void test_guest_dma_xlate_non_null_map_routes_through_gpa_to_host(void) {
+    uint8_t ram[64];
+    hype_gpa_map_t m;
+    uint64_t want;
+
+    hype_gpa_map_reset(&m);
+    hype_gpa_map_add(&m, 0x2000, (uint64_t)(uintptr_t)ram, sizeof(ram));
+    want = hype_gpa_to_host(&m, 0x2000u, 4u);
+
+    CHECK_HEX("legitimate range translates the same as hype_gpa_to_host", want,
+              hype_guest_dma_xlate(&m, 0x2000u, 4u));
+    CHECK_HEX("out-of-range range refuses the same as hype_gpa_to_host", 0u,
+              hype_guest_dma_xlate(&m, 0x9000u, 4u));
+}
+
 int main(void) {
     test_translate_inside_ram();
     test_translate_inside_flash();
@@ -221,6 +242,8 @@ int main(void) {
     test_gpa_read_out_of_range_refuses_without_touching_dst();
     test_gpa_write_legitimate_range_copies_bytes();
     test_gpa_write_out_of_range_refuses_without_touching_ram();
+    test_guest_dma_xlate_null_map_is_identity();
+    test_guest_dma_xlate_non_null_map_routes_through_gpa_to_host();
 
     if (failures == 0) {
         printf("all tests passed\n");

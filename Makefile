@@ -40,7 +40,8 @@ CORE_SRCS := core/format.c core/console.c core/halt.c core/memmap.c \
              core/fat_write.c core/fat_write_fs.c core/fat_exfat.c core/fat_exfat_fs.c core/fat32_selftest.c \
              core/rtc.c core/rtc_hw.c \
              core/log_sink.c core/log_split.c core/disk_inventory.c core/cpu_topology.c core/smp_pack.c core/e1000.c core/e1000_hw.c core/arp.c core/virtio_net_ring.c core/nat.c core/e1000_dev_ring.c core/guest_nic.c core/pe_ident.c core/mtrr.c core/run_state.c
-ARCH_SRCS := arch/x86_64/cpu/gdt.c arch/x86_64/cpu/gdt_load.c arch/x86_64/cpu/idt.c \
+ARCH_SRCS := arch/x86_64/vmm_device_ops.c \
+             arch/x86_64/cpu/gdt.c arch/x86_64/cpu/gdt_load.c arch/x86_64/cpu/idt.c \
              arch/x86_64/cpu/idt_load.c arch/x86_64/cpu/isr_decode.c \
              arch/x86_64/cpu/paging.c arch/x86_64/cpu/paging_load.c arch/x86_64/cpu/mtrr_hw.c \
              arch/x86_64/cpu/pic.c arch/x86_64/cpu/lapic.c arch/x86_64/cpu/pit.c \
