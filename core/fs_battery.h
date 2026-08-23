@@ -4,24 +4,31 @@
 #include "fs_ops.h"
 
 /*
- * #692: a generic, filesystem-agnostic namespace-mutation battery. Drives
- * ONLY hype_fs_ops_t's public wrappers (core/fs_ops.h) -- create, unlink,
- * mkdir, rmdir, rename -- so it does not know or care which driver it is
- * running against. Any driver declaring HYPE_FS_CAP_NAMESPACE (currently
- * ext and NTFS; FAT32/exFAT do not implement namespace mutation) can run
- * this unchanged.
+ * #692: a generic, filesystem-agnostic writer battery. Drives ONLY
+ * hype_fs_ops_t's public wrappers (core/fs_ops.h) -- create, unlink,
+ * mkdir, rmdir, rename, write_at, read_at, append -- so it does not know
+ * or care which driver it is running against. Any driver declaring
+ * HYPE_FS_CAP_NAMESPACE (currently ext and NTFS; FAT32/exFAT do not
+ * implement namespace mutation) can run the namespace half unchanged.
  *
- * Deliberately does NOT touch file CONTENT (write_at/read_at/append):
- * a namespace-created file is not guaranteed to be immediately readable
- * on every driver (NTFS's own $DATA starts resident and empty, which
+ * Namespace existence is proven the way every POSIX-style namespace
+ * actually guarantees it, not by reading content: a second create()/
+ * mkdir() of an existing name must be refused, and unlink()/rmdir() of a
+ * name that was never created, or was already removed, must be refused
+ * too. This works uniformly even for a driver whose freshly-created file
+ * is not yet readable (NTFS's own $DATA starts resident and empty, which
  * hype_ntfs_resolve() correctly refuses per decision 30 until something
  * converts or grows it -- see core/fs_ops.c's ntfs_create() comment).
- * Existence is instead proven the way every POSIX-style namespace
- * actually guarantees it: a second create() of the same name must be
- * refused (already exists), and unlink()/rmdir() of a name that was
- * never created, or was already removed, must be refused too. This is a
- * complete, driver-neutral round-trip proof that does not depend on a
- * capability past HYPE_FS_CAP_NAMESPACE itself.
+ *
+ * CONTENT is then exercised on top, adaptively: the battery attempts
+ * hype_fs_lookup() on a just-created file, and only if that succeeds (the
+ * driver's own capability, not a battery assumption) does it write a
+ * pattern, read it back byte-exact, and -- if HYPE_FS_CAP_APPEND is
+ * advertised -- append more and verify the grown length reads back
+ * correctly too. A driver where lookup on a fresh empty file legitimately
+ * fails (NTFS, until #692's own documented append-through-the-vtable gap
+ * closes) skips content verification for that driver rather than failing
+ * -- a real, reported capability difference, not a masked one.
  */
 
 typedef struct {
@@ -31,6 +38,8 @@ typedef struct {
     unsigned renames_ok;
     unsigned deletes_ok; /* unlink/rmdir that should succeed, did */
     unsigned stale_refusals_ok; /* unlink/rmdir/rename on a gone/missing name correctly refused */
+    unsigned content_verified;   /* write+read (and append+read, if CAP_APPEND) byte-exact */
+    unsigned content_skipped;    /* lookup on the fresh file failed: no content test possible */
     unsigned failures;
     char first_fail[64];
 } hype_fs_battery_result_t;

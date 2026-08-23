@@ -30,6 +30,93 @@ static int step(hype_fs_battery_result_t *res, hype_fs_battery_log_fn log, void 
     return ok;
 }
 
+#define PATTERN_LEN 32u
+#define APPEND_LEN 16u
+
+static void fill_pattern(uint8_t *buf, unsigned n, uint8_t seed) {
+    unsigned i;
+    for (i = 0; i < n; i++) {
+        buf[i] = (uint8_t)(seed + i * 7u + 1u);
+    }
+}
+
+/*
+ * Adaptive content check on a just-created, empty file at `path`: skipped
+ * (not a failure) if hype_fs_lookup() itself cannot produce a handle --
+ * a real, driver-reported capability gap, not a battery assumption. When
+ * it can, writes a pattern and reads it back byte-exact; if the driver
+ * advertises HYPE_FS_CAP_APPEND, appends more and re-verifies the whole,
+ * now-longer file reads back correctly.
+ */
+static void content_test(hype_fs_t *fs, const char *path, hype_fs_battery_result_t *res,
+                         hype_fs_battery_log_fn log, void *logctx) {
+    hype_fs_file_t f;
+    uint8_t want[PATTERN_LEN + APPEND_LEN];
+    uint8_t got[PATTERN_LEN + APPEND_LEN];
+    unsigned caps = hype_fs_caps(fs);
+    unsigned i;
+    int all_ok;
+
+    if (hype_fs_lookup(fs, path, &f) != 0) {
+        res->content_skipped++;
+        if (log != 0) {
+            log(logctx, "content: lookup on fresh file failed (driver capability gap, not a "
+                        "failure)",
+                1);
+        }
+        return;
+    }
+    if ((caps & HYPE_FS_CAP_WRITE_INPLACE) == 0u) {
+        res->content_skipped++;
+        if (log != 0) {
+            log(logctx, "content: driver has no in-place writer", 1);
+        }
+        return;
+    }
+
+    fill_pattern(want, PATTERN_LEN, 0x11u);
+    if (!step(res, log, logctx, "content: write_at", 1, hype_fs_write_at(&f, 0, want, PATTERN_LEN))) {
+        return;
+    }
+    if (!step(res, log, logctx, "content: read_at", 1,
+             hype_fs_read_at(&f, 0, got, PATTERN_LEN))) {
+        return;
+    }
+    all_ok = 1;
+    for (i = 0; i < PATTERN_LEN; i++) {
+        if (got[i] != want[i]) {
+            all_ok = 0;
+            break;
+        }
+    }
+    if (!step(res, log, logctx, "content: write/read byte-exact", 1, all_ok ? 0 : -1)) {
+        return;
+    }
+
+    if ((caps & HYPE_FS_CAP_APPEND) != 0u) {
+        fill_pattern(want + PATTERN_LEN, APPEND_LEN, 0x77u);
+        if (!step(res, log, logctx, "content: append", 1,
+                 hype_fs_append(&f, want + PATTERN_LEN, APPEND_LEN))) {
+            return;
+        }
+        if (!step(res, log, logctx, "content: read_at after append", 1,
+                 hype_fs_read_at(&f, 0, got, PATTERN_LEN + APPEND_LEN))) {
+            return;
+        }
+        all_ok = 1;
+        for (i = 0; i < PATTERN_LEN + APPEND_LEN; i++) {
+            if (got[i] != want[i]) {
+                all_ok = 0;
+                break;
+            }
+        }
+        if (!step(res, log, logctx, "content: append byte-exact", 1, all_ok ? 0 : -1)) {
+            return;
+        }
+    }
+    res->content_verified++;
+}
+
 int hype_fs_battery_run(hype_fs_t *fs, const char *dir, hype_fs_battery_result_t *res,
                         hype_fs_battery_log_fn log, void *logctx) {
     hype_fs_file_t f;
@@ -68,6 +155,7 @@ int hype_fs_battery_run(hype_fs_t *fs, const char *dir, hype_fs_battery_result_t
     if (step(res, log, logctx, "create(f2)", 1, hype_fs_create(fs, p_f2, &f))) {
         res->files_created++;
     }
+    content_test(fs, p_f2, res, log, logctx);
 
     /* rename f1 -> f3: creating AT f3 must now be refused (occupied), and
      * creating a FRESH f1 must now succeed again (the old name is free) */

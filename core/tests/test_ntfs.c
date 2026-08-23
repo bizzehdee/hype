@@ -2506,6 +2506,12 @@ static void test_generic_battery(void) {
     CHECK_HEX("renames ok", 1, res.renames_ok);
     CHECK_HEX("deletes ok", 3, res.deletes_ok);
     CHECK_HEX("stale refusals", 2, res.stale_refusals_ok);
+    /* NTFS's own $DATA starts resident and empty; hype_fs_lookup() on it
+     * correctly fails (decision 30) until something converts/grows it --
+     * the battery reports this as a skip, not a failure, exactly the
+     * documented capability gap this ticket tracks. */
+    CHECK_HEX("content skipped (documented NTFS gap)", 1, res.content_skipped);
+    CHECK_HEX("content verified", 0, res.content_verified);
 
     /* a read-only mount has no namespace capability at all: the battery
      * refuses outright rather than attempting anything */

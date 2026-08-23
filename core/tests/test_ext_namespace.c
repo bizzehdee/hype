@@ -1116,6 +1116,11 @@ static void test_generic_battery(void) {
     CHECK("renames ok", res.renames_ok == 1u);
     CHECK("deletes ok", res.deletes_ok == 3u);
     CHECK("stale refusals", res.stale_refusals_ok == 2u);
+    /* unlike NTFS, ext's lookup() on a freshly created empty file succeeds
+     * immediately, so the battery's content half runs to completion:
+     * write, read back byte-exact, append, read back byte-exact again. */
+    CHECK("content verified (ext has no NTFS-style resident gap)", res.content_verified == 1u);
+    CHECK("content not skipped", res.content_skipped == 0u);
 
     /* a read-only mount has no namespace capability: the battery refuses
      * outright rather than attempting anything */
