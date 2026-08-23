@@ -12,6 +12,7 @@
 #include "../ext_csum.h"
 #include "../fs_ops.h"
 #include "../rtc.h"
+#include "../fs_battery.h"
 
 static int failures = 0;
 #define CHECK(desc, cond) \
@@ -1086,6 +1087,43 @@ static void test_fault_sweep_ns(void) {
     CHECK("namespace fault sweep completed without crashing", 1);
 }
 
+/* #692: the SAME generic, driver-agnostic namespace battery
+ * (core/fs_battery.c) that core/tests/test_ntfs.c runs against NTFS,
+ * run here against ext through the identical hype_fs_ops_t vtable calls
+ * -- proving the two drivers' namespace mutation behaves identically
+ * from a caller's point of view, without either test (or the battery
+ * itself) knowing which driver it is exercising. */
+static void battery_log(void *ctx, const char *what, int ok) {
+    (void)ctx;
+    if (!ok) {
+        printf("  battery step failed: %s\n", what);
+    }
+}
+
+static void test_generic_battery(void) {
+    hype_fs_t fs;
+    hype_fs_battery_result_t res;
+
+    build_vol(0, 0);
+    CHECK("mount via vtable", hype_fs_mount_auto(&fs, vol_read, vol_write, 0) == 0);
+    CHECK("caps advertise namespace support",
+          (hype_fs_caps(&fs) & HYPE_FS_CAP_NAMESPACE) != 0u);
+    CHECK("battery run", hype_fs_battery_run(&fs, "/battery", &res, battery_log, 0) == 0);
+    CHECK("battery failures", res.failures == 0u);
+    CHECK("dirs created", res.dirs_created == 1u);
+    CHECK("files created", res.files_created == 3u);
+    CHECK("duplicate refusals", res.duplicate_refusals_ok == 5u);
+    CHECK("renames ok", res.renames_ok == 1u);
+    CHECK("deletes ok", res.deletes_ok == 3u);
+    CHECK("stale refusals", res.stale_refusals_ok == 2u);
+
+    /* a read-only mount has no namespace capability: the battery refuses
+     * outright rather than attempting anything */
+    CHECK("ro mount", hype_fs_mount_auto(&fs, vol_read, 0, 0) == 0);
+    CHECK("battery refuses on a read-only mount",
+          hype_fs_battery_run(&fs, "/battery2", &res, 0, 0) != 0);
+}
+
 int main(void) {
     test_dirent_basic();
     test_dirent_full_and_grow_refusal();
@@ -1122,6 +1160,7 @@ int main(void) {
     test_full_volume(1);
     test_dispatcher();
     test_fault_sweep_ns();
+    test_generic_battery();
 
     if (failures == 0) {
         printf("all tests passed\n");

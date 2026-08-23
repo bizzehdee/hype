@@ -2,6 +2,7 @@
 #include <string.h>
 #include "../ntfs.h"
 #include "../fs_ops.h"
+#include "../fs_battery.h"
 
 static int failures = 0;
 #define CHECK(desc, cond) \
@@ -2476,6 +2477,60 @@ static void test_path_wrappers(void) {
     CHECK("NULL fs refused", hype_ntfs_create_path(0, vol_write, "/x.bin", 1, &rec_no, 7) != 0);
 }
 
+/* #692: the generic, driver-agnostic namespace battery (core/fs_battery.c)
+ * run against NTFS through the shared hype_fs_ops_t vtable -- the SAME
+ * battery code core/tests/test_ext.c runs against ext, proving the two
+ * drivers' namespace mutation behaves identically from a caller's point
+ * of view, without either test knowing which driver it is exercising. */
+static void battery_log(void *ctx, const char *what, int ok) {
+    (void)ctx;
+    if (!ok) {
+        printf("  battery step failed: %s\n", what);
+    }
+}
+
+static void test_generic_battery(void) {
+    hype_fs_t fs;
+    hype_fs_battery_result_t res;
+
+    build_vol(0);
+    CHECK_HEX("mount via vtable", 0, hype_fs_mount_auto(&fs, vol_read, vol_write, 0));
+    CHECK("caps advertise namespace support",
+          (hype_fs_caps(&fs) & HYPE_FS_CAP_NAMESPACE) != 0u);
+    CHECK_HEX("battery run", 0,
+              hype_fs_battery_run(&fs, "/subdir/battery", &res, battery_log, 0));
+    CHECK_HEX("battery failures", 0, res.failures);
+    CHECK_HEX("dirs created", 1, res.dirs_created);
+    CHECK_HEX("files created", 3, res.files_created); /* f1, f2, f1-again-after-rename */
+    CHECK_HEX("duplicate refusals", 5, res.duplicate_refusals_ok);
+    CHECK_HEX("renames ok", 1, res.renames_ok);
+    CHECK_HEX("deletes ok", 3, res.deletes_ok);
+    CHECK_HEX("stale refusals", 2, res.stale_refusals_ok);
+
+    /* a read-only mount has no namespace capability at all: the battery
+     * refuses outright rather than attempting anything */
+    CHECK_HEX("ro mount", 0, hype_fs_mount_auto(&fs, vol_read, 0, 0));
+    CHECK("battery refuses on a read-only mount",
+          hype_fs_battery_run(&fs, "/subdir/battery2", &res, 0, 0) != 0);
+
+    /* argument guards */
+    CHECK_HEX("mount via vtable", 0, hype_fs_mount_auto(&fs, vol_read, vol_write, 0));
+    CHECK("NULL fs refused", hype_fs_battery_run(0, "/x", &res, 0, 0) != 0);
+    CHECK("NULL dir refused", hype_fs_battery_run(&fs, 0, &res, 0, 0) != 0);
+    CHECK("NULL res refused", hype_fs_battery_run(&fs, "/x", 0, 0, 0) != 0);
+
+    /* a genuine mid-battery failure is recorded, not silently ignored:
+     * pre-create the battery's own directory so its own first mkdir()
+     * fails immediately */
+    build_vol(0);
+    CHECK_HEX("mount via vtable", 0, hype_fs_mount_auto(&fs, vol_read, vol_write, 0));
+    CHECK_HEX("pre-create the battery dir", 0, hype_fs_mkdir(&fs, "/subdir/battery3"));
+    CHECK("battery reports the failure", hype_fs_battery_run(&fs, "/subdir/battery3", &res,
+                                                             battery_log, 0) != 0);
+    CHECK("failures counted", res.failures != 0u);
+    CHECK("first_fail names the step", res.first_fail[0] != 0);
+}
+
 int main(void) {
     test_probe();
     test_mount_refusals();
@@ -2499,6 +2554,7 @@ int main(void) {
     test_mkdir_rmdir();
     test_rename();
     test_path_wrappers();
+    test_generic_battery();
 
     if (failures == 0) {
         printf("test_ntfs: all tests passed\n");
