@@ -24,6 +24,7 @@ static int failures = 0;
 #define INDX_LCN 240u  /* bigdir's one INDX block: clusters 240..247 */
 #define UPCASE_LCN 250u /* $UpCase data: 256 clusters, 250..505 */
 #define DATA_LCN 600u  /* file data region */
+#define BITMAP_LCN 3000u /* $Bitmap: 4096 clusters need exactly 512 bytes = 1 cluster (SPC=1) */
 
 static uint8_t g_vol[VOL_SECTORS * SECSZ];
 static long g_read_countdown = -1;
@@ -375,6 +376,17 @@ static void build_vol(int dirty) {
     rec_fixup(51);
     for (i = 0; i < 3u * SECSZ; i++) g_vol[(DATA_LCN + 80u) * SECSZ + i] = pat(i + 300u);
     for (i = 0; i < 2u * SECSZ; i++) g_vol[(DATA_LCN + 90u) * SECSZ + i] = pat(i + 300u + 3u * SECSZ);
+
+    /* record 6: $Bitmap -- 1 cluster at BITMAP_LCN, covers all VOL_SECTORS
+     * clusters exactly (4096 clusters / 8 == 512 bytes == 1 cluster at
+     * SPC=1), every cluster starts free. */
+    rec_init(6, 0);
+    n = 0;
+    rl[n++] = 0x21; rl[n++] = 1; put16(rl + n, BITMAP_LCN); n += 2; rl[n++] = 0;
+    off = attr_add(6, 0x80, 1, 0, rl, n);
+    nonres_sizes(6, off, 0, 1u * SECSZ, SECSZ, SECSZ);
+    rec_fixup(6);
+    memset(g_vol + BITMAP_LCN * SECSZ, 0, SECSZ);
 }
 
 /* ---- tests ---- */
@@ -1470,6 +1482,85 @@ static void test_final_edges(void) {
           hype_ntfs_resolve(&fs, "/subdir/nested.bin\\", &m) == 0);
 }
 
+/* #417: $Bitmap cluster allocation and release. */
+static void test_cluster_alloc(void) {
+    hype_ntfs_t fs;
+    uint64_t lcn;
+    uint8_t byte;
+
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+
+    /* pristine bitmap: first alloc lands at cluster 0 */
+    CHECK_HEX("alloc 1", 0, hype_ntfs_cluster_alloc(&fs, vol_write, 1, &lcn));
+    CHECK_HEX("alloc 1 lcn", 0, lcn);
+    CHECK_HEX("bit 0 set", 1, g_vol[BITMAP_LCN * SECSZ] & 1u);
+
+    /* next alloc is NOT cluster 0 again -- it is genuinely marked used */
+    CHECK_HEX("alloc 2", 0, hype_ntfs_cluster_alloc(&fs, vol_write, 1, &lcn));
+    CHECK_HEX("alloc 2 lcn", 1, lcn);
+
+    /* a multi-cluster run allocates contiguously right after */
+    CHECK_HEX("alloc run", 0, hype_ntfs_cluster_alloc(&fs, vol_write, 5, &lcn));
+    CHECK_HEX("alloc run lcn", 2, lcn);
+    byte = g_vol[BITMAP_LCN * SECSZ];
+    CHECK_HEX("bits 0-6 set", 0x7Fu, byte);
+    CHECK_HEX("bit 7 still free", 0, g_vol[BITMAP_LCN * SECSZ] & 0x80u);
+
+    /* freeing the middle run makes it available again, and ONLY it */
+    CHECK_HEX("free run", 0, hype_ntfs_cluster_free(&fs, vol_write, 2, 5));
+    CHECK_HEX("bits 2-6 cleared", 0x03u, g_vol[BITMAP_LCN * SECSZ]);
+    CHECK_HEX("realloc reuses freed run", 0, hype_ntfs_cluster_alloc(&fs, vol_write, 5, &lcn));
+    CHECK_HEX("realloc lcn", 2, lcn);
+
+    /* freeing a run that is not fully allocated is refused, and refused
+     * without touching the medium */
+    byte = g_vol[BITMAP_LCN * SECSZ];
+    CHECK("partially-free run refused", hype_ntfs_cluster_free(&fs, vol_write, 6, 3) != 0);
+    CHECK_HEX("refused free left bitmap untouched", byte, g_vol[BITMAP_LCN * SECSZ]);
+    CHECK("double free refused", hype_ntfs_cluster_free(&fs, vol_write, 0, 1) == 0 &&
+                                     hype_ntfs_cluster_free(&fs, vol_write, 0, 1) != 0);
+
+    /* out-of-range alloc/free refused */
+    CHECK("free past total_clusters refused",
+          hype_ntfs_cluster_free(&fs, vol_write, 4090, 100) != 0);
+
+    /* exhaustion: the whole 4096-cluster bitmap fits one more request, one
+     * request past it is refused */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK_HEX("alloc entire volume", 0, hype_ntfs_cluster_alloc(&fs, vol_write, 4096u, &lcn));
+    CHECK_HEX("alloc entire volume lcn", 0, lcn);
+    CHECK("alloc past exhaustion refused", hype_ntfs_cluster_alloc(&fs, vol_write, 1, &lcn) != 0);
+
+    /* a read-only mount's resolve() path never touches $Bitmap: bogus
+     * $Bitmap contents must not affect it */
+    build_vol(0);
+    memset(g_vol + BITMAP_LCN * SECSZ, 0xFF, SECSZ); /* looks fully allocated */
+    CHECK_HEX("mount unaffected by $Bitmap", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    {
+        hype_file_rmap_t m;
+        CHECK_HEX("resolve unaffected by $Bitmap", 0, hype_ntfs_resolve(&fs, "/img.bin", &m));
+    }
+
+    /* argument guards */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("alloc NULL fs refused", hype_ntfs_cluster_alloc(0, vol_write, 1, &lcn) != 0);
+    CHECK("alloc NULL write refused", hype_ntfs_cluster_alloc(&fs, 0, 1, &lcn) != 0);
+    CHECK("alloc NULL out_lcn refused", hype_ntfs_cluster_alloc(&fs, vol_write, 1, 0) != 0);
+    CHECK("alloc zero count refused", hype_ntfs_cluster_alloc(&fs, vol_write, 0, &lcn) != 0);
+    CHECK("free NULL fs refused", hype_ntfs_cluster_free(0, vol_write, 0, 1) != 0);
+    CHECK("free NULL write refused", hype_ntfs_cluster_free(&fs, 0, 0, 1) != 0);
+    CHECK("free zero count refused", hype_ntfs_cluster_free(&fs, vol_write, 0, 0) != 0);
+
+    /* a missing/malformed $Bitmap record is refused, not crashed on */
+    build_vol(0);
+    rec_ptr(6)[0] = 0; /* corrupt the FILE magic */
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("alloc with broken $Bitmap refused", hype_ntfs_cluster_alloc(&fs, vol_write, 1, &lcn) != 0);
+}
+
 int main(void) {
     test_probe();
     test_mount_refusals();
@@ -1483,6 +1574,7 @@ int main(void) {
     test_more_edges();
     test_attr_and_list_guards();
     test_final_edges();
+    test_cluster_alloc();
 
     if (failures == 0) {
         printf("test_ntfs: all tests passed\n");

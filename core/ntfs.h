@@ -53,6 +53,11 @@ typedef struct {
     hype_file_rmap_t mft;  /* $MFT's own $DATA map: every record is read through this */
     uint16_t upcase[HYPE_NTFS_UPCASE_CACHE];
     int upcase_loaded;
+    /* #417: $Bitmap (record 6), loaded lazily on first hype_ntfs_cluster_alloc/free()
+     * call -- never at mount, so a read-only mount/resolve never depends on it. */
+    hype_file_rmap_t bitmap;
+    uint64_t total_clusters;
+    int bitmap_loaded;
 } hype_ntfs_t;
 
 /* Largest MFT record and INDX block hype accepts (the on-disk norm is 1024
@@ -94,5 +99,35 @@ int hype_ntfs_record_write(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t n,
                            uint16_t usn);
 int hype_ntfs_volume_dirty_get(hype_ntfs_t *fs);
 int hype_ntfs_volume_dirty_set(hype_ntfs_t *fs, hype_blk_write_fn write, int dirty, uint16_t usn);
+
+/*
+ * #417: $Bitmap (record 6) cluster allocation and release. $Bitmap has one
+ * bit per cluster, LSB-first within each byte (bit 0 of byte 0 == cluster
+ * 0), 1 == allocated. Loaded lazily on first call and cached for the life
+ * of the mount, so a read-only mount/resolve never needs a well-formed
+ * $Bitmap (matches every other write-side #416+ primitive).
+ *
+ * hype_ntfs_cluster_alloc() first-fits: the first free run of `count`
+ * contiguous clusters, scanning from cluster 0. NTFS does not mandate an
+ * allocation policy (chkdsk validates the bitmap's CONTENTS, never how a
+ * writer chose where to allocate), so first-fit is a complete, correct
+ * choice, not a placeholder for something fancier.
+ *
+ * hype_ntfs_cluster_free() refuses (-1) unless every bit in [lcn, lcn+count)
+ * is currently SET: freeing a run that is not fully allocated is a caller
+ * bug or a sign the bitmap is already inconsistent, and clearing it anyway
+ * would silently paper over either.
+ *
+ * Neither function is crash-safety-complete on its own: they only ever
+ * touch $Bitmap's own bytes. A caller that allocates/frees clusters as part
+ * of a larger mutation (linking a new run into a runlist, updating a
+ * record's allocated size, ...) MUST wrap the whole operation in one
+ * hype_ntfs_txn_open()/hype_ntfs_txn_close() bracket (core/ntfs_journal.h)
+ * so an interrupted write leaves the volume marked dirty rather than
+ * silently inconsistent (plan.md §10 decision 64).
+ */
+int hype_ntfs_cluster_alloc(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t count,
+                            uint64_t *out_lcn);
+int hype_ntfs_cluster_free(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t lcn, uint64_t count);
 
 #endif /* HYPE_CORE_NTFS_H */

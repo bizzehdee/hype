@@ -33,6 +33,7 @@
 #define REC_VOLUME 3u
 #define REC_ROOT 5u
 #define REC_UPCASE 10u
+#define REC_BITMAP 6u
 
 #define VOLUME_IS_DIRTY 0x0001u
 
@@ -542,6 +543,7 @@ int hype_ntfs_mount(hype_blk_read_fn read, void *ctx, hype_ntfs_t *out) {
     out->read = read;
     out->ctx = ctx;
     out->upcase_loaded = 0;
+    out->bitmap_loaded = 0;
     hype_file_rmap_init(&out->mft, 0);
     if (boot_parse(read, ctx, &out->spc, &out->total_sectors, &out->mft_lcn,
                    &out->mft_record_size) != 0) {
@@ -822,4 +824,202 @@ int hype_ntfs_record_write(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t n,
         return -1;
     }
     return mirror_record_if_needed(fs, write, n, rec);
+}
+
+/* ---- #417: $Bitmap cluster allocation ----------------------------------- */
+
+#define BITMAP_CHUNK_BYTES 512u
+
+static void bfill8(uint8_t *dst, uint8_t v, uint32_t n) {
+    uint32_t i;
+    for (i = 0; i < n; i++) dst[i] = v;
+}
+
+static int bitmap_ensure_loaded(hype_ntfs_t *fs) {
+    uint64_t real = 0, init = 0;
+    uint64_t need_bytes;
+
+    if (fs->bitmap_loaded) {
+        return 0;
+    }
+    if (fs->spc == 0u) {
+        return -1; /* unmounted */
+    }
+    if (stream_map(fs, REC_BITMAP, AT_DATA, &fs->bitmap, &real, &init) != 0) {
+        return -1;
+    }
+    fs->bitmap.size_bytes = real;
+    fs->total_clusters = fs->total_sectors / fs->spc;
+    need_bytes = (fs->total_clusters + 7u) / 8u;
+    if (fs->total_clusters == 0u || real < need_bytes) {
+        return -1; /* $Bitmap too small to cover every cluster on the volume */
+    }
+    fs->bitmap_loaded = 1;
+    return 0;
+}
+
+/* First free run of `count` contiguous clusters, scanning from cluster 0 in
+ * BITMAP_CHUNK_BYTES-sized reads. Returns 0 and fills *out_start, or -1 if
+ * no run that large exists. */
+static int bitmap_find_free(hype_ntfs_t *fs, uint64_t count, uint64_t *out_start) {
+    uint8_t buf[BITMAP_CHUNK_BYTES];
+    uint64_t bit = 0;
+    uint64_t total_bytes = (fs->total_clusters + 7u) / 8u;
+    uint64_t run_start = 0, run_len = 0;
+    int in_run = 0;
+
+    while (bit < fs->total_clusters) {
+        uint64_t byte_off = bit / 8u;
+        uint64_t remaining_bytes = total_bytes - byte_off;
+        uint32_t chunk_bytes =
+            remaining_bytes < BITMAP_CHUNK_BYTES ? (uint32_t)remaining_bytes : BITMAP_CHUNK_BYTES;
+        uint64_t chunk_bits = (uint64_t)chunk_bytes * 8u;
+        uint64_t i;
+
+        if (hype_file_rmap_read_at(&fs->bitmap, fs->read, fs->ctx, byte_off, buf, chunk_bytes) !=
+            0) {
+            return -1;
+        }
+        for (i = 0; i < chunk_bits && bit < fs->total_clusters; i++, bit++) {
+            uint32_t byte_i = (uint32_t)(i / 8u);
+            uint32_t bit_i = (uint32_t)(i % 8u);
+            int used = (buf[byte_i] >> bit_i) & 1u;
+            if (!used) {
+                if (!in_run) {
+                    run_start = bit;
+                    in_run = 1;
+                    run_len = 0;
+                }
+                run_len++;
+                if (run_len >= count) {
+                    *out_start = run_start;
+                    return 0;
+                }
+            } else {
+                in_run = 0;
+                run_len = 0;
+            }
+        }
+    }
+    return -1;
+}
+
+/* True iff every bit in [start_bit, start_bit+count) equals `want_used`. */
+static int bitmap_run_is(hype_ntfs_t *fs, uint64_t start_bit, uint64_t count, int want_used) {
+    uint8_t buf[BITMAP_CHUNK_BYTES];
+    uint64_t bit = start_bit;
+    uint64_t end = start_bit + count;
+    uint64_t total_bytes = (fs->total_clusters + 7u) / 8u;
+
+    while (bit < end) {
+        uint64_t byte_off = bit / 8u;
+        uint64_t remaining_bytes = total_bytes - byte_off;
+        uint32_t chunk_bytes =
+            remaining_bytes < BITMAP_CHUNK_BYTES ? (uint32_t)remaining_bytes : BITMAP_CHUNK_BYTES;
+        uint64_t chunk_bits = (uint64_t)chunk_bytes * 8u;
+        uint64_t base = bit;
+        uint64_t i;
+
+        if (hype_file_rmap_read_at(&fs->bitmap, fs->read, fs->ctx, byte_off, buf, chunk_bytes) !=
+            0) {
+            return 0;
+        }
+        for (i = base - byte_off * 8u; i < chunk_bits && bit < end; i++, bit++) {
+            uint32_t byte_i = (uint32_t)(i / 8u);
+            uint32_t bit_i = (uint32_t)(i % 8u);
+            int used = (buf[byte_i] >> bit_i) & 1u;
+            if ((used != 0) != (want_used != 0)) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+/* Sets or clears every bit in [start_bit, start_bit+count). Ragged leading
+ * and trailing bytes go through single-byte read-modify-write; whole bytes
+ * in between are written directly (no read needed -- the value doesn't
+ * depend on what was there). */
+static int bitmap_set_run(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t start_bit,
+                          uint64_t count, int used) {
+    uint64_t bit = start_bit;
+    uint64_t end = start_bit + count;
+
+    while (bit < end) {
+        uint64_t byte_off = bit / 8u;
+        uint32_t bit_in_byte = (uint32_t)(bit % 8u);
+        uint64_t bits_left_in_byte = 8u - bit_in_byte;
+        uint64_t bits_here = end - bit;
+
+        if (bit_in_byte != 0u || bits_here < 8u) {
+            uint8_t b;
+            uint32_t k;
+            uint64_t n = bits_here < bits_left_in_byte ? bits_here : bits_left_in_byte;
+
+            if (hype_file_rmap_read_at(&fs->bitmap, fs->read, fs->ctx, byte_off, &b, 1u) != 0) {
+                return -1;
+            }
+            for (k = 0; k < n; k++) {
+                uint32_t bi = bit_in_byte + k;
+                if (used) {
+                    b = (uint8_t)(b | (1u << bi));
+                } else {
+                    b = (uint8_t)(b & ~(1u << bi));
+                }
+            }
+            if (hype_file_rmap_write_at(&fs->bitmap, fs->read, write, fs->ctx, byte_off, &b, 1u) !=
+                0) {
+                return -1;
+            }
+            bit += n;
+        } else {
+            uint8_t chunk[BITMAP_CHUNK_BYTES];
+            uint64_t whole_bytes = (end - bit) / 8u;
+            uint32_t n =
+                whole_bytes < BITMAP_CHUNK_BYTES ? (uint32_t)whole_bytes : BITMAP_CHUNK_BYTES;
+            bfill8(chunk, used ? 0xFFu : 0x00u, n);
+            if (hype_file_rmap_write_at(&fs->bitmap, fs->read, write, fs->ctx, byte_off, chunk,
+                                        n) != 0) {
+                return -1;
+            }
+            bit += (uint64_t)n * 8u;
+        }
+    }
+    return 0;
+}
+
+int hype_ntfs_cluster_alloc(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t count,
+                            uint64_t *out_lcn) {
+    uint64_t start;
+
+    if (fs == 0 || write == 0 || out_lcn == 0 || count == 0) {
+        return -1;
+    }
+    if (bitmap_ensure_loaded(fs) != 0) {
+        return -1;
+    }
+    if (bitmap_find_free(fs, count, &start) != 0) {
+        return -1;
+    }
+    if (bitmap_set_run(fs, write, start, count, 1) != 0) {
+        return -1;
+    }
+    *out_lcn = start;
+    return 0;
+}
+
+int hype_ntfs_cluster_free(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t lcn, uint64_t count) {
+    if (fs == 0 || write == 0 || count == 0) {
+        return -1;
+    }
+    if (bitmap_ensure_loaded(fs) != 0) {
+        return -1;
+    }
+    if (lcn + count < lcn || lcn + count > fs->total_clusters) {
+        return -1;
+    }
+    if (!bitmap_run_is(fs, lcn, count, 1)) {
+        return -1; /* not fully allocated: caller bug or an already-inconsistent bitmap */
+    }
+    return bitmap_set_run(fs, write, lcn, count, 0);
 }

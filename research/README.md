@@ -46,6 +46,7 @@ not treat them as project-licensed material.
 | `linux-ext4-journal-2026-08-11.html` | Linux kernel ext4 jbd2 journal format | kernel documentation snapshot, 11 August 2026 | https://www.kernel.org/doc/html/latest/filesystems/ext4/journal.html |
 | `linux-ext4-directory-2026-08-22.html` | Linux kernel ext4 directory entry format, checksum tail, htree/dx_root layout | kernel documentation snapshot, 22 August 2026 | https://www.kernel.org/doc/html/latest/filesystems/ext4/directory.html |
 | `microsoft-hyper-v-tlfs-hypercall-interface-94373af.md` | Microsoft Hyper-V TLFS Hypercall Interface | commit `94373af`, 15 December 2025 | https://github.com/MicrosoftDocs/Virtualization-Documentation/blob/94373af503f83b800ac002911f5d137a53392656/virtualization/hyper-v-on-windows/tlfs/hypercall-interface.md |
+| `ntfs-doc-russon-fledel.pdf` | "NTFS Documentation" (Richard Russon, Yuval Fledel) -- the linux-ntfs project's format reference | fetched 22 Aug 2026 | https://dubeyko.com/development/FileSystems/NTFS/ntfsdoc.pdf (mirror; this particular export is a thin/truncated 19-page snapshot -- the #417/#337 work instead relies on the empirical-validation-against-real-volumes method documented below, per this file's own "NTFS (#337)" and "NTFS $Bitmap cluster allocation (#417)" entries) |
 
 ## Archived wiki exports
 
@@ -168,6 +169,36 @@ documentation:
   last LCN (ntfs-3g decompresses each extent from zero and merges by VCN).
 - **$VOLUME_INFORMATION's flags** live at value offset 10 (8 reserved bytes,
   then major/minor version bytes), not offset 8.
+
+## NTFS $Bitmap cluster allocation (#417)
+
+`$Bitmap` (MFT record 6, unnamed non-resident `$DATA`) is one bit per cluster,
+**LSB-first within each byte**: bit 0 of byte 0 is cluster 0. 1 == allocated.
+No separate free-cluster counter exists anywhere on disk (unlike ext2's
+superblock `s_free_blocks_count`) -- a real driver and chkdsk always derive it
+by popcounting the bitmap, so hype's allocator never has a redundant counter
+to keep in sync, only the bitmap bytes themselves. `hype_ntfs_cluster_alloc()`
+first-fits (NTFS has no on-disk-visible allocation-policy requirement; a
+proximity/zone heuristic like ntfs-3g's own allocator uses is a placement
+choice, not a format rule, so first-fit is a complete, correct implementation,
+not a simplification pending later work).
+
+**Empirically validated against a genuine `mkntfs`-created, `ntfs-3g`-written
+volume** (built and inspected on a real Ubuntu box over SSH, since this dev
+sandbox has no root/mount access): `ntfscluster -c 0` independently confirmed
+cluster 0 belongs to `$Boot` before any hype write touched the volume, so
+hype's scanner correctly skips real system-file occupancy rather than
+starting from an assumed-clean bitmap. Mounting the same image with
+`-o show_sys_files` exposes `$Bitmap` as a normal readable file
+(`/$Bitmap`) -- `xxd`-ing the exact byte covering the allocated/freed run
+showed the raw bitmap byte flip from `7f00` (bits 16-22 set, 23-31 clear) to
+`ffff` (allocate 10 clusters from LCN 23: bits 23-32 also set) and back to
+`7f00` after `hype_ntfs_cluster_free()`, byte-exact, with `ntfsfix -n`
+reporting the volume clean at every step. This is stronger evidence than
+`ntfsfix` alone: `ntfsfix -n` checks volume-level consistency (dirty flag,
+`$MFT`/`$MFTMirr` agreement, boot sector), not bitmap bit-for-bit correctness,
+so the raw `$Bitmap` byte dump is what actually proves the LSB-first bit
+convention was implemented correctly, independent of hype's own code.
 
 ## NTFS $LogFile / USN journal (#416)
 
