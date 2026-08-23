@@ -493,6 +493,15 @@ typedef struct {
      */
     hype_log_level_t log_level;
 
+    /*
+     * #709: the serial of a real host disk (core/disk_inventory.c's #258 inventory, selected by
+     * serial the same way `mkdisk`/`target_disk.path_or_id` already are -- never by index) that
+     * carries a marker-gated fs_battery (#692) self-test. Absent (empty string) is the default and
+     * means "no self-test disk configured" -- this is opt-in test infrastructure, never a boot
+     * requirement, and a missing or non-matching serial is a silent no-op rather than an error.
+     */
+    char fs_selftest_disk[21]; /* matches hype_disk_entry_t.serial's width */
+
     /* Set when the section was present but something in it was rejected: the defaults above apply,
      * and the caller should say so rather than let the operator believe a global took effect. */
     int malformed;

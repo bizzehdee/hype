@@ -626,7 +626,8 @@ enum {
     H_LOG_LEVEL = 1u << 7, /* #533 */
     H_UPLINK_IP = 1u << 8,      /* #405 */
     H_UPLINK_MASK = 1u << 9,
-    H_UPLINK_GATEWAY = 1u << 10
+    H_UPLINK_GATEWAY = 1u << 10,
+    H_FS_SELFTEST_DISK = 1u << 11 /* #709 */
 };
 
 static void hype_globals_defaults(hype_cfg_hype_t *h) {
@@ -744,6 +745,19 @@ static hype_cfg_status_t apply_hype_field(hype_cfg_hype_t *h, unsigned int *seen
             return HYPE_CFG_ERR_BAD_VALUE;
         }
         *seen |= H_DASHBOARD_VIEW;
+        return HYPE_CFG_OK;
+    }
+    if (hype_streq(key, "fs_selftest_disk")) {
+        /* #709: a disk serial, not a path/index -- same selection convention as `mkdisk` and
+         * target_disk.path_or_id. An empty value is meaningless (there is no "unset via empty
+         * string" here; absence of the key already means that). */
+        if (*seen & H_FS_SELFTEST_DISK) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (val[0] == '\0') return HYPE_CFG_ERR_BAD_VALUE;
+        if (hype_strlcpy(h->fs_selftest_disk, val, sizeof h->fs_selftest_disk) >=
+            sizeof h->fs_selftest_disk) {
+            return HYPE_CFG_ERR_VALUE_TOO_LONG;
+        }
+        *seen |= H_FS_SELFTEST_DISK;
         return HYPE_CFG_OK;
     }
     if (hype_streq(key, "autostart")) {
@@ -2355,6 +2369,9 @@ static void serialize_hype(hype_cfg_w_t *w, const hype_cfg_hype_t *h) {
      * config_version, no has_* flag needed. */
     w_kv(w, "log_level", hype_log_level_name(h->log_level)); /* #533 */
     w_kv_uint(w, "cpu_avg_window_secs", h->cpu_avg_window_secs);
+    if (h->fs_selftest_disk[0] != '\0') {
+        w_kv(w, "fs_selftest_disk", h->fs_selftest_disk); /* #709 */
+    }
 }
 
 static void serialize_vm(hype_cfg_w_t *w, const hype_cfg_vm_t *vm) {

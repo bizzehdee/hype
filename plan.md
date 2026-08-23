@@ -3224,6 +3224,70 @@ isn't lost.
     waits on every mutation, and single-owner is already the working shape everywhere else in this
     codebase.
 
+65. **#709: the ext/NTFS write battery gets a boot-time self-test hook on a
+    second, named real disk, reusing the disk-inventory + serial-selection
+    machinery TERM-11/#487's `mkdisk` already established -- decided
+    (2026-08-23).** Recorded because it adds new capability to `boot/main.c`
+    (AGENTS.md's highest-blast-radius freestanding code), and because it
+    looks, at first glance, like exactly the thing decision 50 rejected.
+
+    **Why this is not decision 50's mistake.** Decision 50 moved *guest device
+    emulation* self-tests out of `hype.efi` because an in-binary test built its
+    own fixture and so tested hype's emulation against hype's own idea of the
+    hardware -- real defects (#552, #550, #565) were invisible to it precisely
+    because nothing external (a real guest OS driver) ever walked the surface
+    under test. hype's own host filesystem writers are a different shape of
+    code entirely: there is no guest layer to skip, because the thing being
+    proven is "does hype's own FAT32/ext/NTFS writer produce a volume a real,
+    independent tool accepts" -- the FAT32 self-test (`fw_1_run_fat_battery`,
+    `HYPE_FAT32_SELFTEST_MARKER`, pre-existing, host-side, on the real boot
+    media) already established and validated this shape: its own log line
+    says outright "run `sudo fsck.vfat -nv` after this boot -- that is the
+    judge", i.e. the self-test's own PASS is provisional, and an independent
+    tool is still the final word. #692's generic battery run against ext/NTFS
+    the same way is the identical category of test, not a step backward into
+    hypervisor-resident guest emulation testing.
+
+    **Design.** A new optional `[hype]` key, `fs_selftest_disk = <serial>`,
+    naming an entry in `g_disk_inv` (`core/disk_inventory.c`, #258) by serial
+    -- selection by serial, never index, matching every other named-disk
+    convention in this codebase (`mkdisk`, `target_disk.path_or_id`). At boot,
+    after disk inventory and before guest VMs start:
+    - resolve the serial to a `hype_disk_entry_t`; absent or not found is a
+      silent no-op (this is opt-in test infrastructure, never a boot
+      requirement);
+    - bind raw sector I/O to that disk with the same shape
+      `mkdisk_dev_read`/`mkdisk_dev_write` already established (chunked
+      AHCI/NVMe reads/writes through the disk's own bus), as its own
+      independent binding -- not sharing `g_mkdisk`'s state, which belongs to
+      the interactive `mkdisk` terminal command and has its own lifecycle;
+    - `hype_fs_mount_auto()` the first partition (or superfloppy) that
+      mounts, exactly as `mkdisk_mount_volume()` already searches;
+    - marker-gate on a file in that volume's root (`FSTEST.RUN`, matching
+      `HYPE_FAT32_SELFTEST_MARKER`'s convention) so the battery never runs
+      against an operator's real data disk uninvited;
+    - call `hype_fs_battery_run()` (#692) and log PASS/FAIL in the same
+      greppable format `fw_1_run_fat_battery` already uses, so
+      `tools/NNN/run-NNN-*.sh` harnesses can gate on it the same way.
+
+    A QEMU harness (`tools/709/run-709-fsbattery.sh`) formats a small ext (and
+    separately, NTFS) image, attaches it as a second disk with a matching
+    serial, drops the marker, boots `hype.efi`, and asserts the PASS line --
+    then the same disk gets one real-hardware run per this project's
+    validation bar.
+
+    **Alternatives considered.** A new `[disk.*]`-section-based resolution
+    (reusing the guest-disk-attach config schema) -- rejected: `[disk.*]`
+    sections describe a disk's role as a *guest's* backing store (attached
+    through virtio-blk/AHCI/NVMe emulation to a VM), and this self-test never
+    involves a guest at all; overloading that schema for a host-only purpose
+    would make every `[disk.*]` reader need to know about a case that isn't a
+    guest disk. Reusing `g_mkdisk`'s existing binding directly -- rejected:
+    `g_mkdisk` is stateful, pumped incrementally from the BSP dispatch loop
+    across many boot passes for a large qcow2 create, and reusing its fields
+    for an unrelated one-shot mount at a different point in boot risks the
+    two features corrupting each other's state.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what
