@@ -1633,6 +1633,17 @@ int hype_vmx_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
     if (real->spec_ctrl_valid) {
         wrmsr(0x48u, host_spec_ctrl);
     }
+    /* #609: IBPB on the guest->host transition -- see svm_vcpu.c's twin and plan.md decision 66
+     * for the full reasoning. Cached after the first call, same as the SVM side. */
+    {
+        static int have_ibpb = -1;
+        if (have_ibpb < 0) {
+            have_ibpb = hype_cpu_has_ibpb(HYPE_CPU_VENDOR_INTEL, hype_cpu_leaf7_edx(), 0u);
+        }
+        if (have_ibpb) {
+            wrmsr(0x49u, 1ull);
+        }
+    }
     hype_fpu_save(&real->fpu);
     hype_sti();
     if (real->guest_xcr0_valid && g_vmx_host_xcr0 != 0ull) {

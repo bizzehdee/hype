@@ -5698,6 +5698,23 @@ int hype_svm_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
         svm_wrmsr(HYPE_SVM_MSR_SPEC_CTRL, host_spec_ctrl);
     }
     /*
+     * #609: IBPB on the guest->host transition, before any other host C code that contains an
+     * indirect call runs (hype's own dispatch is dense with vtable calls reachable immediately
+     * after this function returns) -- flushes the branch predictor of whatever the guest just
+     * trained it with. Unconditional whenever the host grants it: see plan.md decision 66 for why
+     * this pass does not attempt to skip it on AMD Automatic IBRS hardware. Cached after the
+     * first call -- CPUID does not change while hype is running, and this now runs on every exit.
+     */
+    {
+        static int have_ibpb = -1; /* -1 = not yet computed */
+        if (have_ibpb < 0) {
+            have_ibpb = hype_cpu_has_ibpb(HYPE_CPU_VENDOR_AMD, 0u, hype_cpu_leaf80000008_ebx());
+        }
+        if (have_ibpb) {
+            svm_wrmsr(HYPE_SVM_MSR_PRED_CMD, 1ull);
+        }
+    }
+    /*
      * #244: the flush-this-guest armed at create has now happened. Clear TLB_CONTROL
      * so it does not repeat on every entry -- a permanent per-VMRUN flush would be
      * correct but would throw away this guest's whole nested TLB on every exit, and
