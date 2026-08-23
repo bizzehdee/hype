@@ -9,6 +9,8 @@
 #include "../ext_jalloc.h"
 #include "../ext_csum.h"
 #include "../jbd2.h"
+#include "../fs_battery.h"
+#include "../fs_battery_sparse.h"
 
 static int failures = 0;
 #define CHECK(desc, cond) \
@@ -954,7 +956,6 @@ static void test_fs_ops_ext(void) {
     CHECK("write_at bogus tag", hype_fs_write_at(&f, 0, buf, 1) != 0);
 }
 
-
 /* ---- #384: sparse-aware resolution + the ext2 allocating writer ---- */
 
 /* An ext2-shaped volume (no extents feature) with real allocation metadata:
@@ -1797,6 +1798,90 @@ static void build_vol_ext4j(void) {
     last = off;
     off = dirent(blk(ROOT_BLK), off, 17u, "esp.bin", 1u);
     dirent_close(blk(ROOT_BLK), last + 16u, BS);
+}
+
+/* #692: the generic, driver-agnostic content battery (core/fs_battery.c)
+ * that core/tests/test_ntfs.c runs against NTFS, run here against ext
+ * through the identical hype_fs_ops_t vtable calls. esp.bin (see #497's
+ * test_497_fs_ops_append() above) opens as the journaled allocating
+ * handle, so both halves the battery exercises actually run to
+ * completion: write_at(0) lands inside esp.bin's own leading HOLE (the
+ * #384/#385 allocator fills it, same as any in-place write), and append
+ * grows the file with a fresh chunk. */
+static void battery_log(void *ctx, const char *what, int ok) {
+    (void)ctx;
+    if (!ok) {
+        printf("  battery step failed: %s\n", what);
+    }
+}
+
+static void test_generic_content_battery(void) {
+    static hype_fs_t fs;
+    hype_fs_battery_result_t res;
+
+    g_wfail_at = ~0u;
+    build_vol_ext4j();
+    CHECK_HEX("mount rw", 0, hype_fs_mount_auto(&fs, vol_read, vol_write2, 0));
+    CHECK("battery run", hype_fs_battery_run(&fs, "/esp.bin", &res, battery_log, 0) == 0);
+    CHECK("battery failures", res.failures == 0u);
+    CHECK("read ok", res.read_ok == 1u);
+    CHECK("write verified (hole-fill through the same in-place write path)",
+          res.write_verified == 1u);
+    CHECK("append verified", res.append_verified == 1u);
+    CHECK("nothing skipped", res.skipped_no_write == 0u && res.skipped_no_append == 0u);
+
+    {
+        static hype_fs_t rofs;
+        build_vol_ext4j();
+        CHECK_HEX("ro mount", 0, hype_fs_mount_auto(&rofs, vol_read, 0, 0));
+        CHECK("battery still succeeds read-only (both halves skip, not fail)",
+              hype_fs_battery_run(&rofs, "/esp.bin", &res, 0, 0) == 0);
+        CHECK("ro: write skipped", res.skipped_no_write == 1u);
+        CHECK("ro: append skipped", res.skipped_no_append == 1u);
+    }
+
+    CHECK("missing path is a hard failure, not a skip",
+          hype_fs_battery_run(&fs, "/nope.bin", &res, 0, 0) != 0);
+    CHECK("NULL fs guarded", hype_fs_battery_run(0, "/esp.bin", &res, 0, 0) != 0);
+    CHECK("NULL path guarded", hype_fs_battery_run(&fs, 0, &res, 0, 0) != 0);
+    CHECK("NULL res guarded", hype_fs_battery_run(&fs, "/esp.bin", 0, 0, 0) != 0);
+}
+
+/* #692: the sparse/hole battery (core/fs_battery_sparse.c) against esp.bin's
+ * own genuine leading HOLE range -- proving map_ranges() now actually
+ * reports it (ext_map_ranges() was fixed this session to call the
+ * sparse-aware hype_ext_resolve_rmap() instead of the classic resolver,
+ * which refused any file with a real hole outright), that reading across
+ * it returns real zero bytes, and that ext's #384/#385 allocating writer
+ * fills it rather than refusing (the other legitimate outcome, taken by
+ * NTFS instead, is covered in test_ntfs.c). plain.bin (from
+ * build_vol_ext2()) is the genuinely all-DATA fixture proving the
+ * opposite path -- a file with no hole at all is a fixture bug, not a
+ * driver gap, and fails loudly. */
+static void test_sparse_battery(void) {
+    static hype_fs_t fs;
+    hype_fs_battery_sparse_result_t res;
+
+    g_wfail_at = ~0u;
+    build_vol_ext4j();
+    CHECK_HEX("mount rw", 0, hype_fs_mount_auto(&fs, vol_read, vol_write2, 0));
+    CHECK("sparse battery run", hype_fs_battery_sparse_run(&fs, "/esp.bin", &res, battery_log, 0) == 0);
+    CHECK("sparse battery failures", res.failures == 0u);
+    CHECK("hole found", res.hole_found == 1u);
+    CHECK("hole reads zero", res.hole_reads_zero == 1u);
+    CHECK("ext fills the hole rather than refusing", res.hole_filled_ok == 1u);
+    CHECK("no refusal recorded", res.hole_write_refused == 0u);
+
+    g_wfail_at = ~0u;
+    build_vol_ext2();
+    CHECK_HEX("mount rw (all-data fixture)", 0, hype_fs_mount_auto(&fs, vol_read, vol_write2, 0));
+    CHECK("an all-DATA file is a fixture bug, not a driver gap: hard failure",
+          hype_fs_battery_sparse_run(&fs, "/plain.bin", &res, 0, 0) != 0);
+
+    CHECK("missing path fails", hype_fs_battery_sparse_run(&fs, "/nope.bin", &res, 0, 0) != 0);
+    CHECK("NULL fs guarded", hype_fs_battery_sparse_run(0, "/esp.bin", &res, 0, 0) != 0);
+    CHECK("NULL path guarded", hype_fs_battery_sparse_run(&fs, 0, &res, 0, 0) != 0);
+    CHECK("NULL res guarded", hype_fs_battery_sparse_run(&fs, "/esp.bin", 0, 0, 0) != 0);
 }
 
 static void test_extj_gates(void) {
@@ -3634,6 +3719,8 @@ int main(void) {
     test_ext2_alloc_deep();
     test_384_final_edges();
     test_384_coverage_tail();
+    test_generic_content_battery();
+    test_sparse_battery();
     test_extj_gates();
     test_extj_metadata_csum();
     test_496_64bit_highhalf();

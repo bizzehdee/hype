@@ -12,7 +12,7 @@
 #include "../ext_csum.h"
 #include "../fs_ops.h"
 #include "../rtc.h"
-#include "../fs_battery.h"
+#include "../fs_battery_ntfs_ext.h"
 
 static int failures = 0;
 #define CHECK(desc, cond) \
@@ -1087,12 +1087,14 @@ static void test_fault_sweep_ns(void) {
     CHECK("namespace fault sweep completed without crashing", 1);
 }
 
-/* #692: the SAME generic, driver-agnostic namespace battery
- * (core/fs_battery.c) that core/tests/test_ntfs.c runs against NTFS,
- * run here against ext through the identical hype_fs_ops_t vtable calls
- * -- proving the two drivers' namespace mutation behaves identically
- * from a caller's point of view, without either test (or the battery
- * itself) knowing which driver it is exercising. */
+/* #692: the SAME namespace-mutation battery (core/fs_battery_ntfs_ext.c)
+ * that core/tests/test_ntfs.c runs against NTFS, run here against ext
+ * through the identical hype_fs_ops_t vtable calls -- proving the two
+ * drivers' namespace mutation behaves identically from a caller's point
+ * of view, without either test (or the battery itself) knowing which
+ * driver it is exercising. Content read/write/append and sparse/hole
+ * coverage for ext live in core/tests/test_ext.c instead (against its own
+ * richer, pre-populated fixtures) rather than being duplicated here. */
 static void battery_log(void *ctx, const char *what, int ok) {
     (void)ctx;
     if (!ok) {
@@ -1100,15 +1102,15 @@ static void battery_log(void *ctx, const char *what, int ok) {
     }
 }
 
-static void test_generic_battery(void) {
+static void test_ntfs_ext_battery(void) {
     hype_fs_t fs;
-    hype_fs_battery_result_t res;
+    hype_fs_battery_ntfs_ext_result_t res;
 
     build_vol(0, 0);
     CHECK("mount via vtable", hype_fs_mount_auto(&fs, vol_read, vol_write, 0) == 0);
     CHECK("caps advertise namespace support",
           (hype_fs_caps(&fs) & HYPE_FS_CAP_NAMESPACE) != 0u);
-    CHECK("battery run", hype_fs_battery_run(&fs, "/battery", &res, battery_log, 0) == 0);
+    CHECK("battery run", hype_fs_battery_ntfs_ext_run(&fs, "/battery", &res, battery_log, 0) == 0);
     CHECK("battery failures", res.failures == 0u);
     CHECK("dirs created", res.dirs_created == 1u);
     CHECK("files created", res.files_created == 3u);
@@ -1126,7 +1128,7 @@ static void test_generic_battery(void) {
      * outright rather than attempting anything */
     CHECK("ro mount", hype_fs_mount_auto(&fs, vol_read, 0, 0) == 0);
     CHECK("battery refuses on a read-only mount",
-          hype_fs_battery_run(&fs, "/battery2", &res, 0, 0) != 0);
+          hype_fs_battery_ntfs_ext_run(&fs, "/battery2", &res, 0, 0) != 0);
 }
 
 int main(void) {
@@ -1165,7 +1167,7 @@ int main(void) {
     test_full_volume(1);
     test_dispatcher();
     test_fault_sweep_ns();
-    test_generic_battery();
+    test_ntfs_ext_battery();
 
     if (failures == 0) {
         printf("all tests passed\n");

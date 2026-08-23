@@ -3,6 +3,8 @@
 #include "../ntfs.h"
 #include "../fs_ops.h"
 #include "../fs_battery.h"
+#include "../fs_battery_ntfs_ext.h"
+#include "../fs_battery_sparse.h"
 
 static int failures = 0;
 #define CHECK(desc, cond) \
@@ -2477,11 +2479,12 @@ static void test_path_wrappers(void) {
     CHECK("NULL fs refused", hype_ntfs_create_path(0, vol_write, "/x.bin", 1, &rec_no, 7) != 0);
 }
 
-/* #692: the generic, driver-agnostic namespace battery (core/fs_battery.c)
+/* #692: the ntfs+ext namespace-mutation battery (core/fs_battery_ntfs_ext.c)
  * run against NTFS through the shared hype_fs_ops_t vtable -- the SAME
- * battery code core/tests/test_ext.c runs against ext, proving the two
- * drivers' namespace mutation behaves identically from a caller's point
- * of view, without either test knowing which driver it is exercising. */
+ * battery code core/tests/test_ext_namespace.c runs against ext, proving
+ * the two drivers' namespace mutation (the capability FAT32/exFAT do not
+ * have at all) behaves identically from a caller's point of view, without
+ * either test knowing which driver it is exercising. */
 static void battery_log(void *ctx, const char *what, int ok) {
     (void)ctx;
     if (!ok) {
@@ -2489,16 +2492,16 @@ static void battery_log(void *ctx, const char *what, int ok) {
     }
 }
 
-static void test_generic_battery(void) {
+static void test_ntfs_ext_battery(void) {
     hype_fs_t fs;
-    hype_fs_battery_result_t res;
+    hype_fs_battery_ntfs_ext_result_t res;
 
     build_vol(0);
     CHECK_HEX("mount via vtable", 0, hype_fs_mount_auto(&fs, vol_read, vol_write, 0));
     CHECK("caps advertise namespace support",
           (hype_fs_caps(&fs) & HYPE_FS_CAP_NAMESPACE) != 0u);
     CHECK_HEX("battery run", 0,
-              hype_fs_battery_run(&fs, "/subdir/battery", &res, battery_log, 0));
+              hype_fs_battery_ntfs_ext_run(&fs, "/subdir/battery", &res, battery_log, 0));
     CHECK_HEX("battery failures", 0, res.failures);
     CHECK_HEX("dirs created", 1, res.dirs_created);
     CHECK_HEX("files created", 3, res.files_created); /* f1, f2, f1-again-after-rename */
@@ -2517,13 +2520,13 @@ static void test_generic_battery(void) {
      * refuses outright rather than attempting anything */
     CHECK_HEX("ro mount", 0, hype_fs_mount_auto(&fs, vol_read, 0, 0));
     CHECK("battery refuses on a read-only mount",
-          hype_fs_battery_run(&fs, "/subdir/battery2", &res, 0, 0) != 0);
+          hype_fs_battery_ntfs_ext_run(&fs, "/subdir/battery2", &res, 0, 0) != 0);
 
     /* argument guards */
     CHECK_HEX("mount via vtable", 0, hype_fs_mount_auto(&fs, vol_read, vol_write, 0));
-    CHECK("NULL fs refused", hype_fs_battery_run(0, "/x", &res, 0, 0) != 0);
-    CHECK("NULL dir refused", hype_fs_battery_run(&fs, 0, &res, 0, 0) != 0);
-    CHECK("NULL res refused", hype_fs_battery_run(&fs, "/x", 0, 0, 0) != 0);
+    CHECK("NULL fs refused", hype_fs_battery_ntfs_ext_run(0, "/x", &res, 0, 0) != 0);
+    CHECK("NULL dir refused", hype_fs_battery_ntfs_ext_run(&fs, 0, &res, 0, 0) != 0);
+    CHECK("NULL res refused", hype_fs_battery_ntfs_ext_run(&fs, "/x", 0, 0, 0) != 0);
 
     /* a genuine mid-battery failure is recorded, not silently ignored:
      * pre-create the battery's own directory so its own first mkdir()
@@ -2531,10 +2534,77 @@ static void test_generic_battery(void) {
     build_vol(0);
     CHECK_HEX("mount via vtable", 0, hype_fs_mount_auto(&fs, vol_read, vol_write, 0));
     CHECK_HEX("pre-create the battery dir", 0, hype_fs_mkdir(&fs, "/subdir/battery3"));
-    CHECK("battery reports the failure", hype_fs_battery_run(&fs, "/subdir/battery3", &res,
-                                                             battery_log, 0) != 0);
+    CHECK("battery reports the failure", hype_fs_battery_ntfs_ext_run(&fs, "/subdir/battery3",
+                                                                      &res, battery_log, 0) != 0);
     CHECK("failures counted", res.failures != 0u);
     CHECK("first_fail names the step", res.first_fail[0] != 0);
+}
+
+/* #692: the GENERIC content battery (core/fs_battery.c) run against an
+ * already-existing NTFS file (lst.bin, non-resident, real content) -- this
+ * module needs no namespace support, so it is the piece that could ALSO
+ * run against FAT32/exFAT fixtures unchanged, unlike the battery above. */
+static void test_generic_content_battery(void) {
+    hype_fs_t fs;
+    hype_fs_battery_result_t res;
+
+    build_vol(0);
+    CHECK_HEX("mount via vtable", 0, hype_fs_mount_auto(&fs, vol_read, vol_write, 0));
+    CHECK_HEX("battery run", 0, hype_fs_battery_run(&fs, "/lst.bin", &res, battery_log, 0));
+    CHECK_HEX("battery failures", 0, res.failures);
+    CHECK_HEX("read ok", 1, res.read_ok);
+    CHECK_HEX("write verified", 1, res.write_verified);
+    /* NTFS has no append slot at all (core/fs_ops.c's ntfs_ops leaves it
+     * NULL -- growth needs a handle carrying the MFT record number, #692's
+     * own documented follow-up), so HYPE_FS_CAP_APPEND is never set for
+     * this driver and the battery correctly skips rather than fails it. */
+    CHECK_HEX("append skipped (NTFS has no append slot)", 1, res.skipped_no_append);
+    CHECK_HEX("write not skipped", 0, res.skipped_no_write);
+
+    /* a missing path is the caller's bug: hard failure, not a skip */
+    CHECK("missing path refused", hype_fs_battery_run(&fs, "/nope.bin", &res, 0, 0) != 0);
+    CHECK("NULL fs refused", hype_fs_battery_run(0, "/lst.bin", &res, 0, 0) != 0);
+    CHECK("NULL path refused", hype_fs_battery_run(&fs, 0, &res, 0, 0) != 0);
+    CHECK("NULL res refused", hype_fs_battery_run(&fs, "/lst.bin", 0, 0, 0) != 0);
+
+    /* a read-only mount: read still works, write correctly skipped too
+     * (append was already unconditionally skipped above) */
+    CHECK_HEX("ro mount", 0, hype_fs_mount_auto(&fs, vol_read, 0, 0));
+    CHECK_HEX("battery run (ro)", 0, hype_fs_battery_run(&fs, "/lst.bin", &res, 0, 0));
+    CHECK_HEX("read ok (ro)", 1, res.read_ok);
+    CHECK_HEX("write skipped (ro)", 1, res.skipped_no_write);
+    CHECK_HEX("append skipped (ro)", 1, res.skipped_no_append);
+}
+
+/* #692: the SPARSE/HOLE battery (core/fs_battery_sparse.c) run against
+ * img.bin (record 40): DATA(4cl) HOLE(3cl) DATA(2cl) -- a genuine hole
+ * this fixture already provides. */
+static void test_sparse_battery(void) {
+    hype_fs_t fs;
+    hype_fs_battery_sparse_result_t res;
+
+    build_vol(0);
+    CHECK_HEX("mount via vtable", 0, hype_fs_mount_auto(&fs, vol_read, vol_write, 0));
+    CHECK("caps advertise sparse support", (hype_fs_caps(&fs) & HYPE_FS_CAP_SPARSE) != 0u);
+    CHECK_HEX("battery run", 0, hype_fs_battery_sparse_run(&fs, "/img.bin", &res, battery_log, 0));
+    CHECK_HEX("battery failures", 0, res.failures);
+    CHECK_HEX("hole found", 1, res.hole_found);
+    CHECK_HEX("hole reads zero", 1, res.hole_reads_zero);
+    /* NTFS's generic write_at refuses a span touching a HOLE outright
+     * (decision 30, ntfs_write_at()'s own documented contract) -- this is
+     * the OTHER legitimate outcome the sparse battery accepts, not a
+     * failure to fill it. */
+    CHECK_HEX("hole write refused (NTFS's documented contract)", 1, res.hole_write_refused);
+    CHECK_HEX("hole NOT filled through this vtable", 0, res.hole_filled_ok);
+
+    /* refusals */
+    CHECK("missing path refused",
+          hype_fs_battery_sparse_run(&fs, "/nope.bin", &res, 0, 0) != 0);
+    CHECK("an all-DATA file refused (fixture bug, not a driver gap)",
+          hype_fs_battery_sparse_run(&fs, "/lst.bin", &res, 0, 0) != 0);
+    CHECK("NULL fs refused", hype_fs_battery_sparse_run(0, "/img.bin", &res, 0, 0) != 0);
+    CHECK("NULL path refused", hype_fs_battery_sparse_run(&fs, 0, &res, 0, 0) != 0);
+    CHECK("NULL res refused", hype_fs_battery_sparse_run(&fs, "/img.bin", 0, 0, 0) != 0);
 }
 
 int main(void) {
@@ -2560,7 +2630,9 @@ int main(void) {
     test_mkdir_rmdir();
     test_rename();
     test_path_wrappers();
-    test_generic_battery();
+    test_ntfs_ext_battery();
+    test_generic_content_battery();
+    test_sparse_battery();
 
     if (failures == 0) {
         printf("test_ntfs: all tests passed\n");

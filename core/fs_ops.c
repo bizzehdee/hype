@@ -405,10 +405,11 @@ static int ext_mount(hype_fs_t *fs, hype_blk_read_fn read, hype_blk_write_fn wri
 }
 
 static int ext_map_ranges(hype_fs_t *fs, const char *path, hype_file_rmap_t *out) {
-    if (hype_ext_resolve(fs->read, fs->ctx, path, &g_resolve_map) != 0) {
-        return -1;
-    }
-    return hype_file_rmap_from_extents(&g_resolve_map, out);
+    /* #692: must be the sparse-aware resolver -- hype_ext_resolve() refuses
+     * any file with a real HOLE/UNWRITTEN range outright, which would make
+     * HYPE_FS_CAP_SPARSE a lie for exactly the files that capability exists
+     * to describe. */
+    return hype_ext_resolve_rmap(fs->read, fs->ctx, path, out);
 }
 
 static int ext_lookup(hype_fs_t *fs, const char *path, hype_fs_file_t *out) {
