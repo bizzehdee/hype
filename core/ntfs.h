@@ -308,4 +308,26 @@ int hype_ntfs_create(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t parent_d
 int hype_ntfs_unlink(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t parent_dir_rec,
                      const char *name, uint32_t name_len, uint16_t usn);
 
+/*
+ * #425: create and remove directories, mirroring #423's create()/unlink()
+ * shape. hype_ntfs_mkdir() allocates a directory MFT record (#420),
+ * appends $STANDARD_INFORMATION + $FILE_NAME, appends an empty, correctly
+ * NAMED ($I30) $INDEX_ROOT (real directories' $INDEX_ROOT carries that
+ * name -- see research/README.md's #421 entry on why this matters), and
+ * links the name into the parent (#421). Rolls back the allocated record
+ * on any later failure, same as create().
+ *
+ * hype_ntfs_rmdir() refuses a non-empty directory (any entry beyond the
+ * index terminator) or one that already has an $INDEX_ALLOCATION (out of
+ * scope for #421, so out of scope here too -- such a directory was never
+ * empty by this slice's own definition of empty), then removes the parent
+ * index entry and frees the MFT record (a directory's $INDEX_ROOT is
+ * always resident, so there are never clusters to release).
+ */
+int hype_ntfs_mkdir(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t parent_dir_rec,
+                    const char *name, uint32_t name_len, uint64_t timestamp_filetime,
+                    uint64_t *out_rec_no, uint16_t usn);
+int hype_ntfs_rmdir(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t parent_dir_rec,
+                    const char *name, uint32_t name_len, uint16_t usn);
+
 #endif /* HYPE_CORE_NTFS_H */

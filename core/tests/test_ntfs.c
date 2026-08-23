@@ -2301,6 +2301,73 @@ static void test_create_unlink(void) {
           hype_ntfs_unlink(&fs, 0, 45, "nested.bin", 10, 2) != 0);
 }
 
+/* #425: mkdir and rmdir. subdir (record 45) is resident and roomy. */
+static void test_mkdir_rmdir(void) {
+    hype_ntfs_t fs;
+    uint64_t rec_no;
+
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("newdir not found before mkdir",
+          entry_offset_by_name(&fs, 45, "newdir") == (uint32_t)~0u);
+    CHECK_HEX("mkdir", 0,
+              hype_ntfs_mkdir(&fs, vol_write, 45, "newdir", 6, 1, &rec_no, 2));
+    CHECK("newdir has a directory entry", entry_offset_by_name(&fs, 45, "newdir") != (uint32_t)~0u);
+
+    {
+        uint8_t rec[REC_SIZE];
+        CHECK_HEX("record readable", 0, hype_ntfs_record_read(&fs, rec_no, rec));
+        CHECK("is a directory", (get16(rec + 0x16) & 0x0002u) != 0u);
+        CHECK_HEX("hard link count", 1, get16(rec + 0x12));
+    }
+
+    /* a directory containing a nested subdirectory is not empty */
+    {
+        uint64_t outer_rec = rec_no;
+        uint64_t inner_rec;
+        CHECK_HEX("mkdir nested", 0,
+                  hype_ntfs_mkdir(&fs, vol_write, outer_rec, "inner", 5, 1, &inner_rec, 3));
+        CHECK("rmdir of the now-non-empty outer dir refused",
+              hype_ntfs_rmdir(&fs, vol_write, 45, "newdir", 6, 4) != 0);
+    }
+
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK_HEX("mkdir", 0, hype_ntfs_mkdir(&fs, vol_write, 45, "newdir", 6, 1, &rec_no, 2));
+    CHECK_HEX("rmdir empty dir", 0, hype_ntfs_rmdir(&fs, vol_write, 45, "newdir", 6, 3));
+    CHECK("newdir's directory entry gone",
+          entry_offset_by_name(&fs, 45, "newdir") == (uint32_t)~0u);
+    CHECK("rmdir again refused", hype_ntfs_rmdir(&fs, vol_write, 45, "newdir", 6, 4) != 0);
+
+    /* non-empty directory refused */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK_HEX("mkdir", 0, hype_ntfs_mkdir(&fs, vol_write, 45, "newdir", 6, 1, &rec_no, 2));
+    CHECK_HEX("create a file inside it", 0,
+              hype_ntfs_create(&fs, vol_write, rec_no, "x.bin", 5, 1, &rec_no, 3));
+    CHECK("rmdir of a non-empty directory refused",
+          hype_ntfs_rmdir(&fs, vol_write, 45, "newdir", 6, 4) != 0);
+
+    /* refusals */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("mkdir into a non-directory refused (img.bin, record 40)",
+          hype_ntfs_mkdir(&fs, vol_write, 40, "x", 1, 1, &rec_no, 2) != 0);
+    CHECK("mkdir NULL fs refused", hype_ntfs_mkdir(0, vol_write, 45, "x", 1, 1, &rec_no, 2) != 0);
+    CHECK("mkdir NULL write refused",
+          hype_ntfs_mkdir(&fs, 0, 45, "x", 1, 1, &rec_no, 2) != 0);
+    CHECK("mkdir zero-length name refused",
+          hype_ntfs_mkdir(&fs, vol_write, 45, "x", 0, 1, &rec_no, 2) != 0);
+    CHECK("rmdir a missing name refused",
+          hype_ntfs_rmdir(&fs, vol_write, 45, "nope", 4, 2) != 0);
+    CHECK("rmdir a regular file refused (nested.bin, via subdir)",
+          hype_ntfs_rmdir(&fs, vol_write, 45, "nested.bin", 10, 2) != 0);
+    CHECK("rmdir a large-index directory refused (bigdir, via root)",
+          hype_ntfs_rmdir(&fs, vol_write, 5, "bigdir", 6, 2) != 0);
+    CHECK("rmdir NULL fs refused", hype_ntfs_rmdir(0, vol_write, 45, "nope", 4, 2) != 0);
+    CHECK("rmdir NULL write refused", hype_ntfs_rmdir(&fs, 0, 45, "nope", 4, 2) != 0);
+}
+
 int main(void) {
     test_probe();
     test_mount_refusals();
@@ -2321,6 +2388,7 @@ int main(void) {
     test_index_insert_delete();
     test_data_to_nonresident();
     test_create_unlink();
+    test_mkdir_rmdir();
 
     if (failures == 0) {
         printf("test_ntfs: all tests passed\n");

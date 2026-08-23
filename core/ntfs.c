@@ -2372,3 +2372,191 @@ int hype_ntfs_unlink(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t parent_d
     }
     return hype_ntfs_mft_record_free(fs, write, ref, usn);
 }
+
+
+/* ---- #425: mkdir and rmdir ------------------------------------------------ */
+
+/* Like record_attr_append_resident(), but for a NAMED resident attribute
+ * ($I30, the only name any writer in this module ever needs to produce):
+ * name bytes sit between the standard header and the value, so val_off is
+ * 0x18 + name_bytes, matching what a real $INDEX_ROOT looks like (#421's
+ * val_off-0x20 finding). */
+static int record_attr_append_named_resident(uint8_t *rec, uint32_t mft_record_size,
+                                              uint32_t type, const uint16_t *name_utf16,
+                                              uint32_t name_units, const uint8_t *value,
+                                              uint32_t value_len, uint32_t *out_attr_off) {
+    uint32_t attrs_off = hype_rd16(rec + 0x14);
+    uint32_t name_bytes = name_units * 2u;
+    /* No padding between the name and the value: confirmed on a real
+     * mkntfs $INDEX_ROOT (#421), val_off sits immediately after the name. */
+    uint32_t val_off_rel = 0x18u + name_bytes;
+    uint32_t new_len = round_up_8(val_off_rel + value_len);
+    uint32_t end_marker_pos = attrs_off;
+    uint32_t i;
+
+    for (;;) {
+        ntfs_attr_t tmp;
+        int rc = attr_parse(rec, mft_record_size, end_marker_pos, &tmp);
+        if (rc == 1) {
+            break;
+        }
+        if (rc != 0) {
+            return -1;
+        }
+        end_marker_pos += tmp.length;
+    }
+    if (end_marker_pos + new_len + 4u > mft_record_size) {
+        return -1;
+    }
+
+    for (i = 0; i < new_len; i++) {
+        rec[end_marker_pos + i] = 0u;
+    }
+    hype_wr32(rec + end_marker_pos + 0, type);
+    hype_wr32(rec + end_marker_pos + 4, new_len);
+    rec[end_marker_pos + 8] = 0u; /* resident */
+    rec[end_marker_pos + 9] = (uint8_t)name_units;
+    hype_wr16(rec + end_marker_pos + 0x0A, 0x18u); /* name offset */
+    hype_wr32(rec + end_marker_pos + 0x10, value_len);
+    hype_wr16(rec + end_marker_pos + 0x14, (uint16_t)val_off_rel);
+    for (i = 0; i < name_units; i++) {
+        hype_wr16(rec + end_marker_pos + 0x18u + i * 2u, name_utf16[i]);
+    }
+    for (i = 0; i < value_len; i++) {
+        rec[end_marker_pos + val_off_rel + i] = value[i];
+    }
+    hype_wr32(rec + end_marker_pos + new_len, 0xFFFFFFFFu);
+    hype_wr32(rec + 0x18, end_marker_pos + new_len + 4u);
+    *out_attr_off = end_marker_pos;
+    return 0;
+}
+
+int hype_ntfs_mkdir(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t parent_dir_rec,
+                    const char *name, uint32_t name_len, uint64_t timestamp_filetime,
+                    uint64_t *out_rec_no, uint16_t usn) {
+    static const uint16_t i30_name[4] = {'$', 'I', '3', '0'};
+    uint8_t rec[HYPE_NTFS_MAX_RECORD];
+    uint8_t si[0x30];
+    uint8_t fn[0x42u + 255u * 2u];
+    uint8_t ir[0x10u + 0x10u + 24u]; /* root header + index header + terminator */
+    uint32_t fn_len;
+    uint64_t rec_no;
+    uint16_t seq;
+    uint32_t attr_off;
+    unsigned i;
+
+    if (fs == 0 || write == 0 || name == 0 || name_len == 0u || name_len > 255u ||
+        out_rec_no == 0) {
+        return -1;
+    }
+    if (hype_ntfs_mft_record_alloc(fs, write, 1, &rec_no, &seq, usn) != 0) {
+        return -1;
+    }
+    if (record_read(fs, rec_no, rec) != 0) {
+        (void)hype_ntfs_mft_record_free(fs, write, rec_no, usn);
+        return -1;
+    }
+
+    for (i = 0; i < sizeof si; i++) {
+        si[i] = 0u;
+    }
+    hype_wr64(si + 0x00, timestamp_filetime);
+    hype_wr64(si + 0x08, timestamp_filetime);
+    hype_wr64(si + 0x10, timestamp_filetime);
+    hype_wr64(si + 0x18, timestamp_filetime);
+    hype_wr32(si + 0x20, 0x10u); /* FILE_ATTRIBUTE_DIRECTORY */
+    if (record_attr_append_resident(rec, fs->mft_record_size, AT_STANDARD_INFORMATION, si,
+                                    sizeof si, &attr_off) != 0) {
+        (void)hype_ntfs_mft_record_free(fs, write, rec_no, usn);
+        return -1;
+    }
+
+    fn_len = 0x42u + name_len * 2u;
+    for (i = 0; i < fn_len; i++) {
+        fn[i] = 0u;
+    }
+    hype_wr64(fn + 0x00, parent_dir_rec & 0x0000FFFFFFFFFFFFull);
+    hype_wr64(fn + 0x08, timestamp_filetime);
+    hype_wr64(fn + 0x10, timestamp_filetime);
+    hype_wr64(fn + 0x18, timestamp_filetime);
+    hype_wr64(fn + 0x20, timestamp_filetime);
+    hype_wr32(fn + 0x38, 0x10000010u); /* FILE_ATTRIBUTE_DIRECTORY | I30_INDEX */
+    fn[0x40] = (uint8_t)name_len;
+    fn[0x41] = 1u;
+    for (i = 0; i < name_len; i++) {
+        hype_wr16(fn + 0x42 + i * 2u, (uint16_t)(uint8_t)name[i]);
+    }
+    if (record_attr_append_resident(rec, fs->mft_record_size, AT_FILE_NAME, fn, fn_len,
+                                    &attr_off) != 0) {
+        (void)hype_ntfs_mft_record_free(fs, write, rec_no, usn);
+        return -1;
+    }
+
+    for (i = 0; i < sizeof ir; i++) {
+        ir[i] = 0u;
+    }
+    hype_wr32(ir + 0x00, AT_FILE_NAME);
+    hype_wr32(ir + 0x04, 1u); /* COLLATION_FILE_NAME */
+    hype_wr32(ir + 0x08, 4096u);
+    ir[0x0C] = 1u;
+    hype_wr32(ir + 0x10 + 0x00, 0x10u); /* entries offset, relative to the index header */
+    hype_wr32(ir + 0x10 + 0x04, 0x10u + 24u); /* entries size: header + terminator */
+    hype_wr32(ir + 0x10 + 0x08, 0x10u + 24u); /* allocated */
+    ir[0x10 + 0x0C] = 0u;                     /* no children */
+    hype_wr16(ir + 0x10 + 0x10 + 8, 0x18u);   /* terminator entry length */
+    hype_wr16(ir + 0x10 + 0x10 + 12, 0x02u);  /* IDX_ENTRY_LAST */
+    if (record_attr_append_named_resident(rec, fs->mft_record_size, AT_INDEX_ROOT, i30_name, 4u,
+                                          ir, sizeof ir, &attr_off) != 0) {
+        (void)hype_ntfs_mft_record_free(fs, write, rec_no, usn);
+        return -1;
+    }
+    hype_wr16(rec + 0x12, 1u); /* hard link count */
+
+    if (hype_ntfs_record_write(fs, write, rec_no, rec, usn) != 0) {
+        (void)hype_ntfs_mft_record_free(fs, write, rec_no, usn);
+        return -1;
+    }
+    if (hype_ntfs_index_insert(fs, write, parent_dir_rec, rec_no, name, name_len, 1, usn) != 0) {
+        (void)hype_ntfs_mft_record_free(fs, write, rec_no, usn);
+        return -1;
+    }
+
+    *out_rec_no = rec_no;
+    return 0;
+}
+
+int hype_ntfs_rmdir(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t parent_dir_rec,
+                    const char *name, uint32_t name_len, uint16_t usn) {
+    uint8_t rec[HYPE_NTFS_MAX_RECORD];
+    uint64_t ref;
+    int isdir;
+    uint32_t attr_off, val_off, val_len, ents_off, ents_size;
+
+    if (fs == 0 || write == 0 || name == 0 || name_len == 0u) {
+        return -1;
+    }
+    if (dir_lookup(fs, parent_dir_rec, name, name_len, &ref, &isdir) != 1) {
+        return -1;
+    }
+    if (!isdir) {
+        return -1; /* rmdir is for directories; #423 handles regular files */
+    }
+    if (record_read(fs, ref, rec) != 0) {
+        return -1;
+    }
+    if (index_root_locate(fs, rec, &attr_off, &val_off, &val_len, &ents_off, &ents_size) != 0) {
+        return -1; /* not resident-only, or not a directory index: out of scope */
+    }
+    /* Empty means the FIRST entry in the index is already the terminator
+     * (IDX_ENTRY_LAST) -- not merely "ents_size == ents_off", which would
+     * wrongly demand a zero-byte terminator that never exists on disk. */
+    if (ents_off + 0x10u > ents_size ||
+        !(hype_rd16(rec + val_off + 0x10u + ents_off + 12) & IDX_ENTRY_LAST)) {
+        return -1; /* non-empty directory: refused, like a real rmdir() */
+    }
+
+    if (hype_ntfs_index_delete(fs, write, parent_dir_rec, name, name_len, usn) != 0) {
+        return -1;
+    }
+    return hype_ntfs_mft_record_free(fs, write, ref, usn);
+}
