@@ -121,4 +121,29 @@ int hype_cpu_has_smep(uint32_t leaf7_ebx);
  * Exempt hw shim. */
 uint32_t hype_cpu_leaf7_ebx(void);
 
+/*
+ * #608: which bits of IA32_SPEC_CTRL (0x48) this real host CPU actually implements -- IBRS
+ * (bit 0), STIBP (bit 1), SSBD (bit 2). Both vendors share this exact bit layout (AMD adopted
+ * Intel's IA32_SPEC_CTRL shape for guest/OS compatibility), but each enumerates support through
+ * its own CPUID leaf: Intel CPUID.(EAX=7,ECX=0):EDX bits 26 (IBRS_IBPB)/27 (STIBP)/31 (SSBD);
+ * AMD CPUID.8000_0008H:EBX bits 14 (IBRS)/15 (STIBP)/24 (SSBD). A guest WRMSR to SPEC_CTRL must be
+ * masked to exactly this set before being stored/applied -- accepting a bit the real hardware does
+ * not implement would let a guest arm a control that silently does nothing, the same "advertised a
+ * dead control" failure #269 already names for a different MSR.
+ */
+uint32_t hype_cpu_spec_ctrl_legal_mask(hype_cpu_vendor_t vendor, uint32_t leaf7_edx,
+                                       uint32_t leaf80000008_ebx);
+
+/* Real CPUID.(EAX=7,ECX=0):EDX read. Exempt hw shim. */
+uint32_t hype_cpu_leaf7_edx(void);
+
+/* Whether IA32_PRED_CMD (0x49) bit 0 (IBPB) is real on this host: Intel CPUID.(EAX=7,ECX=0):EDX
+ * bit 26 (the same bit that gates IBRS -- Intel enumerates the pair together); AMD
+ * CPUID.8000_0008H:EBX bit 12 (IBPB is its own, separate bit on AMD, unlike Intel). */
+int hype_cpu_has_ibpb(hype_cpu_vendor_t vendor, uint32_t leaf7_edx, uint32_t leaf80000008_ebx);
+
+/* Real CPUID.8000_0008H:EBX read, gated on the leaf existing (checked against CPUID.8000_0000H's
+ * own reported max extended leaf). Exempt hw shim. */
+uint32_t hype_cpu_leaf80000008_ebx(void);
+
 #endif /* HYPE_ARCH_CPU_FEATURES_H */

@@ -1,4 +1,5 @@
 #include "svm.h"
+#include "../cpu/cpu_features.h"
 #include "../cpu/fpu_state.h"
 #include "../cpu/hyperv.h"
 
@@ -68,6 +69,16 @@ struct hype_vcpu_ctx {
      */
     uint64_t tsc_aux;
     int tsc_aux_valid; /* the guest has written it; skip the swap entirely until then */
+    /*
+     * #608: this vCPU's IA32_SPEC_CTRL (0x48), masked to the bits this real host CPU actually
+     * implements (hype_cpu_spec_ctrl_legal_mask()) before being stored. PER-vCPU for the same
+     * reason tsc_aux above is: two guests running concurrently must never see or influence each
+     * other's speculation-control state, and the value must never leak into hype's own host
+     * execution once VMRUN returns. Same swap-around-VMRUN shape as tsc_aux, same "skip the swap
+     * until the guest has actually written it" gate.
+     */
+    uint64_t spec_ctrl;
+    int spec_ctrl_valid;
     uint64_t pvclock_system_msr;
     uint64_t pvclock_wall_msr;
     /*
@@ -347,6 +358,10 @@ static void reset_gprs(struct hype_vcpu_ctx *ctx) {
      * RDTSCP would then report the wrong CPU to the new guest. */
     ctx->tsc_aux = 0;
     ctx->tsc_aux_valid = 0;
+    /* #608: same recycled-slot reasoning as tsc_aux -- a new guest must not inherit a prior
+     * guest's speculation-control state. */
+    ctx->spec_ctrl = 0;
+    ctx->spec_ctrl_valid = 0;
     ctx->pvclock_system_msr = 0;
     ctx->pvclock_wall_msr = 0;
     {
@@ -1900,6 +1915,9 @@ static void hype_svm_pvclock_arm_wall_clock(struct hype_vcpu_ctx *real, uint64_t
 
 /* #275: IA32_TSC_AUX, read by RDTSCP into ECX. Not covered by VMSAVE/VMLOAD. */
 #define HYPE_SVM_MSR_TSC_AUX 0xC0000103u
+/* #608: the speculation-control MSR pair, same numbers on both vendors. */
+#define HYPE_SVM_MSR_SPEC_CTRL 0x48u
+#define HYPE_SVM_MSR_PRED_CMD 0x49u
 
 static inline uint64_t svm_rdmsr(uint32_t msr) {
     uint32_t lo, hi;
@@ -1998,6 +2016,63 @@ int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lapic) {
          * dormant. Dormant code is untested code: the first guest that woke it
          * did not survive.
          */
+        real->vmcb->save.rip += 2;
+        return 0;
+    }
+
+    /*
+     * #608: IA32_SPEC_CTRL (0x48) and IA32_PRED_CMD (0x49). Serviced here, ahead of the action
+     * switch, for the same "one source of truth, do not let an absorbed write silently
+     * contradict a later real one" reason TSC_AUX is above -- and because this file only ever
+     * runs on AMD hardware (SVM is never selected on Intel, hype_vmm_kind_select()), the vendor
+     * passed to the cpu_features.h helpers below is hardcoded rather than detected at runtime.
+     *
+     * Masked to exactly the bits this real host CPU implements (hype_cpu_spec_ctrl_legal_mask()):
+     * accepting a bit the hardware does not have would let a guest arm a control that silently
+     * does nothing, the #269-class mistake CPUID masking exists to prevent. The legal mask is
+     * read once and cached -- it cannot change while hype is running -- matching the "cheap to
+     * compute, expensive to repeat on every MSR access" reasoning elsewhere in this file.
+     */
+    if (msr_number == HYPE_SVM_MSR_SPEC_CTRL) {
+        static uint32_t legal_mask = 0xFFFFFFFFu; /* sentinel: not yet computed */
+        if (legal_mask == 0xFFFFFFFFu) {
+            legal_mask = hype_cpu_spec_ctrl_legal_mask(HYPE_CPU_VENDOR_AMD, 0u,
+                                                       hype_cpu_leaf80000008_ebx());
+        }
+        if (is_write) {
+            uint64_t value = ((uint64_t)(uint32_t)real->gprs[2] << 32) |
+                              (uint64_t)(uint32_t)real->vmcb->save.rax;
+            real->spec_ctrl = value & (uint64_t)legal_mask;
+            if (!real->spec_ctrl_valid) {
+                hype_debug_print("svm: guest wrote SPEC_CTRL=0x%llx (legal_mask=0x%x) -- per-guest "
+                                 "value now swapped around VMRUN (#608)\n",
+                                 (unsigned long long)real->spec_ctrl, legal_mask);
+            }
+            real->spec_ctrl_valid = 1;
+        } else {
+            real->vmcb->save.rax = (uint64_t)(uint32_t)real->spec_ctrl;
+            real->gprs[2] = (uint64_t)(uint32_t)(real->spec_ctrl >> 32);
+        }
+        real->vmcb->save.rip += 2;
+        return 0;
+    }
+    if (msr_number == HYPE_SVM_MSR_PRED_CMD) {
+        /* Write-only on real hardware -- a guest RDMSR of PRED_CMD must #GP, exactly as it would
+         * on a CPU that implements it. Returning 1 here tells the caller (vmm_handle_msr's
+         * caller in boot/main.c) to inject #GP, the same "invalid synthetic-MSR input is a guest
+         * fault" path the x2APIC/HV rows above already use. */
+        if (!is_write) {
+            return 1;
+        }
+        if (hype_cpu_has_ibpb(HYPE_CPU_VENDOR_AMD, 0u, hype_cpu_leaf80000008_ebx()) &&
+            (real->vmcb->save.rax & 1ull) != 0ull) {
+            /* IBPB is a fire-and-forget command, not persistent state -- issue it on the REAL
+             * core immediately rather than storing anything. It flushes the branch predictor
+             * for whatever ran before this WRMSR, which on hype's own dispatch loop is either
+             * this same guest's earlier code or, on a core the scheduler just switched to,
+             * something else entirely -- either way, exactly what a real IBPB is for. */
+            svm_wrmsr(HYPE_SVM_MSR_PRED_CMD, 1ull);
+        }
         real->vmcb->save.rip += 2;
         return 0;
     }
@@ -5554,6 +5629,7 @@ void hype_svm_set_vmrun_trace(int enabled) {
 int hype_svm_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     uint64_t host_tsc_aux = 0; /* #275 */
+    uint64_t host_spec_ctrl = 0; /* #608 */
     uint64_t vmcb_phys = (uint64_t)(uintptr_t)real->vmcb;
 
     /* Real-hardware debugging: this brackets the single riskiest
@@ -5584,6 +5660,19 @@ int hype_svm_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
         svm_wrmsr(HYPE_SVM_MSR_TSC_AUX, real->tsc_aux);
     }
     /*
+     * #608: same swap, for SPEC_CTRL. Skipped until the guest has actually written the MSR, same
+     * reasoning as tsc_aux above. This is the one bracket in this function where getting the
+     * ordering wrong has a security consequence beyond a wrong guest-visible value: the guest's
+     * SPEC_CTRL must be live for as short a window as possible around the instructions that
+     * actually run guest code, and host's own value must be restored again before ANY other host
+     * C code (including hype_fpu_save() and the debug_print below) executes with the guest's
+     * mitigation posture in effect instead of hype's own.
+     */
+    if (real->spec_ctrl_valid) {
+        host_spec_ctrl = svm_rdmsr(HYPE_SVM_MSR_SPEC_CTRL);
+        svm_wrmsr(HYPE_SVM_MSR_SPEC_CTRL, real->spec_ctrl);
+    }
+    /*
      * #436: CLGI must come FIRST. hype_fpu_restore() puts the GUEST's x87/SSE
      * state in the registers; a host interrupt (the 1ms AP preempt tick)
      * landing between the restore and CLGI runs the ISR dispatch chain, whose
@@ -5600,6 +5689,14 @@ int hype_svm_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
     hype_fpu_restore(&real->fpu);
     vmload(vmcb_phys);
     vmrun_full(real, vmcb_phys);
+    /*
+     * #608: restore host's own SPEC_CTRL FIRST, before any other host C code runs (including
+     * hype_fpu_save() and the TLB/trace bookkeeping below) -- see the comment on the entry-side
+     * swap above for why the window matters here specifically.
+     */
+    if (real->spec_ctrl_valid) {
+        svm_wrmsr(HYPE_SVM_MSR_SPEC_CTRL, host_spec_ctrl);
+    }
     /*
      * #244: the flush-this-guest armed at create has now happened. Clear TLB_CONTROL
      * so it does not repeat on every entry -- a permanent per-VMRUN flush would be

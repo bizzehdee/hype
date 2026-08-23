@@ -238,30 +238,40 @@ static void test_kvm_features_leaf_advertises_only_pvclock(void) {
 static void test_leaf7_structured_ext_passthrough(void) {
     /* Leaf 7 (AVX2/AVX-512/BMI/...) passes straight through from the host for
      * the requested sub-leaf, so leaf 1's XSAVE/AVX advertisement is coherent. */
-    /* edx = 0xFC000000 sets exactly the speculation-control bits 26-31, which
-     * must be masked off (their control MSRs aren't emulated); eax/ebx/ecx pass
-     * through. ebx 0x239C27A9 carries AVX2(5)/BMI(3,8)/... which stay. */
+    /*
+     * #608: edx = 0xFC000000 sets exactly bits 26-31. SPEC_CTRL(26)/STIBP(27)/SSBD(31) now pass
+     * through -- their MSR (IA32_SPEC_CTRL) is genuinely virtualized -- while L1D_FLUSH(28)/
+     * ARCH_CAPABILITIES(29)/CORE_CAPABILITIES(30) stay masked (still unimplemented MSRs).
+     * eax/ebx/ecx pass through unconditionally. ebx 0x239C27A9 carries AVX2(5)/BMI(3,8)/...
+     * which stay.
+     */
     hype_cpuid_result_t real = {0x00000001u, 0x239C27A9u, 0x00000000u, 0xFC000000u};
     hype_cpuid_result_t out;
+    uint32_t expect_edx = (1u << 26) | (1u << 27) | (1u << 31);
 
     hype_cpuid_emulate(7, 0, &real, &out);
 
     CHECK_HEX("leaf7 eax passthrough (max sub-leaf)", real.eax, out.eax);
     CHECK_HEX("leaf7 ebx passthrough", real.ebx, out.ebx);
     CHECK_HEX("leaf7 ecx passthrough", real.ecx, out.ecx);
-    CHECK_HEX("leaf7 edx spec-ctrl bits masked", 0u, out.edx);
+    CHECK_HEX("leaf7 edx: SPEC_CTRL/STIBP/SSBD pass, L1D_FLUSH/ARCH_CAP/CORE_CAP masked",
+              expect_edx, out.edx);
 }
 
 static void test_leaf7_edx_nonspec_bits_survive_mask(void) {
-    /* Non-speculation EDX bits (e.g. FSRM=4, SERIALIZE=14) pass through; only
-     * bits 26-31 are cleared. real.edx = FSRM|SERIALIZE|SPEC_CTRL|SSBD. */
-    hype_cpuid_result_t real = {0, 0, 0, (1u << 4) | (1u << 14) | (1u << 26) | (1u << 31)};
+    /*
+     * #608: FSRM(4)/SERIALIZE(14) pass through unconditionally (never masked); SPEC_CTRL(26) now
+     * ALSO passes through (its MSR is virtualized); SSBD(31) is included in `real` here at 0 so
+     * this case exercises "the bit was never set" rather than duplicating the mask/passthrough
+     * check the test above already makes for bit 31 specifically.
+     */
+    hype_cpuid_result_t real = {0, 0, 0, (1u << 4) | (1u << 14) | (1u << 26)};
     hype_cpuid_result_t out;
 
     hype_cpuid_emulate(7, 0, &real, &out);
 
-    CHECK_HEX("leaf7 edx keeps non-spec bits, clears spec bits",
-              (1u << 4) | (1u << 14), out.edx);
+    CHECK_HEX("leaf7 edx keeps non-spec bits and the now-unmasked SPEC_CTRL bit",
+              (1u << 4) | (1u << 14) | (1u << 26), out.edx);
 }
 
 static void test_leafD_xsave_passthrough(void) {

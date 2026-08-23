@@ -75,3 +75,21 @@ uint32_t hype_cpu_leaf7_ebx(void) {
     cpuid(7u, &a, &b, &c, &d);
     return b;
 }
+
+/* #608: CPUID.(EAX=7,ECX=0):EDX -- IBRS_IBPB(26)/STIBP(27)/SSBD(31), Intel's enumeration. */
+uint32_t hype_cpu_leaf7_edx(void) {
+    uint32_t a = 0, b = 0, c = 0, d = 0;
+    cpuid(0, &a, &b, &c, &d);
+    if (a < 7u) return 0u;
+    cpuid(7u, &a, &b, &c, &d);
+    return d;
+}
+
+/* #608: CPUID.8000_0008H:EBX -- IBPB(12)/IBRS(14)/STIBP(15)/SSBD(24), AMD's enumeration. */
+uint32_t hype_cpu_leaf80000008_ebx(void) {
+    uint32_t a = 0, b = 0, c = 0, d = 0;
+    cpuid(0x80000000u, &a, &b, &c, &d);
+    if (a < 0x80000008u) return 0u;
+    cpuid(0x80000008u, &a, &b, &c, &d);
+    return b;
+}

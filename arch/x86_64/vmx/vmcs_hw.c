@@ -1,4 +1,5 @@
 #include "vmcs.h"
+#include "../cpu/cpu_features.h"
 #include "../cpu/fpu_state.h"
 #include "../cpu/hyperv.h"
 #include "../cpu/idt.h"
@@ -387,6 +388,16 @@ struct hype_vcpu_ctx {
      */
     uint64_t guest_xcr0;
     int guest_xcr0_valid;
+    /*
+     * #608: this vCPU's IA32_SPEC_CTRL (0x48), masked to the bits this real host CPU implements
+     * (hype_cpu_spec_ctrl_legal_mask()) before being stored. Per-vCPU for the same reason
+     * guest_xcr0 above is -- two guests must never see or influence each other's speculation-
+     * control state, and it must never leak into hype's own host execution once the VM exits.
+     * VMX has no VMCS field or MSR-load-area entry hype uses for this, so it is swapped by hand
+     * around VM entry, the same shape SVM's tsc_aux swap already established.
+     */
+    uint64_t spec_ctrl;
+    int spec_ctrl_valid;
 };
 
 /*
@@ -481,6 +492,9 @@ static void vmx_ctx_reset_pending(struct hype_vcpu_ctx *ctx) {
      * architectural reset value is x87-only, which `valid == 0` stands for. */
     ctx->guest_xcr0 = 0;
     ctx->guest_xcr0_valid = 0;
+    /* #608: same recycled-slot reasoning as guest_xcr0 above. */
+    ctx->spec_ctrl = 0;
+    ctx->spec_ctrl_valid = 0;
 }
 
 static void hype_vmx_host_exit_stub(void) {
@@ -515,6 +529,11 @@ static inline uint64_t rdmsr(uint32_t msr) {
     uint32_t lo, hi;
     __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
     return ((uint64_t)hi << 32) | lo;
+}
+
+/* #608: the write half -- rdmsr() above had no counterpart until the SPEC_CTRL swap needed one. */
+static inline void wrmsr(uint32_t msr, uint64_t value) {
+    __asm__ volatile("wrmsr" ::"c"(msr), "a"((uint32_t)value), "d"((uint32_t)(value >> 32)));
 }
 
 /*
@@ -1578,6 +1597,17 @@ int hype_vmx_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
     if (real->guest_xcr0_valid && vmx_ensure_osxsave()) {
         xsetbv0(real->guest_xcr0);
     }
+    /*
+     * #608: same shape as XCR0 above, for SPEC_CTRL -- see svm_vcpu.c's twin for the full
+     * reasoning on why the ordering here matters beyond correctness (the window where hype's
+     * own host code runs under the GUEST's speculation-control posture must be as short as
+     * possible in both directions).
+     */
+    uint64_t host_spec_ctrl = 0;
+    if (real->spec_ctrl_valid) {
+        host_spec_ctrl = rdmsr(0x48u);
+        wrmsr(0x48u, real->spec_ctrl);
+    }
     /* #260/#637: restore AFTER the XCR0 switch (XSETBV can reinitialise state
      * components, discarding whatever we had just loaded) and save BEFORE
      * switching XCR0 back, for the same reason. Nothing between the restore and
@@ -1598,6 +1628,11 @@ int hype_vmx_vcpu_run(hype_vcpu_ctx_t *ctx, hype_vmexit_info_t *info) {
     hype_cli();
     hype_fpu_restore(&real->fpu);
     failed = hype_vmx_launch(ctx, (uint64_t)real->launched);
+    /* #608: restore host's own SPEC_CTRL FIRST, before any other host C code runs -- see the
+     * entry-side comment above. */
+    if (real->spec_ctrl_valid) {
+        wrmsr(0x48u, host_spec_ctrl);
+    }
     hype_fpu_save(&real->fpu);
     hype_sti();
     if (real->guest_xcr0_valid && g_vmx_host_xcr0 != 0ull) {
@@ -1939,6 +1974,46 @@ int hype_vmx_vcpu_handle_msr(hype_vcpu_ctx_t *ctx, int is_write, hype_guest_lapi
         return 0;
     }
 #endif
+
+    /*
+     * #608: IA32_SPEC_CTRL (0x48) / IA32_PRED_CMD (0x49), the VMX twin of the SVM handling in
+     * svm_vcpu.c -- see that file's own comment for the full reasoning. This file only ever runs
+     * on Intel hardware (VMX is never selected on AMD, hype_vmm_kind_select()), so the vendor
+     * passed to the cpu_features.h helpers is hardcoded here too.
+     */
+    if (msr_number == 0x48u) {
+        static uint32_t legal_mask = 0xFFFFFFFFu; /* sentinel: not yet computed */
+        if (legal_mask == 0xFFFFFFFFu) {
+            legal_mask =
+                hype_cpu_spec_ctrl_legal_mask(HYPE_CPU_VENDOR_INTEL, hype_cpu_leaf7_edx(), 0u);
+        }
+        if (is_write) {
+            uint64_t value =
+                ((uint64_t)(uint32_t)real->gprs[2] << 32) | (uint64_t)(uint32_t)real->gprs[0];
+            real->spec_ctrl = value & (uint64_t)legal_mask;
+            if (!real->spec_ctrl_valid) {
+                hype_debug_print("vmx: guest wrote SPEC_CTRL=0x%llx (legal_mask=0x%x) -- per-guest "
+                                 "value now swapped around VM entry (#608)\n",
+                                 (unsigned long long)real->spec_ctrl, legal_mask);
+            }
+            real->spec_ctrl_valid = 1;
+        } else {
+            vmx_msr_return(real, real->spec_ctrl);
+        }
+        vmx_advance_rip();
+        return 0;
+    }
+    if (msr_number == 0x49u) {
+        if (!is_write) {
+            return 1; /* write-only on real hardware -- caller injects #GP(0) */
+        }
+        if (hype_cpu_has_ibpb(HYPE_CPU_VENDOR_INTEL, hype_cpu_leaf7_edx(), 0u) &&
+            (real->gprs[0] & 1ull) != 0ull) {
+            wrmsr(0x49u, 1ull);
+        }
+        vmx_advance_rip();
+        return 0;
+    }
 
     action = hype_msr_decide_ex(msr_number, is_write, real->hv_enabled);
     area_slot = vmx_msr_area_slot(msr_number);

@@ -44,6 +44,15 @@
  * dead leaves the guest's mitigation state self-inconsistent. */
 #define HYPE_CPUID_LEAF7_EDX_SPECCTRL_MASK                                     \
     ((1u << 26) | (1u << 27) | (1u << 28) | (1u << 29) | (1u << 30) | (1u << 31))
+/*
+ * #608: SPEC_CTRL(26)/STIBP(27)/SSBD(31) are now genuinely backed (IA32_SPEC_CTRL is virtualized
+ * per-vCPU) and so are no longer masked -- only L1D_FLUSH(28)/ARCH_CAPABILITIES(29)/
+ * CORE_CAPABILITIES(30) remain, whose own MSRs are still unimplemented. Kept as a distinct name
+ * from the mask above rather than redefining it in place, so a `git blame`/history reader can see
+ * exactly which bits moved and when, rather than the same macro name silently meaning a smaller
+ * set at two different points in history.
+ */
+#define HYPE_CPUID_LEAF7_EDX_SPECCTRL_REMAINING_MASK ((1u << 28) | (1u << 29) | (1u << 30))
 #define HYPE_CPUID_EXT1_ECX_SVM_BIT (1u << 2)
 /*
  * #552: leaf 1 ECX bit 5, VMX. The Intel half of #316's rule -- hype does not expose
@@ -410,7 +419,16 @@ void hype_cpuid_emulate_topo(uint32_t eax_in, uint32_t ecx_in, int hv_enabled,
         if (ecx_in == 0u) {
             out->ecx = real->ecx & ~HYPE_CPUID_LEAF7_ECX_WAITPKG_BIT;
         }
-        out->edx = real->edx & ~HYPE_CPUID_LEAF7_EDX_SPECCTRL_MASK;
+        /*
+         * #608: bits 26 (IBRS/IBPB)/27 (STIBP)/31 (SSBD) are no longer forced clear -- their
+         * control MSRs (IA32_SPEC_CTRL 0x48, IA32_PRED_CMD 0x49) are now genuinely virtualized
+         * per-vCPU (arch/x86_64/svm/svm_vcpu.c, arch/x86_64/vmx/vmcs_hw.c), so advertising them
+         * is no longer the "CPUID says yes, the MSR is a dead no-op" mistake this mask existed to
+         * prevent. Bits 28 (L1D_FLUSH)/29 (ARCH_CAPABILITIES)/30 (CORE_CAPABILITIES) stay masked:
+         * their own MSRs (IA32_FLUSH_CMD 0x10b, IA32_ARCH_CAPABILITIES 0x10a,
+         * IA32_CORE_CAPABILITIES 0xcf) are still unimplemented.
+         */
+        out->edx = real->edx & ~HYPE_CPUID_LEAF7_EDX_SPECCTRL_REMAINING_MASK;
         return;
     }
 

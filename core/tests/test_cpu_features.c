@@ -110,9 +110,41 @@ static void test_has_smep(void) {
     CHECK_INT("an unrelated bit does not false-positive", 0, hype_cpu_has_smep(1u << 6));
 }
 
+/* #608: IA32_SPEC_CTRL's legal-bit mask, per vendor's own CPUID enumeration. */
+static void test_spec_ctrl_legal_mask(void) {
+    CHECK_INT("Intel: all three bits set", 0x7,
+              (int)hype_cpu_spec_ctrl_legal_mask(HYPE_CPU_VENDOR_INTEL,
+                                                 (1u << 26) | (1u << 27) | (1u << 31), 0u));
+    CHECK_INT("Intel: none set", 0x0,
+              (int)hype_cpu_spec_ctrl_legal_mask(HYPE_CPU_VENDOR_INTEL, 0u, 0u));
+    CHECK_INT("Intel: IBRS only", 0x1,
+              (int)hype_cpu_spec_ctrl_legal_mask(HYPE_CPU_VENDOR_INTEL, 1u << 26, 0u));
+    CHECK_INT("AMD: all three bits set", 0x7,
+              (int)hype_cpu_spec_ctrl_legal_mask(HYPE_CPU_VENDOR_AMD, 0u,
+                                                 (1u << 14) | (1u << 15) | (1u << 24)));
+    CHECK_INT("AMD: STIBP only", 0x2,
+              (int)hype_cpu_spec_ctrl_legal_mask(HYPE_CPU_VENDOR_AMD, 0u, 1u << 15));
+    CHECK_INT("AMD does not read Intel's bits", 0x0,
+              (int)hype_cpu_spec_ctrl_legal_mask(HYPE_CPU_VENDOR_AMD,
+                                                 (1u << 26) | (1u << 27) | (1u << 31), 0u));
+    CHECK_INT("unknown vendor grants nothing", 0x0,
+              (int)hype_cpu_spec_ctrl_legal_mask(HYPE_CPU_VENDOR_UNKNOWN, ~0u, ~0u));
+}
+
+static void test_has_ibpb(void) {
+    CHECK_INT("Intel bit 26 set", 1, hype_cpu_has_ibpb(HYPE_CPU_VENDOR_INTEL, 1u << 26, 0u));
+    CHECK_INT("Intel bit 26 clear", 0, hype_cpu_has_ibpb(HYPE_CPU_VENDOR_INTEL, 0u, ~0u));
+    CHECK_INT("AMD bit 12 set", 1, hype_cpu_has_ibpb(HYPE_CPU_VENDOR_AMD, 0u, 1u << 12));
+    CHECK_INT("AMD bit 12 clear", 0, hype_cpu_has_ibpb(HYPE_CPU_VENDOR_AMD, ~0u, 0u));
+    CHECK_INT("unknown vendor never claims it", 0,
+              hype_cpu_has_ibpb(HYPE_CPU_VENDOR_UNKNOWN, ~0u, ~0u));
+}
+
 int main(void) {
     test_therm_status_requires_the_dts_bit();
     test_has_smep();
+    test_spec_ctrl_legal_mask();
+    test_has_ibpb();
     test_vendor_from_string();
     test_has_vmx();
     test_has_svm();

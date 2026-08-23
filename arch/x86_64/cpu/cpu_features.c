@@ -80,3 +80,27 @@ int hype_cpu_has_eff_freq(hype_cpu_vendor_t vendor, uint32_t leaf6_ecx,
 int hype_cpu_has_smep(uint32_t leaf7_ebx) {
     return (int)((leaf7_ebx >> 7) & 1u);
 }
+
+/* #608: see the header for the bit-position citations (both vendors share IA32_SPEC_CTRL's
+ * layout; only the CPUID enumeration differs). Unknown vendor grants nothing -- same "the
+ * default is do not offer it" rule as every other capability check on this page. */
+uint32_t hype_cpu_spec_ctrl_legal_mask(hype_cpu_vendor_t vendor, uint32_t leaf7_edx,
+                                       uint32_t leaf80000008_ebx) {
+    uint32_t mask = 0;
+    if (vendor == HYPE_CPU_VENDOR_INTEL) {
+        if ((leaf7_edx >> 26) & 1u) mask |= (1u << 0); /* IBRS */
+        if ((leaf7_edx >> 27) & 1u) mask |= (1u << 1); /* STIBP */
+        if ((leaf7_edx >> 31) & 1u) mask |= (1u << 2); /* SSBD */
+    } else if (vendor == HYPE_CPU_VENDOR_AMD) {
+        if ((leaf80000008_ebx >> 14) & 1u) mask |= (1u << 0); /* IBRS */
+        if ((leaf80000008_ebx >> 15) & 1u) mask |= (1u << 1); /* STIBP */
+        if ((leaf80000008_ebx >> 24) & 1u) mask |= (1u << 2); /* SSBD */
+    }
+    return mask;
+}
+
+int hype_cpu_has_ibpb(hype_cpu_vendor_t vendor, uint32_t leaf7_edx, uint32_t leaf80000008_ebx) {
+    if (vendor == HYPE_CPU_VENDOR_INTEL) return (int)((leaf7_edx >> 26) & 1u);
+    if (vendor == HYPE_CPU_VENDOR_AMD) return (int)((leaf80000008_ebx >> 12) & 1u);
+    return 0;
+}
