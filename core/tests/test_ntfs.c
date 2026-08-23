@@ -1742,6 +1742,140 @@ static void test_data_append(void) {
           hype_ntfs_data_append(&fs, vol_write, 22, 0, 1, SECSZ, 1, 1, 2) != 0);
 }
 
+/* #419: hole/sparse fill. img.bin (record 40): DATA(4cl@600) HOLE(3cl,
+ * VCN 4-6) DATA(2cl@620, VCN 7-8), 4300 bytes real size. */
+static void test_hole_fill(void) {
+    hype_ntfs_t fs;
+    hype_file_rmap_t m;
+    uint64_t lcn;
+
+    /* full hole fill: the whole 3-cluster hole becomes one DATA run */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK_HEX("resolve before", 0, hype_ntfs_resolve(&fs, "/img.bin", &m));
+    CHECK_HEX("ranges before", 3, m.count);
+    CHECK_HEX("kind[1] before", HYPE_RANGE_HOLE, m.ranges[1].kind);
+    CHECK_HEX("size before", 4300, m.size_bytes);
+
+    CHECK_HEX("alloc 3", 0, hype_ntfs_cluster_alloc(&fs, vol_write, 3, &lcn));
+    CHECK_HEX("fill whole hole", 0, hype_ntfs_hole_fill(&fs, vol_write, 40, 4, 3, lcn, 2));
+
+    CHECK_HEX("resolve after", 0, hype_ntfs_resolve(&fs, "/img.bin", &m));
+    CHECK_HEX("ranges after", 3, m.count); /* still 3: hole -> DATA, none adjacent */
+    CHECK_HEX("kind[1] after", HYPE_RANGE_DATA, m.ranges[1].kind);
+    CHECK_HEX("lba[1] after", lcn * fs.spc, m.ranges[1].start_lba);
+    CHECK_HEX("sectors[1] after", 3u * fs.spc, m.ranges[1].sector_count);
+    CHECK_HEX("size unchanged", 4300, m.size_bytes); /* hole-fill never changes real_size */
+
+    /* zero-fill happened for real, on the medium, before the metadata
+     * commit -- read it back raw */
+    {
+        unsigned i;
+        int all_zero = 1;
+        for (i = 0; i < 3u * SECSZ; i++) {
+            if (g_vol[lcn * fs.spc * SECSZ + i] != 0u) {
+                all_zero = 0;
+                break;
+            }
+        }
+        CHECK("new clusters zero-filled on medium", all_zero);
+    }
+
+    /* partial fill: only the MIDDLE cluster of a 3-cluster hole, leaving a
+     * 1-cluster hole on each side */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK_HEX("alloc 1", 0, hype_ntfs_cluster_alloc(&fs, vol_write, 1, &lcn));
+    CHECK_HEX("partial fill", 0, hype_ntfs_hole_fill(&fs, vol_write, 40, 5, 1, lcn, 2));
+    CHECK_HEX("resolve after partial", 0, hype_ntfs_resolve(&fs, "/img.bin", &m));
+    CHECK_HEX("ranges after partial", 5, m.count); /* DATA,HOLE,DATA,HOLE,DATA */
+    CHECK_HEX("kind[0]", HYPE_RANGE_DATA, m.ranges[0].kind);
+    CHECK_HEX("kind[1]", HYPE_RANGE_HOLE, m.ranges[1].kind);
+    CHECK_HEX("sectors[1]", 1u * fs.spc, m.ranges[1].sector_count);
+    CHECK_HEX("kind[2]", HYPE_RANGE_DATA, m.ranges[2].kind);
+    CHECK_HEX("lba[2]", lcn * fs.spc, m.ranges[2].start_lba);
+    CHECK_HEX("kind[3]", HYPE_RANGE_HOLE, m.ranges[3].kind);
+    CHECK_HEX("sectors[3]", 1u * fs.spc, m.ranges[3].sector_count);
+    CHECK_HEX("kind[4]", HYPE_RANGE_DATA, m.ranges[4].kind);
+    CHECK_HEX("size unchanged after partial", 4300, m.size_bytes);
+
+    /* fill the leading edge only (before_len=0, after_len=2) */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK_HEX("alloc 1", 0, hype_ntfs_cluster_alloc(&fs, vol_write, 1, &lcn));
+    CHECK_HEX("leading fill", 0, hype_ntfs_hole_fill(&fs, vol_write, 40, 4, 1, lcn, 2));
+    CHECK_HEX("resolve after leading", 0, hype_ntfs_resolve(&fs, "/img.bin", &m));
+    CHECK_HEX("ranges after leading", 4, m.count); /* DATA,DATA(new),HOLE(2),DATA */
+    CHECK_HEX("kind[1]", HYPE_RANGE_DATA, m.ranges[1].kind);
+    CHECK_HEX("kind[2]", HYPE_RANGE_HOLE, m.ranges[2].kind);
+    CHECK_HEX("sectors[2]", 2u * fs.spc, m.ranges[2].sector_count);
+
+    /* sparse flag clears when the last hole is filled */
+    build_vol(0);
+    rec_ptr(40)[0x38 + 0x0D] |= 0x80u; /* ATTR_IS_SPARSE (0x8000): high byte of the u16 flags field */
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK_HEX("alloc 3", 0, hype_ntfs_cluster_alloc(&fs, vol_write, 3, &lcn));
+    CHECK_HEX("fill whole hole (flag test)", 0,
+              hype_ntfs_hole_fill(&fs, vol_write, 40, 4, 3, lcn, 2));
+    CHECK_HEX("sparse flag cleared", 0,
+              ((uint32_t)rec_ptr(40)[0x38 + 0x0C] | ((uint32_t)rec_ptr(40)[0x38 + 0x0D] << 8)) &
+                  0x8000u);
+
+    /* refusals */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("fill spans into a DATA run refused",
+          hype_ntfs_hole_fill(&fs, vol_write, 40, 3, 2, 0, 2) != 0);
+    CHECK("target is already DATA refused",
+          hype_ntfs_hole_fill(&fs, vol_write, 40, 0, 1, 0, 2) != 0);
+    CHECK("fill exceeds the hole's own bounds refused",
+          hype_ntfs_hole_fill(&fs, vol_write, 40, 4, 5, 0, 2) != 0);
+    CHECK("no such VCN refused", hype_ntfs_hole_fill(&fs, vol_write, 40, 9000, 1, 0, 2) != 0);
+    CHECK("resident $DATA refused", hype_ntfs_hole_fill(&fs, vol_write, 44, 0, 1, 0, 2) != 0);
+    CHECK("multi-extent $DATA refused", hype_ntfs_hole_fill(&fs, vol_write, 48, 0, 1, 0, 2) != 0);
+    CHECK("zero cluster_count refused",
+          hype_ntfs_hole_fill(&fs, vol_write, 40, 4, 0, 0, 2) != 0);
+    CHECK("NULL fs refused", hype_ntfs_hole_fill(0, vol_write, 40, 4, 1, 0, 2) != 0);
+    CHECK("NULL write refused", hype_ntfs_hole_fill(&fs, 0, 40, 4, 1, 0, 2) != 0);
+    CHECK("past medium refused",
+          hype_ntfs_hole_fill(&fs, vol_write, 40, 4, 1, VOL_SECTORS, 2) != 0);
+    CHECK("missing record refused",
+          hype_ntfs_hole_fill(&fs, vol_write, 9999, 4, 1, 0, 2) != 0);
+
+    /* tail containing BOTH a DATA run (needs its delta re-derived) and a
+     * HOLE run after it (copied through as-is): HOLE(2) DATA(1) HOLE(2) --
+     * fill the FIRST hole entirely. */
+    build_vol(0);
+    {
+        uint8_t rl2[16];
+        uint32_t n2 = 0, off2;
+        rec_init(23, 0);
+        rl2[n2++] = 0x01; rl2[n2++] = 2; /* HOLE, 2 clusters, VCN 0-1 */
+        rl2[n2++] = 0x21; rl2[n2++] = 1; put16(rl2 + n2, DATA_LCN + 99u); n2 += 2; /* DATA, VCN 2 */
+        rl2[n2++] = 0x01; rl2[n2++] = 2; /* HOLE, 2 clusters, VCN 3-4 */
+        rl2[n2++] = 0;
+        off2 = attr_add(23, 0x80, 1, 0, rl2, n2);
+        nonres_sizes(23, off2, 0, 5u * SECSZ, 5u * SECSZ, 5u * SECSZ);
+        rec_fixup(23);
+        for (unsigned k = 0; k < SECSZ; k++) {
+            g_vol[(DATA_LCN + 99u) * SECSZ + k] = pat(k + 9000u);
+        }
+    }
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK_HEX("alloc 2", 0, hype_ntfs_cluster_alloc(&fs, vol_write, 2, &lcn));
+    CHECK_HEX("fill first hole with data+hole tail", 0,
+              hype_ntfs_hole_fill(&fs, vol_write, 23, 0, 2, lcn, 2));
+    /* round-trip proof without a directory entry to resolve() through:
+     * the tail's DATA run (VCN 2) must still decode to its original LCN,
+     * and its trailing HOLE (VCN 3-4) must still be fillable -- both only
+     * succeed if the re-encoded tail bytes are structurally correct. */
+    CHECK_HEX("alloc 2 more", 0, hype_ntfs_cluster_alloc(&fs, vol_write, 2, &lcn));
+    CHECK_HEX("fill trailing hole after re-encoded tail", 0,
+              hype_ntfs_hole_fill(&fs, vol_write, 23, 3, 2, lcn, 3));
+    CHECK("re-fill of an already-fully-allocated stream refused",
+          hype_ntfs_hole_fill(&fs, vol_write, 23, 0, 1, lcn, 4) != 0);
+}
+
 int main(void) {
     test_probe();
     test_mount_refusals();
@@ -1757,6 +1891,7 @@ int main(void) {
     test_final_edges();
     test_cluster_alloc();
     test_data_append();
+    test_hole_fill();
 
     if (failures == 0) {
         printf("test_ntfs: all tests passed\n");

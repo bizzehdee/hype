@@ -241,6 +241,39 @@ runs must update Highest VCN too** -- it is easy to miss because nothing
 in hype's own read path depends on it, so only a genuine external driver
 catches its absence.
 
+## NTFS AllocatedSize does not always exclude sparse holes on-disk (#419)
+
+The spec model (and this ticket's own initial assumption) is that a sparse
+non-resident attribute's on-disk **AllocatedSize** field excludes sparse
+(`HOLE`) runs -- only bytes truly backed by clusters count. **Measured
+counter-example**: a genuinely sparse file created via `ntfs-3g` itself
+(`truncate` past written data, then `dd seek=` to write past the gap) had
+AllocatedSize on disk ALREADY equal to the file's full logical size (all 5
+clusters' worth) even though only 3 were actually backed -- `ntfsinfo`
+separately reported the true backed-byte count under a **different** label,
+"Compressed size", derived by walking the runlist, not read from the
+AllocatedSize field. So on at least this `ntfs-3g` version/code path, the
+on-disk field itself does not reliably track true backing.
+
+Consequence for `hype_ntfs_hole_fill()`: computing the new AllocatedSize as
+"old on-disk AllocatedSize + newly-filled bytes" silently double-counts
+on a file with this looseness (28672 observed instead of the correct
+20480 in the concrete case above). Fixed by **recomputing AllocatedSize
+from scratch** every time -- sum every DATA run's cluster count across the
+WHOLE attribute (prefix runs walked to find the target hole, the fill
+itself, and the tail runs after it) and multiply by cluster size, never
+trusting the old field's arithmetic relationship to the new one. This is
+correct regardless of which convention produced the file. Re-verified on
+the same real volume: AllocatedSize came out exactly right (20480) after
+this fix, content read back byte-for-byte unchanged, and the `SPARSE_FILE`
+attribute flag correctly cleared once no `HOLE` runs remained.
+
+**Lesson for #420+**: don't trust an existing size/count field's absolute
+value as a baseline to increment -- when a writer can be handed a file
+built by an external, less-rigorous path, recomputing derived fields from
+the authoritative source (here, the runlist itself) is safer than trusting
+prior bookkeeping to have been consistent.
+
 ## NTFS $LogFile / USN journal (#416)
 
 #416 (plan.md §10 decision 64) descoped `$LogFile` replay entirely: Microsoft's LFS (Log File

@@ -1210,3 +1210,328 @@ int hype_ntfs_data_append(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t rec
 
     return hype_ntfs_record_write(fs, write, rec_no, rec, usn);
 }
+
+/* ---- #419: hole/sparse fill ---------------------------------------------- */
+
+#define HOLE_FILL_MAX_TAIL_RUNS 32u
+
+typedef struct {
+    int is_hole;
+    uint64_t run_len;  /* clusters */
+    uint64_t abs_lcn;  /* meaningful only if !is_hole */
+} tail_run_t;
+
+/* Zero-fills `count` clusters starting at `lcn`, BEFORE any metadata makes
+ * them visible: a crash here still leaves the run sparse (reads as zero
+ * anyway), never a readable stale byte. */
+static int hole_fill_zero_clusters(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t lcn,
+                                   uint64_t count) {
+    uint8_t chunk[BITMAP_CHUNK_BYTES];
+    uint64_t sector = lcn * fs->spc;
+    uint64_t sectors_left = count * fs->spc;
+
+    bfill8(chunk, 0u, sizeof chunk);
+    while (sectors_left != 0u) {
+        uint32_t n = sectors_left < (BITMAP_CHUNK_BYTES / SECSZ)
+                         ? (uint32_t)sectors_left
+                         : (BITMAP_CHUNK_BYTES / SECSZ);
+        if (write(fs->ctx, sector, n, chunk) != 0) {
+            return -1;
+        }
+        sector += n;
+        sectors_left -= n;
+    }
+    return 0;
+}
+
+int hype_ntfs_hole_fill(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t rec_no,
+                        uint64_t fill_start_vcn, uint64_t cluster_count, uint64_t lcn,
+                        uint16_t usn) {
+    static uint8_t rec[HYPE_NTFS_MAX_RECORD];
+    ntfs_attr_t a, dup;
+    uint32_t cur = 0, dup_cur;
+    uint32_t attr_off;
+    const uint8_t *rl;
+    uint32_t rl_bytes;
+    uint32_t p;
+    uint64_t vcn = 0;
+    int64_t lcn_cursor = 0;
+    uint32_t run_start_p;
+    uint64_t run_start_vcn = 0;
+    uint64_t run_len = 0;
+    int run_is_hole = 0;
+    int found = 0;
+    tail_run_t tail[HOLE_FILL_MAX_TAIL_RUNS];
+    unsigned tail_n = 0;
+    uint64_t before_len, after_len;
+    uint8_t out[8u + HOLE_FILL_MAX_TAIL_RUNS * (1u + 8u + 8u) + 1u];
+    uint32_t out_len = 0u;
+    int64_t enc_cursor;
+    unsigned i;
+    uint32_t content_prefix_len, new_content_len, new_attr_length, delta;
+    uint32_t bytes_used;
+    int any_hole_left = 0;
+    uint64_t prefix_data_clusters = 0;
+    uint64_t tail_data_clusters = 0;
+    uint64_t total_data_clusters;
+
+    if (fs == 0 || write == 0 || cluster_count == 0u) {
+        return -1;
+    }
+    if (record_read(fs, rec_no, rec) != 0) {
+        return -1;
+    }
+    cur = 0;
+    if (attr_find(rec, fs->mft_record_size, AT_ATTRIBUTE_LIST, &cur, &dup) == 0) {
+        return -1;
+    }
+    cur = 0;
+    if (attr_find(rec, fs->mft_record_size, AT_DATA, &cur, &a) != 0) {
+        return -1;
+    }
+    if (a.name_len != 0u) {
+        return -1;
+    }
+    attr_off = cur - a.length;
+    dup_cur = cur;
+    if (attr_find(rec, fs->mft_record_size, AT_DATA, &dup_cur, &dup) == 0 && dup.name_len == 0u) {
+        return -1;
+    }
+    if (!a.non_resident) {
+        return -1;
+    }
+    if (a.flags & (ATTR_IS_COMPRESSED | ATTR_IS_ENCRYPTED)) {
+        return -1;
+    }
+    if (fill_start_vcn + cluster_count < fill_start_vcn) {
+        return -1;
+    }
+    if (lcn + cluster_count < lcn || (lcn + cluster_count) * fs->spc > fs->total_sectors) {
+        return -1;
+    }
+
+    /* Walk runs from the start, tracking VCN/LCN cursors, until the one
+     * containing [fill_start_vcn, fill_start_vcn+cluster_count) is found. */
+    rl = rec + attr_off + a.rl_off;
+    rl_bytes = a.length - a.rl_off;
+    p = 0;
+    while (p < rl_bytes && rl[p] != 0u) {
+        uint32_t len_sz = rl[p] & 0x0Fu;
+        uint32_t off_sz = (rl[p] >> 4) & 0x0Fu;
+        uint64_t this_len = 0;
+        int64_t off = 0;
+
+        run_start_p = p;
+        run_start_vcn = vcn;
+        p++;
+        if (len_sz == 0u || len_sz > 8u || off_sz > 8u || p + len_sz + off_sz > rl_bytes) {
+            return -1;
+        }
+        for (i = 0; i < len_sz; i++) this_len |= (uint64_t)rl[p + i] << (8u * i);
+        p += len_sz;
+        if (this_len == 0u) {
+            return -1;
+        }
+        if (off_sz != 0u) {
+            for (i = 0; i < off_sz; i++) off |= (int64_t)((uint64_t)rl[p + i] << (8u * i));
+            if (rl[p + off_sz - 1u] & 0x80u) off -= (int64_t)((uint64_t)1u << (8u * off_sz));
+            p += off_sz;
+        }
+        run_len = this_len;
+        run_is_hole = (off_sz == 0u);
+        if (!run_is_hole) {
+            lcn_cursor += off;
+        }
+
+        if (fill_start_vcn >= run_start_vcn && fill_start_vcn < run_start_vcn + run_len) {
+            if (!run_is_hole) {
+                return -1; /* target is already allocated, not a hole */
+            }
+            if (fill_start_vcn + cluster_count > run_start_vcn + run_len) {
+                return -1; /* fill spans past this one hole run: refused */
+            }
+            found = 1;
+            break;
+        }
+        if (!run_is_hole) {
+            prefix_data_clusters += run_len;
+        }
+        vcn += run_len;
+    }
+    if (!found) {
+        return -1; /* no run covers the requested VCN range */
+    }
+    /* lcn_cursor here is exactly the cursor value BEFORE the target hole
+     * (the hole itself never touched it) -- the correct baseline for the
+     * new DATA run's own delta below. */
+    enc_cursor = lcn_cursor;
+
+    /* Decode every run AFTER the target hole into `tail`, so the whole
+     * remainder can be re-encoded: each tail run's absolute LCN is fixed
+     * (physical layout doesn't change), but a DATA run's ENCODED delta is
+     * relative to whatever the cursor was going in, so tail runs still need
+     * their absolute LCN recorded even though only the first tail DATA run
+     * (right after this hole) will actually get a different delta. */
+    while (p < rl_bytes && rl[p] != 0u) {
+        uint32_t len_sz = rl[p] & 0x0Fu;
+        uint32_t off_sz = (rl[p] >> 4) & 0x0Fu;
+        uint64_t this_len = 0;
+        int64_t off = 0;
+
+        p++;
+        if (len_sz == 0u || len_sz > 8u || off_sz > 8u || p + len_sz + off_sz > rl_bytes) {
+            return -1;
+        }
+        for (i = 0; i < len_sz; i++) this_len |= (uint64_t)rl[p + i] << (8u * i);
+        p += len_sz;
+        if (this_len == 0u) {
+            return -1;
+        }
+        if (off_sz != 0u) {
+            for (i = 0; i < off_sz; i++) off |= (int64_t)((uint64_t)rl[p + i] << (8u * i));
+            if (rl[p + off_sz - 1u] & 0x80u) off -= (int64_t)((uint64_t)1u << (8u * off_sz));
+            p += off_sz;
+        }
+        if (tail_n >= HOLE_FILL_MAX_TAIL_RUNS) {
+            return -1;
+        }
+        tail[tail_n].is_hole = (off_sz == 0u);
+        tail[tail_n].run_len = this_len;
+        if (!tail[tail_n].is_hole) {
+            lcn_cursor += off;
+            tail[tail_n].abs_lcn = (uint64_t)lcn_cursor;
+            tail_data_clusters += this_len;
+        }
+        tail_n++;
+    }
+    if (p >= rl_bytes) {
+        return -1; /* no terminator */
+    }
+
+    before_len = fill_start_vcn - run_start_vcn;
+    after_len = (run_start_vcn + run_len) - (fill_start_vcn + cluster_count);
+
+    /* Encode: [HOLE before]? [DATA fill]? [HOLE after]? [tail runs...] [term] */
+    if (before_len != 0u) {
+        out[out_len++] = 0x01u; /* len_sz=1, off_sz=0: sparse */
+        if (before_len > 0xFFu) {
+            return -1; /* this slice keeps the encoder simple: refuse an
+                          oversized split hole rather than multi-byte-length
+                          sparse runs (real files rarely need it here) */
+        }
+        out[out_len++] = (uint8_t)before_len;
+        any_hole_left = 1;
+    }
+    {
+        int64_t delta_lcn = (int64_t)lcn - enc_cursor;
+        uint32_t len_sz = min_bytes_unsigned(cluster_count);
+        uint32_t off_sz = min_bytes_signed(delta_lcn);
+        if (out_len + 1u + len_sz + off_sz > sizeof out) {
+            return -1;
+        }
+        out[out_len++] = (uint8_t)(len_sz | (off_sz << 4));
+        for (i = 0; i < len_sz; i++) out[out_len++] = (uint8_t)(cluster_count >> (8u * i));
+        for (i = 0; i < off_sz; i++) out[out_len++] = (uint8_t)((uint64_t)delta_lcn >> (8u * i));
+        enc_cursor = (int64_t)lcn;
+    }
+    if (after_len != 0u) {
+        if (after_len > 0xFFu) {
+            return -1;
+        }
+        out[out_len++] = 0x01u;
+        out[out_len++] = (uint8_t)after_len;
+        any_hole_left = 1;
+    }
+    for (i = 0; i < tail_n; i++) {
+        if (tail[i].is_hole) {
+            if (tail[i].run_len > 0xFFu) {
+                return -1;
+            }
+            if (out_len + 2u > sizeof out) {
+                return -1;
+            }
+            out[out_len++] = 0x01u;
+            out[out_len++] = (uint8_t)tail[i].run_len;
+            any_hole_left = 1;
+        } else {
+            int64_t delta_lcn = (int64_t)tail[i].abs_lcn - enc_cursor;
+            uint32_t len_sz = min_bytes_unsigned(tail[i].run_len);
+            uint32_t off_sz = min_bytes_signed(delta_lcn);
+            if (out_len + 1u + len_sz + off_sz > sizeof out) {
+                return -1;
+            }
+            out[out_len++] = (uint8_t)(len_sz | (off_sz << 4));
+            for (unsigned k = 0; k < len_sz; k++) {
+                out[out_len++] = (uint8_t)(tail[i].run_len >> (8u * k));
+            }
+            for (unsigned k = 0; k < off_sz; k++) {
+                out[out_len++] = (uint8_t)((uint64_t)delta_lcn >> (8u * k));
+            }
+            enc_cursor = (int64_t)tail[i].abs_lcn;
+        }
+    }
+    if (out_len + 1u > sizeof out) {
+        return -1;
+    }
+    out[out_len++] = 0u; /* terminator */
+
+    content_prefix_len = a.rl_off + run_start_p;
+    new_content_len = content_prefix_len + out_len;
+    new_attr_length = round_up_8(new_content_len);
+    if (new_attr_length < a.length) {
+        new_attr_length = a.length;
+    }
+    delta = new_attr_length - a.length;
+
+    bytes_used = hype_rd32(rec + 0x18);
+    if (bytes_used < attr_off + a.length || bytes_used > fs->mft_record_size) {
+        return -1;
+    }
+    if (delta != 0u) {
+        if (bytes_used + delta > fs->mft_record_size) {
+            return -1; /* no room: would need an $ATTRIBUTE_LIST, out of scope */
+        }
+        for (i = bytes_used; i > attr_off + a.length; i--) {
+            rec[i - 1u + delta] = rec[i - 1u];
+        }
+        hype_wr32(rec + 0x18, bytes_used + delta);
+    }
+    hype_wr32(rec + attr_off + 4, new_attr_length);
+
+    for (i = 0; i < out_len; i++) {
+        rec[attr_off + content_prefix_len + i] = out[i];
+    }
+    for (i = content_prefix_len + out_len; i < new_attr_length; i++) {
+        rec[attr_off + i] = 0u;
+    }
+
+    /* highest_vcn is unchanged: filling a hole never changes the stream's
+     * total VCN coverage, only what backs part of it (#418's bug, this
+     * function cannot repeat it since the total run-length sum is
+     * unchanged: before_len + cluster_count + after_len == run_len). */
+
+    if (any_hole_left == 0) {
+        uint16_t flags = hype_rd16(rec + attr_off + 0x0C);
+        flags = (uint16_t)(flags & ~ATTR_IS_SPARSE);
+        hype_wr16(rec + attr_off + 0x0C, flags);
+    }
+    /*
+     * AllocatedSize is recomputed from scratch as (every DATA run's cluster
+     * count) * cluster bytes -- NOT derived by adding to the OLD on-disk
+     * AllocatedSize field. Confirmed empirically necessary: a genuine
+     * ntfs-3g-created sparse file had its on-disk AllocatedSize already
+     * equal to the FULL logical size even before any hole was filled (it
+     * tracks true physical backing separately, in a derived "compressed
+     * size" ntfsinfo computes from the runlist, not in this field) -- so
+     * "old + newly filled bytes" silently double-counts on such a file.
+     * Recomputing from the actual runlist is correct regardless of what
+     * convention produced the file.
+     */
+    total_data_clusters = prefix_data_clusters + cluster_count + tail_data_clusters;
+    hype_wr64(rec + attr_off + 0x28, total_data_clusters * (uint64_t)fs->spc * SECSZ);
+
+    if (hole_fill_zero_clusters(fs, write, lcn, cluster_count) != 0) {
+        return -1;
+    }
+    return hype_ntfs_record_write(fs, write, rec_no, rec, usn);
+}

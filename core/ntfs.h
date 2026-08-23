@@ -158,4 +158,29 @@ int hype_ntfs_data_append(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t rec
                           uint64_t cluster_count, uint64_t new_alloc_size, uint64_t new_real_size,
                           uint64_t new_init_size, uint16_t usn);
 
+/*
+ * #419: materialize part or all of a sparse (HOLE) run inside an unnamed,
+ * non-resident $DATA attribute. [fill_start_vcn, fill_start_vcn+cluster_count)
+ * must lie ENTIRELY within one existing HOLE run (never spanning two runs,
+ * never touching an already-allocated run) -- the caller already allocated
+ * `cluster_count` contiguous clusters at `lcn` (typically via
+ * hype_ntfs_cluster_alloc()). Splits the hole at the fill boundaries as
+ * needed (0, 1, or 2 remaining HOLE pieces), zero-fills the new clusters on
+ * the medium BEFORE committing the runlist change (a crash before the
+ * commit leaves the old, still-valid HOLE state; one after leaves the new,
+ * fully-committed state -- never a readable stale byte), advances
+ * AllocatedSize by the newly-backed bytes, and clears the attribute's
+ * SPARSE flag if this was the last HOLE run. DataSize/InitializedSize are
+ * untouched: filling a hole does not change the file's logical length.
+ *
+ * Same refusals as hype_ntfs_data_append() (resident, $ATTRIBUTE_LIST
+ * present, a second unnamed $DATA piece, compressed/encrypted), plus:
+ * the target range not fully inside one HOLE run, and more runs following
+ * the split than this function's internal cap can re-encode (reported the
+ * same way as HYPE_FILE_MAX_RANGES: a real refusal, not silent truncation).
+ */
+int hype_ntfs_hole_fill(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t rec_no,
+                        uint64_t fill_start_vcn, uint64_t cluster_count, uint64_t lcn,
+                        uint16_t usn);
+
 #endif /* HYPE_CORE_NTFS_H */
