@@ -2144,6 +2144,59 @@ static void test_index_insert_delete(void) {
           hype_ntfs_index_delete(&fs, 0, 5, "img.bin", 7, 2) != 0);
 }
 
+/* #422: resident-to-non-resident $DATA conversion. res.bin (record 44):
+ * resident $DATA, 32 bytes, content pat(i) for i in 0..31. */
+static void test_data_to_nonresident(void) {
+    hype_ntfs_t fs;
+    hype_file_rmap_t m;
+    uint8_t buf[5000];
+    unsigned i;
+
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("res.bin refused while resident", hype_ntfs_resolve(&fs, "/res.bin", &m) != 0);
+
+    CHECK_HEX("convert", 0, hype_ntfs_data_to_nonresident(&fs, vol_write, 44, 5000, 2));
+    CHECK_HEX("resolve after convert", 0, hype_ntfs_resolve(&fs, "/res.bin", &m));
+    CHECK_HEX("size after convert", 5000, m.size_bytes);
+    CHECK("every range is DATA (no stray holes)", m.count >= 1);
+    for (i = 0; i < m.count; i++) {
+        CHECK_HEX("range kind", HYPE_RANGE_DATA, m.ranges[i].kind);
+    }
+
+    CHECK_HEX("read back", 0, hype_file_rmap_read_at(&m, vol_read, 0, 0, buf, sizeof buf));
+    for (i = 0; i < 32u; i++) {
+        if (buf[i] != pat(i)) {
+            CHECK("original resident bytes preserved", 0);
+            break;
+        }
+    }
+    for (i = 32u; i < sizeof buf; i++) {
+        if (buf[i] != 0u) {
+            CHECK("rest zero-filled", 0);
+            break;
+        }
+    }
+
+    /* a second call refuses: already non-resident */
+    CHECK("second conversion refused (already non-resident)",
+          hype_ntfs_data_to_nonresident(&fs, vol_write, 44, 6000, 3) != 0);
+
+    /* refusals */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("shrinking refused (#422 is growth-only)",
+          hype_ntfs_data_to_nonresident(&fs, vol_write, 44, 10, 2) != 0);
+    CHECK("multi-extent $DATA refused",
+          hype_ntfs_data_to_nonresident(&fs, vol_write, 48, 5000, 2) != 0);
+    CHECK("no unnamed $DATA refused (subdir, record 45)",
+          hype_ntfs_data_to_nonresident(&fs, vol_write, 45, 5000, 2) != 0);
+    CHECK("missing record refused",
+          hype_ntfs_data_to_nonresident(&fs, vol_write, 9999, 5000, 2) != 0);
+    CHECK("NULL fs refused", hype_ntfs_data_to_nonresident(0, vol_write, 44, 5000, 2) != 0);
+    CHECK("NULL write refused", hype_ntfs_data_to_nonresident(&fs, 0, 44, 5000, 2) != 0);
+}
+
 int main(void) {
     test_probe();
     test_mount_refusals();
@@ -2162,6 +2215,7 @@ int main(void) {
     test_hole_fill();
     test_mft_alloc();
     test_index_insert_delete();
+    test_data_to_nonresident();
 
     if (failures == 0) {
         printf("test_ntfs: all tests passed\n");

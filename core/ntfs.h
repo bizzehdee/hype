@@ -257,4 +257,26 @@ int hype_ntfs_index_insert(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t di
 int hype_ntfs_index_delete(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t dir_rec,
                            const char *name, uint32_t name_len, uint16_t usn);
 
+/*
+ * #422: converts an unnamed, resident $DATA attribute to non-resident, for
+ * a stream growing past what fits inside its MFT record. Allocates
+ * `ceil(new_size / cluster_bytes)` clusters via the #417 allocator, writes
+ * the existing resident bytes (zero-padded to new_size, then zero-padded
+ * again through the rest of the allocation) to the medium BEFORE replacing
+ * the attribute -- a crash before the replace leaves the old, still-valid
+ * resident attribute; one after leaves the new, fully-committed
+ * non-resident one; never a half-converted record. `new_size` must be >=
+ * the current resident length (this is a GROWTH path, not a truncation --
+ * #422 does not shrink).
+ *
+ * Same refusals as #418/#419/#421 (non-resident already, named-only,
+ * duplicate unnamed $DATA, $ATTRIBUTE_LIST present, compressed/encrypted),
+ * plus: new_size shorter than the current resident length, and no room in
+ * the record for the new non-resident attribute header + single-run
+ * mapping pairs (vanishingly unlikely -- that header is far smaller than
+ * the resident bytes it replaces -- but checked, not assumed).
+ */
+int hype_ntfs_data_to_nonresident(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t rec_no,
+                                  uint64_t new_size, uint16_t usn);
+
 #endif /* HYPE_CORE_NTFS_H */

@@ -1988,3 +1988,179 @@ int hype_ntfs_index_delete(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t di
 
     return hype_ntfs_record_write(fs, write, dir_rec, rec, usn);
 }
+
+
+/* ---- #422: resident-to-non-resident $DATA conversion --------------------- */
+
+/*
+ * Replaces the byte range [attr_off, attr_off+old_length) with a new
+ * region of new_length bytes, shifting every byte from attr_off+old_length
+ * to bytes_used accordingly (forward if growing, backward if shrinking --
+ * unlike #418/#419/#421, which only ever grow). Updates the record's
+ * bytes-in-use field. The caller writes the new attribute's own content
+ * into [attr_off, attr_off+new_length) afterward; this only makes room.
+ * Returns 0, or -1 if it would not fit in the record.
+ */
+static int record_resize_attr_region(uint8_t *rec, uint32_t mft_record_size, uint32_t attr_off,
+                                     uint32_t old_length, uint32_t new_length) {
+    uint32_t bytes_used = hype_rd32(rec + 0x18);
+    uint32_t tail_len;
+    uint32_t i;
+
+    if (bytes_used < attr_off + old_length || bytes_used > mft_record_size) {
+        return -1;
+    }
+    tail_len = bytes_used - (attr_off + old_length);
+    if (new_length > old_length) {
+        uint32_t grow = new_length - old_length;
+        if (bytes_used + grow > mft_record_size) {
+            return -1;
+        }
+        for (i = tail_len; i > 0; i--) {
+            rec[attr_off + new_length + i - 1u] = rec[attr_off + old_length + i - 1u];
+        }
+        hype_wr32(rec + 0x18, bytes_used + grow);
+    } else if (new_length < old_length) {
+        uint32_t shrink = old_length - new_length;
+        for (i = 0; i < tail_len; i++) {
+            rec[attr_off + new_length + i] = rec[attr_off + old_length + i];
+        }
+        hype_wr32(rec + 0x18, bytes_used - shrink);
+    }
+    return 0;
+}
+
+int hype_ntfs_data_to_nonresident(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t rec_no,
+                                  uint64_t new_size, uint16_t usn) {
+    static uint8_t rec[HYPE_NTFS_MAX_RECORD];
+    ntfs_attr_t a, dup;
+    uint32_t cur = 0, dup_cur;
+    uint32_t attr_off;
+    uint64_t cluster_bytes;
+    uint64_t clusters_needed;
+    uint64_t lcn;
+    uint32_t len_sz, off_sz, rl_len;
+    uint8_t rl[1u + 8u + 8u + 1u];
+    uint32_t old_attr_length, new_attr_length;
+    uint32_t old_val_len;
+    uint32_t old_val_off;
+    uint32_t i;
+
+    if (fs == 0 || write == 0) {
+        return -1;
+    }
+    if (record_read(fs, rec_no, rec) != 0) {
+        return -1;
+    }
+    cur = 0;
+    if (attr_find(rec, fs->mft_record_size, AT_ATTRIBUTE_LIST, &cur, &dup) == 0) {
+        return -1;
+    }
+    cur = 0;
+    if (attr_find(rec, fs->mft_record_size, AT_DATA, &cur, &a) != 0) {
+        return -1;
+    }
+    if (a.name_len != 0u) {
+        return -1;
+    }
+    attr_off = cur - a.length;
+    dup_cur = cur;
+    if (attr_find(rec, fs->mft_record_size, AT_DATA, &dup_cur, &dup) == 0 && dup.name_len == 0u) {
+        return -1;
+    }
+    if (a.non_resident) {
+        return -1; /* already non-resident: nothing for this function to do */
+    }
+    if (a.flags & (ATTR_IS_COMPRESSED | ATTR_IS_ENCRYPTED)) {
+        return -1;
+    }
+    old_val_len = a.val_len;
+    old_val_off = a.val_off;
+    if (new_size < old_val_len) {
+        return -1; /* growth path only: #422 does not truncate */
+    }
+
+    cluster_bytes = (uint64_t)fs->spc * SECSZ;
+    clusters_needed = (new_size + cluster_bytes - 1u) / cluster_bytes;
+    if (clusters_needed == 0u) {
+        clusters_needed = 1u; /* a zero-byte non-resident stream still owns one cluster */
+    }
+
+    if (hype_ntfs_cluster_alloc(fs, write, clusters_needed, &lcn) != 0) {
+        return -1;
+    }
+
+    len_sz = min_bytes_unsigned(clusters_needed);
+    off_sz = min_bytes_signed((int64_t)lcn);
+    rl_len = 1u + len_sz + off_sz + 1u; /* + terminator */
+    if (rl_len > sizeof rl) {
+        (void)hype_ntfs_cluster_free(fs, write, lcn, clusters_needed);
+        return -1;
+    }
+    rl[0] = (uint8_t)(len_sz | (off_sz << 4));
+    for (i = 0; i < len_sz; i++) {
+        rl[1u + i] = (uint8_t)(clusters_needed >> (8u * i));
+    }
+    for (i = 0; i < off_sz; i++) {
+        rl[1u + len_sz + i] = (uint8_t)((uint64_t)lcn >> (8u * i));
+    }
+    rl[1u + len_sz + off_sz] = 0u; /* terminator */
+
+    old_attr_length = a.length;
+    new_attr_length = round_up_8(0x40u + rl_len);
+
+    /* Write the real bytes to the medium BEFORE the attribute is replaced:
+     * old resident content, zero-padded to new_size, then zero-padded
+     * again through the rest of the allocation. */
+    {
+        uint8_t chunk[BITMAP_CHUNK_BYTES];
+        uint64_t sector = lcn * fs->spc;
+        uint64_t total_sectors = clusters_needed * fs->spc;
+        uint64_t resident_sectors = (old_val_len + SECSZ - 1u) / SECSZ;
+        uint32_t k;
+
+        for (i = 0; i < total_sectors; i++) {
+            uint32_t n = (uint32_t)(SECSZ < sizeof chunk ? SECSZ : sizeof chunk);
+            bfill8(chunk, 0u, n);
+            if (i < resident_sectors) {
+                uint64_t base = i * SECSZ;
+                uint32_t take = (uint32_t)(old_val_len > base ? old_val_len - base : 0u);
+                if (take > SECSZ) {
+                    take = SECSZ;
+                }
+                for (k = 0; k < take; k++) {
+                    chunk[k] = rec[attr_off + old_val_off + base + k];
+                }
+            }
+            if (write(fs->ctx, sector + i, 1u, chunk) != 0) {
+                (void)hype_ntfs_cluster_free(fs, write, lcn, clusters_needed);
+                return -1;
+            }
+        }
+    }
+
+    if (record_resize_attr_region(rec, fs->mft_record_size, attr_off, old_attr_length,
+                                  new_attr_length) != 0) {
+        (void)hype_ntfs_cluster_free(fs, write, lcn, clusters_needed);
+        return -1; /* no room: vanishingly unlikely, checked anyway */
+    }
+
+    for (i = 0; i < new_attr_length; i++) {
+        rec[attr_off + i] = 0u;
+    }
+    hype_wr32(rec + attr_off + 0, AT_DATA);
+    hype_wr32(rec + attr_off + 4, new_attr_length);
+    rec[attr_off + 8] = 1u; /* non-resident */
+    hype_wr16(rec + attr_off + 0x0C, 0u); /* flags: plain, not sparse/compressed */
+    hype_wr64(rec + attr_off + 0x10, 0u); /* start_vcn */
+    hype_wr64(rec + attr_off + 0x18, clusters_needed - 1u); /* highest_vcn */
+    hype_wr16(rec + attr_off + 0x20, 0x40u); /* mapping pairs offset */
+    hype_wr64(rec + attr_off + 0x28, clusters_needed * cluster_bytes); /* allocated size */
+    hype_wr64(rec + attr_off + 0x30, new_size);                        /* real size */
+    hype_wr64(rec + attr_off + 0x38, new_size);                        /* initialized size */
+    for (i = 0; i < rl_len; i++) {
+        rec[attr_off + 0x40 + i] = rl[i];
+    }
+
+    return hype_ntfs_record_write(fs, write, rec_no, rec, usn);
+}
