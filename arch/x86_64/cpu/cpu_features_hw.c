@@ -66,3 +66,12 @@ uint32_t hype_cpu_leaf80000007_edx(void) {
     cpuid(0x80000007u, &a, &b, &c, &d);
     return d;
 }
+
+/* #604: CPUID.(EAX=7,ECX=0):EBX -- SMEP is bit 7. */
+uint32_t hype_cpu_leaf7_ebx(void) {
+    uint32_t a = 0, b = 0, c = 0, d = 0;
+    cpuid(0, &a, &b, &c, &d);
+    if (a < 7u) return 0u;
+    cpuid(7u, &a, &b, &c, &d);
+    return b;
+}

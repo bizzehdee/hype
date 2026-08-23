@@ -75,3 +75,8 @@ int hype_cpu_has_eff_freq(hype_cpu_vendor_t vendor, uint32_t leaf6_ecx,
     if (vendor == HYPE_CPU_VENDOR_AMD) return (int)((leaf80000007_edx >> 10) & 1u);
     return 0;
 }
+
+/* #604: SMEP, vendor-agnostic -- both vendors use the same bit at the same leaf. */
+int hype_cpu_has_smep(uint32_t leaf7_ebx) {
+    return (int)((leaf7_ebx >> 7) & 1u);
+}

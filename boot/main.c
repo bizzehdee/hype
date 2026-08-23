@@ -24223,6 +24223,26 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * serial-less machine otherwise all start with identical boilerplate. */
     hype_debug_print("hype: build " HYPE_BUILD_ID "\n");
 
+    /*
+     * #604: CR4.SMEP on the BSP, where hype's own dispatch/administrative code runs. Safe to set
+     * unconditionally once CPUID grants it: hype's own host page tables (arch/x86_64/cpu/paging.c)
+     * never mark a page User (every PTE is PRESENT|WRITE, no US bit, ever), so SMEP -- which only
+     * traps a supervisor-mode EXECUTE from a User page -- cannot affect anything hype currently
+     * does; it is pure headroom against ever accidentally mapping something User-and-executable
+     * later. Per-AP-core application (each vCPU's own dispatch core) is a separate, still-open
+     * follow-up: this project's real per-vCPU AP entry point was not conclusively identified in
+     * the time available, and guessing wrong risks mutating CR4 on a core already mid-dispatch.
+     */
+    if (hype_cpu_has_smep(hype_cpu_leaf7_ebx())) {
+        uint64_t cr4;
+        __asm__ volatile("mov %%cr4, %0" : "=r"(cr4));
+        cr4 |= (1ull << 20); /* CR4.SMEP */
+        __asm__ volatile("mov %0, %%cr4" : : "r"(cr4) : "memory");
+        hype_debug_print("hype: CR4.SMEP enabled on the BSP [#604]\n");
+    } else {
+        hype_debug_print("hype: CR4.SMEP not available on this CPU -- skipped [#604]\n");
+    }
+
     /* M9-2 (#175): keep Runtime Services reachable post-EBS for the host reboot/off action.
      * Legal at physical addresses because hype never calls SetVirtualAddressMap. */
     g_runtime_services = SystemTable->RuntimeServices;

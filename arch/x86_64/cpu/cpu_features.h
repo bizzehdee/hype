@@ -108,4 +108,17 @@ uint32_t hype_cpu_leaf6_eax(void);
 uint32_t hype_cpu_leaf6_ecx(void);
 uint32_t hype_cpu_leaf80000007_edx(void);
 
+/*
+ * #604: SMEP (Supervisor Mode Execution Prevention), CPUID.(EAX=7,ECX=0):EBX bit 7. Present on
+ * both vendors since roughly 2013 (Intel Ivy Bridge / AMD Excavator onward); a CPU too old to have
+ * it just does not get the mitigation, same "the default when absent is off" shape as every other
+ * capability check on this page. Pure bit check; the leaf read is the exempt hw shim below.
+ */
+int hype_cpu_has_smep(uint32_t leaf7_ebx);
+
+/* Real CPUID.(EAX=7,ECX=0):EBX read, gated on the leaf existing first (same #370 discipline as
+ * leaf 6/0x80000007 above -- reading past the reported max leaf returns another leaf's contents).
+ * Exempt hw shim. */
+uint32_t hype_cpu_leaf7_ebx(void);
+
 #endif /* HYPE_ARCH_CPU_FEATURES_H */

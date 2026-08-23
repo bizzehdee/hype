@@ -102,8 +102,17 @@ static void test_therm_status_requires_the_dts_bit(void) {
 }
 
 
+/* #604: SMEP, CPUID.(EAX=7,ECX=0):EBX bit 7. Vendor-agnostic, unlike the pair above. */
+static void test_has_smep(void) {
+    CHECK_INT("bit 7 set", 1, hype_cpu_has_smep(1u << 7));
+    CHECK_INT("bit 7 clear", 0, hype_cpu_has_smep(~(1u << 7)));
+    CHECK_INT("a missing leaf 7 reads as zero and refuses", 0, hype_cpu_has_smep(0u));
+    CHECK_INT("an unrelated bit does not false-positive", 0, hype_cpu_has_smep(1u << 6));
+}
+
 int main(void) {
     test_therm_status_requires_the_dts_bit();
+    test_has_smep();
     test_vendor_from_string();
     test_has_vmx();
     test_has_svm();
