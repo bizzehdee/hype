@@ -607,23 +607,88 @@ static int ntfs_write_at(hype_fs_file_t *f, uint64_t offset, const void *src, un
                                    src, len);
 }
 
+/* #692: namespace mutation (create/unlink/mkdir/rmdir/rename), over
+ * #423-#425's path-based wrappers. `set_time` supplies a real NTFS
+ * FILETIME (100ns intervals since 1601-01-01) derived from the same
+ * hype_rtc_time_t every other driver's set_time receives -- never a
+ * fixed or zero epoch, matching #253's fix. `usn` just needs to be
+ * nonzero and not 0xFFFF for each write; a simple incrementing counter
+ * is enough since hype writes to one volume at a time, never concurrently.
+ *
+ * Deliberately NOT wired here: append/write-past-EOF. A file namespace
+ * op creates a RESIDENT, empty $DATA (#423) -- exactly the shape
+ * hype_ntfs_resolve() (and so ntfs_map_ranges/ntfs_lookup) always refuses
+ * (decision 30) until something converts it non-resident (#422) or grows
+ * it (#418). Wiring that through this vtable needs the write handle to
+ * carry the file's own MFT record number, which TAG_RMAP does not --
+ * a real but separate piece of work, tracked as a #692 follow-up rather
+ * than rushed in here.
+ */
+static uint64_t g_ntfs_ns_filetime;
+static uint16_t g_ntfs_ns_usn = 2u;
+
+static uint16_t ntfs_next_usn(void) {
+    uint16_t v = g_ntfs_ns_usn;
+    g_ntfs_ns_usn++;
+    if (g_ntfs_ns_usn == 0u || g_ntfs_ns_usn == 0xFFFFu) {
+        g_ntfs_ns_usn = 2u;
+    }
+    return v;
+}
+
+static int ntfs_create(hype_fs_t *fs, const char *path, hype_fs_file_t *out) {
+    uint64_t rec_no;
+    if (hype_ntfs_create_path(&fs->u.ntfs, fs->write, path, g_ntfs_ns_filetime, &rec_no,
+                              ntfs_next_usn()) != 0) {
+        return -1;
+    }
+    /* the new file's $DATA is resident and empty -- ntfs_lookup() (via
+     * hype_ntfs_resolve()) correctly refuses it until something converts
+     * or grows it (see the vtable comment above). The create() ITSELF
+     * still succeeded: the file exists, is named, and is in its parent's
+     * index -- exactly what this slice's HYPE_FS_CAP_NAMESPACE promises. */
+    (void)ntfs_lookup(fs, path, out);
+    return 0;
+}
+static int ntfs_unlink(hype_fs_t *fs, const char *path) {
+    return hype_ntfs_unlink_path(&fs->u.ntfs, fs->write, path, ntfs_next_usn());
+}
+static int ntfs_mkdir(hype_fs_t *fs, const char *path) {
+    uint64_t rec_no;
+    return hype_ntfs_mkdir_path(&fs->u.ntfs, fs->write, path, g_ntfs_ns_filetime, &rec_no,
+                                ntfs_next_usn());
+}
+static int ntfs_rmdir(hype_fs_t *fs, const char *path) {
+    return hype_ntfs_rmdir_path(&fs->u.ntfs, fs->write, path, ntfs_next_usn());
+}
+static int ntfs_rename(hype_fs_t *fs, const char *from, const char *to) {
+    return hype_ntfs_rename_path(&fs->u.ntfs, fs->write, from, to, ntfs_next_usn());
+}
+static void ntfs_set_time(hype_fs_t *fs, const hype_rtc_time_t *now) {
+    /* FILETIME = 100ns intervals since 1601-01-01; hype_rtc_to_unix() gives
+     * seconds since 1970-01-01 -- 11644473600 is the gap between those two
+     * epochs, in seconds (a standard, well-known constant, not derived). */
+    (void)fs;
+    g_ntfs_ns_filetime = ((uint64_t)hype_rtc_to_unix(now) + 11644473600ull) * 10000000ull;
+}
+
 static const hype_fs_ops_t ntfs_ops = {
     "ntfs",
-    HYPE_FS_CAP_READ | HYPE_FS_CAP_WRITE_INPLACE | HYPE_FS_CAP_SPARSE,
+    HYPE_FS_CAP_READ | HYPE_FS_CAP_WRITE_INPLACE | HYPE_FS_CAP_SPARSE | HYPE_FS_CAP_NAMESPACE,
     ntfs_probe,
     ntfs_mount,
     ntfs_lookup,
     ntfs_map_ranges,
     rmap_read_at,
     ntfs_write_at,
-    0, /* append: growth is out of scope, permanently (decision 30) */
-    0, /* create */
-    0, /* unlink */
-    0, /* mkdir */
-    0, /* rmdir */
-    0, /* rename */
-    0, /* sync */
-    0, /* set_time */
+    0, /* append: see the comment above ntfs_create() */
+    ntfs_create,
+    ntfs_unlink,
+    ntfs_mkdir,
+    ntfs_rmdir,
+    ntfs_rename,
+    0, /* sync: every #423-#425 op already commits durably before returning */
+    ntfs_set_time,
     0, /* set_barrier */
 };
 

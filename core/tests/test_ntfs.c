@@ -593,9 +593,9 @@ static void test_fs_ops_ntfs(void) {
     build_vol(0);
     CHECK_HEX("auto-mount claims ntfs", 0, hype_fs_mount_auto(&fs, vol_read, vol_write, 0));
     CHECK("driver name", strcmp(fs.ops->name, "ntfs") == 0);
-    CHECK("caps: read + in-place + sparse, nothing else",
-          hype_fs_caps(&fs) ==
-              (HYPE_FS_CAP_READ | HYPE_FS_CAP_WRITE_INPLACE | HYPE_FS_CAP_SPARSE));
+    CHECK("caps: read + in-place + sparse + namespace (#692), nothing else",
+          hype_fs_caps(&fs) == (HYPE_FS_CAP_READ | HYPE_FS_CAP_WRITE_INPLACE |
+                                HYPE_FS_CAP_SPARSE | HYPE_FS_CAP_NAMESPACE));
 
     CHECK_HEX("lookup", 0, hype_fs_lookup(&fs, "/img.bin", &f));
     CHECK_HEX("size", 4300, f.size);
@@ -624,9 +624,10 @@ static void test_fs_ops_ntfs(void) {
     CHECK("write into unwritten refused", hype_fs_write_at(&f, 2000, buf, 8) != 0);
     CHECK("write into initialized prefix ok", hype_fs_write_at(&f, 10, buf, 8) == 0);
 
-    /* growth/namespace are absent, not stubbed */
+    /* append/growth are absent, not stubbed (#692's vtable comment above
+     * ntfs_create() explains why); namespace mutation (#692) now works */
     CHECK("append refused", hype_fs_append(&f, buf, 1) != 0);
-    CHECK("create refused", hype_fs_create(&fs, "/x", &f) != 0);
+    CHECK_HEX("create via vtable", 0, hype_fs_create(&fs, "/x", &f));
     CHECK("write past EOF refused", hype_fs_write_at(&f, f.size - 2, buf, 8) != 0);
 
     /* read-only mount masks the write capability */
@@ -2439,6 +2440,42 @@ static void test_rename(void) {
           hype_ntfs_rename(&fs, vol_write, 45, "nested.bin", 10, 45, "x.bin", 0, 2) != 0);
 }
 
+/* #692: path-based wrappers over #423-#425. */
+static void test_path_wrappers(void) {
+    hype_ntfs_t fs;
+    uint64_t rec_no, pdir_rec;
+
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK_HEX("mkdir via path", 0,
+              hype_ntfs_mkdir_path(&fs, vol_write, "/subdir/pdir", 1, &pdir_rec, 2));
+    CHECK("pdir present under subdir", entry_offset_by_name(&fs, 45, "pdir") != (uint32_t)~0u);
+
+    CHECK_HEX("create via path", 0,
+              hype_ntfs_create_path(&fs, vol_write, "/subdir/pdir/pfile.bin", 1, &rec_no, 3));
+    CHECK("pfile present under pdir",
+          entry_offset_by_name(&fs, (unsigned)pdir_rec, "pfile.bin") != (uint32_t)~0u);
+
+    CHECK_HEX("rename via path", 0,
+              hype_ntfs_rename_path(&fs, vol_write, "/subdir/pdir/pfile.bin",
+                                    "/subdir/pfile2.bin", 4));
+    CHECK("pfile2 present under subdir",
+          entry_offset_by_name(&fs, 45, "pfile2.bin") != (uint32_t)~0u);
+
+    CHECK_HEX("unlink via path", 0, hype_ntfs_unlink_path(&fs, vol_write, "/subdir/pfile2.bin", 5));
+    CHECK("pfile2 gone", entry_offset_by_name(&fs, 45, "pfile2.bin") == (uint32_t)~0u);
+
+    CHECK_HEX("rmdir via path", 0, hype_ntfs_rmdir_path(&fs, vol_write, "/subdir/pdir", 6));
+    CHECK("pdir gone", entry_offset_by_name(&fs, 45, "pdir") == (uint32_t)~0u);
+
+    /* refusals */
+    CHECK("create with no parent refused",
+          hype_ntfs_create_path(&fs, vol_write, "/nosuch/x.bin", 1, &rec_no, 7) != 0);
+    CHECK("create at bare root refused (no parent to split into)",
+          hype_ntfs_create_path(&fs, vol_write, "/", 1, &rec_no, 7) != 0);
+    CHECK("NULL fs refused", hype_ntfs_create_path(0, vol_write, "/x.bin", 1, &rec_no, 7) != 0);
+}
+
 int main(void) {
     test_probe();
     test_mount_refusals();
@@ -2461,6 +2498,7 @@ int main(void) {
     test_create_unlink();
     test_mkdir_rmdir();
     test_rename();
+    test_path_wrappers();
 
     if (failures == 0) {
         printf("test_ntfs: all tests passed\n");

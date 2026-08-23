@@ -359,4 +359,24 @@ int hype_ntfs_rename(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t src_pare
                      const char *src_name, uint32_t src_name_len, uint64_t dst_parent,
                      const char *dst_name, uint32_t dst_name_len, uint16_t usn);
 
+/*
+ * #692: path-based wrappers over #423/#424/#425's (dir_rec, name) writer
+ * primitives, splitting `path` into "every component but the last, walked
+ * as directories via the same dir_lookup() hype_ntfs_resolve() itself
+ * uses" and "the final component" -- so NTFS can be driven by the same
+ * ASCII-path calling convention as every other host-FS driver
+ * (core/fs_ops.h's hype_fs_ops_t vtable), instead of every caller needing
+ * to know MFT record numbers.
+ */
+int hype_ntfs_create_path(hype_ntfs_t *fs, hype_blk_write_fn write, const char *path,
+                          uint64_t timestamp_filetime, uint64_t *out_rec_no, uint16_t usn);
+int hype_ntfs_unlink_path(hype_ntfs_t *fs, hype_blk_write_fn write, const char *path,
+                          uint16_t usn);
+int hype_ntfs_mkdir_path(hype_ntfs_t *fs, hype_blk_write_fn write, const char *path,
+                         uint64_t timestamp_filetime, uint64_t *out_rec_no, uint16_t usn);
+int hype_ntfs_rmdir_path(hype_ntfs_t *fs, hype_blk_write_fn write, const char *path,
+                         uint16_t usn);
+int hype_ntfs_rename_path(hype_ntfs_t *fs, hype_blk_write_fn write, const char *from,
+                          const char *to, uint16_t usn);
+
 #endif /* HYPE_CORE_NTFS_H */

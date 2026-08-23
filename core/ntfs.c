@@ -2661,3 +2661,121 @@ int hype_ntfs_rename(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t src_pare
     }
     return 0;
 }
+
+
+/* ---- #692: path-based wrappers -------------------------------------------- */
+
+/* Splits `path` into the record of every component but the last (walked as
+ * directories, exactly like hype_ntfs_resolve()) and the final component
+ * itself. *out_name points INTO `path` -- it is not copied. */
+static int resolve_parent_and_name(hype_ntfs_t *fs, const char *path, uint64_t *out_dir_rec,
+                                   const char **out_name, uint32_t *out_name_len) {
+    uint64_t rec_no = REC_ROOT;
+    uint32_t p = 0;
+    int isdir = 1;
+    uint32_t last_start, last_len;
+
+    if (fs->upcase_loaded == 0 || path == 0) {
+        return -1;
+    }
+    while (path[p] == '/' || path[p] == '\\') {
+        p++;
+    }
+    if (path[p] == 0) {
+        return -1; /* the root itself has no parent to split into */
+    }
+
+    for (;;) {
+        uint32_t start = p, nlen, q;
+        while (path[p] != 0 && path[p] != '/' && path[p] != '\\') {
+            p++;
+        }
+        nlen = p - start;
+        q = p;
+        while (path[q] == '/' || path[q] == '\\') {
+            q++;
+        }
+        if (path[q] == 0) {
+            last_start = start;
+            last_len = nlen;
+            break;
+        }
+        p = q;
+        if (nlen == 0u || nlen > 255u || !isdir) {
+            return -1;
+        }
+        {
+            uint64_t ref;
+            if (dir_lookup(fs, rec_no, path + start, nlen, &ref, &isdir) != 1) {
+                return -1;
+            }
+            rec_no = ref;
+        }
+    }
+    if (!isdir || last_len == 0u || last_len > 255u) {
+        return -1;
+    }
+    *out_dir_rec = rec_no;
+    *out_name = path + last_start;
+    *out_name_len = last_len;
+    return 0;
+}
+
+int hype_ntfs_create_path(hype_ntfs_t *fs, hype_blk_write_fn write, const char *path,
+                          uint64_t timestamp_filetime, uint64_t *out_rec_no, uint16_t usn) {
+    uint64_t dir_rec;
+    const char *name;
+    uint32_t name_len;
+    if (fs == 0 || resolve_parent_and_name(fs, path, &dir_rec, &name, &name_len) != 0) {
+        return -1;
+    }
+    return hype_ntfs_create(fs, write, dir_rec, name, name_len, timestamp_filetime, out_rec_no,
+                            usn);
+}
+
+int hype_ntfs_unlink_path(hype_ntfs_t *fs, hype_blk_write_fn write, const char *path,
+                          uint16_t usn) {
+    uint64_t dir_rec;
+    const char *name;
+    uint32_t name_len;
+    if (fs == 0 || resolve_parent_and_name(fs, path, &dir_rec, &name, &name_len) != 0) {
+        return -1;
+    }
+    return hype_ntfs_unlink(fs, write, dir_rec, name, name_len, usn);
+}
+
+int hype_ntfs_mkdir_path(hype_ntfs_t *fs, hype_blk_write_fn write, const char *path,
+                         uint64_t timestamp_filetime, uint64_t *out_rec_no, uint16_t usn) {
+    uint64_t dir_rec;
+    const char *name;
+    uint32_t name_len;
+    if (fs == 0 || resolve_parent_and_name(fs, path, &dir_rec, &name, &name_len) != 0) {
+        return -1;
+    }
+    return hype_ntfs_mkdir(fs, write, dir_rec, name, name_len, timestamp_filetime, out_rec_no,
+                           usn);
+}
+
+int hype_ntfs_rmdir_path(hype_ntfs_t *fs, hype_blk_write_fn write, const char *path,
+                         uint16_t usn) {
+    uint64_t dir_rec;
+    const char *name;
+    uint32_t name_len;
+    if (fs == 0 || resolve_parent_and_name(fs, path, &dir_rec, &name, &name_len) != 0) {
+        return -1;
+    }
+    return hype_ntfs_rmdir(fs, write, dir_rec, name, name_len, usn);
+}
+
+int hype_ntfs_rename_path(hype_ntfs_t *fs, hype_blk_write_fn write, const char *from,
+                          const char *to, uint16_t usn) {
+    uint64_t src_dir, dst_dir;
+    const char *src_name, *dst_name;
+    uint32_t src_len, dst_len;
+    if (fs == 0 || resolve_parent_and_name(fs, from, &src_dir, &src_name, &src_len) != 0 ||
+        resolve_parent_and_name(fs, to, &dst_dir, &dst_name, &dst_len) != 0) {
+        return -1;
+    }
+    return hype_ntfs_rename(fs, write, src_dir, src_name, src_len, dst_dir, dst_name, dst_len,
+                            usn);
+}
