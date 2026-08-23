@@ -279,4 +279,33 @@ int hype_ntfs_index_delete(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t di
 int hype_ntfs_data_to_nonresident(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t rec_no,
                                   uint64_t new_size, uint16_t usn);
 
+/*
+ * #423: create and unlink a regular file, composed entirely from #417-#421's
+ * primitives (allocate an MFT record, build its base attributes, link it
+ * into the parent's index; reverse on unlink).
+ *
+ * hype_ntfs_create(): allocates an MFT record (#420), appends
+ * $STANDARD_INFORMATION and $FILE_NAME (both resident, real caller-supplied
+ * FILETIME timestamps -- never a fixed or zero epoch, per #253's fix this
+ * mirrors) and an empty resident $DATA, then inserts the $FILE_NAME key
+ * into the parent directory's index (#421). Only ever creates ONE
+ * $FILE_NAME (WIN32 namespace) -- no separate 8.3 DOS name, so there is
+ * nothing for unlink to reconcile across multiple names for a file this
+ * function itself created. Refuses (rolling back the MFT record it just
+ * allocated) if the index insert fails, e.g. a duplicate name.
+ *
+ * hype_ntfs_unlink(): finds the file via the parent's index, removes that
+ * index entry, decrements the target's hard-link count, and -- only once
+ * it reaches zero -- releases every DATA range's clusters (resident $DATA
+ * owns none) and frees the MFT record. A file with more than one
+ * $FILE_NAME entry (e.g. an alias inserted directly via
+ * hype_ntfs_index_insert(), not through this function) is therefore left
+ * fully intact by unlinking any one name, exactly like a real hard link.
+ */
+int hype_ntfs_create(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t parent_dir_rec,
+                     const char *name, uint32_t name_len, uint64_t timestamp_filetime,
+                     uint64_t *out_rec_no, uint16_t usn);
+int hype_ntfs_unlink(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t parent_dir_rec,
+                     const char *name, uint32_t name_len, uint16_t usn);
+
 #endif /* HYPE_CORE_NTFS_H */

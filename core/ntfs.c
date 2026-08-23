@@ -2164,3 +2164,211 @@ int hype_ntfs_data_to_nonresident(hype_ntfs_t *fs, hype_blk_write_fn write, uint
 
     return hype_ntfs_record_write(fs, write, rec_no, rec, usn);
 }
+
+
+/* ---- #423: create and unlink a regular file ------------------------------ */
+
+/* Appends a new RESIDENT attribute at the end of the record's attribute
+ * chain (right where the current end-of-attributes marker sits), refusing
+ * if it would not fit. *out_attr_off is the new attribute's own offset. */
+static int record_attr_append_resident(uint8_t *rec, uint32_t mft_record_size, uint32_t type,
+                                       const uint8_t *value, uint32_t value_len,
+                                       uint32_t *out_attr_off) {
+    uint32_t attrs_off = hype_rd16(rec + 0x14);
+    uint32_t new_len = round_up_8(0x18u + value_len);
+    uint32_t end_marker_pos = attrs_off;
+    uint32_t i;
+
+    for (;;) {
+        ntfs_attr_t tmp;
+        int rc = attr_parse(rec, mft_record_size, end_marker_pos, &tmp);
+        if (rc == 1) {
+            break;
+        }
+        if (rc != 0) {
+            return -1;
+        }
+        end_marker_pos += tmp.length;
+    }
+    if (end_marker_pos + new_len + 4u > mft_record_size) {
+        return -1; /* no room: real create() into a packed record fails cleanly */
+    }
+
+    for (i = 0; i < new_len; i++) {
+        rec[end_marker_pos + i] = 0u;
+    }
+    hype_wr32(rec + end_marker_pos + 0, type);
+    hype_wr32(rec + end_marker_pos + 4, new_len);
+    rec[end_marker_pos + 8] = 0u; /* resident */
+    hype_wr32(rec + end_marker_pos + 0x10, value_len);
+    hype_wr16(rec + end_marker_pos + 0x14, 0x18u); /* val_off */
+    for (i = 0; i < value_len; i++) {
+        rec[end_marker_pos + 0x18u + i] = value[i];
+    }
+    hype_wr32(rec + end_marker_pos + new_len, 0xFFFFFFFFu); /* new end marker */
+    hype_wr32(rec + 0x18, end_marker_pos + new_len + 4u);
+    *out_attr_off = end_marker_pos;
+    return 0;
+}
+
+int hype_ntfs_create(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t parent_dir_rec,
+                     const char *name, uint32_t name_len, uint64_t timestamp_filetime,
+                     uint64_t *out_rec_no, uint16_t usn) {
+    uint8_t rec[HYPE_NTFS_MAX_RECORD];
+    uint8_t si[0x30];
+    uint8_t fn[0x42u + 255u * 2u];
+    uint32_t fn_len;
+    uint64_t rec_no;
+    uint16_t seq;
+    uint32_t attr_off;
+    unsigned i;
+
+    if (fs == 0 || write == 0 || name == 0 || name_len == 0u || name_len > 255u ||
+        out_rec_no == 0) {
+        return -1;
+    }
+    if (hype_ntfs_mft_record_alloc(fs, write, 0, &rec_no, &seq, usn) != 0) {
+        return -1;
+    }
+    if (record_read(fs, rec_no, rec) != 0) {
+        (void)hype_ntfs_mft_record_free(fs, write, rec_no, usn);
+        return -1;
+    }
+
+    for (i = 0; i < sizeof si; i++) {
+        si[i] = 0u;
+    }
+    hype_wr64(si + 0x00, timestamp_filetime); /* creation time */
+    hype_wr64(si + 0x08, timestamp_filetime); /* modification time */
+    hype_wr64(si + 0x10, timestamp_filetime); /* MFT change time */
+    hype_wr64(si + 0x18, timestamp_filetime); /* access time */
+    hype_wr32(si + 0x20, 0x20u);              /* FILE_ATTRIBUTE_ARCHIVE */
+    if (record_attr_append_resident(rec, fs->mft_record_size, AT_STANDARD_INFORMATION, si,
+                                    sizeof si, &attr_off) != 0) {
+        (void)hype_ntfs_mft_record_free(fs, write, rec_no, usn);
+        return -1;
+    }
+
+    fn_len = 0x42u + name_len * 2u;
+    for (i = 0; i < fn_len; i++) {
+        fn[i] = 0u;
+    }
+    hype_wr64(fn + 0x00, parent_dir_rec & 0x0000FFFFFFFFFFFFull);
+    hype_wr64(fn + 0x08, timestamp_filetime);
+    hype_wr64(fn + 0x10, timestamp_filetime);
+    hype_wr64(fn + 0x18, timestamp_filetime);
+    hype_wr64(fn + 0x20, timestamp_filetime);
+    hype_wr32(fn + 0x38, 0x20u); /* FILE_ATTRIBUTE_ARCHIVE */
+    fn[0x40] = (uint8_t)name_len;
+    fn[0x41] = 1u; /* WIN32 namespace */
+    for (i = 0; i < name_len; i++) {
+        hype_wr16(fn + 0x42 + i * 2u, (uint16_t)(uint8_t)name[i]);
+    }
+    if (record_attr_append_resident(rec, fs->mft_record_size, AT_FILE_NAME, fn, fn_len,
+                                    &attr_off) != 0) {
+        (void)hype_ntfs_mft_record_free(fs, write, rec_no, usn);
+        return -1;
+    }
+
+    if (record_attr_append_resident(rec, fs->mft_record_size, AT_DATA, 0, 0u, &attr_off) != 0) {
+        (void)hype_ntfs_mft_record_free(fs, write, rec_no, usn);
+        return -1;
+    }
+    hype_wr16(rec + 0x12, 1u); /* hard link count */
+
+    if (hype_ntfs_record_write(fs, write, rec_no, rec, usn) != 0) {
+        (void)hype_ntfs_mft_record_free(fs, write, rec_no, usn);
+        return -1;
+    }
+    if (hype_ntfs_index_insert(fs, write, parent_dir_rec, rec_no, name, name_len, 0, usn) != 0) {
+        (void)hype_ntfs_mft_record_free(fs, write, rec_no, usn);
+        return -1;
+    }
+
+    *out_rec_no = rec_no;
+    return 0;
+}
+
+/* Releases every DATA range's clusters for record `rec_no`'s unnamed
+ * $DATA, if any -- resident owns none, and an $ATTRIBUTE_LIST-split
+ * stream is refused (mirrors the write-side scope boundary throughout
+ * this epic; unlink() only ever meets what hype_ntfs_create() built). */
+static int release_data_clusters(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t rec_no) {
+    uint8_t rec[HYPE_NTFS_MAX_RECORD];
+    ntfs_attr_t a, dup;
+    uint32_t cur = 0;
+    static hype_file_rmap_t m;
+    uint64_t lcn_cursor = 0;
+    unsigned i;
+
+    if (record_read(fs, rec_no, rec) != 0) {
+        return -1;
+    }
+    cur = 0;
+    if (attr_find(rec, fs->mft_record_size, AT_ATTRIBUTE_LIST, &cur, &dup) == 0) {
+        return -1;
+    }
+    cur = 0;
+    if (attr_find(rec, fs->mft_record_size, AT_DATA, &cur, &a) != 0) {
+        return -1; /* every hype_ntfs_create()'d file has one */
+    }
+    if (!a.non_resident) {
+        return 0; /* resident: no clusters to release */
+    }
+    hype_file_rmap_init(&m, 0);
+    if (runlist_decode(fs, rec + (cur - a.length) + a.rl_off, a.length - a.rl_off, &m,
+                       &lcn_cursor) != 0) {
+        return -1;
+    }
+    for (i = 0; i < m.count; i++) {
+        if (m.ranges[i].kind == HYPE_RANGE_DATA) {
+            uint64_t lcn = m.ranges[i].start_lba / fs->spc;
+            uint64_t count = m.ranges[i].sector_count / fs->spc;
+            if (hype_ntfs_cluster_free(fs, write, lcn, count) != 0) {
+                return -1;
+            }
+        }
+    }
+    return 0;
+}
+
+int hype_ntfs_unlink(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t parent_dir_rec,
+                     const char *name, uint32_t name_len, uint16_t usn) {
+    uint8_t rec[HYPE_NTFS_MAX_RECORD];
+    uint64_t ref;
+    int isdir;
+    uint16_t links;
+
+    if (fs == 0 || write == 0 || name == 0 || name_len == 0u) {
+        return -1;
+    }
+    if (dir_lookup(fs, parent_dir_rec, name, name_len, &ref, &isdir) != 1) {
+        return -1; /* no such name */
+    }
+    if (isdir) {
+        return -1; /* unlink is for regular files; #425 handles directories */
+    }
+    if (hype_ntfs_index_delete(fs, write, parent_dir_rec, name, name_len, usn) != 0) {
+        return -1;
+    }
+
+    if (record_read(fs, ref, rec) != 0) {
+        return -1; /* index said it existed; the record itself is broken */
+    }
+    links = hype_rd16(rec + 0x12);
+    if (links > 0u) {
+        links--;
+    }
+    hype_wr16(rec + 0x12, links);
+    if (hype_ntfs_record_write(fs, write, ref, rec, usn) != 0) {
+        return -1;
+    }
+    if (links != 0u) {
+        return 0; /* another name still references this record */
+    }
+
+    if (release_data_clusters(fs, write, ref) != 0) {
+        return -1;
+    }
+    return hype_ntfs_mft_record_free(fs, write, ref, usn);
+}

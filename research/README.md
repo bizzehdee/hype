@@ -349,6 +349,31 @@ readable under the new name (correct inode), and deleting the original
 name left the alias intact and fully accessible -- both via a REAL
 `ntfs-3g` mount, not just hype's own resolver.
 
+## Test helper trap: reading raw record bytes without fixup_apply() (#423)
+
+Not a hype bug, but a test-harness one worth recording so it isn't
+re-learned the hard way: `core/tests/test_ntfs.c` had a helper
+(`entry_offset_by_name`, added for #421) that peeked at a record's bytes
+directly (`rec_ptr(n)`, a raw pointer into the fixture's backing buffer)
+instead of going through `hype_ntfs_record_read()`. For most positions
+this is harmless, but the on-disk bytes at every sector's last 2 bytes
+(offset 510-511 and 1022-1023 of a 1024-byte, 2-sector record) are USA
+fixup territory: `hype_ntfs_record_write()` legitimately overwrites them
+with the USN, saving the real bytes into the update sequence array, and
+only `fixup_apply()` (called by `hype_ntfs_record_read()`) restores them.
+A new #423 test happened to insert a directory entry whose last 2 bytes
+landed exactly on such a boundary, and the raw-peek helper read the
+stamped USN there instead of the real bytes -- looking exactly like data
+corruption. It wasn't: `hype_ntfs_index_insert()`'s own in-memory
+splice was byte-perfect (confirmed by temporarily dumping it before the
+fixup-stamping write), and the production read paths
+(`hype_ntfs_unlink()`'s internal `dir_lookup()`, which does go through
+`record_read()`) found the entry correctly the whole time. Fixed by
+making the test helper call `hype_ntfs_record_read()` too. **Any test
+helper that inspects a record's raw bytes directly, instead of through
+the read API, will occasionally "see" fixup corruption that was never
+really there** -- always read through `hype_ntfs_record_read()`.
+
 ## NTFS $LogFile / USN journal (#416)
 
 #416 (plan.md §10 decision 64) descoped `$LogFile` replay entirely: Microsoft's LFS (Log File

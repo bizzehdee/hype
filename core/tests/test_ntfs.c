@@ -1998,9 +1998,20 @@ static void test_mft_alloc(void) {
  * entry is findable via linear scan, not that it landed in the right
  * collated position (a real ntfs-3g driver's own lookup does care, unlike
  * hype's own deliberately-linear dir_lookup()). */
-static uint32_t entry_offset_by_name(unsigned rec_no, const char *name) {
-    uint8_t *rec = rec_ptr(rec_no);
-    uint32_t attrs_off = get16(rec + 0x14);
+static uint32_t entry_offset_by_name(hype_ntfs_t *fs, unsigned rec_no, const char *name) {
+    uint8_t rec_buf[REC_SIZE];
+    uint8_t *rec = rec_buf;
+    uint32_t attrs_off;
+    /* MUST go through hype_ntfs_record_read(), not a raw rec_ptr() peek:
+     * the on-disk sector tails are fixup (USA) territory -- the real bytes
+     * there are only restored by fixup_apply(), which record_read() calls
+     * and a raw g_vol read does not. A raw peek near a sector boundary
+     * (byte 512/1024 for a 2-sector, 1024-byte record) sees the stamped
+     * USN, not the real content, and wrongly looks corrupted. */
+    if (hype_ntfs_record_read(fs, rec_no, rec) != 0) {
+        return (uint32_t)~0u;
+    }
+    attrs_off = get16(rec + 0x14);
     uint32_t off = attrs_off;
     uint32_t nlen = (uint32_t)strlen(name);
     for (;;) {
@@ -2110,9 +2121,9 @@ static void test_index_insert_delete(void) {
      * dir_lookup() never caught it -- only a real ntfs-3g mount's lookup by
      * path did, "No such file or directory" despite `ls` listing the name). */
     {
-        uint32_t off_aaa = entry_offset_by_name(45, "aaa.bin");
-        uint32_t off_mmm = entry_offset_by_name(45, "mmm.bin");
-        uint32_t off_zzz = entry_offset_by_name(45, "zzz.bin");
+        uint32_t off_aaa = entry_offset_by_name(&fs, 45, "aaa.bin");
+        uint32_t off_mmm = entry_offset_by_name(&fs, 45, "mmm.bin");
+        uint32_t off_zzz = entry_offset_by_name(&fs, 45, "zzz.bin");
         CHECK("aaa found on disk", off_aaa != (uint32_t)~0u);
         CHECK("mmm found on disk", off_mmm != (uint32_t)~0u);
         CHECK("zzz found on disk", off_zzz != (uint32_t)~0u);
@@ -2197,6 +2208,99 @@ static void test_data_to_nonresident(void) {
     CHECK("NULL write refused", hype_ntfs_data_to_nonresident(&fs, 0, 44, 5000, 2) != 0);
 }
 
+/* #423: create and unlink a regular file. subdir (record 45) is resident,
+ * roomy, and empty enough to create into. */
+static void test_create_unlink(void) {
+    hype_ntfs_t fs;
+    hype_file_rmap_t m;
+    uint64_t rec_no;
+
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("newfile not found before create",
+          hype_ntfs_resolve(&fs, "/subdir/newfile.bin", &m) != 0);
+    CHECK_HEX("create", 0,
+              hype_ntfs_create(&fs, vol_write, 45, "newfile.bin", 11, 0x01D0DE6B0A0000ULL,
+                               &rec_no, 2));
+    /* a freshly created file's $DATA is resident and empty -- resolve()
+     * correctly refuses ANY resident $DATA (decision 30); existence is
+     * checked via the directory entry itself instead, the same way #421's
+     * tests do for on-disk structure that resolve() cannot speak to. */
+    CHECK("newfile has a directory entry now",
+          entry_offset_by_name(&fs, 45, "newfile.bin") != (uint32_t)~0u);
+    CHECK_HEX("original entries unaffected", 0, hype_ntfs_resolve(&fs, "/subdir/nested.bin", &m));
+
+    /* the new record is well-formed: FILE magic, in use, not a directory,
+     * hard link count 1, $STANDARD_INFORMATION + $FILE_NAME + $DATA */
+    {
+        uint8_t rec[REC_SIZE];
+        CHECK_HEX("record readable", 0, hype_ntfs_record_read(&fs, rec_no, rec));
+        CHECK("not a directory", (get16(rec + 0x16) & 0x0002u) == 0u);
+        CHECK_HEX("hard link count", 1, get16(rec + 0x12));
+    }
+
+    /* duplicate create refused (name already exists) */
+    CHECK("duplicate create refused",
+          hype_ntfs_create(&fs, vol_write, 45, "newfile.bin", 11, 1, &rec_no, 3) != 0);
+
+    /* unlink: name gone, siblings unaffected, record freed */
+    CHECK_HEX("unlink", 0, hype_ntfs_unlink(&fs, vol_write, 45, "newfile.bin", 11, 4));
+    CHECK("newfile's directory entry gone after unlink",
+          entry_offset_by_name(&fs, 45, "newfile.bin") == (uint32_t)~0u);
+    CHECK_HEX("sibling unaffected", 0, hype_ntfs_resolve(&fs, "/subdir/nested.bin", &m));
+    CHECK("unlinking it again refused",
+          hype_ntfs_unlink(&fs, vol_write, 45, "newfile.bin", 11, 5) != 0);
+
+    /* the freed record can be reused by a fresh create */
+    CHECK_HEX("recreate after unlink", 0,
+              hype_ntfs_create(&fs, vol_write, 45, "again.bin", 9, 1, &rec_no, 6));
+    CHECK("recreated has a directory entry now",
+          entry_offset_by_name(&fs, 45, "again.bin") != (uint32_t)~0u);
+
+    /* create-then-grow-then-unlink releases the file's clusters back to
+     * $Bitmap: a pristine bitmap's first allocation always lands at LCN 0,
+     * so freeing everything this file owns must make LCN 0 available
+     * again for the exact same size. */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK_HEX("create big", 0,
+              hype_ntfs_create(&fs, vol_write, 45, "big.bin", 7, 1, &rec_no, 2));
+    /* a fresh create()'s $DATA is resident (empty) -- grow it via #422
+     * (resident-to-non-resident), the intended composition for a file
+     * that needs backing clusters, not #418's append (which only ever
+     * operates on an already-non-resident stream). */
+    CHECK_HEX("grow to non-resident", 0,
+              hype_ntfs_data_to_nonresident(&fs, vol_write, rec_no, 5u * SECSZ, 3));
+    CHECK_HEX("unlink big", 0, hype_ntfs_unlink(&fs, vol_write, 45, "big.bin", 7, 4));
+    {
+        uint64_t lcn;
+        CHECK_HEX("clusters released back to $Bitmap", 0,
+                  hype_ntfs_cluster_alloc(&fs, vol_write, 5u, &lcn));
+        CHECK_HEX("reallocates the exact same range", 0, lcn);
+    }
+
+    /* refusals */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("create into a non-directory refused (img.bin, record 40)",
+          hype_ntfs_create(&fs, vol_write, 40, "x.bin", 5, 1, &rec_no, 2) != 0);
+    CHECK("create NULL fs refused", hype_ntfs_create(0, vol_write, 45, "x.bin", 5, 1, &rec_no,
+                                                     2) != 0);
+    CHECK("create NULL write refused",
+          hype_ntfs_create(&fs, 0, 45, "x.bin", 5, 1, &rec_no, 2) != 0);
+    CHECK("create NULL out_rec_no refused",
+          hype_ntfs_create(&fs, vol_write, 45, "x.bin", 5, 1, 0, 2) != 0);
+    CHECK("create zero-length name refused",
+          hype_ntfs_create(&fs, vol_write, 45, "x.bin", 0, 1, &rec_no, 2) != 0);
+    CHECK("unlink a missing name refused",
+          hype_ntfs_unlink(&fs, vol_write, 45, "nope.bin", 8, 2) != 0);
+    CHECK("unlink a directory refused (bigdir, via root)",
+          hype_ntfs_unlink(&fs, vol_write, 5, "bigdir", 6, 2) != 0);
+    CHECK("unlink NULL fs refused", hype_ntfs_unlink(0, vol_write, 45, "nested.bin", 10, 2) != 0);
+    CHECK("unlink NULL write refused",
+          hype_ntfs_unlink(&fs, 0, 45, "nested.bin", 10, 2) != 0);
+}
+
 int main(void) {
     test_probe();
     test_mount_refusals();
@@ -2216,6 +2320,7 @@ int main(void) {
     test_mft_alloc();
     test_index_insert_delete();
     test_data_to_nonresident();
+    test_create_unlink();
 
     if (failures == 0) {
         printf("test_ntfs: all tests passed\n");
