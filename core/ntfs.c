@@ -1023,3 +1023,190 @@ int hype_ntfs_cluster_free(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t lc
     }
     return bitmap_set_run(fs, write, lcn, count, 0);
 }
+
+/* ---- #418: append/grow a $DATA stream ----------------------------------- */
+
+/* Walks a raw mapping-pairs byte range the same way runlist_decode() does,
+ * but only to find where the terminator (0x00) sits and what the final
+ * absolute LCN cursor is -- the two things an append needs and a full
+ * decode-to-rmap does not expose. */
+static int runlist_find_end(const uint8_t *rl, uint32_t rl_bytes, uint32_t *out_end,
+                            int64_t *out_lcn_cursor) {
+    uint32_t p = 0;
+    int64_t lcn = 0;
+
+    while (p < rl_bytes && rl[p] != 0u) {
+        uint32_t len_sz = rl[p] & 0x0Fu;
+        uint32_t off_sz = (rl[p] >> 4) & 0x0Fu;
+        int64_t off = 0;
+        uint32_t i;
+
+        p++;
+        if (len_sz == 0u || len_sz > 8u || off_sz > 8u) return -1;
+        if (p + len_sz + off_sz > rl_bytes) return -1;
+        p += len_sz;
+        if (off_sz != 0u) {
+            for (i = 0; i < off_sz; i++) off |= (int64_t)((uint64_t)rl[p + i] << (8u * i));
+            if (rl[p + off_sz - 1u] & 0x80u) off -= (int64_t)((uint64_t)1u << (8u * off_sz));
+            p += off_sz;
+            lcn += off;
+        }
+    }
+    if (p >= rl_bytes) {
+        return -1; /* ran off the end without ever finding a terminator */
+    }
+    *out_end = p;
+    *out_lcn_cursor = lcn;
+    return 0;
+}
+
+/* Fewest bytes (1..8) needed to hold unsigned `v` little-endian. */
+static uint32_t min_bytes_unsigned(uint64_t v) {
+    uint32_t n = 1;
+    v >>= 8;
+    while (v != 0u && n < 8u) {
+        n++;
+        v >>= 8;
+    }
+    return n;
+}
+
+/* Fewest bytes (1..8) needed to hold signed `v` two's-complement
+ * little-endian such that sign-extending byte n-1 reproduces `v` exactly. */
+static uint32_t min_bytes_signed(int64_t v) {
+    uint32_t n;
+    for (n = 1; n < 8u; n++) {
+        int64_t lo = -((int64_t)1 << (8u * n - 1u));
+        int64_t hi = ((int64_t)1 << (8u * n - 1u)) - 1;
+        if (v >= lo && v <= hi) {
+            return n;
+        }
+    }
+    return 8u;
+}
+
+static uint32_t round_up_8(uint32_t v) { return (v + 7u) & ~7u; }
+
+int hype_ntfs_data_append(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t rec_no, uint64_t lcn,
+                          uint64_t cluster_count, uint64_t new_alloc_size, uint64_t new_real_size,
+                          uint64_t new_init_size, uint16_t usn) {
+    static uint8_t rec[HYPE_NTFS_MAX_RECORD];
+    ntfs_attr_t a;
+    ntfs_attr_t dup;
+    uint32_t cur = 0, dup_cur;
+    uint32_t attr_off;
+    uint32_t rl_end;
+    int64_t lcn_cursor;
+    int64_t lcn_delta;
+    uint32_t len_sz, off_sz, newrun_len;
+    uint8_t newrun[1u + 8u + 8u];
+    uint32_t content_end_before, new_content_len, new_attr_length, delta;
+    uint32_t bytes_used;
+    uint32_t i;
+
+    if (fs == 0 || write == 0 || cluster_count == 0u) {
+        return -1;
+    }
+    if (record_read(fs, rec_no, rec) != 0) {
+        return -1;
+    }
+    /* Out of scope: a $DATA stream already split across records. */
+    cur = 0;
+    if (attr_find(rec, fs->mft_record_size, AT_ATTRIBUTE_LIST, &cur, &dup) == 0) {
+        return -1;
+    }
+    cur = 0;
+    if (attr_find(rec, fs->mft_record_size, AT_DATA, &cur, &a) != 0) {
+        return -1; /* no unnamed $DATA here at all */
+    }
+    if (a.name_len != 0u) {
+        return -1; /* only a named stream exists -- not the one we grow */
+    }
+    attr_off = cur - a.length;
+    /* Refuse a second unnamed $DATA piece in the same record: ambiguous. */
+    dup_cur = cur;
+    if (attr_find(rec, fs->mft_record_size, AT_DATA, &dup_cur, &dup) == 0 && dup.name_len == 0u) {
+        return -1;
+    }
+    if (!a.non_resident) {
+        return -1; /* resident: #422's job */
+    }
+    if (a.flags & (ATTR_IS_COMPRESSED | ATTR_IS_ENCRYPTED)) {
+        return -1;
+    }
+    if (lcn + cluster_count < lcn || (lcn + cluster_count) * fs->spc > fs->total_sectors) {
+        return -1; /* overflow or past the medium */
+    }
+
+    if (runlist_find_end(rec + attr_off + a.rl_off, a.length - a.rl_off, &rl_end, &lcn_cursor) !=
+        0) {
+        return -1;
+    }
+    lcn_delta = (int64_t)lcn - lcn_cursor;
+
+    len_sz = min_bytes_unsigned(cluster_count);
+    off_sz = min_bytes_signed(lcn_delta);
+    newrun_len = 1u + len_sz + off_sz;
+    if (newrun_len > sizeof newrun) {
+        return -1;
+    }
+
+    newrun[0] = (uint8_t)(len_sz | (off_sz << 4));
+    for (i = 0; i < len_sz; i++) {
+        newrun[1u + i] = (uint8_t)(cluster_count >> (8u * i));
+    }
+    for (i = 0; i < off_sz; i++) {
+        newrun[1u + len_sz + i] = (uint8_t)((uint64_t)lcn_delta >> (8u * i));
+    }
+
+    content_end_before = a.rl_off + rl_end; /* offset of the old terminator == start of new content */
+    new_content_len = content_end_before + newrun_len + 1u; /* new run + its terminator */
+    new_attr_length = round_up_8(new_content_len);
+    if (new_attr_length < a.length) {
+        new_attr_length = a.length; /* never shrink: the next attribute already starts here */
+    }
+    delta = new_attr_length - a.length;
+
+    bytes_used = hype_rd32(rec + 0x18);
+    if (bytes_used < attr_off + a.length || bytes_used > fs->mft_record_size) {
+        return -1; /* record already inconsistent */
+    }
+    if (delta != 0u) {
+        if (bytes_used + delta > fs->mft_record_size) {
+            return -1; /* no room: would need an $ATTRIBUTE_LIST, out of scope */
+        }
+        for (i = bytes_used; i > attr_off + a.length; i--) {
+            rec[i - 1u + delta] = rec[i - 1u];
+        }
+        hype_wr32(rec + 0x18, bytes_used + delta);
+    }
+    hype_wr32(rec + attr_off + 4, new_attr_length);
+
+    /* Write the new run, a fresh terminator, and zero-pad to the attribute's
+     * (possibly now larger) end -- the old trailing padding's exact bytes
+     * carry no meaning, so overwriting them is correct, not merely tolerated. */
+    for (i = 0; i < newrun_len; i++) {
+        rec[attr_off + a.rl_off + rl_end + i] = newrun[i];
+    }
+    for (i = a.rl_off + rl_end + newrun_len; i < new_attr_length; i++) {
+        rec[attr_off + i] = 0u;
+    }
+
+    /*
+     * Highest VCN (+0x18, between start_vcn and the mapping-pairs offset --
+     * present but never read by our OWN runlist_decode, which derives
+     * everything from the mapping pairs themselves; a real driver validates
+     * it against the runlist's actual VCN coverage and refuses the WHOLE
+     * attribute, from VCN 0, if it disagrees. Confirmed empirically: leaving
+     * this stale on a genuine ntfs-3g volume made ntfs-3g refuse to read
+     * even the ORIGINAL, untouched bytes of the file with EIO, despite the
+     * runlist and every size field being individually well-formed -- see
+     * research/README.md's NTFS $DATA append entry (#418).
+     */
+    hype_wr64(rec + attr_off + 0x18, hype_rd64(rec + attr_off + 0x18) + cluster_count);
+    hype_wr64(rec + attr_off + 0x28, new_alloc_size);
+    hype_wr64(rec + attr_off + 0x30, new_real_size);
+    hype_wr64(rec + attr_off + 0x38, new_init_size);
+
+    return hype_ntfs_record_write(fs, write, rec_no, rec, usn);
+}

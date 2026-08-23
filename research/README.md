@@ -200,6 +200,47 @@ reporting the volume clean at every step. This is stronger evidence than
 so the raw `$Bitmap` byte dump is what actually proves the LSB-first bit
 convention was implemented correctly, independent of hype's own code.
 
+## NTFS non-resident $DATA's Highest VCN field (#418)
+
+A non-resident attribute header has a field hype's OWN read path never
+needed and so never modeled: **Highest VCN at value offset +0x18** (8 bytes,
+between Starting VCN at +0x10 and the mapping-pairs offset at +0x20 --
+`ntfs_attr_t` in `core/ntfs.c` only tracks `start_vcn` and `rl_off`, skipping
+straight over it). `runlist_decode()` derives a file's coverage entirely from
+walking the mapping pairs themselves, so a stale Highest VCN is invisible to
+every one of hype's OWN read-side tests -- host unit tests and hype's own
+`hype_ntfs_resolve()` both parsed an appended runlist with a stale Highest
+VCN perfectly correctly.
+
+**Empirically discovered the hard way**: the first version of
+`hype_ntfs_data_append()` (appends a new run) updated the runlist bytes and
+the allocated/real/initialized size fields but never touched Highest VCN.
+Every unit test passed. Appending to a genuine `mkntfs`-created,
+`ntfs-3g`-written file on the Intel validation box, though, made `ntfs-3g`
+refuse to read the file with `EIO` -- **from VCN 0**, i.e. it refused even
+the ORIGINAL, completely untouched bytes, not just the newly appended
+region. Isolated by elimination (each ruled out with its own real-volume
+test): not `$Bitmap` (a `noop` record rewrite round-tripped byte-identical;
+a pure allocated-size-only field bump also read back fine); not the runlist
+encoding itself (manually decoded the on-disk mapping-pairs bytes after the
+append and confirmed every run, delta, and terminator were spec-correct,
+byte-for-byte); not $MFTMirr (this volume's mirror covers only records 0-3,
+record 64 is untouched by it). The only field left unaccounted was Highest
+VCN, still holding the OLD run count after a new run was appended -- a
+real driver validates it against the runlist's actual VCN coverage and, on
+mismatch, refuses the whole attribute rather than serving what it can.
+
+Fix: `hype_ntfs_data_append()` now advances Highest VCN by the same
+`cluster_count` it appends. Re-verified against the same real volume: the
+file (and its unmodified original bytes, exact byte-for-byte) reads back
+successfully after the append, both when only allocated size grows
+(pure preallocation, real/initialized size unchanged -- valid, spec-legal
+NTFS) and when real/initialized size grow to match (a full non-sparse
+append). **Any future non-resident-attribute writer that adds or removes
+runs must update Highest VCN too** -- it is easy to miss because nothing
+in hype's own read path depends on it, so only a genuine external driver
+catches its absence.
+
 ## NTFS $LogFile / USN journal (#416)
 
 #416 (plan.md §10 decision 64) descoped `$LogFile` replay entirely: Microsoft's LFS (Log File

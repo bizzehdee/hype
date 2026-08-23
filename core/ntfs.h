@@ -130,4 +130,32 @@ int hype_ntfs_cluster_alloc(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t c
                             uint64_t *out_lcn);
 int hype_ntfs_cluster_free(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t lcn, uint64_t count);
 
+/*
+ * #418: append ONE new run of `cluster_count` contiguous clusters starting
+ * at `lcn` (already allocated by the caller, typically via
+ * hype_ntfs_cluster_alloc()) to MFT record `rec_no`'s unnamed, non-resident
+ * $DATA attribute's mapping pairs, and set the attribute's allocated/real/
+ * initialized sizes to `new_alloc_size`/`new_real_size`/`new_init_size`
+ * (bytes). Writes the record back via hype_ntfs_record_write() (fixups +
+ * $MFTMirr, same as every other write-side primitive).
+ *
+ * Refused, permanently out of scope for this slice (a caller needing any of
+ * these must fall back to #422/a future ticket, never silently degraded
+ * here):
+ *   - resident $DATA (that is #422's resident-to-non-resident conversion);
+ *   - an $ATTRIBUTE_LIST already present in the record (a $DATA stream
+ *     split across multiple MFT records) -- growing that needs the list
+ *     itself maintained, which this function does not do;
+ *   - more than one unnamed $DATA piece already inside this one record;
+ *   - the growth would not fit in the record's allocated size (no
+ *     $ATTRIBUTE_LIST is created to spill into an extension record).
+ *
+ * Crash safety is the caller's job, same as hype_ntfs_cluster_alloc(): wrap
+ * the allocate-then-append pair (and any $Bitmap release on a failure path)
+ * in one hype_ntfs_txn_open()/close() bracket.
+ */
+int hype_ntfs_data_append(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t rec_no, uint64_t lcn,
+                          uint64_t cluster_count, uint64_t new_alloc_size, uint64_t new_real_size,
+                          uint64_t new_init_size, uint16_t usn);
+
 #endif /* HYPE_CORE_NTFS_H */

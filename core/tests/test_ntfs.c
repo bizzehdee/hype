@@ -48,6 +48,9 @@ static void put32(uint8_t *p, uint32_t v) {
     p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
 }
 static void put64(uint8_t *p, uint64_t v) { put32(p, (uint32_t)v); put32(p + 4, (uint32_t)(v >> 32)); }
+static uint32_t get32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
 
 /* ---- record + attribute builders ---- */
 
@@ -215,6 +218,18 @@ static void build_vol(int dirty) {
     off = attr_add(0, 0x80, 1, 0, rl, n);
     nonres_sizes(0, off, 0, 128u * SECSZ, (uint64_t)MFT_RECORDS * REC_SIZE, (uint64_t)MFT_RECORDS * REC_SIZE);
     rec_fixup(0);
+
+    /* record 1: $MFTMirr -- backs up records 0-3 only (4 * REC_SIZE = 4096
+     * bytes = 8 clusters at SPC=1), at a free LCN well clear of everything
+     * else. Real content is irrelevant to every test that writes a record
+     * >= 4: mirror_record_if_needed() sees n >= mirrored_records and takes
+     * its "nothing to mirror" path without touching these bytes at all. */
+    rec_init(1, 0);
+    n = 0;
+    rl[n++] = 0x21; rl[n++] = 8; put16(rl + n, BITMAP_LCN + 1u); n += 2; rl[n++] = 0;
+    off = attr_add(1, 0x80, 1, 0, rl, n);
+    nonres_sizes(1, off, 0, 4u * REC_SIZE, 4u * REC_SIZE, 4u * REC_SIZE);
+    rec_fixup(1);
 
     /* record 3: $Volume with $VOLUME_INFORMATION */
     rec_init(3, 0);
@@ -1561,6 +1576,172 @@ static void test_cluster_alloc(void) {
     CHECK("alloc with broken $Bitmap refused", hype_ntfs_cluster_alloc(&fs, vol_write, 1, &lcn) != 0);
 }
 
+/* #418: append/grow a $DATA stream. */
+static void test_data_append(void) {
+    hype_ntfs_t fs;
+    hype_file_rmap_t m;
+    uint64_t lcn;
+
+    /* happy path: allocate then append, and resolve() sees the new range */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK_HEX("resolve before", 0, hype_ntfs_resolve(&fs, "/img.bin", &m));
+    CHECK_HEX("ranges before", 3, m.count); /* DATA, HOLE, DATA */
+    CHECK_HEX("size before", 4300, m.size_bytes);
+
+    CHECK_HEX("alloc 2", 0, hype_ntfs_cluster_alloc(&fs, vol_write, 2, &lcn));
+    CHECK_HEX("alloc lcn", 0, lcn); /* pristine #417 bitmap: first free is LCN 0 */
+    CHECK_HEX("append", 0,
+              hype_ntfs_data_append(&fs, vol_write, 40, lcn, 2, 11u * SECSZ, 4300 + 2u * SECSZ,
+                                    4300 + 2u * SECSZ, 2));
+
+    CHECK_HEX("resolve after", 0, hype_ntfs_resolve(&fs, "/img.bin", &m));
+    CHECK_HEX("ranges after", 4, m.count); /* DATA, HOLE, DATA, DATA(new) */
+    CHECK_HEX("size after", 4300 + 2u * SECSZ, m.size_bytes);
+    CHECK_HEX("new range kind", HYPE_RANGE_DATA, m.ranges[3].kind);
+    CHECK_HEX("new range lba", lcn * fs.spc, m.ranges[3].start_lba);
+    CHECK_HEX("new range len", 2u * fs.spc, m.ranges[3].sector_count);
+
+    /* the mirror stays byte-identical: record 40 is below MFT_RECORDS but
+     * NOT below the mirrored range unless it is < mirrored_records -- check
+     * via a fresh mount + resolve, which re-reads through $MFT (not $MFTMirr,
+     * but proves the WRITE at least round-trips through the primary copy) */
+    CHECK_HEX("remount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK_HEX("resolve after remount", 0, hype_ntfs_resolve(&fs, "/img.bin", &m));
+    CHECK_HEX("ranges survive remount", 4, m.count);
+
+    /* a second append keeps growing correctly (exercises a second insertion
+     * point, not just the first) */
+    CHECK_HEX("alloc 1 more", 0, hype_ntfs_cluster_alloc(&fs, vol_write, 1, &lcn));
+    CHECK_HEX("second append", 0,
+              hype_ntfs_data_append(&fs, vol_write, 40, lcn, 1, 12u * SECSZ, 4300 + 3u * SECSZ,
+                                    4300 + 3u * SECSZ, 3));
+    CHECK_HEX("resolve after 2nd append", 0, hype_ntfs_resolve(&fs, "/img.bin", &m));
+    /* still 4, not 5: the new run's LCN (2) lands immediately after the
+     * first append's DATA(0,2) range, so the #381 rmap builder coalesces
+     * them -- correct behavior, not a missed insertion (the on-disk
+     * runlist genuinely holds two separate mapping-pair entries; only the
+     * logical range VIEW merges adjacent same-kind runs). */
+    CHECK_HEX("ranges after 2nd append", 4, m.count);
+    CHECK_HEX("size after 2nd append", 4300 + 3u * SECSZ, m.size_bytes);
+
+    /* refusals */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("resident $DATA refused", hype_ntfs_data_append(&fs, vol_write, 44, 0, 1, SECSZ, 1, 1,
+                                                          2) != 0);
+    CHECK("multi-extent ($ATTRIBUTE_LIST present) $DATA refused",
+          hype_ntfs_data_append(&fs, vol_write, 48, 0, 1, SECSZ, 1, 1, 2) != 0);
+    CHECK("missing record refused",
+          hype_ntfs_data_append(&fs, vol_write, 9999, 0, 1, SECSZ, 1, 1, 2) != 0);
+    CHECK("zero cluster_count refused",
+          hype_ntfs_data_append(&fs, vol_write, 40, 0, 0, SECSZ, 1, 1, 2) != 0);
+    CHECK("NULL fs refused", hype_ntfs_data_append(0, vol_write, 40, 0, 1, SECSZ, 1, 1, 2) != 0);
+    CHECK("NULL write refused", hype_ntfs_data_append(&fs, 0, 40, 0, 1, SECSZ, 1, 1, 2) != 0);
+    CHECK("past medium refused",
+          hype_ntfs_data_append(&fs, vol_write, 40, VOL_SECTORS, 1, SECSZ, 1, 1, 2) != 0);
+
+    /* no room: pad record 40 with a big resident dummy attribute leaving
+     * only a few bytes of slack, then keep appending 1-cluster runs -- the
+     * attribute's own local padding absorbs the first one or two, but it
+     * must eventually need to grow past the packed record and be refused
+     * cleanly rather than corrupt anything (no $ATTRIBUTE_LIST support in
+     * this slice). */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    {
+        uint8_t junk[REC_SIZE];
+        uint32_t used = get32(rec_ptr(40) + 0x18);
+        uint32_t body_len = REC_SIZE - used - 0x20u;
+        unsigned k;
+        int saw_refusal = 0;
+
+        memset(junk, 0xAB, sizeof junk);
+        attr_add(40, 0x10 /* AT_STANDARD_INFORMATION */, 0, 0, junk, body_len);
+        rec_fixup(40);
+
+        for (k = 0; k < 8u; k++) {
+            uint64_t lcn2;
+            if (hype_ntfs_cluster_alloc(&fs, vol_write, 1, &lcn2) != 0) {
+                break;
+            }
+            if (hype_ntfs_data_append(&fs, vol_write, 40, lcn2, 1, (11u + k) * SECSZ,
+                                      4300 + (k + 1u) * SECSZ, 4300 + (k + 1u) * SECSZ,
+                                      (uint16_t)(2u + k)) != 0) {
+                saw_refusal = 1;
+                break;
+            }
+        }
+        CHECK("no room eventually refused", saw_refusal);
+    }
+
+    /* more refusals, each exercising a distinct guard */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("no $DATA at all refused" /* record 45: subdir, index-only */,
+          hype_ntfs_data_append(&fs, vol_write, 45, 0, 1, SECSZ, 1, 1, 2) != 0);
+
+    /* named-stream-only: poke an existing unnamed $DATA's name_len so
+     * attr_find's match is (from this function's view) "not ours" */
+    build_vol(0);
+    rec_ptr(44)[0x38 + 9] = 1; /* name_len := 1, no name bytes needed for this check */
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("named-stream-only $DATA refused",
+          hype_ntfs_data_append(&fs, vol_write, 44, 0, 1, SECSZ, 1, 1, 2) != 0);
+
+    /* two unnamed $DATA pieces in one record: ambiguous, refused */
+    build_vol(0);
+    {
+        uint8_t rl2[8];
+        uint32_t n2 = 0, off2;
+        rec_init(20, 0);
+        rl2[n2++] = 0x21; rl2[n2++] = 1; put16(rl2 + n2, DATA_LCN + 95u); n2 += 2; rl2[n2++] = 0;
+        off2 = attr_add(20, 0x80, 1, 0, rl2, n2);
+        nonres_sizes(20, off2, 0, SECSZ, 100, 100);
+        n2 = 0;
+        rl2[n2++] = 0x21; rl2[n2++] = 1; put16(rl2 + n2, DATA_LCN + 96u); n2 += 2; rl2[n2++] = 0;
+        off2 = attr_add(20, 0x80, 1, 0, rl2, n2);
+        nonres_sizes(20, off2, 1, SECSZ, 100, 100);
+        rec_fixup(20);
+    }
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("duplicate unnamed $DATA refused",
+          hype_ntfs_data_append(&fs, vol_write, 20, 0, 1, SECSZ, 1, 1, 2) != 0);
+
+    /* compressed/encrypted $DATA refused */
+    build_vol(0);
+    {
+        uint8_t rl2[8];
+        uint32_t n2 = 0, off2;
+        rec_init(21, 0);
+        rl2[n2++] = 0x21; rl2[n2++] = 1; put16(rl2 + n2, DATA_LCN + 97u); n2 += 2; rl2[n2++] = 0;
+        off2 = attr_add(21, 0x80, 1, 0x0001 /* ATTR_IS_COMPRESSED */, rl2, n2);
+        nonres_sizes(21, off2, 0, SECSZ, 100, 100);
+        rec_fixup(21);
+    }
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("compressed $DATA refused", hype_ntfs_data_append(&fs, vol_write, 21, 0, 1, SECSZ, 1, 1,
+                                                            2) != 0);
+
+    /* malformed runlist (no terminator inside the attribute's own bounds)
+     * is refused, not scanned past its own record */
+    build_vol(0);
+    {
+        uint8_t rl2[8];
+        uint32_t off2;
+        rec_init(22, 0);
+        /* 0xFF: len_sz=15, off_sz=15 -- runlist_find_end must refuse this,
+         * never read past the attribute looking for a terminator */
+        memset(rl2, 0xFFu, sizeof rl2);
+        off2 = attr_add(22, 0x80, 1, 0, rl2, 8u); /* body_len a multiple of 8: no extra zero pad */
+        nonres_sizes(22, off2, 0, SECSZ, 100, 100);
+        rec_fixup(22);
+    }
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("malformed runlist refused",
+          hype_ntfs_data_append(&fs, vol_write, 22, 0, 1, SECSZ, 1, 1, 2) != 0);
+}
+
 int main(void) {
     test_probe();
     test_mount_refusals();
@@ -1575,6 +1756,7 @@ int main(void) {
     test_attr_and_list_guards();
     test_final_edges();
     test_cluster_alloc();
+    test_data_append();
 
     if (failures == 0) {
         printf("test_ntfs: all tests passed\n");
