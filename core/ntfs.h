@@ -183,4 +183,38 @@ int hype_ntfs_hole_fill(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t rec_n
                         uint64_t fill_start_vcn, uint64_t cluster_count, uint64_t lcn,
                         uint16_t usn);
 
+/*
+ * #420: $MFT record allocation and release, over $MFT's OWN $BITMAP
+ * attribute (record 0, unnamed $BITMAP -- one bit per MFT record, tracking
+ * which records are in use; distinct from #417's $Bitmap file, which
+ * tracks CLUSTERS). $MFTMirr consistency and fixups are already handled by
+ * every hype_ntfs_record_write() call (#416) -- this slice adds only the
+ * record-slot bookkeeping create/unlink/mkdir/rmdir (#423/#425) need.
+ *
+ * hype_ntfs_mft_record_alloc() scans strictly within the bitmap's
+ * CURRENTLY-INITIALIZED region (its real/init size) for a clear bit,
+ * cross-checks the corresponding $MFT record is genuinely not in use
+ * on-disk (a bitmap/record disagreement is refused, not trusted either
+ * way), initializes a fresh record (FILE magic, fixups sized for
+ * fs->mft_record_size, an empty attribute list, sequence number bumped
+ * from whatever was last stored there so stale references become
+ * detectable), marks the bit used, and writes it out. Returns the new
+ * record number and its sequence number.
+ *
+ * Deliberately out of scope for this slice, refused rather than silently
+ * degraded: growing $MFT itself (or its $BITMAP) when the initialized
+ * region is fully packed -- that needs the cluster allocator plus
+ * hype_ntfs_data_append() chained through $MFT's own $DATA and $BITMAP,
+ * a real but rarer path than the common case of allocating into an
+ * already-initialized, partially-used $MFT.
+ *
+ * hype_ntfs_mft_record_free() clears MFT_IN_USE, bumps the sequence
+ * number again (so a reference minted before the free is stale even if
+ * the slot is reused before anyone notices), and clears the bit.
+ */
+int hype_ntfs_mft_record_alloc(hype_ntfs_t *fs, hype_blk_write_fn write, int is_dir,
+                               uint64_t *out_rec_no, uint16_t *out_seq, uint16_t usn);
+int hype_ntfs_mft_record_free(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t rec_no,
+                              uint16_t usn);
+
 #endif /* HYPE_CORE_NTFS_H */

@@ -274,6 +274,33 @@ built by an external, less-rigorous path, recomputing derived fields from
 the authoritative source (here, the runlist itself) is safer than trusting
 prior bookkeeping to have been consistent.
 
+## NTFS $MFT record allocation: pre-formatted-but-unused records (#420)
+
+`mkntfs` pre-initializes a batch of `$MFT` records with a valid `FILE`
+magic, fixups, and a real (nonzero) sequence number, all still marked NOT
+in use -- confirmed empirically: allocating an apparently-fresh record on a
+real `mkntfs` volume came back with sequence number 17, not 1, because the
+raw bytes at that slot already held a valid record with sequence number 16
+stored (`hype_ntfs_mft_record_alloc()` reads the raw bytes first and reuses
++ bumps whatever sequence number is already there, rather than assuming an
+all-zero, never-touched slot). Don't assume a bit being clear in `$MFT`'s
+own `$BITMAP` means the corresponding record is all-zero bytes -- it is
+just as likely to be a real, structurally valid, previously-prepared or
+previously-freed record.
+
+A record built by `hype_ntfs_mft_record_alloc()` alone (magic, fixups, an
+empty attribute list) is intentionally not yet a "file" any higher-level
+tool recognizes -- `ntfsinfo` correctly reports "No STANDARD_INFORMATION in
+base record N" for it, which is the EXPECTED result of this slice's scope
+boundary (adding `$STANDARD_INFORMATION`/`$FILE_NAME`/a directory entry is
+#423/#425's job), not a defect. What matters at this layer is that the
+record's own bytes are spec-valid (fixups round-trip, sequence number and
+flags correct) and that `ntfsfix -n` stays clean through alloc, free, and
+immediate re-allocation of the same slot (verified: sequence number
+correctly advances 16 -> 17 (alloc) -> 18 (free) -> 19 (realloc) across
+the cycle) -- i.e. the record-slot bookkeeping is sound even though the
+record has no visible file content yet.
+
 ## NTFS $LogFile / USN journal (#416)
 
 #416 (plan.md §10 decision 64) descoped `$LogFile` replay entirely: Microsoft's LFS (Log File

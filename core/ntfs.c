@@ -858,17 +858,19 @@ static int bitmap_ensure_loaded(hype_ntfs_t *fs) {
     return 0;
 }
 
-/* First free run of `count` contiguous clusters, scanning from cluster 0 in
- * BITMAP_CHUNK_BYTES-sized reads. Returns 0 and fills *out_start, or -1 if
- * no run that large exists. */
-static int bitmap_find_free(hype_ntfs_t *fs, uint64_t count, uint64_t *out_start) {
+/* First free run of `count` contiguous bits in `m` (any bitmap-shaped
+ * stream: #417's $Bitmap file OR #420's $MFT-record bitmap), scanning from
+ * bit 0 across `total_bits`, in BITMAP_CHUNK_BYTES-sized reads. Returns 0
+ * and fills *out_start, or -1 if no run that large exists. */
+static int bitmap_find_free(hype_ntfs_t *fs, hype_file_rmap_t *m, uint64_t total_bits,
+                            uint64_t count, uint64_t *out_start) {
     uint8_t buf[BITMAP_CHUNK_BYTES];
     uint64_t bit = 0;
-    uint64_t total_bytes = (fs->total_clusters + 7u) / 8u;
+    uint64_t total_bytes = (total_bits + 7u) / 8u;
     uint64_t run_start = 0, run_len = 0;
     int in_run = 0;
 
-    while (bit < fs->total_clusters) {
+    while (bit < total_bits) {
         uint64_t byte_off = bit / 8u;
         uint64_t remaining_bytes = total_bytes - byte_off;
         uint32_t chunk_bytes =
@@ -876,11 +878,10 @@ static int bitmap_find_free(hype_ntfs_t *fs, uint64_t count, uint64_t *out_start
         uint64_t chunk_bits = (uint64_t)chunk_bytes * 8u;
         uint64_t i;
 
-        if (hype_file_rmap_read_at(&fs->bitmap, fs->read, fs->ctx, byte_off, buf, chunk_bytes) !=
-            0) {
+        if (hype_file_rmap_read_at(m, fs->read, fs->ctx, byte_off, buf, chunk_bytes) != 0) {
             return -1;
         }
-        for (i = 0; i < chunk_bits && bit < fs->total_clusters; i++, bit++) {
+        for (i = 0; i < chunk_bits && bit < total_bits; i++, bit++) {
             uint32_t byte_i = (uint32_t)(i / 8u);
             uint32_t bit_i = (uint32_t)(i % 8u);
             int used = (buf[byte_i] >> bit_i) & 1u;
@@ -904,12 +905,14 @@ static int bitmap_find_free(hype_ntfs_t *fs, uint64_t count, uint64_t *out_start
     return -1;
 }
 
-/* True iff every bit in [start_bit, start_bit+count) equals `want_used`. */
-static int bitmap_run_is(hype_ntfs_t *fs, uint64_t start_bit, uint64_t count, int want_used) {
+/* True iff every bit in [start_bit, start_bit+count) of `m` (bounded by
+ * `total_bits`) equals `want_used`. */
+static int bitmap_run_is(hype_ntfs_t *fs, hype_file_rmap_t *m, uint64_t total_bits,
+                         uint64_t start_bit, uint64_t count, int want_used) {
     uint8_t buf[BITMAP_CHUNK_BYTES];
     uint64_t bit = start_bit;
     uint64_t end = start_bit + count;
-    uint64_t total_bytes = (fs->total_clusters + 7u) / 8u;
+    uint64_t total_bytes = (total_bits + 7u) / 8u;
 
     while (bit < end) {
         uint64_t byte_off = bit / 8u;
@@ -920,8 +923,7 @@ static int bitmap_run_is(hype_ntfs_t *fs, uint64_t start_bit, uint64_t count, in
         uint64_t base = bit;
         uint64_t i;
 
-        if (hype_file_rmap_read_at(&fs->bitmap, fs->read, fs->ctx, byte_off, buf, chunk_bytes) !=
-            0) {
+        if (hype_file_rmap_read_at(m, fs->read, fs->ctx, byte_off, buf, chunk_bytes) != 0) {
             return 0;
         }
         for (i = base - byte_off * 8u; i < chunk_bits && bit < end; i++, bit++) {
@@ -936,12 +938,12 @@ static int bitmap_run_is(hype_ntfs_t *fs, uint64_t start_bit, uint64_t count, in
     return 1;
 }
 
-/* Sets or clears every bit in [start_bit, start_bit+count). Ragged leading
- * and trailing bytes go through single-byte read-modify-write; whole bytes
- * in between are written directly (no read needed -- the value doesn't
- * depend on what was there). */
-static int bitmap_set_run(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t start_bit,
-                          uint64_t count, int used) {
+/* Sets or clears every bit in [start_bit, start_bit+count) of `m`. Ragged
+ * leading and trailing bytes go through single-byte read-modify-write;
+ * whole bytes in between are written directly (no read needed -- the value
+ * doesn't depend on what was there). */
+static int bitmap_set_run(hype_ntfs_t *fs, hype_file_rmap_t *m, hype_blk_write_fn write,
+                          uint64_t start_bit, uint64_t count, int used) {
     uint64_t bit = start_bit;
     uint64_t end = start_bit + count;
 
@@ -956,7 +958,7 @@ static int bitmap_set_run(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t sta
             uint32_t k;
             uint64_t n = bits_here < bits_left_in_byte ? bits_here : bits_left_in_byte;
 
-            if (hype_file_rmap_read_at(&fs->bitmap, fs->read, fs->ctx, byte_off, &b, 1u) != 0) {
+            if (hype_file_rmap_read_at(m, fs->read, fs->ctx, byte_off, &b, 1u) != 0) {
                 return -1;
             }
             for (k = 0; k < n; k++) {
@@ -967,8 +969,7 @@ static int bitmap_set_run(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t sta
                     b = (uint8_t)(b & ~(1u << bi));
                 }
             }
-            if (hype_file_rmap_write_at(&fs->bitmap, fs->read, write, fs->ctx, byte_off, &b, 1u) !=
-                0) {
+            if (hype_file_rmap_write_at(m, fs->read, write, fs->ctx, byte_off, &b, 1u) != 0) {
                 return -1;
             }
             bit += n;
@@ -978,8 +979,7 @@ static int bitmap_set_run(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t sta
             uint32_t n =
                 whole_bytes < BITMAP_CHUNK_BYTES ? (uint32_t)whole_bytes : BITMAP_CHUNK_BYTES;
             bfill8(chunk, used ? 0xFFu : 0x00u, n);
-            if (hype_file_rmap_write_at(&fs->bitmap, fs->read, write, fs->ctx, byte_off, chunk,
-                                        n) != 0) {
+            if (hype_file_rmap_write_at(m, fs->read, write, fs->ctx, byte_off, chunk, n) != 0) {
                 return -1;
             }
             bit += (uint64_t)n * 8u;
@@ -998,10 +998,10 @@ int hype_ntfs_cluster_alloc(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t c
     if (bitmap_ensure_loaded(fs) != 0) {
         return -1;
     }
-    if (bitmap_find_free(fs, count, &start) != 0) {
+    if (bitmap_find_free(fs, &fs->bitmap, fs->total_clusters, count, &start) != 0) {
         return -1;
     }
-    if (bitmap_set_run(fs, write, start, count, 1) != 0) {
+    if (bitmap_set_run(fs, &fs->bitmap, write, start, count, 1) != 0) {
         return -1;
     }
     *out_lcn = start;
@@ -1018,10 +1018,10 @@ int hype_ntfs_cluster_free(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t lc
     if (lcn + count < lcn || lcn + count > fs->total_clusters) {
         return -1;
     }
-    if (!bitmap_run_is(fs, lcn, count, 1)) {
+    if (!bitmap_run_is(fs, &fs->bitmap, fs->total_clusters, lcn, count, 1)) {
         return -1; /* not fully allocated: caller bug or an already-inconsistent bitmap */
     }
-    return bitmap_set_run(fs, write, lcn, count, 0);
+    return bitmap_set_run(fs, &fs->bitmap, write, lcn, count, 0);
 }
 
 /* ---- #418: append/grow a $DATA stream ----------------------------------- */
@@ -1534,4 +1534,135 @@ int hype_ntfs_hole_fill(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t rec_n
         return -1;
     }
     return hype_ntfs_record_write(fs, write, rec_no, rec, usn);
+}
+
+/* ---- #420: $MFT record allocation ---------------------------------------- */
+
+/* Initializes a fresh, empty FILE record for `rec_no`: magic, fixup array
+ * sized for `rec_size`, sequence number, MFT_IN_USE (+ MFT_IS_DIR), and an
+ * empty attribute list (just the end marker) -- the base attributes any
+ * actual file needs are #423/#425's job to add. */
+static void mft_record_init_empty(uint8_t *rec, uint32_t rec_size, uint64_t rec_no, uint16_t seq,
+                                  int is_dir) {
+    uint32_t usa_off = 0x30u;
+    uint32_t usa_count = (rec_size / SECSZ) + 1u;
+    uint32_t attrs_off = round_up_8(usa_off + usa_count * 2u);
+    uint32_t i;
+
+    for (i = 0; i < rec_size; i++) {
+        rec[i] = 0u;
+    }
+    rec[0] = 'F'; rec[1] = 'I'; rec[2] = 'L'; rec[3] = 'E';
+    hype_wr16(rec + 4, (uint16_t)usa_off);
+    hype_wr16(rec + 6, (uint16_t)usa_count);
+    hype_wr16(rec + 0x10, seq);
+    hype_wr16(rec + 0x12, 0u); /* hard link count */
+    hype_wr16(rec + 0x14, (uint16_t)attrs_off);
+    hype_wr16(rec + 0x16, (uint16_t)(MFT_IN_USE | (is_dir ? MFT_IS_DIR : 0u)));
+    hype_wr32(rec + 0x18, attrs_off + 8u); /* bytes in use: attrs area + end marker */
+    hype_wr32(rec + 0x1C, rec_size);       /* bytes allocated */
+    hype_wr64(rec + 0x20, 0u);             /* base file record: 0, this IS a base record */
+    hype_wr16(rec + 0x28, 0u);             /* next attribute instance */
+    hype_wr32(rec + 0x2C, (uint32_t)rec_no); /* self-reference, NTFS 3.1+ */
+    hype_wr32(rec + attrs_off, 0xFFFFFFFFu);  /* end marker: no attributes yet */
+}
+
+int hype_ntfs_mft_record_alloc(hype_ntfs_t *fs, hype_blk_write_fn write, int is_dir,
+                               uint64_t *out_rec_no, uint16_t *out_seq, uint16_t usn) {
+    hype_file_rmap_t bmap;
+    uint64_t real = 0, init = 0;
+    uint64_t total_bits;
+    uint64_t bit;
+    uint8_t rec[HYPE_NTFS_MAX_RECORD];
+    uint16_t old_seq, new_seq;
+
+    if (fs == 0 || write == 0 || out_rec_no == 0 || out_seq == 0) {
+        return -1;
+    }
+    if (stream_map(fs, REC_MFT, AT_BITMAP, &bmap, &real, &init) != 0) {
+        return -1; /* missing, resident, or otherwise malformed: refused */
+    }
+    bmap.size_bytes = real;
+    total_bits = init * 8u;
+    if (total_bits == 0u) {
+        return -1;
+    }
+
+    if (bitmap_find_free(fs, &bmap, total_bits, 1u, &bit) != 0) {
+        /* $MFT's bitmap has no free bit within its already-initialized
+         * region. Growing $MFT (and/or its $BITMAP) through the cluster
+         * allocator is out of scope for this slice -- refuse honestly. */
+        return -1;
+    }
+    if (bit >= fs->mft.size_bytes / fs->mft_record_size) {
+        return -1; /* bitmap claims a slot $MFT's own $DATA doesn't cover */
+    }
+
+    /* Cross-check: the record must genuinely be free on disk, not merely
+     * absent from the bitmap by mistake. record_read() itself requires
+     * MFT_IN_USE, so a clean "not in use" read fails it too -- read the raw
+     * bytes directly to tell "genuinely free" apart from "corrupt", and to
+     * recover any previous sequence number to bump. */
+    if (hype_file_rmap_read_at(&fs->mft, fs->read, fs->ctx, bit * fs->mft_record_size, rec,
+                               fs->mft_record_size) != 0) {
+        return -1;
+    }
+    old_seq = 0u;
+    if (rec[0] == 'F' && rec[1] == 'I' && rec[2] == 'L' && rec[3] == 'E') {
+        if (fixup_apply(rec, fs->mft_record_size) != 0) {
+            return -1; /* torn write on a slot the bitmap claims is free */
+        }
+        if (hype_rd16(rec + 0x16) & MFT_IN_USE) {
+            return -1; /* bitmap/record disagree: refused, not guessed */
+        }
+        old_seq = hype_rd16(rec + 0x10);
+    }
+    new_seq = (uint16_t)(old_seq + 1u);
+    if (new_seq == 0u) {
+        new_seq = 1u; /* 0 is reserved for "never used" */
+    }
+
+    mft_record_init_empty(rec, fs->mft_record_size, bit, new_seq, is_dir);
+    if (hype_ntfs_record_write(fs, write, bit, rec, usn) != 0) {
+        return -1;
+    }
+    if (bitmap_set_run(fs, &bmap, write, bit, 1u, 1) != 0) {
+        return -1;
+    }
+    *out_rec_no = bit;
+    *out_seq = new_seq;
+    return 0;
+}
+
+int hype_ntfs_mft_record_free(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t rec_no,
+                              uint16_t usn) {
+    uint8_t rec[HYPE_NTFS_MAX_RECORD];
+    hype_file_rmap_t bmap;
+    uint64_t real = 0, init = 0;
+    uint16_t seq;
+
+    if (fs == 0 || write == 0) {
+        return -1;
+    }
+    if (record_read(fs, rec_no, rec) != 0) {
+        return -1; /* not currently a valid, in-use record */
+    }
+    seq = (uint16_t)(hype_rd16(rec + 0x10) + 1u);
+    if (seq == 0u) {
+        seq = 1u;
+    }
+    hype_wr16(rec + 0x10, seq);
+    hype_wr16(rec + 0x16, (uint16_t)(hype_rd16(rec + 0x16) & (uint16_t)~MFT_IN_USE));
+    if (hype_ntfs_record_write(fs, write, rec_no, rec, usn) != 0) {
+        return -1;
+    }
+
+    if (stream_map(fs, REC_MFT, AT_BITMAP, &bmap, &real, &init) != 0) {
+        return -1;
+    }
+    bmap.size_bytes = real;
+    if (rec_no >= init * 8u) {
+        return -1; /* out of the bitmap's tracked range: inconsistent */
+    }
+    return bitmap_set_run(fs, &bmap, write, rec_no, 1u, 0);
 }

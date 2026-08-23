@@ -51,6 +51,7 @@ static void put64(uint8_t *p, uint64_t v) { put32(p, (uint32_t)v); put32(p + 4, 
 static uint32_t get32(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
 }
+static uint16_t get16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
 
 /* ---- record + attribute builders ---- */
 
@@ -217,6 +218,18 @@ static void build_vol(int dirty) {
     rl[n++] = 0x21; rl[n++] = 128; put16(rl + n, MFT_LCN); n += 2; rl[n++] = 0;
     off = attr_add(0, 0x80, 1, 0, rl, n);
     nonres_sizes(0, off, 0, 128u * SECSZ, (uint64_t)MFT_RECORDS * REC_SIZE, (uint64_t)MFT_RECORDS * REC_SIZE);
+    /* $MFT's OWN $BITMAP: one bit per record, LSB-first, marking exactly
+     * the records THIS fixture actually populates (0,1,3,5,6,10,40-51) as
+     * in use -- 1 cluster at BITMAP_LCN+9 (BITMAP_LCN and +1..+8 are
+     * #417's $Bitmap file and $MFTMirr respectively). */
+    {
+        static const uint8_t mftbm[8] = {0x6Bu, 0x04u, 0x00u, 0x00u, 0x00u, 0xFFu, 0x0Fu, 0x00u};
+        n = 0;
+        rl[n++] = 0x21; rl[n++] = 1; put16(rl + n, BITMAP_LCN + 9u); n += 2; rl[n++] = 0;
+        off = attr_add(0, 0xB0, 1, 0, rl, n);
+        nonres_sizes(0, off, 0, 1u * SECSZ, 8, 8);
+        memcpy(g_vol + (BITMAP_LCN + 9u) * SECSZ, mftbm, sizeof mftbm);
+    }
     rec_fixup(0);
 
     /* record 1: $MFTMirr -- backs up records 0-3 only (4 * REC_SIZE = 4096
@@ -1876,6 +1889,109 @@ static void test_hole_fill(void) {
           hype_ntfs_hole_fill(&fs, vol_write, 23, 0, 1, lcn, 4) != 0);
 }
 
+/* #420: $MFT record allocation and release. build_vol(0)'s $MFT bitmap
+ * marks records 0,1,3,5,6,10,40-51 in use; 2,4,7,8,9,11-39,52-63 are free
+ * (see the mftbm[] comment in build_vol()). First-fit finds bit 2 first. */
+static void test_mft_alloc(void) {
+    hype_ntfs_t fs;
+    uint64_t rec_no;
+    uint16_t seq;
+    uint8_t rec[REC_SIZE];
+
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+
+    CHECK_HEX("alloc file", 0, hype_ntfs_mft_record_alloc(&fs, vol_write, 0, &rec_no, &seq, 2));
+    CHECK_HEX("alloc file rec_no", 2, rec_no);
+    CHECK_HEX("alloc file seq", 1, seq);
+    CHECK_HEX("record now readable", 0, hype_ntfs_record_read(&fs, 2, rec));
+    CHECK("not a directory", (get16(rec + 0x16) & 0x0002u) == 0u);
+    CHECK_HEX("empty attr list", 0xFFFFFFFFu, get32(rec + get16(rec + 0x14)));
+
+    CHECK_HEX("alloc dir", 0, hype_ntfs_mft_record_alloc(&fs, vol_write, 1, &rec_no, &seq, 3));
+    CHECK_HEX("alloc dir rec_no", 4, rec_no); /* next free bit after 2 */
+    CHECK_HEX("alloc dir seq", 1, seq);
+    CHECK_HEX("record now readable", 0, hype_ntfs_record_read(&fs, 4, rec));
+    CHECK("is a directory", (get16(rec + 0x16) & 0x0002u) != 0u);
+
+    /* free + realloc: sequence number bumps twice total (once on free, once
+     * on the next alloc reusing the same slot) */
+    CHECK_HEX("free rec 2", 0, hype_ntfs_mft_record_free(&fs, vol_write, 2, 4));
+    CHECK("freed record now unreadable", hype_ntfs_record_read(&fs, 2, rec) != 0);
+    CHECK_HEX("realloc reuses freed slot", 0,
+              hype_ntfs_mft_record_alloc(&fs, vol_write, 0, &rec_no, &seq, 5));
+    CHECK_HEX("realloc rec_no", 2, rec_no);
+    CHECK_HEX("realloc seq bumped past the freed value", 3, seq);
+
+    /* exhaustion: allocate every remaining free bit, then one more refuses */
+    {
+        unsigned k;
+        int exhausted = 0;
+        for (k = 0; k < 60u; k++) {
+            uint64_t r2;
+            uint16_t s2;
+            if (hype_ntfs_mft_record_alloc(&fs, vol_write, 0, &r2, &s2,
+                                           (uint16_t)(6u + k)) != 0) {
+                exhausted = 1;
+                break;
+            }
+        }
+        CHECK("bitmap eventually exhausted", exhausted);
+    }
+
+    /* bitmap/record disagreement refused: record 7 (free in the bitmap)
+     * manually marked in-use on disk without updating the bitmap */
+    build_vol(0);
+    rec_init(7, 0); /* sets MFT_IN_USE */
+    rec_fixup(7);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    /* consume every free bit before 7 (bits 2 and 4) so first-fit lands
+     * exactly on the sabotaged record next */
+    {
+        unsigned k;
+        uint64_t r2;
+        uint16_t s2;
+        for (k = 0; k < 2u; k++) {
+            CHECK_HEX("pre-consume", 0,
+                      hype_ntfs_mft_record_alloc(&fs, vol_write, 0, &r2, &s2, (uint16_t)(8u + k)));
+        }
+    }
+    CHECK("bitmap/record disagreement refused",
+          hype_ntfs_mft_record_alloc(&fs, vol_write, 0, &rec_no, &seq, 20) != 0);
+
+    /* torn record at the target bit refused rather than guessed: corrupt
+     * record 2's own fixup tail (it is free in the bitmap, all zero, but
+     * make it LOOK like a torn FILE record instead) */
+    build_vol(0);
+    {
+        uint8_t *r2 = rec_ptr(2);
+        r2[0] = 'F'; r2[1] = 'I'; r2[2] = 'L'; r2[3] = 'E';
+        put16(r2 + 4, 0x30);
+        put16(r2 + 6, 3);
+        put16(r2 + 0x30, 0x0001); /* USN stamped in the header */
+        /* sector tails deliberately NOT stamped to match -- torn write */
+    }
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("torn record at the target bit refused",
+          hype_ntfs_mft_record_alloc(&fs, vol_write, 0, &rec_no, &seq, 2) != 0);
+
+    /* refusals: bad args */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("alloc NULL fs refused",
+          hype_ntfs_mft_record_alloc(0, vol_write, 0, &rec_no, &seq, 2) != 0);
+    CHECK("alloc NULL write refused",
+          hype_ntfs_mft_record_alloc(&fs, 0, 0, &rec_no, &seq, 2) != 0);
+    CHECK("alloc NULL out_rec_no refused",
+          hype_ntfs_mft_record_alloc(&fs, vol_write, 0, 0, &seq, 2) != 0);
+    CHECK("alloc NULL out_seq refused",
+          hype_ntfs_mft_record_alloc(&fs, vol_write, 0, &rec_no, 0, 2) != 0);
+    CHECK("free NULL fs refused", hype_ntfs_mft_record_free(0, vol_write, 40, 2) != 0);
+    CHECK("free NULL write refused", hype_ntfs_mft_record_free(&fs, 0, 40, 2) != 0);
+    CHECK("free a never-used record refused", hype_ntfs_mft_record_free(&fs, vol_write, 2, 2) != 0);
+    CHECK("free a missing record refused", hype_ntfs_mft_record_free(&fs, vol_write, 9999, 2) != 0);
+}
+
 int main(void) {
     test_probe();
     test_mount_refusals();
@@ -1892,6 +2008,7 @@ int main(void) {
     test_cluster_alloc();
     test_data_append();
     test_hole_fill();
+    test_mft_alloc();
 
     if (failures == 0) {
         printf("test_ntfs: all tests passed\n");
