@@ -3345,6 +3345,57 @@ isn't lost.
     lacks it, the WRMSR itself would #GP on the host (this runs on hype's own CPU, not inside a
     guest), which is worse than skipping the mitigation.
 
+67. **#691: AVIC's per-VM ID tables are grouped by an explicit `vm_idx` parameter threaded to the
+    setup path, not by regrouping the flat vCPU pool; the AVIC backing page is authoritative for
+    guest-visible LAPIC state once AVIC is active for a vCPU, with `g_fw_1_lapic`'s software model
+    left as the flag-off fallback rather than kept in sync -- decided (2026-08-24).** Recorded
+    because #691 exists specifically to make this decision before #640's implementation lands, per
+    this project's own new-capability workflow.
+
+    **The shape problem.** AVIC's IPI-delivery model needs a vCPU to look up any OTHER vCPU of the
+    SAME guest by physical APIC ID, in a table the CPU itself walks in hardware -- so that table
+    must be shared across every vCPU of one VM, and separate across VMs (hype's guest-visible APIC
+    IDs are not globally unique: `boot/main.c`'s per-VM LAPIC init assigns IDs starting at 0 for
+    every VM, so VM0/vCPU0 and VM1/vCPU0 collide if they ever shared a table). `svm_vcpu.c`'s own
+    vCPU pool (`g_vmcb_pool`/`g_ctx_pool`) is a flat sequential slot array today, with no notion of
+    "these N slots belong to VM K" -- the exact gap #640 found as its own cause 2.
+
+    **Decided: thread `vm_idx` explicitly, don't regroup the pool.** `boot/main.c` already has
+    `vm_idx` at every AVIC setup call site (it is iterating `g_vms[i]`); `svm_bits.c`'s AVIC
+    configure function gains a `vm_idx` parameter and indexes a new
+    `g_avic_physical_table[HYPE_CFG_MAX_VMS][4096]` /
+    `g_avic_logical_table[HYPE_CFG_MAX_VMS][4096]` pair by it -- one physical/logical ID table PER
+    VM, shared by every vCPU of that VM, sized by the existing `HYPE_CFG_MAX_VMS` bound rather than
+    a new allocation scheme. The AVIC **backing page** stays genuinely per-vCPU (one page per pool
+    slot, the same shape VMX's own `g_virtual_apic_page[slot]` already uses for its analogous
+    per-vCPU virtual-APIC page) -- it is that one vCPU's own register file, never shared.
+
+    **Alternative considered and rejected: regroup `g_ctx_pool`/`g_vmcb_pool` by VM.** Retrofitting
+    VM-grouping into the pool's own allocation would touch every existing caller that computes a
+    slot index today (`gpr_ptr`, the whole exit-dispatch slot-lookup family), for a benefit only
+    AVIC's ID tables need. Threading one extra `int vm_idx` parameter down a call chain
+    `boot/main.c` already has the value for is smaller, safer, and localized to exactly the new
+    feature that needs it -- the same "don't disturb a large, working, well-tested structure for
+    one new caller's need" reasoning this project has applied elsewhere.
+
+    **Which owns guest-visible LAPIC state: the AVIC backing page, once AVIC is active for that
+    vCPU.** AVIC's entire point is that most guest APIC register accesses never trap to hype at
+    all -- the CPU services them directly against the backing page in hardware. Keeping
+    `g_fw_1_lapic`'s existing software model bidirectionally synchronized with that page would mean
+    either polling it on a schedule (races against the guest's own concurrent hardware-accelerated
+    writes, and costs cycles AVIC exists to avoid spending) or intercepting every write (which
+    defeats AVIC's own acceleration by turning every access back into a trap). Instead: once AVIC
+    is active for a vCPU, any HOST-side code that needs that vCPU's guest-visible LAPIC state reads
+    the backing page directly (a new accessor, `#640`'s own implementation scope) rather than
+    `g_fw_1_lapic`; the software model remains exactly as it is today for the flag-off build and
+    for any vCPU AVIC is not active on. This is the same ownership split KVM's own AVIC support
+    uses: hardware owns the fast path, software intervenes only on the two exit reasons
+    (AVIC-incomplete-IPI, AVIC-noaccel) hardware cannot service itself.
+
+    **Not part of this decision** (left to #640's own implementation): the three-copy setup-call
+    consolidation, the incomplete-IPI/noaccel exit handlers themselves, and the actual backing-page
+    accessor's exact signature.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what
