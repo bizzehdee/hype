@@ -1123,6 +1123,11 @@ int hype_svm_vcpu_handle_pci_ecam_npf(hype_vcpu_ctx_t *ctx, hype_pci_t *pci, uin
 int hype_svm_vcpu_handle_bochs_vbe_npf(hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *dev,
                                         uint64_t mmio_base_phys, const uint8_t *insn);
 
+/* #690: BAR0, the linear framebuffer VRAM -- a raw byte array, not a register set. Same
+ * exempt-from-unit-testing rationale as the DISPI handler above. */
+int hype_svm_vcpu_handle_bochs_vbe_vram_npf(hype_vcpu_ctx_t *ctx, uint8_t *vram,
+                                            uint64_t mmio_base_phys, const uint8_t *insn);
+
 /*
  * FW-1b's exempt NPF glue for the guest Local APIC (devices/guest_lapic.h)
  * at [lapic_base_phys, lapic_base_phys + HYPE_GUEST_LAPIC_MMIO_SIZE).

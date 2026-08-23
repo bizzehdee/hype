@@ -156,6 +156,9 @@ int hype_vmx_vcpu_handle_ahci_disk_npf_map(hype_vcpu_ctx_t *ctx, hype_ahci_t *ah
                                            const uint8_t *guest_insn_bytes);
 int hype_vmx_vcpu_handle_bochs_vbe_npf(hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *dev,
                                        uint64_t mmio_base_phys, const uint8_t *insn);
+/* #690: BAR0, the linear framebuffer VRAM -- a raw byte array, not a register set. */
+int hype_vmx_vcpu_handle_bochs_vbe_vram_npf(hype_vcpu_ctx_t *ctx, uint8_t *vram,
+                                            uint64_t mmio_base_phys, const uint8_t *insn);
 
 /* #591: guest-facing xHCI controller MMIO (live-guest flavour, dma_map for ring DMA). */
 int hype_vmx_vcpu_handle_xhci_npf(hype_vcpu_ctx_t *ctx, hype_xhci_dev_t *dev,

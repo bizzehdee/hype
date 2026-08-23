@@ -316,6 +316,61 @@ static void test_video_memory_64k_saturates_rather_than_wraps(void) {
     CHECK_HEX("VIDEO_MEMORY_64K saturates at 0xFFFF rather than wrapping", 0xFFFFu, units);
 }
 
+/* #690: BAR0 raw VRAM access -- a plain byte array, not a register set. */
+static void test_vram_roundtrip_every_size(void) {
+    static uint8_t vram[HYPE_BOCHS_VBE_VRAM_SIZE];
+    uint32_t v;
+
+    CHECK_HEX("write 1 byte", 0, hype_bochs_vbe_vram_write(vram, sizeof vram, 10u, 1u, 0xABu));
+    CHECK_HEX("read 1 byte", 0, hype_bochs_vbe_vram_read(vram, sizeof vram, 10u, 1u, &v));
+    CHECK_HEX("1 byte value", 0xABu, v);
+
+    CHECK_HEX("write 2 bytes", 0, hype_bochs_vbe_vram_write(vram, sizeof vram, 20u, 2u, 0xBEEFu));
+    CHECK_HEX("read 2 bytes", 0, hype_bochs_vbe_vram_read(vram, sizeof vram, 20u, 2u, &v));
+    CHECK_HEX("2 byte value", 0xBEEFu, v);
+
+    CHECK_HEX("write 4 bytes", 0,
+             hype_bochs_vbe_vram_write(vram, sizeof vram, 40u, 4u, 0xDEADBEEFu));
+    CHECK_HEX("read 4 bytes", 0, hype_bochs_vbe_vram_read(vram, sizeof vram, 40u, 4u, &v));
+    CHECK_HEX("4 byte value", 0xDEADBEEFu, v);
+
+    /* little-endian byte order, matching every other MMIO decode in this codebase */
+    CHECK_HEX("byte 0", 0xEFu, vram[40]);
+    CHECK_HEX("byte 1", 0xBEu, vram[41]);
+    CHECK_HEX("byte 2", 0xADu, vram[42]);
+    CHECK_HEX("byte 3", 0xDEu, vram[43]);
+}
+
+static void test_vram_rejects_bad_size(void) {
+    static uint8_t vram[HYPE_BOCHS_VBE_VRAM_SIZE];
+    uint32_t v;
+
+    CHECK_HEX("write rejects 0-length", -1, hype_bochs_vbe_vram_write(vram, sizeof vram, 0u, 0u, 0u));
+    CHECK_HEX("write rejects 8-byte", -1, hype_bochs_vbe_vram_write(vram, sizeof vram, 0u, 8u, 0u));
+    CHECK_HEX("write rejects 3-byte", -1, hype_bochs_vbe_vram_write(vram, sizeof vram, 0u, 3u, 0u));
+    CHECK_HEX("read rejects 8-byte", -1, hype_bochs_vbe_vram_read(vram, sizeof vram, 0u, 8u, &v));
+    CHECK_HEX("NULL vram guarded (write)", -1, hype_bochs_vbe_vram_write(0, sizeof vram, 0u, 4u, 0u));
+    CHECK_HEX("NULL vram guarded (read)", -1, hype_bochs_vbe_vram_read(0, sizeof vram, 0u, 4u, &v));
+    CHECK_HEX("NULL out guarded", -1, hype_bochs_vbe_vram_read(vram, sizeof vram, 0u, 4u, 0));
+}
+
+static void test_vram_rejects_out_of_range(void) {
+    static uint8_t vram[HYPE_BOCHS_VBE_VRAM_SIZE];
+    uint32_t v;
+
+    CHECK_HEX("write at the very last valid dword", 0,
+             hype_bochs_vbe_vram_write(vram, sizeof vram, (uint32_t)sizeof(vram) - 4u, 4u, 1u));
+    CHECK_HEX("write one byte past the end refused", -1,
+             hype_bochs_vbe_vram_write(vram, sizeof vram, (uint32_t)sizeof(vram) - 3u, 4u, 1u));
+    CHECK_HEX("write at offset == size refused", -1,
+             hype_bochs_vbe_vram_write(vram, sizeof vram, (uint32_t)sizeof(vram), 1u, 1u));
+    /* #655-class overflow check: offset + len must not wrap a 32-bit computation */
+    CHECK_HEX("write near UINT32_MAX offset refused", -1,
+             hype_bochs_vbe_vram_write(vram, sizeof vram, 0xFFFFFFFCu, 4u, 1u));
+    CHECK_HEX("read near UINT32_MAX offset refused", -1,
+             hype_bochs_vbe_vram_read(vram, sizeof vram, 0xFFFFFFFCu, 4u, &v));
+}
+
 int main(void) {
     test_reset_clears_all_registers();
     test_id_register_always_reads_id5();
@@ -334,6 +389,9 @@ int main(void) {
     test_disable_does_not_latch();
     test_large_registers_do_not_overflow_stride_or_offset();
     test_video_memory_64k_saturates_rather_than_wraps();
+    test_vram_roundtrip_every_size();
+    test_vram_rejects_bad_size();
+    test_vram_rejects_out_of_range();
 
     if (failures == 0) {
         printf("all tests passed\n");

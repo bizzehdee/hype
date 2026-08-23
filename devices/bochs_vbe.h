@@ -70,6 +70,15 @@
 /* 11 registers (indices 0x0..0xA), 2 bytes each. */
 #define HYPE_BOCHS_VBE_DISPI_SIZE 0x16u
 
+/*
+ * #690: BAR0, the linear framebuffer -- #565's own bar item 3, never wired. Real bochs-display
+ * defaults to 16 MiB of VRAM (QEMU's vgamem_mb); hype's own minimal scope (this device's whole
+ * philosophy, per this header's top comment) needs only enough to prove the BAR is real and
+ * byte-exact, not to back a production display pipeline, so 4 MiB is used instead -- comfortably
+ * covers every mode this device's own bpp/resolution limits allow for a correctness test.
+ */
+#define HYPE_BOCHS_VBE_VRAM_SIZE (4u * 1024u * 1024u)
+
 /* PCI identity constants (see this header's own top comment). */
 #define HYPE_BOCHS_VBE_PCI_VENDOR_ID 0x1234u
 #define HYPE_BOCHS_VBE_PCI_DEVICE_ID 0x1111u
@@ -139,5 +148,19 @@ int hype_bochs_vbe_mmio_write(hype_bochs_vbe_t *dev, uint32_t offset, uint16_t v
  * resolution rather than producing a nonsensical (too-small) stride.
  */
 void hype_bochs_vbe_get_mode(const hype_bochs_vbe_t *dev, hype_bochs_vbe_mode_t *out_mode);
+
+/*
+ * #690: raw byte-array access to the BAR0 VRAM backing store (a plain memory window, not a
+ * register set -- kept as its own pure function pair rather than folded into the DISPI
+ * register-model functions above, the same register-model/transport split devices/ahci.h already
+ * established for this file). `len` must be 1, 2 or 4 (the shared VMX/SVM MMIO decode helpers this
+ * project already has do not carry an 8-byte value path outside HPET's own special case); `offset`
+ * and `offset+len` must fit inside `vram_size`, checked in uint64_t to avoid the #655 class of
+ * 32-bit overflow on a guest-controlled offset. Returns 0 on success, -1 otherwise.
+ */
+int hype_bochs_vbe_vram_read(const uint8_t *vram, uint32_t vram_size, uint32_t offset,
+                             uint32_t len, uint32_t *out_value);
+int hype_bochs_vbe_vram_write(uint8_t *vram, uint32_t vram_size, uint32_t offset, uint32_t len,
+                              uint32_t value);
 
 #endif /* HYPE_DEVICES_BOCHS_VBE_H */

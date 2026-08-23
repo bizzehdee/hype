@@ -916,6 +916,12 @@ typedef struct hype_fw_vm {
      */
     hype_bochs_vbe_t bochs_vbe;
     /*
+     * #690: this VM's Bochs VBE BAR0 -- the linear framebuffer VRAM, #565's own bar item 3, never
+     * wired until now. Same lifetime convention as bochs_vbe above: present unconditionally,
+     * touched only when `display = bochs` actually presented the device.
+     */
+    uint8_t bochs_vbe_vram[HYPE_BOCHS_VBE_VRAM_SIZE];
+    /*
      * NET-2 (#81): this VM's virtio-net adapter, present only when `net_mode = nat`. Same
      * always-allocated/conditionally-presented shape as the VBE adapter above.
      *
@@ -1179,6 +1185,10 @@ typedef struct hype_fw_vm {
      */
     volatile uint64_t shared_vbe_bar;
     volatile unsigned shared_vbe_mapped;
+    /* #690: the Bochs VBE BAR0 window (the linear framebuffer VRAM), same publish-on-VM latch
+     * convention as BAR2 above -- a separate window on the same device. */
+    volatile uint64_t shared_vbe_vram_bar;
+    volatile unsigned shared_vbe_vram_mapped;
     /* #591: the guest xHCI controller's BAR0 window, same publish-on-VM latch convention. */
     volatile uint64_t shared_xhci_bar;
     volatile unsigned shared_xhci_mapped;
@@ -4137,6 +4147,8 @@ static int vmm_handle_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_pic_
 static int vmm_reason_is_npf(hype_vmm_kind_t kind, uint64_t reason);
 static int vmm_handle_bochs_vbe_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *dev,
                                     uint64_t mmio_base_phys, const uint8_t *insn);
+static int vmm_handle_bochs_vbe_vram_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint8_t *vram,
+                                         uint64_t mmio_base_phys, const uint8_t *insn);
 static void vmm_set_cs_ss_selectors(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint16_t cs,
                                     uint16_t ss);
 static void vmm_request_interrupt(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
@@ -4434,6 +4446,15 @@ static int vmm_handle_bochs_vbe_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, 
         return hype_vmx_vcpu_handle_bochs_vbe_npf(ctx, dev, mmio_base_phys, insn);
     }
     return hype_svm_vcpu_handle_bochs_vbe_npf(ctx, dev, mmio_base_phys, insn);
+}
+/* #690: BAR0, the linear framebuffer VRAM -- a plain memory window, so this vendor shim mirrors
+ * the register-window one above exactly, just against the raw byte array instead. */
+static int vmm_handle_bochs_vbe_vram_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint8_t *vram,
+                                         uint64_t mmio_base_phys, const uint8_t *insn) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        return hype_vmx_vcpu_handle_bochs_vbe_vram_npf(ctx, vram, mmio_base_phys, insn);
+    }
+    return hype_svm_vcpu_handle_bochs_vbe_vram_npf(ctx, vram, mmio_base_phys, insn);
 }
 static void vmm_set_cs_ss_selectors(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint16_t cs,
                                     uint16_t ss) {
@@ -9717,10 +9738,13 @@ static void fw_1_bochs_vbe_present(hype_fw_vm_t *vm) {
         return;
     }
     hype_pci_set_bar_size(&vm->pci, HYPE_FW_1_PCI_DEV_BOCHS_VBE, 2, HYPE_BOCHS_VBE_MMIO_SIZE);
+    /* #690: BAR0, the linear framebuffer -- #565's own bar item 3, never wired until now. */
+    hype_pci_set_bar_size(&vm->pci, HYPE_FW_1_PCI_DEV_BOCHS_VBE, 0, HYPE_BOCHS_VBE_VRAM_SIZE);
     hype_bochs_vbe_reset(&vm->bochs_vbe);
-    hype_debug_print("fw-1[vm %u]: Bochs VBE adapter presented at PCI dev %u, BAR2 %u bytes "
-                     "(display = bochs) [#565]\n",
-                     idx, HYPE_FW_1_PCI_DEV_BOCHS_VBE, HYPE_BOCHS_VBE_MMIO_SIZE);
+    hype_debug_print("fw-1[vm %u]: Bochs VBE adapter presented at PCI dev %u, BAR0 %u bytes "
+                     "(VRAM) + BAR2 %u bytes (registers) (display = bochs) [#565 #690]\n",
+                     idx, HYPE_FW_1_PCI_DEV_BOCHS_VBE, HYPE_BOCHS_VBE_VRAM_SIZE,
+                     HYPE_BOCHS_VBE_MMIO_SIZE);
 }
 
 /*
@@ -10097,6 +10121,24 @@ static void fw_1_program_kernel_bars(hype_fw_vm_t *vm) {
             if (!dev->in_use) {
                 continue;
             }
+            /*
+             * #690: the Bochs VBE adapter is deliberately excluded from this kernel-boot
+             * convenience. Every other device here gets auto-placed because most kernel-boot
+             * micro guests never do their own PCI resource assignment and just want a fixed
+             * address to read. Bochs VBE (decision 49/#565) is the opposite case on purpose --
+             * tests/micro/bochsvbe.c exists specifically to prove a guest can discover, size and
+             * place this BAR itself. Auto-placing and pre-latching it here (as this loop used to,
+             * once BAR0 was added in #690 and made the pre-existing bug visible) silently defeats
+             * that: shared_vbe_mapped/shared_vbe_vram_mapped would latch onto HYPE's own chosen
+             * address before the guest ever runs, and the guest's later self-placement at a
+             * different address would then never be honored -- the ECAM latch below only fires
+             * when the flag is not yet set. This was a real, pre-existing bug (present before
+             * #690 too, for BAR2 alone -- #690 just gave it a second, larger BAR that made the
+             * mismatch reliably reproduce instead of coincidentally not mattering).
+             */
+            if (d == HYPE_FW_1_PCI_DEV_BOCHS_VBE) {
+                continue;
+            }
             for (bar = 0u; bar < 6u; bar++) {
                 hype_pci_ecam_addr_t addr;
                 uint32_t size = dev->bar_size[bar];
@@ -10206,13 +10248,12 @@ static void fw_1_program_kernel_bars(hype_fw_vm_t *vm) {
             }
         }
     }
-    if (hype_pci_memory_space_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_BOCHS_VBE)) {
-        uint64_t bar = hype_pci_get_bar_value(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_BOCHS_VBE, 2);
-        if (bar != 0) {
-            vm->shared_vbe_bar = bar;
-            vm->shared_vbe_mapped = 1u;
-        }
-    }
+    /*
+     * #690: NO pre-latch for Bochs VBE here, unlike every other device above -- see the exclusion
+     * comment earlier in this function. The guest places and enables both its BARs itself; the
+     * ECAM branch in the main dispatch loop (fw_1_shared_mmio_npf's caller) latches them the
+     * moment that happens, the same way it would for a non-kernel-boot VM.
+     */
     if (vm->xhci_present &&
         hype_pci_memory_space_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_XHCI)) {
         uint64_t bar = hype_pci_get_bar_value(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_XHCI, 0);
@@ -11179,6 +11220,21 @@ static hype_fw_dev_t fw_1_shared_mmio_npf(hype_fw_vm_t *vm, hype_vmm_kind_t kind
         if (refusal != 0) {
             refusal->dev = HYPE_FW_DEV_VBE;
             refusal->base = (uint64_t)vm->shared_vbe_bar;
+        }
+        return HYPE_FW_DEV_NONE;
+    }
+
+    /* #690: the Bochs VBE adapter's BAR0 -- the linear framebuffer VRAM, a second window on the
+     * same device as BAR2 above. */
+    if (vm->shared_vbe_vram_mapped && npf.guest_phys_addr >= vm->shared_vbe_vram_bar &&
+        npf.guest_phys_addr < vm->shared_vbe_vram_bar + HYPE_BOCHS_VBE_VRAM_SIZE) {
+        if (vmm_handle_bochs_vbe_vram_npf(kind, ctx, vm->bochs_vbe_vram,
+                                          (uint64_t)vm->shared_vbe_vram_bar, insn) == 0) {
+            return HYPE_FW_DEV_VBE;
+        }
+        if (refusal != 0) {
+            refusal->dev = HYPE_FW_DEV_VBE;
+            refusal->base = (uint64_t)vm->shared_vbe_vram_bar;
         }
         return HYPE_FW_DEV_NONE;
     }
@@ -17900,6 +17956,20 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                             vm->shared_vbe_mapped = 1u;
                             hype_debug_print("fw-1: Bochs VBE BAR2 enabled at guest-physical 0x%llx -- "
                                              "routing its MMIO to the VBE model now [#565]\n",
+                                             (unsigned long long)bar);
+                        }
+                    }
+                    /* #690: the same latch for BAR0, the linear framebuffer VRAM. */
+                    if (!vm->shared_vbe_vram_mapped &&
+                        hype_pci_memory_space_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_BOCHS_VBE)) {
+                        uint64_t bar = hype_pci_get_bar_value(&g_fw_1_pci,
+                                                              HYPE_FW_1_PCI_DEV_BOCHS_VBE, 0);
+                        if (bar != 0) {
+                            vm->shared_vbe_vram_bar = bar;
+                            vm->shared_vbe_vram_mapped = 1u;
+                            hype_debug_print("fw-1: Bochs VBE BAR0 (VRAM) enabled at "
+                                             "guest-physical 0x%llx -- routing its MMIO to the "
+                                             "framebuffer now [#690]\n",
                                              (unsigned long long)bar);
                         }
                     }

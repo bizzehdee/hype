@@ -4029,6 +4029,71 @@ int hype_svm_vcpu_handle_bochs_vbe_npf(hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *d
     return 0;
 }
 
+/* #690: SVM MMIO handler for the Bochs VBE BAR0 (linear framebuffer VRAM) -- a plain memory
+ * window, not a register set, so this reads/writes the raw byte array directly. Mirror of the
+ * VMX twin; 1/2/4-byte accesses only (no generic 8-byte path in this decode helper family). */
+int hype_svm_vcpu_handle_bochs_vbe_vram_npf(hype_vcpu_ctx_t *ctx, uint8_t *vram,
+                                            uint64_t mmio_base_phys, const uint8_t *insn) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_svm_npf_t npf;
+    hype_mmio_decode_t decoded;
+    uint64_t *reg;
+    uint32_t offset;
+    const uint8_t *guest_bytes;
+
+    hype_svm_decode_npf_info(real->vmcb->control.exitinfo1, real->vmcb->control.exitinfo2, &npf);
+
+    if (npf.guest_phys_addr < mmio_base_phys ||
+        npf.guest_phys_addr >= mmio_base_phys + HYPE_BOCHS_VBE_VRAM_SIZE) {
+        return -1;
+    }
+    offset = (uint32_t)(npf.guest_phys_addr - mmio_base_phys);
+
+    guest_bytes = (insn != 0) ? insn : (const uint8_t *)(uintptr_t)real->vmcb->save.rip;
+    if (hype_mmio_decode(guest_bytes, HYPE_MMIO_MAX_INSTR_BYTES, &decoded) != 0) {
+        return -1;
+    }
+    if (decoded.is_write != npf.is_write) {
+        return -1;
+    }
+    if (decoded.size_bytes != 1u && decoded.size_bytes != 2u && decoded.size_bytes != 4u) {
+        return -1;
+    }
+
+    reg = decoded.has_imm ? 0 : gpr_ptr(real, decoded.reg);
+    if (reg == 0 && !decoded.has_imm) {
+        return -1;
+    }
+
+    if (decoded.is_write) {
+        uint32_t value;
+        if (decoded.mem_is_dst) {
+            uint32_t cur = 0;
+            if (hype_bochs_vbe_vram_read(vram, HYPE_BOCHS_VBE_VRAM_SIZE, offset,
+                                         decoded.size_bytes, &cur) != 0) {
+                return -1;
+            }
+            value = hype_mmio_rmw_value(&decoded, reg ? *reg : 0u, cur, &real->vmcb->save.rflags);
+        } else {
+            value = hype_mmio_store_value(&decoded, reg ? *reg : 0u);
+        }
+        if (hype_bochs_vbe_vram_write(vram, HYPE_BOCHS_VBE_VRAM_SIZE, offset, decoded.size_bytes,
+                                      value) != 0) {
+            return -1;
+        }
+    } else {
+        uint32_t value = 0;
+        if (hype_bochs_vbe_vram_read(vram, HYPE_BOCHS_VBE_VRAM_SIZE, offset, decoded.size_bytes,
+                                     &value) != 0) {
+            return -1;
+        }
+        hype_mmio_complete_read(&decoded, reg, value, &real->vmcb->save.rflags); /* #457 */
+    }
+
+    real->vmcb->save.rip += decoded.instr_len;
+    return 0;
+}
+
 /*
  * #591: guest-facing xHCI controller MMIO. Same decode/RIP-advance skeleton as the virtio-blk
  * handler; the model's own mmio_read/write take the width and drive the ring DMA through dma_map

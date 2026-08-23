@@ -156,3 +156,37 @@ void hype_bochs_vbe_get_mode(const hype_bochs_vbe_t *dev, hype_bochs_vbe_mode_t 
         out_mode->valid = 1;
     }
 }
+
+int hype_bochs_vbe_vram_read(const uint8_t *vram, uint32_t vram_size, uint32_t offset,
+                             uint32_t len, uint32_t *out_value) {
+    uint32_t value = 0;
+    uint32_t i;
+
+    if (vram == 0 || out_value == 0 || (len != 1u && len != 2u && len != 4u)) {
+        return -1;
+    }
+    if ((uint64_t)offset + (uint64_t)len > (uint64_t)vram_size) {
+        return -1;
+    }
+    for (i = 0; i < len; i++) {
+        value |= (uint32_t)vram[offset + i] << (8u * i);
+    }
+    *out_value = value;
+    return 0;
+}
+
+int hype_bochs_vbe_vram_write(uint8_t *vram, uint32_t vram_size, uint32_t offset, uint32_t len,
+                              uint32_t value) {
+    uint32_t i;
+
+    if (vram == 0 || (len != 1u && len != 2u && len != 4u)) {
+        return -1;
+    }
+    if ((uint64_t)offset + (uint64_t)len > (uint64_t)vram_size) {
+        return -1;
+    }
+    for (i = 0; i < len; i++) {
+        vram[offset + i] = (uint8_t)(value >> (8u * i));
+    }
+    return 0;
+}
