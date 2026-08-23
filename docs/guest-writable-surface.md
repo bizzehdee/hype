@@ -64,11 +64,11 @@ exit paths.
 
 | Guest-writable field | Check | What it verifies | Test |
 |---|---|---|---|
-| Command-list base (`PxCLB`/`PxCLBU`), ATAPI port | `process_ahci_command_slot()` (`svm_vcpu.c:2444`), via `guest_dma_xlate()` | Command-list GPA fits the VM's mapped range; a rejected translation aborts the command | Gap — no test calls `process_ahci_command_slot()` directly. Tracked by **#663**, **#661**. |
-| Command-list base (`PxCLB`/`PxCLBU`), disk port | `process_ahci_ata_command_slot()` (`svm_vcpu.c:3265`) | **Missing.** The translated pointer is dereferenced by `hype_ahci_decode_cmd_header()` with no null check, unlike the ATAPI sibling above. Guest-triggerable NULL dereference via `PxCLB`/`PxCLBU`. | **Defect, not just a test gap — filed as #672.** |
-| Command-table + PRDT base (`hdr.cmd_table_phys`), both ports | Same functions, second `guest_dma_xlate()` call | Command-table GPA + `0x80 + prdtl*16` bytes fits the mapped range | Gap — tracked by **#663**, **#661** |
-| Each PRD entry's data pointer | Same functions' PRDT loop (`svm_vcpu.c:2649`, `ahci_backend_rw_prdt()` at `:3161`) | Data-buffer GPA + byte count fits the mapped range before read/write | Gap — tracked by **#663**, **#661** |
-| Received-FIS area (`PxFB`/`PxFBU`) | Same functions | FIS-area GPA fits the mapped range | Gap — tracked by **#663**, **#661** |
+| Command-list base (`PxCLB`/`PxCLBU`), ATAPI port | `process_ahci_command_slot()` (`svm_vcpu.c:2444`), via `guest_dma_xlate()` | Command-list GPA fits the VM's mapped range; a rejected translation aborts the command | `core/tests/test_ahci_dma.c: test_out_of_range_command_list_refused` (added closing **#663**/**#661**) |
+| Command-list base (`PxCLB`/`PxCLBU`), disk port | `process_ahci_ata_command_slot()` (`svm_vcpu.c:3265`) | A rejected translation now aborts the command instead of being dereferenced — fixed as **#672** (was a guest-triggerable NULL dereference, the ATAPI sibling above was never affected) | `core/tests/test_ahci_dma.c` (same suite as **#663** above; **#672** is the fix commit `8efc71d`) |
+| Command-table + PRDT base (`hdr.cmd_table_phys`), both ports | Same functions, second `guest_dma_xlate()` call | Command-table GPA + `0x80 + prdtl*16` bytes fits the mapped range | `test_ahci_dma.c: test_out_of_range_command_table_refused` (closed **#663**/**#661**) |
+| Each PRD entry's data pointer | Same functions' PRDT loop (`svm_vcpu.c:2649`, `ahci_backend_rw_prdt()` at `:3161`) | Data-buffer GPA + byte count fits the mapped range before read/write | `test_ahci_dma.c: test_out_of_range_prd_data_pointer_refused` (closed **#663**/**#661**) |
+| Received-FIS area (`PxFB`/`PxFBU`) | Same functions | FIS-area GPA fits the mapped range | Covered by the same `test_ahci_dma.c` suite (closed **#663**/**#661**) |
 | Disk-port LBA/sector-count (backend-attached path) | `hype_blk_backend_read/write()` -> `hype_blk_range_in_bounds()` | `lba + count <= total_sectors` | `core/tests/test_blk_backend.c: test_bounds_gate_rejects_oob` |
 | Disk-port LBA/sector-count (RAM-media fallback, no backend attached) | `devices/ata_disk.c: hype_ata_disk_range_in_bounds()` (`:150`) | Same bound, against the RAM-media capacity | `core/tests/test_ata_disk.c: test_range_in_bounds` |
 
@@ -86,7 +86,7 @@ problem is tracked separately as **#659**.
 |---|---|---|---|
 | READ(10)/READ(12) LBA + transfer count | `devices/atapi.c: handle_read()` (`:141`) | `lba >= total_sectors \|\| count > total_sectors - lba` rejected as `CHECK_CONDITION`/`ILLEGAL_REQUEST` | `core/tests/test_atapi.c: test_read10_out_of_range`, `test_read12_out_of_range` |
 | Destination buffer for the transfer | Handled by the AHCI PRDT loop above (ATAPI is always hosted on an AHCI port) | Same GPA bound as the AHCI command-table/PRDT check | See AHCI row above |
-| READ(12) byte-length arithmetic | `handle_read()`'s `count * HYPE_ATAPI_SECTOR_SIZE` | 32-bit multiply can overflow for a large enough backing ISO — confirmed not an out-of-bounds read, but a reported-length correctness bug | Filed as **#656** (found by the AUDIT-2 storage-model review, **#613**) |
+| READ(12) byte-length arithmetic | `handle_read()`'s `count * HYPE_ATAPI_SECTOR_SIZE` | 32-bit multiply can overflow for a large enough backing ISO — was a reported-length correctness bug, not an out-of-bounds read | Fixed as **#656** (found by the AUDIT-2 storage-model review, **#613**) — the multiply is now computed in 64 bits and refused if it would overflow the reported length |
 
 ATAPI is read-only optical media, never backed by a `hype_blk_backend_t`, so
 it reimplements the LBA-bounds check rather than routing through
@@ -97,7 +97,7 @@ gap.
 
 | Guest-writable field | Check | What it verifies | Test |
 |---|---|---|---|
-| Submission/completion queue base addresses | `nvme_guest_read()`/`nvme_guest_write()` (`boot/main.c:8936-8963`), via `hype_gpa_to_host()` | Queue-base GPA + access length fits the VM's mapped range | Gap — `boot/main.c` is not linked into the host test build. Tracked by **#669** |
+| Submission/completion queue base addresses | `nvme_guest_read()`/`nvme_guest_write()` (`boot/main.c`), delegating to `hype_gpa_read()`/`hype_gpa_write()` (`core/guest_mem.c`, extracted by **#669**) | Queue-base GPA + access length fits the VM's mapped range | `core/tests/test_guest_mem.c` (closed **#669**: the translate-then-copy shape every injected callback used is now a shared, directly host-tested primitive rather than living unreachably inside `boot/main.c`) |
 | SQE fetch / CQE post | `devices/nvme.c: hype_nvme_process_sq()` (`:659`), via injected `gread`/`gwrite` callbacks | Same GPA bound, applied per queue entry | `core/tests/test_nvme.c: test_sqe_decode`, `test_processor_consumes_each_entry_exactly_once` — against *fake* callbacks only; the real `boot/main.c` wiring is the #669 gap |
 | PRP list continuation entries | `devices/nvme.c: hype_nvme_prp_next()` (`:396`) | Page-alignment enforced on every continuation PRP | `test_nvme.c: test_prp_refuses_malformed_descriptors`, `test_prp_list_chains_at_the_last_slot` |
 | IO data payload | `hype_blk_backend_read/write()` (`devices/nvme.c:547,551`) | `lba + count <= total_sectors`, same centralized gate as virtio-blk | `test_nvme.c: test_io_bounds_and_error_paths` |
@@ -160,19 +160,18 @@ Every guest-memory touch in `devices/xhci_dev.c` goes through local helpers
 
 | Guest-writable field | Check | What it verifies | Test |
 |---|---|---|---|
-| CRCR (command-ring base) | `process_command_ring()` (`xhci_dev.c:313`) | Each TRB read via `gread32`, bounded ring walk | Happy-path only. Tracked by **#665** |
-| ERSTBA / event-ring segment table | `event_ring_latch()` (`:134`) | Base/size translated and rejected if zero | Happy-path only (`test_event_ring_wrap`). Tracked by **#665** |
-| DCBAAP + per-slot DCBAA entry | `cmd_address_device()` (`:211`) | Entry GPA translated; input-context pointer also checked for alignment | Tracked by **#665** |
-| Input Context (slot/EP0/EP-N) | `cmd_address_device()`/`cmd_configure_endpoint()` (`:231-288`) | Each sub-structure translated before read | Tracked by **#665** |
-| Output Device Context writes | Same functions | Write target translated before write | Tracked by **#665** |
-| Transfer-ring TRB data-buffer address + length | `process_transfer_ring()` (`:452,513,536`) | Buffer GPA + `xfer_len` fits the mapped range before the transfer runs | Tracked by **#662** |
+| CRCR (command-ring base) | `process_command_ring()` (`xhci_dev.c:313`) | Each TRB read via `gread32`, bounded ring walk | `core/tests/test_xhci_dev.c: test_command_ring_base_outside_map_is_inert` (closed **#665**) |
+| ERSTBA / event-ring segment table | `event_ring_latch()` (`:134`) | Base/size translated and rejected if zero | `test_event_ring_wrap` plus the out-of-map cases below (closed **#665**) |
+| DCBAAP + per-slot DCBAA entry | `cmd_address_device()` (`:211`) | Entry GPA translated; input-context pointer also checked for alignment | `test_xhci_dev.c: test_address_device_dcbaap_outside_map_is_rejected`, `test_address_device_dcbaa_entry_outside_map_is_rejected` (closed **#665**) |
+| Input Context (slot/EP0/EP-N) | `cmd_address_device()`/`cmd_configure_endpoint()` (`:231-288`) | Each sub-structure translated before read | `test_xhci_dev.c: test_address_device_input_context_outside_map_is_rejected` (closed **#665**) |
+| Output Device Context writes | Same functions | Write target translated before write | Covered by the same `test_xhci_dev.c` suite (closed **#665**) |
+| Transfer-ring TRB data-buffer address + length | `process_transfer_ring()` (`:452,513,536`) | Buffer GPA + `xfer_len` fits the mapped range before the transfer runs | Closed **#662** — see `test_xhci_dev.c`'s transfer-ring out-of-map cases |
 
-The checks are real and present by inspection; what is missing is a
-`test_virtio_net_ring.c`-style negative test for each one (a CRCR/ERSTBA/
-DCBAAP/context/TRB-buffer pointer deliberately placed outside the map). That
-gap is tracked by **#662** and **#665**. `core/xhci.c`/`core/xhci_hw.c` are
-hype's own **host**-side driver for a real controller, not guest-facing —
-out of scope.
+The checks are real, present by inspection, and now each has a
+`test_virtio_net_ring.c`-style negative test (a CRCR/ERSTBA/DCBAAP/context/
+TRB-buffer pointer deliberately placed outside the map) — **#662** and
+**#665** are both closed. `core/xhci.c`/`core/xhci_hw.c` are hype's own
+**host**-side driver for a real controller, not guest-facing — out of scope.
 
 ### USB mass storage (USB-MSC)
 
@@ -272,12 +271,13 @@ Port 0x604 (PM1a_CNT/PM1a_EVT, 16-bit), port 0xCF9 (reset control).
 
 | Guest-writable field | Check | What it verifies | Test |
 |---|---|---|---|
-| PM1a_CNT (SLP_EN and the rest of the 16-bit register) | `hype_svm_vcpu_handle_pm1_cnt_ioio()` / `hype_vmx_vcpu_handle_pm1_cnt_ioio()` (`svm_vcpu.c:512`, mirrored in `vmcs_hw.c`) | SLP_EN (bit 13) is extracted and masked off before the rest of the 16-bit value is stored; no array index or pointer derived from the value | Gap — tracked by **#668** |
-| 0xCF9 reset-control register | `hype_svm_vcpu_handle_reset_ctl_ioio()` / VMX equivalent | Bit 2 (RST_CPU) triggers a platform reset request; no other bits are trusted for anything beyond that flag | Gap — tracked by **#668** |
+| PM1a_CNT (SLP_EN and the rest of the 16-bit register) | `hype_svm_vcpu_handle_pm1_cnt_ioio()` / `hype_vmx_vcpu_handle_pm1_cnt_ioio()` (`svm_vcpu.c:512`, mirrored in `vmcs_hw.c`) | SLP_EN (bit 13) is extracted and masked off before the rest of the 16-bit value is stored; no array index or pointer derived from the value | N/A to §6j — closed as **#668**: neither handler ever dereferences a guest-supplied address/length, so the "bounds-check" question this audit asks doesn't apply. A plain correctness test for SLP_EN readback would be a reasonable nice-to-have, just not a §6j finding. |
+| 0xCF9 reset-control register | `hype_svm_vcpu_handle_reset_ctl_ioio()` / VMX equivalent | Bit 2 (RST_CPU) triggers a platform reset request; no other bits are trusted for anything beyond that flag | N/A to §6j, same reasoning as the row above (**#668**) |
 
 Both handlers live in the same coverage-exempt files as the AHCI functions
 above (**#659**); the underlying logic is a simple fixed-width register mask
-with no bounds-check risk, but is unproven by a direct unit test.
+with no guest-address to bounds-check at all, which is why **#668** closed
+as out-of-scope rather than as a fixed gap.
 
 ## 5. Firmware-interface surfaces
 
@@ -287,14 +287,14 @@ with no bounds-check risk, but is unproven by a direct unit test.
 |---|---|---|---|
 | Writable-file internal offset (`etc/ramfb` is the only registered writable file) | `hype_fw_cfg_dma_execute()`: `if (dst_off < size)` | Bytes past the registered buffer's own size are dropped, not written | `core/tests/test_fw_cfg.c: test_writable_file_write_past_end_is_dropped` |
 | Only registered items are writable | `lookup_writable_item()` (checks `write_data != 0`) | A guest cannot write to a read-only fw_cfg file | `test_fw_cfg.c: test_dma_execute_write_rejected` |
-| DMA access-struct address (port 0x518) and the data-buffer GPA it names | `guest_dma_xlate()` -> `hype_gpa_to_host()`, called once for the 16-byte control struct and once for the data buffer (`svm_vcpu.c`/`vmcs_hw.c`, port 0x518 handler) | Both GPAs fit the VM's mapped range before either is dereferenced | Gap — only reachable from the vCPU exit handlers. Tracked by **#664**, **#667** |
+| DMA access-struct address (port 0x518) and the data-buffer GPA it names | `hype_fw_cfg_dma_op_run()` (`devices/fw_cfg.c`, extracted by **#667** from the SVM/VMX port-0x518 handlers, which both now call it instead of duplicating it) | Both GPAs fit the VM's mapped range before either is dereferenced | `core/tests/test_fw_cfg.c: test_dma_op_run_out_of_range_access_struct_refused`, `test_dma_op_run_out_of_range_data_buffer_reports_dma_error` (closed **#664**, **#667**) |
 
 ### ramfb (`devices/ramfb.c`)
 
 | Guest-writable field | Check | What it verifies | Test |
 |---|---|---|---|
 | Surface descriptor fields (fourcc, width, height, stride) | `hype_ramfb_frame_size()` | Internal consistency: known format, non-zero dimensions, `stride >= width * 4` | `core/tests/test_ramfb.c: test_frame_size_validation` |
-| Surface `address` + computed frame size, as a guest-physical range | `boot/main.c: fw_1_ramfb_surface()` -> `hype_gpa_to_host(&vm->dma_map, cfg->address, frame_size)` | Framebuffer GPA + size fits the VM's mapped range before hype blits to/from it | Gap — `boot/main.c` is not linked into the test build. Tracked by **#666**, **#669** |
+| Surface `address` + computed frame size, as a guest-physical range | `boot/main.c: fw_1_ramfb_surface()` -> `hype_gpa_to_host(&vm->dma_map, cfg->address, frame_size)` | Framebuffer GPA + size fits the VM's mapped range before hype blits to/from it | Closed as **#666**: deliberately NOT extracted, because this call site is a direct, no-separable-logic call to `hype_gpa_to_host()` — the underlying primitive is already exhaustively tested (`core/tests/test_guest_mem.c`), and extraction here would add a wrapper with no new coverage, unlike NVMe's case below where real translate-then-copy logic existed to extract. **#669** (below) is the sibling ticket that DID find real logic worth extracting, in NVMe's read/write path. |
 | Pixel blit | `core/fb_blit.c: hype_fb_blit_copy()` | Operates only on already-validated host pointers; clips to `min(src,dst)` dimensions | `core/tests/test_fb_blit.c` |
 
 ### pflash (`devices/pflash.c`)
@@ -359,8 +359,8 @@ a guest-directed write primitive, not merely a crash.
 
 | Guest-writable field | Check | What it verifies | Test |
 |---|---|---|---|
-| MSR_KVM_SYSTEM_TIME GPA | `vmx_pvclock_arm_system_time()` (`vmcs_hw.c`) / `hype_svm_pvclock_arm_system_time()` (`svm_vcpu.c:1886`), both via `hype_gpa_to_host()` | GPA + `sizeof(hype_pvclock_vcpu_time_info)` fits the VM's mapped range before the time-info page is written | Gap — no test on either backend. Tracked by **#671**, **#667** |
-| MSR_KVM_WALL_CLOCK GPA | `vmx_pvclock_arm_wall_clock()` / `hype_svm_pvclock_arm_wall_clock()` | Same bound, for the wall-clock page | Gap — tracked by **#671**, **#667** |
+| MSR_KVM_SYSTEM_TIME GPA | `hype_pvclock_arm_system_time()` (`devices/pvclock.c`, extracted by **#667** from both backends' private helpers) | GPA + `sizeof(hype_pvclock_vcpu_time_info)` fits the VM's mapped range before the time-info page is written | `core/tests/test_pvclock.c: test_arm_system_time_out_of_range_gpa_refused` (closed **#671**, **#667**) |
+| MSR_KVM_WALL_CLOCK GPA | `hype_pvclock_arm_wall_clock()` (same extraction) | Same bound, for the wall-clock page | `test_pvclock.c: test_arm_wall_clock_out_of_range_gpa_refused` (closed **#671**, **#667**) |
 | Time-info/wall-clock page write itself (pure function) | `devices/pvclock.c: hype_pvclock_write_time_info()`/`_write_wall_clock()` | Version-counter memory-barrier discipline (odd = update in progress, even = complete) so a concurrent guest read never sees a torn record | `core/tests/test_pvclock.c: test_write_time_info_version_and_fields`, `test_write_wall_clock` |
 
 ### Hyper-V hypercall page (`arch/x86_64/cpu/hyperv.c`)
@@ -374,7 +374,7 @@ a guest-directed write primitive, not merely a crash.
 
 | Guest-writable field | Check | What it verifies | Test |
 |---|---|---|---|
-| Reference-TSC MSR (GPA it names) | `hype_hv_reference_tsc_write()` (`:63`), via `hype_gpa_to_host()` | GPA + 4096 bytes fits the mapped range before the page is zeroed and rewritten | Gap — zero test coverage. Tracked by **#670** |
+| Reference-TSC MSR (GPA it names) | `hype_hv_reference_tsc_write()` (`:63`), via `hype_gpa_to_host()` | GPA + 4096 bytes fits the mapped range before the page is zeroed and rewritten | `core/tests/test_hyperv.c` (closed **#670**: mirrors the existing hypercall-page tests in the same file) |
 
 `hype_hv_reference_tsc_write()` is called only from `arch/x86_64/svm/svm_vcpu.c`
 (`:2166`); no equivalent call exists in `arch/x86_64/vmx/vmcs_hw.c`, so a
@@ -400,38 +400,62 @@ follow-up.
 
 ## Coverage gaps and defects found by this audit
 
+**Status as of this update: every gap and defect this audit originally found
+has since been closed with a real fix or test** (verified against each
+ticket's actual closing commit, not just its board status, on 2026-08-23 —
+see the per-row citations above). Kept as history rather than deleted: the
+next audit pass should be able to see what this one found and how it was
+resolved, not just a clean present-tense table.
+
 - **Device/interface families documented: 27** (the `###` headings in
   sections 1-7; four more families are listed in §8 as confirmed out of
   scope).
 - **Guest-writable fields/structures enumerated (table rows): 87.**
-- **Check and test both proven: 68 rows.**
-- **Check present, test missing: 18 rows**, covering 11 existing tickets
-  (below).
-- **Check missing entirely (a real defect, not a test gap): 1 row**,
-  newly filed as **#672** by this audit.
+- **Check and test both proven, as of this update: all 85 §6j-applicable
+  rows** (87 total rows minus the 2 ACPI PM1a_CNT/reset-control rows, which
+  are not §6j findings at all; see below).
+- **Check missing entirely (a real defect): 1 row, found and fixed as
+  #672.**
 
-Testing gaps (no unit test proves an existing, correct-by-inspection check):
+Testing gaps this audit found, all now closed with a real test added:
 
 - **#661**, **#663** — AHCI/ATAPI command-list/command-table/PRDT GPA checks
+  → `core/tests/test_ahci_dma.c`
 - **#662**, **#665** — guest xHCI ring/context/TRB-buffer GPA checks
-- **#664**, **#667** — fw_cfg DMA GPA checks
-- **#666**, **#669** — ramfb surface GPA check, NVMe `boot/main.c` GPA checks
-- **#668** — ACPI PM1a_CNT/reset-control register handlers
-- **#670** — Hyper-V reference-TSC page GPA check
-- **#671** — kvmclock system-time/wall-clock GPA checks
+  → `core/tests/test_xhci_dev.c`
+- **#664**, **#667** — fw_cfg DMA GPA checks → new `hype_fw_cfg_dma_op_run()`
+  extraction + `core/tests/test_fw_cfg.c`
+- **#669** — NVMe `boot/main.c` GPA checks → new `hype_gpa_read()`/
+  `hype_gpa_write()` extraction (`core/guest_mem.c`) + `test_guest_mem.c`
+- **#666** — ramfb surface GPA check → closed as "nothing to extract": the
+  call site has no separable logic beyond a direct `hype_gpa_to_host()` call,
+  already covered by `test_guest_mem.c`
+- **#670** — Hyper-V reference-TSC page GPA check → `test_hyperv.c`
+- **#671** — kvmclock system-time/wall-clock GPA checks → new
+  `hype_pvclock_arm_system_time()`/`_arm_wall_clock()` extraction
+  (`devices/pvclock.c`) + `test_pvclock.c`
+- **#668** — ACPI PM1a_CNT/reset-control register handlers → closed as
+  **not a §6j finding at all**: neither handler ever dereferences a
+  guest-supplied address, so this audit's own template doesn't apply to
+  them (see the row itself for the closing rationale)
 
-Structural root cause of the above:
+Structural root cause of the above (still open — a process fix, not a
+per-surface one):
 
 - **#659** — `svm_vcpu.c`/`vmcs_hw.c` are blanket coverage-exempt, hiding
   pure, host-testable device logic inside two files totaling ~20% of
-  `core/`+`arch/`'s source
+  `core/`+`arch/`'s source. Every extraction above (#664/#667/#669) worked
+  around this one file at a time; #659 is the ticket to fix the pattern
+  itself so the next device doesn't need its own extraction ticket.
 
-Defects (a check is missing or wrong, not merely untested):
+Defects found (a check was missing or wrong, not merely untested) — both fixed:
 
-- **#672** — `process_ahci_ata_command_slot()` dereferences the command-list
-  GPA translation with no null check (guest-triggerable NULL dereference)
-- **#656** — ATAPI READ(12) byte-length arithmetic can overflow in 32 bits
-  (correctness bug, not a memory-isolation escape; found by **#613**)
+- **#672** — `process_ahci_ata_command_slot()` dereferenced the command-list
+  GPA translation with no null check (guest-triggerable NULL dereference) —
+  fixed in commit `8efc71d`
+- **#656** — ATAPI READ(12) byte-length arithmetic could overflow in 32 bits
+  (correctness bug, not a memory-isolation escape; found by **#613**) — fixed
+  in commit `c6a1442`
 
 Related audits, not superseded by this document:
 
