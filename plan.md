@@ -3288,6 +3288,63 @@ isn't lost.
     for an unrelated one-shot mount at a different point in boot risks the
     two features corrupting each other's state.
 
+66. **#609: host indirect-branch posture -- IBPB on the guest->host transition where the CPU
+    grants it; retpoline compilation deferred as its own, separately-risked follow-up -- decided
+    (2026-08-23).** Recorded because #609's own Bar requires this decision exist before any code
+    for it lands, and because the two items in its cost-ordered list turned out to carry very
+    different risk profiles once actually investigated.
+
+    **The gap.** hype's post-exit code is dense with indirect calls through vtables
+    (`vmm_ops`, `hype_fs_ops_t`, `hype_blk_backend_t`) reachable immediately after a VM exit, and
+    nothing conditions the host's own branch predictor between guest execution and those calls --
+    a guest can train the BTB and speculatively steer host code, the classic Spectre-v2 guest-host
+    channel. Decision 48 (L1TF) and decision 47 (contention channels) do not cover this axis.
+
+    **Decided: implement item 2 (IBPB on the transition) now; defer item 1 (retpoline
+    compilation).** The two are not equally risky to attempt in this codebase, which only became
+    clear from #604's own stack-canary attempt this same session (#711): `-fstack-protector`
+    -- a FAR less invasive codegen change than retpoline, which rewrites every indirect
+    call/jump in the binary into a thunk sequence -- broke `hype.efi`'s boot outright on this
+    project's `x86_64-unknown-uefi` / `ld.lld -flavor link` combination, for a reason not yet
+    root-caused (#711). Retpoline is compiler-flag-level, whole-binary, and touches the exact
+    code shape (indirect branches) this project's minimal PE/COFF pipeline has already shown one
+    surprising incompatibility with. Attempting it blind, in the same session #711 happened in,
+    repeats exactly the mistake that ticket is a lesson in.
+
+    IBPB-on-exit carries none of that risk: it reuses `#608`'s own just-landed infrastructure
+    (`hype_cpu_has_ibpb()`, the real IBPB `wrmsr`, both already proven correct and boot-tested) and
+    adds one MSR write at a point in the SVM/VMX exit path already proven safe to touch (the same
+    bracket #608's SPEC_CTRL restore lives in). No new compiler flags, no whole-binary codegen
+    change, no new failure class to root-cause blind.
+
+    **What lands:** after every VM exit, on both backends, if the host CPU grants IBPB
+    (`hype_cpu_has_ibpb()`, already vendor-hardcoded per file from #608), issue it before any other
+    host C code that contains an indirect call runs -- the same "restore host state before
+    anything else executes" placement #608's SPEC_CTRL restore already established. No skip-logic
+    against AMD Automatic IBRS or Intel `IA32_ARCH_CAPABILITIES` in this pass: getting either
+    exactly right needs bit-position certainty this session did not verify against a primary
+    source (the `research-provenance` rule this project already follows), and a redundant-but-
+    correct IBPB on hardware that already provides the guarantee some other way is a safe default
+    to fall back to, unlike guessing a skip condition wrong and silently dropping the mitigation
+    where it was still needed. Recorded as an explicit follow-up refinement, not a blocking gap.
+
+    **Measured cost, both vendors, exit-path microbenchmark (`tests/micro/pausespin.c`-shaped
+    spin-loop, N VM exits timed via TSC before/after this change):** recorded in #609's own ticket
+    comment rather than duplicated here, since a benchmark number is a snapshot of one run on one
+    machine on one day and belongs where it can be dated and re-run, not baked into a design
+    decision that is supposed to stay true.
+
+    **Retpoline itself remains open**, tracked by #609 continuing to reference this decision until
+    it lands separately, with its own root-cause work on #711 as a prerequisite (the same toolchain
+    combination is implicated) and its own before/after measurement.
+
+    **Alternatives considered.** Attempting retpoline anyway, accepting the regression risk --
+    rejected outright: #711 already spent real time on exactly this failure mode once this
+    session, and there is no reason to expect a different toolchain interaction to fail more
+    gracefully. A blanket unconditional IBPB with no CPUID gate -- rejected: on hardware that
+    lacks it, the WRMSR itself would #GP on the host (this runs on hype's own CPU, not inside a
+    guest), which is worse than skipping the mitigation.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what
