@@ -217,4 +217,44 @@ int hype_ntfs_mft_record_alloc(hype_ntfs_t *fs, hype_blk_write_fn write, int is_
 int hype_ntfs_mft_record_free(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t rec_no,
                               uint16_t usn);
 
+/*
+ * #421: $I30 directory index insert/delete -- RESIDENT $INDEX_ROOT only.
+ * hype's own read-side lookup (dir_lookup(), core/ntfs.c) already scans
+ * $INDEX_ROOT plus every $INDEX_ALLOCATION block LINEARLY rather than
+ * descending a B+tree -- the same simplification this write-side slice
+ * makes: a directory small enough to keep its whole index resident in
+ * $INDEX_ROOT (no $INDEX_ALLOCATION) is maintained as one sorted array,
+ * with no node split/merge machinery at all. This covers the common case
+ * every create/mkdir into a modest directory needs.
+ *
+ * Deliberately out of scope for this slice, refused rather than silently
+ * degraded: a directory that already has (or would need to grow into) an
+ * $INDEX_ALLOCATION B+tree -- real node split/merge, INDX block
+ * allocation, and index-bitmap maintenance are a materially bigger, later
+ * ticket, not a partial implementation of this one.
+ *
+ * Both maintain sorted order via $UpCase collation (case-insensitive,
+ * shorter-is-less on a common prefix, raw-byte tiebreak so two names that
+ * only differ by case still get a deterministic total order) -- required
+ * for chkdsk's own index-order validation, not just for correctness of
+ * hype's own lookup.
+ *
+ * hype_ntfs_index_insert() refuses a duplicate name (case-insensitively).
+ * `name`/`name_len` is ASCII, the same convention hype_ntfs_resolve() and
+ * every other name-taking function in this module already use (decision
+ * 24: fold exactly through the verified $UpCase prefix, or not at all --
+ * a byte string is always inside that prefix by construction). Stored in
+ * the WIN32 namespace, matching how dir_lookup() already interprets it.
+ * `is_dir` sets FILE_ATTR_I30_INDEX (0x10000000) so this slice's own
+ * dir_lookup treats the new entry as a directory when it should.
+ *
+ * hype_ntfs_index_delete() removes the first entry (any namespace) whose
+ * name matches, refusing if none does.
+ */
+int hype_ntfs_index_insert(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t dir_rec,
+                           uint64_t mft_ref, const char *name, uint32_t name_len, int is_dir,
+                           uint16_t usn);
+int hype_ntfs_index_delete(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t dir_rec,
+                           const char *name, uint32_t name_len, uint16_t usn);
+
 #endif /* HYPE_CORE_NTFS_H */

@@ -1666,3 +1666,325 @@ int hype_ntfs_mft_record_free(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t
     }
     return bitmap_set_run(fs, &bmap, write, rec_no, 1u, 0);
 }
+
+/* ---- #421: $I30 index insert/delete (resident $INDEX_ROOT only) --------- */
+
+/* Three-way $UpCase collation: case-insensitive first, then (only on a
+ * full case-insensitive tie) raw code units, so two names differing only
+ * by case still get a deterministic, chkdsk-acceptable total order. -1/0/1. */
+static int index_collate(const hype_ntfs_t *fs, const uint8_t *a_utf16, uint32_t a_units,
+                         const uint8_t *b_utf16, uint32_t b_units) {
+    uint32_t n = a_units < b_units ? a_units : b_units;
+    uint32_t i;
+    for (i = 0; i < n; i++) {
+        uint16_t ca = hype_rd16(a_utf16 + i * 2u);
+        uint16_t cb = hype_rd16(b_utf16 + i * 2u);
+        uint16_t ua = ca < HYPE_NTFS_UPCASE_CACHE ? fs->upcase[ca] : ca;
+        uint16_t ub = cb < HYPE_NTFS_UPCASE_CACHE ? fs->upcase[cb] : cb;
+        if (ua != ub) {
+            return ua < ub ? -1 : 1;
+        }
+    }
+    if (a_units != b_units) {
+        return a_units < b_units ? -1 : 1;
+    }
+    for (i = 0; i < n; i++) {
+        uint16_t ca = hype_rd16(a_utf16 + i * 2u);
+        uint16_t cb = hype_rd16(b_utf16 + i * 2u);
+        if (ca != cb) {
+            return ca < cb ? -1 : 1;
+        }
+    }
+    return 0;
+}
+
+#define IDX_ENTRY_LAST 0x02u
+
+/* Builds one $FILE_NAME index entry (header + key) for `name`, WIN32
+ * namespace. Returns the entry's total (8-aligned) length. */
+static uint32_t index_build_entry(uint8_t *out, uint64_t mft_ref, uint64_t parent_ref,
+                                  const char *name, uint32_t name_len, int is_dir) {
+    uint32_t klen = 0x42u + name_len * 2u;
+    uint32_t elen = round_up_8(0x10u + klen);
+    uint32_t i;
+
+    for (i = 0; i < elen; i++) {
+        out[i] = 0u;
+    }
+    hype_wr64(out + 0, mft_ref);
+    hype_wr16(out + 8, (uint16_t)elen);
+    hype_wr16(out + 10, (uint16_t)klen);
+    hype_wr16(out + 12, 0u); /* not the last entry */
+    hype_wr64(out + 0x10, parent_ref & 0x0000FFFFFFFFFFFFull);
+    hype_wr32(out + 0x10 + 0x38, is_dir ? 0x10000000u : 0u); /* FILE_ATTR_I30_INDEX */
+    out[0x10 + 0x40] = (uint8_t)name_len;
+    out[0x10 + 0x41] = 1u; /* WIN32 namespace */
+    for (i = 0; i < name_len; i++) {
+        hype_wr16(out + 0x10 + 0x42 + i * 2u, (uint16_t)(uint8_t)name[i]);
+    }
+    return elen;
+}
+
+/* Locates $INDEX_ROOT's $FILE_NAME index in `rec`, refusing anything this
+ * slice does not maintain (non-resident, wrong indexed attribute, or an
+ * $INDEX_ALLOCATION already present -- a B+tree this slice does not
+ * descend or grow). On success: *out_attr_off is the attribute's own
+ * offset, *out_val_off the value's offset from record start, *out_val_len
+ * its current length, out_ents_off/out_ents_size the index header's own
+ * fields (both relative to the index header, i.e. value offset + 0x10). */
+static int index_root_locate(hype_ntfs_t *fs, uint8_t *rec, uint32_t *out_attr_off,
+                             uint32_t *out_val_off, uint32_t *out_val_len,
+                             uint32_t *out_ents_off, uint32_t *out_ents_size) {
+    ntfs_attr_t a, dup;
+    uint32_t cur = 0;
+    const uint8_t *ir;
+
+    if (!(hype_rd16(rec + 0x16) & MFT_IS_DIR)) {
+        return -1;
+    }
+    cur = 0;
+    if (attr_find(rec, fs->mft_record_size, AT_INDEX_ALLOCATION, &cur, &dup) == 0) {
+        return -1; /* out of scope: a B+tree already exists */
+    }
+    cur = 0;
+    if (attr_find(rec, fs->mft_record_size, AT_INDEX_ROOT, &cur, &a) != 0) {
+        return -1;
+    }
+    if (a.non_resident || a.val_len < 0x20u) {
+        return -1;
+    }
+    *out_attr_off = cur - a.length;
+    *out_val_off = *out_attr_off + a.val_off;
+    *out_val_len = a.val_len;
+    ir = rec + *out_val_off;
+    if (hype_rd32(ir) != AT_FILE_NAME) {
+        return -1;
+    }
+    *out_ents_off = hype_rd32(ir + 0x10);
+    *out_ents_size = hype_rd32(ir + 0x14);
+    if (ir[0x10 + 12] & 0x01u) {
+        return -1; /* has-children flag: an $INDEX_ALLOCATION is expected */
+    }
+    if (*out_ents_off > *out_ents_size || 0x10u + *out_ents_size > *out_val_len) {
+        return -1;
+    }
+    return 0;
+}
+
+int hype_ntfs_index_insert(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t dir_rec,
+                           uint64_t mft_ref, const char *name, uint32_t name_len, int is_dir,
+                           uint16_t usn) {
+    static uint8_t rec[HYPE_NTFS_MAX_RECORD];
+    uint32_t attr_off, val_off, val_len, ents_off, ents_size;
+    uint8_t new_entry[0x10u + 0x42u + 510u];
+    uint8_t new_key[510u];
+    uint32_t new_elen;
+    uint32_t p, insert_at;
+    uint32_t new_val_len, new_attr_length, old_attr_length, delta;
+    uint32_t bytes_used;
+    uint32_t i;
+
+    if (fs == 0 || write == 0 || name == 0 || name_len == 0u || name_len > 255u) {
+        return -1;
+    }
+    if (record_read(fs, dir_rec, rec) != 0) {
+        return -1;
+    }
+    if (index_root_locate(fs, rec, &attr_off, &val_off, &val_len, &ents_off, &ents_size) != 0) {
+        return -1;
+    }
+    /* index_collate() reads UTF-16LE code units (like every on-disk key),
+     * so `name` must be widened here, not byte-packed -- every byte of an
+     * ASCII `name` is already < HYPE_NTFS_UPCASE_CACHE (256) by
+     * construction, decision 24's "fold exactly or not at all" rule holds
+     * structurally, the same reasoning name_eq() relies on. */
+    for (i = 0; i < name_len; i++) {
+        hype_wr16(new_key + i * 2u, (uint16_t)(uint8_t)name[i]);
+    }
+
+    /* Walk existing entries in order, finding the sorted insertion point
+     * and refusing a case-insensitive duplicate. */
+    p = 0;
+    insert_at = (uint32_t)~0u;
+    while (p + 0x10u <= ents_size - ents_off) {
+        const uint8_t *e = rec + val_off + 0x10u + ents_off + p;
+        uint32_t elen = hype_rd16(e + 8);
+        uint32_t klen = hype_rd16(e + 10);
+        uint32_t eflags = hype_rd16(e + 12);
+        if (elen < 0x10u || p + elen > ents_size - ents_off) {
+            return -1;
+        }
+        if (eflags & IDX_ENTRY_LAST) {
+            if (insert_at == (uint32_t)~0u) {
+                insert_at = p;
+            }
+            break;
+        }
+        if (klen >= 0x42u && 0x10u + klen <= elen) {
+            const uint8_t *fn = e + 0x10u;
+            uint32_t fn_nlen = fn[0x40];
+            if (0x42u + fn_nlen * 2u <= klen) {
+                if (name_eq(fs, fn + 0x42, fn_nlen, name, name_len)) {
+                    return -1; /* duplicate name (case-insensitive): refused, like a real create() */
+                }
+                if (insert_at == (uint32_t)~0u &&
+                    index_collate(fs, new_key, name_len, fn + 0x42, fn_nlen) < 0) {
+                    insert_at = p;
+                }
+            }
+        }
+        p += elen;
+    }
+    if (insert_at == (uint32_t)~0u) {
+        return -1; /* no terminator found: malformed index */
+    }
+
+    new_elen = index_build_entry(new_entry, mft_ref, dir_rec, name, name_len, is_dir);
+    if (new_elen > sizeof new_entry) {
+        return -1;
+    }
+
+    new_val_len = val_len + new_elen;
+    old_attr_length = 0;
+    {
+        ntfs_attr_t a;
+        uint32_t cur = 0;
+        if (attr_find(rec, fs->mft_record_size, AT_INDEX_ROOT, &cur, &a) != 0) {
+            return -1;
+        }
+        old_attr_length = a.length;
+    }
+    /*
+     * NOT a fixed 0x18: $INDEX_ROOT (any "indexed" resident attribute) has
+     * an extra 8-byte indexed-flag/reserved field between the standard
+     * resident header and its value, so a.val_off is 0x20 here, not 0x18.
+     * Confirmed empirically on a real mkntfs/ntfs-3g directory -- assuming
+     * 0x18 undercounted the attribute's true header size by 8 bytes,
+     * corrupting the splice math even though every individual entry byte
+     * was correct. Always use the attribute's OWN val_off, never assume.
+     */
+    new_attr_length = round_up_8((val_off - attr_off) + new_val_len);
+    if (new_attr_length < old_attr_length) {
+        new_attr_length = old_attr_length;
+    }
+    delta = new_attr_length - old_attr_length;
+
+    bytes_used = hype_rd32(rec + 0x18);
+    if (bytes_used < attr_off + old_attr_length || bytes_used > fs->mft_record_size) {
+        return -1;
+    }
+    if (delta != 0u) {
+        if (bytes_used + delta > fs->mft_record_size) {
+            return -1; /* no room: this is exactly the "needs $INDEX_ALLOCATION" case */
+        }
+        for (i = bytes_used; i > attr_off + old_attr_length; i--) {
+            rec[i - 1u + delta] = rec[i - 1u];
+        }
+        hype_wr32(rec + 0x18, bytes_used + delta);
+    }
+    hype_wr32(rec + attr_off + 4, new_attr_length);
+    hype_wr32(rec + attr_off + 0x10, new_val_len); /* resident val_len */
+
+    /* Shift entries from the insertion point onward (still within the OLD
+     * val_len bytes, which are all still valid at their old offsets since
+     * the shift above only moved bytes AFTER the whole attribute) forward
+     * by new_elen, then splice the new entry into the gap. */
+    {
+        uint32_t region_start = val_off + 0x10u + ents_off;
+        uint32_t region_old_len = ents_size - ents_off;
+        for (i = region_old_len; i > insert_at; i--) {
+            rec[region_start + i - 1u + new_elen] = rec[region_start + i - 1u];
+        }
+        for (i = 0; i < new_elen; i++) {
+            rec[region_start + insert_at + i] = new_entry[i];
+        }
+    }
+    hype_wr32(rec + val_off + 0x10 + 4, ents_size + new_elen);  /* entries_size */
+    hype_wr32(rec + val_off + 0x10 + 8, ents_size + new_elen);  /* allocated: kept tight */
+
+    return hype_ntfs_record_write(fs, write, dir_rec, rec, usn);
+}
+
+int hype_ntfs_index_delete(hype_ntfs_t *fs, hype_blk_write_fn write, uint64_t dir_rec,
+                           const char *name, uint32_t name_len, uint16_t usn) {
+    static uint8_t rec[HYPE_NTFS_MAX_RECORD];
+    uint32_t attr_off, val_off, val_len, ents_off, ents_size;
+    uint32_t p;
+    uint32_t found_off = (uint32_t)~0u, found_elen = 0;
+    uint32_t new_val_len, old_attr_length;
+    uint32_t i;
+
+    if (fs == 0 || write == 0 || name == 0 || name_len == 0u) {
+        return -1;
+    }
+    if (record_read(fs, dir_rec, rec) != 0) {
+        return -1;
+    }
+    if (index_root_locate(fs, rec, &attr_off, &val_off, &val_len, &ents_off, &ents_size) != 0) {
+        return -1;
+    }
+
+    p = 0;
+    while (p + 0x10u <= ents_size - ents_off) {
+        const uint8_t *e = rec + val_off + 0x10u + ents_off + p;
+        uint32_t elen = hype_rd16(e + 8);
+        uint32_t klen = hype_rd16(e + 10);
+        uint32_t eflags = hype_rd16(e + 12);
+        if (elen < 0x10u || p + elen > ents_size - ents_off) {
+            return -1;
+        }
+        if (eflags & IDX_ENTRY_LAST) {
+            break;
+        }
+        if (klen >= 0x42u && 0x10u + klen <= elen) {
+            const uint8_t *fn = e + 0x10u;
+            uint32_t fn_nlen = fn[0x40];
+            if (0x42u + fn_nlen * 2u <= klen && fn_nlen == name_len) {
+                if (name_eq(fs, fn + 0x42, fn_nlen, name, name_len)) {
+                    found_off = p;
+                    found_elen = elen;
+                    break;
+                }
+            }
+        }
+        p += elen;
+    }
+    if (found_off == (uint32_t)~0u) {
+        return -1; /* no such name */
+    }
+
+    /* Shift everything after the removed entry back over it. */
+    {
+        uint32_t region_start = val_off + 0x10u + ents_off;
+        uint32_t region_old_len = ents_size - ents_off;
+        for (i = found_off + found_elen; i < region_old_len; i++) {
+            rec[region_start + i - found_elen] = rec[region_start + i];
+        }
+    }
+
+    new_val_len = val_len - found_elen;
+    {
+        ntfs_attr_t a;
+        uint32_t cur = 0;
+        if (attr_find(rec, fs->mft_record_size, AT_INDEX_ROOT, &cur, &a) != 0) {
+            return -1;
+        }
+        old_attr_length = a.length;
+    }
+    /*
+     * The attribute's own declared length is NEVER shrunk here (the next
+     * attribute already starts right after it, exactly like #418/#419) --
+     * deleting only ever frees content bytes within that same space, so no
+     * record-wide shift is ever needed.
+     */
+    hype_wr32(rec + attr_off + 0x10, new_val_len);
+    hype_wr32(rec + val_off + 0x10 + 4, ents_size - found_elen);
+    hype_wr32(rec + val_off + 0x10 + 8, ents_size - found_elen);
+    /* zero the vacated tail for cleanliness (not required for correctness:
+     * it sits past the new val_len, which nothing reads) */
+    for (i = (val_off - attr_off) + new_val_len; i < old_attr_length; i++) {
+        rec[attr_off + i] = 0u;
+    }
+
+    return hype_ntfs_record_write(fs, write, dir_rec, rec, usn);
+}

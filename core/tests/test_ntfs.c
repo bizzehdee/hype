@@ -1992,6 +1992,158 @@ static void test_mft_alloc(void) {
     CHECK("free a missing record refused", hype_ntfs_mft_record_free(&fs, vol_write, 9999, 2) != 0);
 }
 
+/* Byte offset (relative to the entries region) of the first index entry in
+ * record `n`'s resident $INDEX_ROOT whose name matches `name`, or ~0u. Used
+ * to assert on-disk SORT ORDER directly -- resolve() succeeding proves an
+ * entry is findable via linear scan, not that it landed in the right
+ * collated position (a real ntfs-3g driver's own lookup does care, unlike
+ * hype's own deliberately-linear dir_lookup()). */
+static uint32_t entry_offset_by_name(unsigned rec_no, const char *name) {
+    uint8_t *rec = rec_ptr(rec_no);
+    uint32_t attrs_off = get16(rec + 0x14);
+    uint32_t off = attrs_off;
+    uint32_t nlen = (uint32_t)strlen(name);
+    for (;;) {
+        uint32_t t = get32(rec + off);
+        uint32_t length = get32(rec + off + 4);
+        if (t == 0xFFFFFFFFu) return (uint32_t)~0u;
+        if (t == 0x90u) {
+            uint32_t val_off = off + get16(rec + off + 0x14);
+            uint32_t ents_off = get32(rec + val_off + 0x10);
+            uint32_t ents_size = get32(rec + val_off + 0x14);
+            uint32_t p = ents_off;
+            while (p + 0x10u <= ents_size) {
+                const uint8_t *e = rec + val_off + 0x10u + p;
+                uint32_t elen = get16(e + 8);
+                uint32_t klen = get16(e + 10);
+                uint32_t eflags = get16(e + 12);
+                if (eflags & 0x02u || elen == 0u) break;
+                if (klen >= 0x42u) {
+                    uint32_t fn_nlen = e[0x10 + 0x40];
+                    if (fn_nlen == nlen) {
+                        uint32_t i, eq = 1;
+                        for (i = 0; i < nlen; i++) {
+                            if (get16(e + 0x10 + 0x42 + i * 2u) != (uint16_t)(uint8_t)name[i]) {
+                                eq = 0;
+                                break;
+                            }
+                        }
+                        if (eq) return p;
+                    }
+                }
+                p += elen;
+            }
+            return (uint32_t)~0u;
+        }
+        off += length;
+    }
+}
+
+/* #421: $I30 index insert/delete (resident $INDEX_ROOT only). Root (record
+ * 5) holds img.bin(40) vdl.bin(41) comp.bin(42) enc.bin(43) res.bin(44)
+ * subdir(45,dir) bigdir(47,dir) lst.bin(48), all resident, no
+ * $INDEX_ALLOCATION -- exactly this slice's scope. */
+static void test_index_insert_delete(void) {
+    hype_ntfs_t fs;
+    hype_file_rmap_t m, m2;
+
+    /* insert: a second name for an EXISTING file's inode (41, vdl.bin) --
+     * resolving the new name must reach the identical underlying data.
+     * Root (record 5) has very little resident slack left (its 8 existing
+     * entries already nearly fill the 1024-byte record) -- alias.bin is
+     * sized to be the last insert that fits before deleting something. */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("alias not found before insert", hype_ntfs_resolve(&fs, "/alias.bin", &m) != 0);
+    CHECK_HEX("insert alias", 0,
+              hype_ntfs_index_insert(&fs, vol_write, 5, 41, "alias.bin", 9, 0, 2));
+    CHECK_HEX("resolve alias", 0, hype_ntfs_resolve(&fs, "/alias.bin", &m));
+    CHECK_HEX("resolve vdl.bin", 0, hype_ntfs_resolve(&fs, "/vdl.bin", &m2));
+    CHECK_HEX("alias reaches the same data (size)", m2.size_bytes, m.size_bytes);
+    CHECK_HEX("alias reaches the same data (count)", m2.count, m.count);
+    CHECK_HEX("alias reaches the same data (lba)", m2.ranges[0].start_lba, m.ranges[0].start_lba);
+    /* every original name still resolves */
+    CHECK_HEX("img.bin still there", 0, hype_ntfs_resolve(&fs, "/img.bin", &m));
+    CHECK_HEX("lst.bin still there", 0, hype_ntfs_resolve(&fs, "/lst.bin", &m));
+
+    /* case-insensitive duplicate refused */
+    CHECK("duplicate (case-insensitive) refused",
+          hype_ntfs_index_insert(&fs, vol_write, 5, 41, "IMG.BIN", 7, 0, 3) != 0);
+    CHECK("exact duplicate refused",
+          hype_ntfs_index_insert(&fs, vol_write, 5, 41, "img.bin", 7, 0, 3) != 0);
+
+    /* delete: removing a name must not disturb any sibling, and frees room
+     * for a later insert to reuse */
+    CHECK_HEX("delete img.bin", 0, hype_ntfs_index_delete(&fs, vol_write, 5, "img.bin", 7, 6));
+    CHECK("img.bin gone after delete", hype_ntfs_resolve(&fs, "/img.bin", &m) != 0);
+    CHECK_HEX("vdl.bin unaffected", 0, hype_ntfs_resolve(&fs, "/vdl.bin", &m));
+    CHECK_HEX("lst.bin unaffected", 0, hype_ntfs_resolve(&fs, "/lst.bin", &m));
+    CHECK_HEX("alias.bin unaffected", 0, hype_ntfs_resolve(&fs, "/alias.bin", &m));
+    CHECK("deleting it again refused", hype_ntfs_index_delete(&fs, vol_write, 5, "img.bin", 7, 7) !=
+                                            0);
+
+    /* insert a directory entry into the room just freed, then delete it */
+    CHECK_HEX("insert dir entry", 0,
+              hype_ntfs_index_insert(&fs, vol_write, 5, 47, "bigdir2", 7, 1, 8));
+    CHECK_HEX("resolve dir entry unaffected siblings", 0, hype_ntfs_resolve(&fs, "/lst.bin", &m));
+    CHECK_HEX("delete dir entry", 0, hype_ntfs_index_delete(&fs, vol_write, 5, "bigdir2", 7, 9));
+
+    /* many inserts in mixed order still resolve correctly (sorted-position
+     * logic exercised at the start, middle, and end) -- subdir (record 45)
+     * has only 3 entries, plenty of resident slack for this. */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK_HEX("insert zzz (end)", 0,
+              hype_ntfs_index_insert(&fs, vol_write, 45, 41, "zzz.bin", 7, 0, 2));
+    CHECK_HEX("insert aaa (start)", 0,
+              hype_ntfs_index_insert(&fs, vol_write, 45, 41, "aaa.bin", 7, 0, 3));
+    CHECK_HEX("insert mmm (middle)", 0,
+              hype_ntfs_index_insert(&fs, vol_write, 45, 41, "mmm.bin", 7, 0, 4));
+    CHECK_HEX("resolve zzz", 0, hype_ntfs_resolve(&fs, "/subdir/zzz.bin", &m));
+    CHECK_HEX("resolve aaa", 0, hype_ntfs_resolve(&fs, "/subdir/aaa.bin", &m));
+    CHECK_HEX("resolve mmm", 0, hype_ntfs_resolve(&fs, "/subdir/mmm.bin", &m));
+    CHECK_HEX("original entries still resolve", 0, hype_ntfs_resolve(&fs, "/subdir/nested.bin", &m));
+    /* on-disk collation order, not just linear-scan findability -- a real
+     * driver's own lookup depends on this (#421 finding: an earlier version
+     * built a byte-packed, not UTF-16LE, comparison key here, which put
+     * every insert in the wrong position; resolve() via hype's own linear
+     * dir_lookup() never caught it -- only a real ntfs-3g mount's lookup by
+     * path did, "No such file or directory" despite `ls` listing the name). */
+    {
+        uint32_t off_aaa = entry_offset_by_name(45, "aaa.bin");
+        uint32_t off_mmm = entry_offset_by_name(45, "mmm.bin");
+        uint32_t off_zzz = entry_offset_by_name(45, "zzz.bin");
+        CHECK("aaa found on disk", off_aaa != (uint32_t)~0u);
+        CHECK("mmm found on disk", off_mmm != (uint32_t)~0u);
+        CHECK("zzz found on disk", off_zzz != (uint32_t)~0u);
+        CHECK("aaa sorts before mmm on disk", off_aaa < off_mmm);
+        CHECK("mmm sorts before zzz on disk", off_mmm < off_zzz);
+    }
+
+    /* refusals */
+    build_vol(0);
+    CHECK_HEX("mount", 0, hype_ntfs_mount(vol_read, 0, &fs));
+    CHECK("insert into a $INDEX_ALLOCATION dir refused (bigdir, record 47)",
+          hype_ntfs_index_insert(&fs, vol_write, 47, 41, "x.bin", 5, 0, 2) != 0);
+    CHECK("insert into a non-directory refused (img.bin, record 40)",
+          hype_ntfs_index_insert(&fs, vol_write, 40, 41, "x.bin", 5, 0, 2) != 0);
+    CHECK("insert into a missing record refused",
+          hype_ntfs_index_insert(&fs, vol_write, 9999, 41, "x.bin", 5, 0, 2) != 0);
+    CHECK("insert NULL fs refused",
+          hype_ntfs_index_insert(0, vol_write, 5, 41, "x.bin", 5, 0, 2) != 0);
+    CHECK("insert NULL write refused",
+          hype_ntfs_index_insert(&fs, 0, 5, 41, "x.bin", 5, 0, 2) != 0);
+    CHECK("insert zero-length name refused",
+          hype_ntfs_index_insert(&fs, vol_write, 5, 41, "x.bin", 0, 0, 2) != 0);
+    CHECK("delete from a missing record refused",
+          hype_ntfs_index_delete(&fs, vol_write, 9999, "img.bin", 7, 2) != 0);
+    CHECK("delete a name that never existed refused",
+          hype_ntfs_index_delete(&fs, vol_write, 5, "nope.bin", 8, 2) != 0);
+    CHECK("delete NULL fs refused", hype_ntfs_index_delete(0, vol_write, 5, "img.bin", 7, 2) != 0);
+    CHECK("delete NULL write refused",
+          hype_ntfs_index_delete(&fs, 0, 5, "img.bin", 7, 2) != 0);
+}
+
 int main(void) {
     test_probe();
     test_mount_refusals();
@@ -2009,6 +2161,7 @@ int main(void) {
     test_data_append();
     test_hole_fill();
     test_mft_alloc();
+    test_index_insert_delete();
 
     if (failures == 0) {
         printf("test_ntfs: all tests passed\n");

@@ -301,6 +301,54 @@ correctly advances 16 -> 17 (alloc) -> 18 (free) -> 19 (realloc) across
 the cycle) -- i.e. the record-slot bookkeeping is sound even though the
 record has no visible file content yet.
 
+## NTFS $I30 index insert: named resident attributes, and UTF-16 keys (#421)
+
+Two real bugs found only by testing against a genuine `mkntfs`/`ntfs-3g`
+directory (both invisible to host unit tests built on hand-crafted
+fixtures, for related reasons):
+
+1. **`$INDEX_ROOT`'s resident value offset is not a fixed 0x18.** Any
+   "indexed" resident attribute -- in practice always true for
+   `$INDEX_ROOT`/`$INDEX_ALLOCATION`/`$BITMAP` -- carries an attribute
+   NAME (`$I30`, 4 UTF-16 units = 8 bytes) placed between the standard
+   resident header and the value, so `a.val_off` on a real directory came
+   back `0x20`, not `0x18`. hype's own `attr_parse()` already reads
+   `val_off` dynamically and was never wrong; the bug was in the
+   NEW write-side code computing the attribute's total on-disk length
+   from a hardcoded `0x18 + value_length` instead of `a.val_off +
+   value_length`. Every synthetic host-test fixture uses an UNNAMED
+   $INDEX_ROOT (val_off genuinely 0x18), so this never showed up until a
+   real volume was tried. **Fixed: always derive the header size from the
+   attribute's own val_off, never assume a constant** -- the same lesson
+   #418's mapping-pairs code already had to learn for a different field.
+2. **The insertion key must be UTF-16LE, not byte-packed ASCII.** The new
+   entry's comparison key (`new_key`) was filled one BYTE per character
+   (`new_key[i] = name[i]`), but the collation comparator reads UTF-16
+   code units (2 bytes each, matching every on-disk key and
+   `index_build_entry()`'s own encoding) -- so every collation compare
+   read garbage and every insert landed in an essentially-random position
+   in the sorted array. **This passed every host unit test**: hype's own
+   `hype_ntfs_resolve()`/`dir_lookup()` scan entries LINEARLY and never
+   cared about sort order, so a wrongly-placed entry still resolved fine
+   through hype's own code. Only a REAL `ntfs-3g` mount exposed it: `ls`
+   (a linear `readdir()`) listed the new file, but `stat`/`cat` (`ntfs-3g`'s
+   own by-name lookup, which apparently does depend on collation order)
+   reported "No such file or directory" for the exact same name `ls` had
+   just shown. Fixed by widening the key to UTF-16LE before comparing.
+   **Lesson for #422+**: a host-test assertion that only checks
+   "resolve() finds it" is not sufficient for anything touching on-disk
+   ORDER (index sort order, runlist VCN sequencing, attribute list VCN
+   ranges) -- add a test that reads the raw bytes back and checks the
+   actual on-disk arrangement, and treat a real-driver check as the
+   decisive one, not a formality, whenever ordering is part of the
+   contract.
+
+Both fixes re-verified against the same real `mkntfs`/`ntfs-3g` directory:
+inserting a second name for an existing file made it openable and
+readable under the new name (correct inode), and deleting the original
+name left the alias intact and fully accessible -- both via a REAL
+`ntfs-3g` mount, not just hype's own resolver.
+
 ## NTFS $LogFile / USN journal (#416)
 
 #416 (plan.md §10 decision 64) descoped `$LogFile` replay entirely: Microsoft's LFS (Log File
