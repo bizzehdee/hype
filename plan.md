@@ -3426,6 +3426,82 @@ isn't lost.
     from a stale one (see `HYPE_BUILD_ID`'s own Makefile comment) -- a rebuild of an old commit
     would misreport itself as an old build.
 
+69. **#506: a file-backed virtual disk grows its backing file on demand, so a sparse image is
+    usable at runtime, not merely creatable -- decided (2026-08-24), revised same day after
+    finding the right layer already exists.** First pass of this decision proposed teaching
+    `core/blk_image.c`'s physical-only `hype_file_map_t` path to tolerate holes. Wrong layer:
+    `core/file_range.c` (#381) already has a sparse-aware contract, `hype_file_rmap_t`, with
+    `hype_file_rmap_read_at()` synthesizing zeros for HOLE/UNWRITTEN ranges without touching the
+    medium, and `hype_file_rmap_write_at()` already refusing a write into a HOLE ("needs
+    allocation... this layer must not fake") rather than inventing sectors. Both are unit-tested
+    and already load-bearing for NTFS/ext internals (journal/allocator reads). A sparse guest
+    disk should be built on this, not a second implementation of the same hole semantics inside
+    `blk_image.c`.
+
+    **A new guest block backend, `hype_blk_image_sparse_t`, sits beside (not inside)
+    `hype_blk_image_t`.** It holds a `hype_file_rmap_t` instead of a `hype_file_map_t`, plus a
+    growth handle (`hype_fs_t *`, `hype_fs_file_t *`, and the file's path -- needed to re-resolve
+    the rmap after growth via `hype_fs_map_ranges`). A disk not marked sparse in `hype.cfg` keeps
+    using `hype_blk_image_t` exactly as today, unconditionally -- the fast, no-holes,
+    no-filesystem-metadata-ever path is untouched for every existing raw/qcow2-backed disk.
+    Read: `hype_file_rmap_read_at()` directly -- DATA through the injected host read, HOLE as
+    zeros, no filesystem writer ever touched by a guest read. Write: `hype_file_rmap_locate()`
+    first to classify the target range. DATA -> `hype_file_rmap_write_at()`, the existing fast
+    in-place path. HOLE -> the growth path below (UNWRITTEN should not occur here in practice --
+    #507 restricts sparse creation to ext, which represents an unallocated region as HOLE, never
+    ext4 fallocate's UNWRITTEN, precisely because hype's own extent-walking reader already
+    refuses an unwritten extent, #696 -- but a write hitting UNWRITTEN is refused the same as any
+    other non-DATA range this layer cannot fake, not silently promoted to a growth attempt).
+
+    **The write path, not a separate allocator, does the growing.** `HYPE_FS_CAP_WRITE_GROW`
+    already exists (`core/fs_ops.h`) and FAT32 (#382) and ext (#384/#385, jbd2-journaled) already
+    implement it: `write_at` past current EOF allocates and zero-fills the gap, crash-safely, and
+    is exactly what `tools/487`'s mkdisk pump already calls to build a file cluster by cluster.
+    On a HOLE hit, the sparse backend hands the guest's OWN write buffer straight to
+    `hype_fs_write_at()` on the growth handle -- one filesystem-level call, not an
+    allocate-then-remap-then-retry dance -- then re-resolves the rmap (`hype_fs_map_ranges`) so
+    the newly-allocated region joins the fast DATA path for every subsequent access. `map.size_bytes`
+    is the file's LOGICAL/virtual size from the first `hype_fs_map_ranges` call at VM setup, so
+    `be->total_sectors` reports the full guest-visible disk size before the guest has written
+    anything -- exactly what `hype_file_rmap_t` already carries.
+
+    **Serialization reuses the existing per-resource ticket lock (`core/ticket_lock.c`, SMP-7
+    #191), one new instance scoped to filesystem growth, not per-volume.** Two vCPUs -- possibly
+    on two different VMs' sparse disks that happen to share a host volume's allocation bitmap --
+    growing at once is the hazard the ticket names explicitly; a single global growth lock is
+    simpler than per-volume and growth is rare relative to steady-state I/O, so the extra
+    serialization cost is not worth the complexity of scoping it narrower. The lock is held for
+    exactly one `hype_fs_write_at` call plus the following re-resolve -- never across a guest
+    VM-exit boundary, matching every other lock in this codebase (SMP-7's own "nothing may block,
+    spin on another condition, or enter a guest while holding it").
+
+    **Refusal surface, per the ticket's bar:** the fs write_at call fails cleanly (volume full,
+    file would exceed `HYPE_FILE_MAX_RANGES`, or the mounted filesystem lacks
+    `HYPE_FS_CAP_WRITE_GROW`) and the sparse backend's write returns -1 for that guest write --
+    the same "guest write fails" contract every other blk_backend error already has, never a
+    host-side abort. A filesystem without `HYPE_FS_CAP_WRITE_GROW` cannot back a sparse image at
+    all; refused at VM setup time (disk marked sparse but the volume can't grow files) rather
+    than discovered at the first hole.
+
+    **Alternative considered and rejected: allocate-then-remap-then-retry-via-raw-sectors**, i.e.
+    ask the filesystem only to extend the allocation (no data), remap, then issue the guest's
+    write through the normal raw-sector path. Rejected because it reintroduces exactly the
+    ordering hazard #385's journaled ext writer exists to avoid: a crash between "extend" and
+    "write the guest's actual bytes" leaves a newly-allocated, zero-filled region that reads as
+    valid but is not what the guest asked to be there -- functionally silent data loss for that
+    write, distinguishable from a clean failure only by an alert guest checking its own data.
+    Routing the real bytes through `write_at` in the SAME call as the growth means the filesystem
+    driver's own crash-safety story (data before the metadata that exposes it, #385's rule)
+    covers this path for free, because it is the same call ext's own hole-filling writer already
+    makes crash-safe for its own sake.
+
+    **Alternative considered and rejected: extend `hype_blk_image_t`/`hype_file_map_t` itself to
+    tolerate holes** (this decision's own first draft). Rejected on discovering `hype_file_rmap_t`
+    already solves the identical problem, tested, for NTFS/ext's own internal readers --
+    duplicating it inside `blk_image.c` would mean two independent implementations of "HOLE reads
+    as zero, UNWRITTEN reads as zero but is allocated, a write into either needs a capability this
+    layer does not have" to keep in sync, for no benefit over reusing the one that already exists.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what
