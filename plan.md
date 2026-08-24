@@ -3396,6 +3396,36 @@ isn't lost.
     consolidation, the incomplete-IPI/noaccel exit handlers themselves, and the actual backing-page
     accessor's exact signature.
 
+68. **#716: a date-based build version, `YYYY.MM.DD[-tag] (#commit-id)`, shown on the dashboard
+    (§6b) and the startup banner (`boot/main.c`'s existing `"hype: build " HYPE_BUILD_ID` line) --
+    decided (2026-08-24).** The date component is the build date, not the commit date -- when the
+    running binary was actually produced, not when its source last changed, since the same commit
+    can be rebuilt on different days and the two can legitimately differ.
+
+    **`-tag` comes from a build flag, not a fixed value.** Following `HYPE_BUILD_ID`'s own pattern
+    (Makefile, `EXTRA_CFLAGS` baking a `-D` define into the build): a new `HYPE_BUILD_TAG` define,
+    settable the same way, defaults to `alpha` for an unconfigured/local build, is set to `ci` by
+    the CI pipeline's own invocation, and is passed empty for a release build so the version string
+    carries no tag suffix at all -- `2026.8.24 (#aaaaaaaa)` rather than `2026.8.24- (#aaaaaaaa)`.
+    This keeps the mechanism identical to the existing `HYPE_BUILD_ID` wiring rather than inventing
+    a second convention for build-time metadata.
+
+    **`#commit-id` is `HYPE_BUILD_ID` itself** (`git describe --always --dirty --abbrev=7`) --
+    not a second git invocation. The version string composes the existing define with the new
+    date/tag pieces rather than duplicating what `HYPE_BUILD_ID` already computes.
+
+    **Open question, not resolved by this decision: zero-padding of month/day.** The worked
+    example that prompted this ticket used `2026.8.24` (no leading zero); whether the format should
+    instead zero-pad to `2026.08.24` for fixed-width sorting/display is left to whoever implements
+    #716 to confirm before writing the date-formatting code, and is called out explicitly in that
+    ticket rather than assumed either way here.
+
+    **Alternative considered and rejected: derive the date from the commit (`git show -s
+    --format=%cd`) instead of the build machine's clock.** Rejected because it collapses the one
+    piece of information a build stamp is for on this project -- distinguishing a fresh capture
+    from a stale one (see `HYPE_BUILD_ID`'s own Makefile comment) -- a rebuild of an old commit
+    would misreport itself as an old build.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what
