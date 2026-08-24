@@ -30,6 +30,18 @@
  * than executing whatever comes next in a now-untrustworthy state. That check is the whole point
  * of this file existing before it is anything else.
  *
+ * #710 CORRECTION: an earlier version of this file assumed no operand these instructions read
+ * (RAX as VMRUN/VMLOAD/VMSAVE's VMCB pointer, RAX/ECX as INVLPGA's address/ASID) could matter,
+ * since interception was assumed to fire before any of that is examined. Real hardware validates
+ * at least the VMCB pointer's page-alignment as a step the VMRUN intercept does NOT gate -- an
+ * unformed RAX faulted with #GP instead of the expected #UD, and this guest's own IDT (only #UD
+ * is wired up) could not handle it, cascading to a real architectural shutdown. The trigger_*()
+ * functions below now pass a well-formed (page-aligned) scratch pointer for exactly that reason;
+ * see their own comment for the full account. The instructions themselves are still never
+ * ALLOWED to execute for real -- the intercept still fires before the VMCB's actual contents (or
+ * INVLPGA's TLB invalidation) would matter -- only their operands now avoid tripping a check the
+ * intercept does not cover.
+ *
  * COVERAGE TABLE -- exit reason -> probe -> EXHIST counter (boot/main.c's per-VM stat_ex_* /
  * the "fw-1 EXHIST:" debug line). EXHIST is dumped at most once per ~30s of wall-clock per VM
  * (fw_1_publish_and_render()'s cadence), so a run must last >= 35s before the coordinator greps
@@ -340,19 +352,40 @@ static void probe_mmio_absorb(void) {
 
 /* ================= the dangerous group: SVM privileged instructions + plain INVLPG ================= */
 /*
- * Every trigger_*() below is exactly the 3-byte 0F 01 xx encoding named in this file's header --
- * nothing more, so there is nothing for the CPU to act on even in the (never-taken, on hype)
- * branch where interception is somehow missing. No operand is meaningful to any of them until
- * AFTER the point where hype's interception (or, on VMX, the CPU's own lack of an SVM unit) takes
- * over -- see the header's "HARD SAFETY RULE" paragraph.
+ * Every trigger_*() below is exactly the 3-byte 0F 01 xx encoding named in this file's header,
+ * plus (for VMRUN/VMLOAD/VMSAVE/INVLPGA) a well-formed RAX. That last part is NOT optional --
+ * #710 spent a real investigation on why an intercepted VMRUN still produced an architectural
+ * SHUTDOWN instead of hype ever seeing exit reason 0x80: with the intercept bit provably armed
+ * (read back from the live VMCB at the exact moment of the crash), a single first-and-only VMRUN
+ * with RAX left at whatever garbage the PRECEDING probe happened to leave there (observed: 0xa --
+ * not page-aligned) still produced a #GP whose delivery the guest's own IDT (only #UD is wired up
+ * here) could not handle, cascading through #DF (confirmed via EXITINTINFO) to a triple fault.
+ * Real hardware apparently validates the guest-supplied VMCB pointer's FORMAT (page alignment) as
+ * a step that is not gated by the VMRUN intercept -- this file's own former "no operand is
+ * meaningful ... until AFTER interception takes over" claim was wrong. VMLOAD/VMSAVE read RAX the
+ * same way; INVLPGA reads RAX as a linear address (canonical, not page-aligned, is what matters,
+ * but the same well-formed pointer satisfies both). STGI/CLGI/SKINIT take no register operand.
+ *
+ * g_scratch_vmcb's CONTENTS are never read as a real VMCB -- the intercept still fires before any
+ * of that would matter, exactly as designed. Only its ADDRESS needs to be well-formed.
  */
-static void trigger_vmrun(void) { __asm__ volatile(".byte 0x0f,0x01,0xd8" ::: "memory"); }
-static void trigger_vmload(void) { __asm__ volatile(".byte 0x0f,0x01,0xda" ::: "memory"); }
-static void trigger_vmsave(void) { __asm__ volatile(".byte 0x0f,0x01,0xdb" ::: "memory"); }
+static uint8_t g_scratch_vmcb[4096] __attribute__((aligned(4096)));
+
+static void trigger_vmrun(void) {
+    __asm__ volatile(".byte 0x0f,0x01,0xd8" : : "a"(g_scratch_vmcb) : "memory");
+}
+static void trigger_vmload(void) {
+    __asm__ volatile(".byte 0x0f,0x01,0xda" : : "a"(g_scratch_vmcb) : "memory");
+}
+static void trigger_vmsave(void) {
+    __asm__ volatile(".byte 0x0f,0x01,0xdb" : : "a"(g_scratch_vmcb) : "memory");
+}
 static void trigger_stgi(void) { __asm__ volatile(".byte 0x0f,0x01,0xdc" ::: "memory"); }
 static void trigger_clgi(void) { __asm__ volatile(".byte 0x0f,0x01,0xdd" ::: "memory"); }
 static void trigger_skinit(void) { __asm__ volatile(".byte 0x0f,0x01,0xde" ::: "memory"); }
-static void trigger_invlpga(void) { __asm__ volatile(".byte 0x0f,0x01,0xdf" ::: "memory"); }
+static void trigger_invlpga(void) {
+    __asm__ volatile(".byte 0x0f,0x01,0xdf" : : "a"(g_scratch_vmcb), "c"(0) : "memory");
+}
 
 /*
  * Returns 1 if the instruction faulted (#UD, caught and skipped by ud_isr) exactly once, 0
