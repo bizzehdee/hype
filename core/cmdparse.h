@@ -29,7 +29,8 @@ typedef enum {
     /* #529: HYPE_CMD_RESOLUTION retired with the config key (decision 44). */
     HYPE_CMD_CREATE, /* TERM-10 (#486): interactive VM-creation wizard */
     HYPE_CMD_DELETE, /* TERM-15 (#491): two-step-confirmed VM removal */
-    HYPE_CMD_MKDISK, /* TERM-11 (#487): create a preallocated qcow2 on a host disk */
+    HYPE_CMD_MKDISK, /* TERM-11 (#487): create a preallocated qcow2 on a host disk; #505 adds a raw
+                       * format option (arg4, defaults to qcow2) */
     HYPE_CMD_ATTACH, /* TERM-12 (#488): attach a device (usb-msc/sata/usb-phys) to a VM */
     HYPE_CMD_DETACH, /* TERM-12 (#488): detach a device from a VM by id */
     /* TERM-6 (#444): arg = a VM name/index (the same addressing every other per-VM verb uses).
@@ -76,14 +77,16 @@ typedef struct {
     char arg[HYPE_CMD_ARG_MAX];  /* first argument token, "" if none */
     char arg2[HYPE_CMD_ARG_MAX]; /* TERM-14: second argument token (the key) */
     char arg3[HYPE_CMD_ARG_MAX]; /* TERM-14: third argument token (the value) */
+    char arg4[HYPE_CMD_ARG_MAX]; /* #505: fourth argument token (mkdisk's optional format) */
     int has_arg;
     int has_arg2;
     int has_arg3;
+    int has_arg4;
 } hype_cmd_t;
 
 /* Parse one command line. Leading/trailing space ignored; the verb is the first
- * whitespace-delimited token, then up to three argument tokens (further tokens
- * ignored). Only TERM-14's `set` consumes all three today. */
+ * whitespace-delimited token, then up to four argument tokens (further tokens
+ * ignored). Only TERM-14's `set` and TERM-11's `mkdisk` consume more than two. */
 /* Fill-in-place form -- the only one the freestanding build may use: hype_cmd_t is too large
  * to return by value without emitting a memcpy call libc-free code cannot link (AGENTS.md). */
 void hype_cmd_parse_at(const char *line, hype_cmd_t *out);

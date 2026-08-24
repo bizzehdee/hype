@@ -94,6 +94,13 @@ int main(void) {
         c = P("dump vm0");
         CHECK("dump verb", c.verb == HYPE_CMD_DUMP && c.has_arg &&
               strcmp(c.arg, "vm0") == 0);
+        /* #505: mkdisk's fourth argument (format). */
+        c = P("mkdisk WD-1234 \\hype\\disks\\smp.img 10 raw");
+        CHECK("mkdisk verb", c.verb == HYPE_CMD_MKDISK);
+        CHECK("mkdisk arg3", c.has_arg3 && strcmp(c.arg3, "10") == 0);
+        CHECK("mkdisk arg4", c.has_arg4 && strcmp(c.arg4, "raw") == 0);
+        c = P("mkdisk WD-1234 \\hype\\disks\\smp.img 10");
+        CHECK("mkdisk without format leaves arg4 empty", !c.has_arg4 && c.arg4[0] == '\0');
     }
 
     {

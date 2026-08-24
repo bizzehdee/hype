@@ -45,16 +45,18 @@ static hype_cmd_verb_t verb_of(const char *tok, unsigned len) {
 void hype_cmd_parse_at(const char *line, hype_cmd_t *out) {
     hype_cmd_t *cp = out;
 #define c (*cp)
-    char *dst[3];
-    int *has[3];
+    char *dst[4];
+    int *has[4];
     unsigned t;
     c.verb = HYPE_CMD_NONE;
     c.arg[0] = '\0';
     c.arg2[0] = '\0';
     c.arg3[0] = '\0';
+    c.arg4[0] = '\0';
     c.has_arg = 0;
     c.has_arg2 = 0;
     c.has_arg3 = 0;
+    c.has_arg4 = 0;
 
     if (!line) return;
 
@@ -69,10 +71,12 @@ void hype_cmd_parse_at(const char *line, hype_cmd_t *out) {
     dst[0] = c.arg;
     dst[1] = c.arg2;
     dst[2] = c.arg3;
+    dst[3] = c.arg4;
     has[0] = &c.has_arg;
     has[1] = &c.has_arg2;
     has[2] = &c.has_arg3;
-    for (t = 0; t < 3u; t++) {
+    has[3] = &c.has_arg4;
+    for (t = 0; t < 4u; t++) {
         while (line[i] && is_ws(line[i])) i++;  /* skip ws before this token */
         unsigned astart = i;
         while (line[i] && !is_ws(line[i])) i++;
@@ -104,7 +108,7 @@ static const char *const g_cmd_usage[] = {
     "confirm <serial>",
     "create",
     "delete <vm>",
-    "mkdisk <disk-serial> <path> <GiB>",
+    "mkdisk <disk-serial> <path> <GiB> [raw|qcow2]",
     "attach <vm> <usb-msc|sata|usb-phys>:<path-or-serial>",
     "detach <vm> <device-id>",
     "config <vm>",

@@ -2514,7 +2514,8 @@ static void term_create_feed(const char *line);
 static int g_wizard_active;
 /* TERM-15 (#491): the delete confirmation owns the command line while it is active. */
 static void term_delete_begin(int idx);
-static void term_mkdisk_begin(const char *serial, const char *path, const char *gb_str);
+static void term_mkdisk_begin(const char *serial, const char *path, const char *gb_str,
+                              const char *format_str);
 static void fw_1_mkdisk_pump(void);
 static uint64_t fw_1_tpm_entropy(void *ctx); /* #433 */
 static void term_delete_feed(const char *line);
@@ -2706,7 +2707,7 @@ static void term_run_cmdline(void) {
         }
         case HYPE_CMD_MKDISK:
             term_mkdisk_begin(c.has_arg ? c.arg : 0, c.has_arg2 ? c.arg2 : 0,
-                              c.has_arg3 ? c.arg3 : "");
+                              c.has_arg3 ? c.arg3 : "", c.has_arg4 ? c.arg4 : "");
             break;
         case HYPE_CMD_DELETE:
             if (idx < 0) {
@@ -21191,15 +21192,29 @@ static void fw_1_arm_physical_targets(void) {
  * already exists on a named host disk. The content decisions are core/qcow2_create.c's (pure,
  * tested, qemu-img-clean); this is the pacing and the plumbing.
  *
- * PUMPED from the BSP dispatch loop, a few clusters per pass, because a 1 GiB create written
+ * #505 adds a RAW format option alongside qcow2: the same fully-allocated, no-holes
+ * contract tools/make-disk-image.sh already produces, so a raw image made this way is
+ * exactly what core/blk_image.h's post-EBS raw path requires. Real zero bytes are written
+ * for the whole file, never fallocate/truncate -- make-disk-image.sh's own notes explain
+ * why (exFAT leaves ValidDataLength behind DataLength, and ext4 marks a fallocated range
+ * as an unwritten extent hype's own extent-walking reader refuses) -- so writing every
+ * byte through the filesystem's own writer is the only path that is honest on every
+ * filesystem hype can create on.
+ *
+ * PUMPED from the BSP dispatch loop, a few chunks per pass, because a 1 GiB create written
  * synchronously would park every guest this core serves for minutes. Progress lands on the
  * terminal's result line each percent, per the ticket: report progress rather than appearing
  * hung.
  */
+typedef enum { HYPE_MKDISK_FMT_QCOW2 = 0, HYPE_MKDISK_FMT_RAW } hype_mkdisk_fmt_t;
+
 static struct {
     int active;
-    hype_qcow2_layout_t lo;
-    uint64_t next_cluster;
+    hype_mkdisk_fmt_t format;
+    hype_qcow2_layout_t lo;    /* qcow2 only */
+    uint64_t next_unit;        /* qcow2: cluster index; raw: chunk index */
+    uint64_t total_units;      /* qcow2: lo.total_clusters; raw: total_bytes / chunk size */
+    uint64_t raw_total_bytes;  /* raw only, for the completion report and readback verify */
     unsigned last_pct;
     char path[48];
     hype_fs_t fs;
@@ -21279,15 +21294,17 @@ static int mkdisk_mount_volume(void) {
     return -1;
 }
 
-static void term_mkdisk_begin(const char *serial, const char *path, const char *gb_str) {
+static void term_mkdisk_begin(const char *serial, const char *path, const char *gb_str,
+                              const char *format_str) {
     unsigned i;
     uint64_t gb = 0;
     const char *p2 = gb_str;
+    hype_mkdisk_fmt_t format = HYPE_MKDISK_FMT_QCOW2;
 
     if (g_mkdisk.active) {
-        term_resultf("mkdisk: a create is already running (%llu/%llu clusters) -- one at a time",
-                     (unsigned long long)g_mkdisk.next_cluster,
-                     (unsigned long long)g_mkdisk.lo.total_clusters);
+        term_resultf("mkdisk: a create is already running (%llu/%llu units) -- one at a time",
+                     (unsigned long long)g_mkdisk.next_unit,
+                     (unsigned long long)g_mkdisk.total_units);
         return;
     }
     if (serial == 0 || serial[0] == '\0') {
@@ -21295,7 +21312,8 @@ static void term_mkdisk_begin(const char *serial, const char *path, const char *
         char line[96];
         int off = 0;
         (void)off;
-        term_resultf("mkdisk: usage mkdisk <disk-serial> <path> <GiB> -- disks present:");
+        term_resultf("mkdisk: usage mkdisk <disk-serial> <path> <GiB> [raw|qcow2] -- disks "
+                     "present:");
         for (i = 0; i < g_disk_inv.count; i++) {
             hype_snprintf(line, sizeof(line), "  %s '%s' %s %lluMiB",
                           g_disk_inv.disks[i].bus == HYPE_DISK_BUS_AHCI ? "ahci" : "nvme",
@@ -21309,8 +21327,16 @@ static void term_mkdisk_begin(const char *serial, const char *path, const char *
         gb = gb * 10u + (uint64_t)(*p2 - '0');
     }
     if (gb == 0u || *p2 != '\0' || path == 0 || path[0] == '\0') {
-        term_resultf("mkdisk: usage: mkdisk <disk-serial> <path> <GiB>");
+        term_resultf("mkdisk: usage: mkdisk <disk-serial> <path> <GiB> [raw|qcow2]");
         return;
+    }
+    if (format_str != 0 && format_str[0] != '\0') {
+        if (term_streq(format_str, "raw")) {
+            format = HYPE_MKDISK_FMT_RAW;
+        } else if (!term_streq(format_str, "qcow2")) {
+            term_resultf("mkdisk: unknown format '%s' -- expected raw or qcow2", format_str);
+            return;
+        }
     }
     for (i = 0; i < g_disk_inv.count; i++) {
         if (term_streq(g_disk_inv.disks[i].serial, serial)) break;
@@ -21326,9 +21352,16 @@ static void term_mkdisk_begin(const char *serial, const char *path, const char *
                      "the create needs a filesystem that already exists there", serial);
         return;
     }
-    if (hype_qcow2_layout(gb << 30, &g_mkdisk.lo) != 0) {
-        term_resultf("mkdisk: bad size");
-        return;
+    g_mkdisk.format = format;
+    if (format == HYPE_MKDISK_FMT_RAW) {
+        g_mkdisk.raw_total_bytes = gb << 30;
+        g_mkdisk.total_units = g_mkdisk.raw_total_bytes / HYPE_QCOW2_CREATE_CLUSTER_SIZE;
+    } else {
+        if (hype_qcow2_layout(gb << 30, &g_mkdisk.lo) != 0) {
+            term_resultf("mkdisk: bad size");
+            return;
+        }
+        g_mkdisk.total_units = g_mkdisk.lo.total_clusters;
     }
     (void)hype_strlcpy(g_mkdisk.path, path, sizeof(g_mkdisk.path));
     /* Create where the filesystem can (FAT32); on ext -- no namespace mutation -- the file must
@@ -21340,59 +21373,106 @@ static void term_mkdisk_begin(const char *serial, const char *path, const char *
                      g_mkdisk.fs.ops->name);
         return;
     }
-    g_mkdisk.next_cluster = 0;
+    g_mkdisk.next_unit = 0;
     g_mkdisk.last_pct = ~0u;
     g_mkdisk.active = 1;
     HYPE_LOGF(HYPE_LOG_INFO,
-              "fw-1 MKDISK: creating %s (%llu GiB virtual, %llu clusters) on %s '%s' [#487]\n",
+              "fw-1 MKDISK: creating %s (%llu GiB virtual, %s, %llu units) on %s '%s' [#487 #505]\n",
               g_mkdisk.path, (unsigned long long)gb,
-              (unsigned long long)g_mkdisk.lo.total_clusters,
+              format == HYPE_MKDISK_FMT_RAW ? "raw" : "qcow2",
+              (unsigned long long)g_mkdisk.total_units,
               g_mkdisk.fs.ops->name, serial);
 }
 
-/* A few clusters per BSP pass: enough to finish a 1 GiB create in minutes without ever holding
+/*
+ * #505: read back the LAST sector of a raw create and confirm it is the zero byte hype just
+ * wrote there. A short or partially-assigned allocation (the exact failure mode
+ * make-disk-image.sh's own probe_tail_valid guards against on the host side) shows up here as
+ * hype's own writer having refused, or as a readback mismatch -- either way this fails loudly
+ * at creation instead of leaving an image that looks right until a guest writes near the end of
+ * it.
+ */
+static int mkdisk_verify_raw_tail(void) {
+    static uint8_t tail[512];
+    uint64_t off = g_mkdisk.raw_total_bytes - sizeof(tail);
+    unsigned i;
+    if (hype_fs_read_at(&g_mkdisk.file, off, tail, sizeof(tail)) != 0) {
+        return -1;
+    }
+    for (i = 0; i < sizeof(tail); i++) {
+        if (tail[i] != 0u) return -1;
+    }
+    return 0;
+}
+
+/* A few chunks per BSP pass: enough to finish a 1 GiB create in minutes without ever holding
  * the dispatch loop for more than one write's latency. */
 static void fw_1_mkdisk_pump(void) {
     static uint8_t cl[HYPE_QCOW2_CREATE_CLUSTER_SIZE];
     unsigned burst;
+    const char *fmt_name = (g_mkdisk.format == HYPE_MKDISK_FMT_RAW) ? "raw" : "qcow2";
 
     if (!g_mkdisk.active) {
         return;
     }
-    for (burst = 0; burst < 8u && g_mkdisk.next_cluster < g_mkdisk.lo.total_clusters; burst++) {
-        if (hype_qcow2_create_cluster(&g_mkdisk.lo, g_mkdisk.next_cluster, cl) != 0 ||
-            hype_fs_write_at(&g_mkdisk.file, g_mkdisk.next_cluster *
-                             (uint64_t)HYPE_QCOW2_CREATE_CLUSTER_SIZE, cl, sizeof(cl)) != 0) {
-            term_resultf("mkdisk: WRITE FAILED at cluster %llu of %llu -- '%s' is INCOMPLETE and "
+    if (g_mkdisk.format == HYPE_MKDISK_FMT_RAW) {
+        unsigned k;
+        for (k = 0; k < sizeof(cl); k++) cl[k] = 0u;
+    }
+    for (burst = 0; burst < 8u && g_mkdisk.next_unit < g_mkdisk.total_units; burst++) {
+        int ok;
+        if (g_mkdisk.format == HYPE_MKDISK_FMT_RAW) {
+            ok = hype_fs_write_at(&g_mkdisk.file,
+                                  g_mkdisk.next_unit * (uint64_t)HYPE_QCOW2_CREATE_CLUSTER_SIZE, cl,
+                                  sizeof(cl)) == 0;
+        } else {
+            ok = hype_qcow2_create_cluster(&g_mkdisk.lo, g_mkdisk.next_unit, cl) == 0 &&
+                hype_fs_write_at(&g_mkdisk.file,
+                                 g_mkdisk.next_unit * (uint64_t)HYPE_QCOW2_CREATE_CLUSTER_SIZE, cl,
+                                 sizeof(cl)) == 0;
+        }
+        if (!ok) {
+            term_resultf("mkdisk: WRITE FAILED at unit %llu of %llu -- '%s' is INCOMPLETE and "
                          "not a usable image (volume full?)",
-                         (unsigned long long)g_mkdisk.next_cluster,
-                         (unsigned long long)g_mkdisk.lo.total_clusters, g_mkdisk.path);
-            HYPE_LOGF(HYPE_LOG_ERROR, "fw-1 MKDISK: FAILED at cluster %llu/%llu [#487]\n",
-                      (unsigned long long)g_mkdisk.next_cluster,
-                      (unsigned long long)g_mkdisk.lo.total_clusters);
+                         (unsigned long long)g_mkdisk.next_unit,
+                         (unsigned long long)g_mkdisk.total_units, g_mkdisk.path);
+            HYPE_LOGF(HYPE_LOG_ERROR, "fw-1 MKDISK: FAILED at unit %llu/%llu (%s) [#487 #505]\n",
+                      (unsigned long long)g_mkdisk.next_unit,
+                      (unsigned long long)g_mkdisk.total_units, fmt_name);
             g_mkdisk.active = 0;
             return;
         }
-        g_mkdisk.next_cluster++;
+        g_mkdisk.next_unit++;
     }
     {
-        unsigned pct = (unsigned)((g_mkdisk.next_cluster * 100u) / g_mkdisk.lo.total_clusters);
+        unsigned pct = (unsigned)((g_mkdisk.next_unit * 100u) / g_mkdisk.total_units);
         if (pct != g_mkdisk.last_pct) {
             g_mkdisk.last_pct = pct;
-            term_resultf("mkdisk: %s -- %u%% (%llu/%llu clusters)", g_mkdisk.path, pct,
-                         (unsigned long long)g_mkdisk.next_cluster,
-                         (unsigned long long)g_mkdisk.lo.total_clusters);
+            term_resultf("mkdisk: %s -- %u%% (%llu/%llu units)", g_mkdisk.path, pct,
+                         (unsigned long long)g_mkdisk.next_unit,
+                         (unsigned long long)g_mkdisk.total_units);
         }
     }
-    if (g_mkdisk.next_cluster >= g_mkdisk.lo.total_clusters) {
+    if (g_mkdisk.next_unit >= g_mkdisk.total_units) {
         (void)hype_fs_sync(&g_mkdisk.fs);
         g_mkdisk.active = 0;
-        term_resultf("mkdisk: DONE -- %s, %llu MiB virtual, fully preallocated. Attach it with a "
-                     "[disk.*] entry or target_disk = file:%s",
+        if (g_mkdisk.format == HYPE_MKDISK_FMT_RAW && mkdisk_verify_raw_tail() != 0) {
+            term_resultf("mkdisk: FAILED -- %s wrote %llu units but the tail sector did not read "
+                         "back as written; the image is INCOMPLETE and not usable",
+                         g_mkdisk.path, (unsigned long long)g_mkdisk.total_units);
+            HYPE_LOGF(HYPE_LOG_ERROR, "fw-1 MKDISK: tail readback FAILED for %s [#505]\n",
+                      g_mkdisk.path);
+            return;
+        }
+        term_resultf("mkdisk: DONE -- %s, %llu MiB virtual, fully preallocated (%s). Attach it "
+                     "with a [disk.*] entry or target_disk = file:%s",
                      g_mkdisk.path,
-                     (unsigned long long)(g_mkdisk.lo.virtual_bytes >> 20), g_mkdisk.path);
-        HYPE_LOGF(HYPE_LOG_INFO, "fw-1 MKDISK: DONE -- %s (%llu clusters) [#487]\n", g_mkdisk.path,
-                  (unsigned long long)g_mkdisk.lo.total_clusters);
+                     (unsigned long long)((g_mkdisk.format == HYPE_MKDISK_FMT_RAW
+                                               ? g_mkdisk.raw_total_bytes
+                                               : g_mkdisk.lo.virtual_bytes) >> 20),
+                     fmt_name, g_mkdisk.path);
+        HYPE_LOGF(HYPE_LOG_INFO, "fw-1 MKDISK: DONE -- %s (%llu units, %s) [#487 #505]\n",
+                  g_mkdisk.path, (unsigned long long)g_mkdisk.total_units, fmt_name);
     }
 }
 
