@@ -2,6 +2,7 @@
 #define HYPE_CORE_NVME_HOST_H
 
 #include <stdint.h>
+#include "blk_backend.h" /* #715: hype_blk_seg_t, for hype_nvme_gather_segs() */
 
 /*
  * M10-1b (#194, split from M10-1): a minimal HOST-side NVMe-over-PCIe driver, so
@@ -66,6 +67,26 @@ void hype_nvme_build_read_sqe(uint8_t sqe[64], uint16_t cid, uint32_t nsid, uint
  */
 void hype_nvme_build_write_sqe(uint8_t sqe[64], uint16_t cid, uint32_t nsid, uint64_t slba,
                                uint16_t nlb_0based, uint64_t prp1, uint64_t prp2);
+
+/*
+ * #715: gathers `len` bytes starting at byte offset `off` into the logical concatenation of
+ * `segs` (nsegs entries, each segs[i].count 512-byte sectors from segs[i].buf) into `dst`.
+ *
+ * The write path's own vectored command (hype_nvme_host_writev) needs this because NVMe's PRP
+ * mechanism requires every entry PAST THE FIRST to be page-aligned -- true of the read/write
+ * path's existing single bounce buffer, but not of an arbitrary virtio-blk segment boundary
+ * (#295's own comment on hype_blk_seg_t: "the guest's pages are scattered", not page-aligned by
+ * construction). AHCI's PRDT has no such restriction, which is why hype_ahci_host_writev can
+ * point straight at the scattered guest buffers and this can't; gathering into one contiguous
+ * bounce region first turns the same segments into a shape the existing (already-correct)
+ * single-buffer PRP1/PRP2/PRP-list construction can use unchanged.
+ *
+ * Returns 0 on success, -1 if [off, off+len) runs past the segments' total byte length -- a
+ * caller bug (the caller already bounds-checked the WHOLE vectored write against the backend's
+ * capacity before building `segs`), never a guest-triggerable condition. Pure.
+ */
+int hype_nvme_gather_segs(const hype_blk_seg_t *segs, uint32_t nsegs, uint64_t off, uint32_t len,
+                          void *dst);
 
 /*
  * Builds a 64-byte IDENTIFY Submission Queue Entry: opcode 0x06, `cns`
@@ -152,6 +173,30 @@ int hype_nvme_host_read(uint64_t abar_phys, uint64_t lba, uint16_t count, void *
  * Signature matches hype_ahci_host_write.
  */
 int hype_nvme_host_write(uint64_t abar_phys, uint64_t lba, uint16_t count, const void *src);
+
+/*
+ * #715: the bounce buffer's own capacity, in 512-byte sectors -- 128 (64 KiB), matching
+ * BOUNCE_SECTORS in nvme_host_hw.c. Exposed so blk_phys_hw.c's hype_blk_phys_enable_writev()
+ * call can bound a single hype_nvme_host_writev() command to what the bounce buffer can hold in
+ * one shot, the same way HYPE_AHCI_HOST_SG_MAX_PRDT bounds a single AHCI command's PRDT count.
+ */
+#define HYPE_NVME_WRITEV_MAX_SECTORS 128u
+
+/*
+ * #715: writes the `nsegs` scattered segments of `segs` (hype_blk_seg_t, core/blk_backend.h) as
+ * ONE I/O WRITE command to LBA `lba` on the initialised controller -- the vectored sibling of
+ * hype_nvme_host_write(), same shape as hype_ahci_host_writev(). Segments are gathered into the
+ * existing bounce buffer first (hype_nvme_gather_segs()) rather than PRP-listed directly, because
+ * NVMe's PRP mechanism requires page alignment past the first entry, which an arbitrary
+ * virtio-blk segment boundary cannot guarantee (see hype_nvme_gather_segs()'s own comment).
+ * Callers must keep the total sector count at or under HYPE_NVME_WRITEV_MAX_SECTORS -- one
+ * bounce-buffer's worth -- exactly what hype_blk_phys_enable_writev()'s max_sectors cap already
+ * guarantees when this is registered as the writev callback. Returns 0 on success, -1 on a
+ * timeout, an NVMe error, or a total exceeding the bounce buffer's capacity. DESTRUCTIVE -- same
+ * §6d/phys_guard gating as hype_nvme_host_write().
+ */
+int hype_nvme_host_writev(uint64_t abar_phys, uint64_t lba, const hype_blk_seg_t *segs,
+                          uint32_t nsegs);
 
 /*
  * #660: records which core is the BSP, mirroring hype_ahci_host_set_bsp_apic()/

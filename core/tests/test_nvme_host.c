@@ -174,7 +174,66 @@ static void test_set_num_queues(void) {
     CHECK_HEX("cqe dw0", 0x00010003u, hype_nvme_cqe_dw0(cqe));
 }
 
+/* hype_blk_seg_t.count is in 512-byte SECTORS, not bytes -- these fixtures are three
+ * one-sector (512-byte) segments, each filled with its own byte value, so a gathered byte's
+ * VALUE names which segment it came from. */
+static uint8_t g_seg_a[512], g_seg_b[512], g_seg_c[512];
+
+static void gather_fixture_init(void) {
+    memset(g_seg_a, 0xAA, sizeof(g_seg_a));
+    memset(g_seg_b, 0xBB, sizeof(g_seg_b));
+    memset(g_seg_c, 0xCC, sizeof(g_seg_c));
+}
+
+static void test_gather_segs_single(void) {
+    uint8_t out[512];
+    hype_blk_seg_t segs[1] = {{g_seg_a, 1u}};
+    memset(out, 0, sizeof(out));
+    CHECK_HEX("single seg, whole sector", 0, hype_nvme_gather_segs(segs, 1u, 0, 512u, out));
+    CHECK_HEX("gathered bytes match the source segment", 0, memcmp(g_seg_a, out, 512u));
+}
+
+static void test_gather_segs_multi(void) {
+    /* Three 1-sector segments gathered as one 1536-byte transfer -- the boundary bytes (511/512
+     * and 1023/1024) prove segments are walked in order with no off-by-one at the seams. */
+    hype_blk_seg_t segs[3] = {{g_seg_a, 1u}, {g_seg_b, 1u}, {g_seg_c, 1u}};
+    uint8_t out[1536];
+    memset(out, 0, sizeof(out));
+    CHECK_HEX("multi-seg gather succeeds", 0, hype_nvme_gather_segs(segs, 3u, 0, 1536u, out));
+    CHECK_HEX("last byte of seg A", 0xAAu, out[511]);
+    CHECK_HEX("first byte of seg B", 0xBBu, out[512]);
+    CHECK_HEX("last byte of seg B", 0xBBu, out[1023]);
+    CHECK_HEX("first byte of seg C", 0xCCu, out[1024]);
+    CHECK_HEX("last byte of seg C", 0xCCu, out[1535]);
+}
+
+static void test_gather_segs_mid_offset(void) {
+    /* Starts 100 bytes into segment A, ends 100 bytes into segment C -- proves the seg_off/avail
+     * math at BOTH ends, not just whole-segment copies. */
+    hype_blk_seg_t segs[3] = {{g_seg_a, 1u}, {g_seg_b, 1u}, {g_seg_c, 1u}};
+    uint8_t out[1236]; /* (512-100) + 512 + 100 */
+    memset(out, 0, sizeof(out));
+    CHECK_HEX("mid-offset gather succeeds", 0, hype_nvme_gather_segs(segs, 3u, 100u, 1236u, out));
+    CHECK_HEX("first byte is still from seg A", 0xAAu, out[0]);
+    CHECK_HEX("last byte of the A portion", 0xAAu, out[411]); /* 512-100-1 */
+    CHECK_HEX("first byte of the B portion", 0xBBu, out[412]);
+    CHECK_HEX("first byte of the C portion", 0xCCu, out[924]); /* 412+512 */
+    CHECK_HEX("last byte gathered", 0xCCu, out[1235]);
+}
+
+static void test_gather_segs_out_of_range(void) {
+    hype_blk_seg_t segs[1] = {{g_seg_a, 1u}};
+    uint8_t out[600];
+    CHECK_HEX("asking past the segments' total length is refused", -1,
+              hype_nvme_gather_segs(segs, 1u, 0, 600u, out));
+}
+
 int main(void) {
+    gather_fixture_init();
+    test_gather_segs_single();
+    test_gather_segs_multi();
+    test_gather_segs_mid_offset();
+    test_gather_segs_out_of_range();
     test_set_num_queues();
     test_read_sqe();
     test_write_sqe();

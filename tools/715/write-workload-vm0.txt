@@ -1,0 +1,15 @@
+# #715: same shape as #295's own write-workload-vm0.txt (large dd, raw device, no fs) --
+# drive a real WRITE workload against the physical NVMe target so blk_phys's own batching
+# has segments to merge, and the DIAG line's vec= counters prove hype_nvme_host_writev()
+# actually gets called instead of the scalar hype_nvme_host_write() path.
+timeout 300000
+expect localhost login:
+send root\n
+expect ~#
+send ls -l /dev/vd* /dev/sd* 2>/dev/null; echo DEVLIST-DONE\n
+expect DEVLIST-DONE
+send dd if=/dev/zero of=/dev/vda bs=1M count=48 conv=fsync; echo DD-DONE\n
+expect DD-DONE
+send sync; echo SYNC-DONE\n
+expect SYNC-DONE
+pass write-workload-715

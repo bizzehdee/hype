@@ -15394,9 +15394,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         if (ws->first_tsc != 0 && g_fw_1_host_tsc_hz != 0) {
                             w_ms = ((hype_rdtsc() - ws->first_tsc) * 1000ULL) / g_fw_1_host_tsc_hz;
                         }
-                        /* #295: vec= is the merge report -- vectored commands issued, segments
-                         * they carried, and the largest single merge. All zero on a backend with
-                         * no vectored impl (file/qcow2/NVMe/USB), so the line also says WHICH
+                        /* #295/#715: vec= is the merge report -- vectored commands issued,
+                         * segments they carried, and the largest single merge. All zero on a
+                         * backend with no vectored impl (file/qcow2/USB; AHCI since #295 and
+                         * physical NVMe since #715 both have one), so the line also says WHICH
                          * path served the writes. */
                         hype_debug_print("fw-1 DIAG: BLK WRITE count=%llu sectors=%llu max=%u "
                                          "hist=%u/%u/%u/%u/%u/%u vec=%llu/%llu/%u "

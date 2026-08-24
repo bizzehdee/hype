@@ -26,6 +26,9 @@
 #define BOUNCE_BYTES (BOUNCE_SECTORS * HYPE_NVME_SECTOR_SIZE)
 #define PAGE 4096u
 
+_Static_assert(BOUNCE_SECTORS == HYPE_NVME_WRITEV_MAX_SECTORS,
+              "#715: hype_blk_phys_enable_writev()'s cap must match what g_bounce can hold");
+
 static uint8_t g_admin_sq[Q_ENTRIES * HYPE_NVME_SQE_SIZE] __attribute__((aligned(PAGE)));
 static uint8_t g_admin_cq[Q_ENTRIES * HYPE_NVME_CQE_SIZE] __attribute__((aligned(PAGE)));
 static uint8_t g_io_sq[Q_ENTRIES * HYPE_NVME_SQE_SIZE] __attribute__((aligned(PAGE)));
@@ -426,6 +429,61 @@ int hype_nvme_host_write(uint64_t abar_phys, uint64_t lba, uint16_t count, const
         return -1;
     }
     rc = nvme_host_write_locked(abar_phys, lba, count, src);
+    nvme_host_unlock();
+    return rc;
+}
+
+/*
+ * #715: one I/O WRITE command for the whole (already-validated) segment list, instead of one
+ * command per segment. Gathers into g_bounce (hype_nvme_gather_segs(), pure) then reuses the
+ * exact PRP1/PRP2/PRP-list construction nvme_host_write_locked() already has -- the segments
+ * become, from the controller's point of view, indistinguishable from one scalar write of the
+ * same total size. Callers bound the total to BOUNCE_SECTORS (HYPE_NVME_WRITEV_MAX_SECTORS in
+ * the header), so this never needs the outer per-BOUNCE_SECTORS-chunk loop the scalar path has.
+ */
+static int nvme_host_writev_locked(uint64_t abar_phys, uint64_t lba, const hype_blk_seg_t *segs,
+                                   uint32_t nsegs) {
+    volatile uint8_t *bar = (volatile uint8_t *)(uintptr_t)abar_phys;
+    uint64_t total_sectors = 0;
+    uint32_t bytes;
+    uint32_t pages;
+    uint64_t prp1 = phys(g_bounce);
+    uint64_t prp2 = 0;
+    uint8_t sqe[64];
+    uint32_t i;
+
+    for (i = 0; i < nsegs; i++) {
+        total_sectors += (uint64_t)segs[i].count;
+    }
+    if (total_sectors == 0u || total_sectors > BOUNCE_SECTORS) {
+        return -1; /* a caller bug -- hype_blk_phys_enable_writev()'s own cap should prevent this */
+    }
+    bytes = (uint32_t)total_sectors * HYPE_NVME_SECTOR_SIZE;
+    if (hype_nvme_gather_segs(segs, nsegs, 0, bytes, g_bounce) != 0) {
+        return -1;
+    }
+
+    pages = (bytes + PAGE - 1u) / PAGE;
+    if (pages == 2u) {
+        prp2 = phys(g_bounce) + PAGE;
+    } else if (pages > 2u) {
+        for (i = 0; i + 1u < pages; i++) {
+            *(uint64_t *)(g_prp_list + i * 8u) = phys(g_bounce) + (uint64_t)(i + 1u) * PAGE;
+        }
+        prp2 = phys(g_prp_list);
+    }
+
+    hype_nvme_build_write_sqe(sqe, ++g_cid, 1u, lba, (uint16_t)(total_sectors - 1u), prp1, prp2);
+    return submit_and_poll(bar, g_io_sq, g_io_cq, 1, &g_io_sq_tail, &g_io_cq_head, &g_io_phase, sqe);
+}
+
+int hype_nvme_host_writev(uint64_t abar_phys, uint64_t lba, const hype_blk_seg_t *segs,
+                          uint32_t nsegs) {
+    int rc;
+    if (nvme_host_lock_or_fail() != 0) {
+        return -1;
+    }
+    rc = nvme_host_writev_locked(abar_phys, lba, segs, nsegs);
     nvme_host_unlock();
     return rc;
 }

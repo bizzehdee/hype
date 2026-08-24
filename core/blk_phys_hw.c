@@ -67,8 +67,22 @@ static int nvme_write_adapter(void *hw, uint64_t lba, uint32_t count, const void
     return hype_nvme_host_write(a->abar_phys, lba, (uint16_t)count, buf);
 }
 
+/* #715: the vectored adapter, mirroring ahci_writev_adapter -- one hype_nvme_host_writev() call
+ * per batch instead of one hype_nvme_host_write() per segment. */
+static int nvme_writev_adapter(void *hw, uint64_t lba, const hype_blk_seg_t *segs, uint32_t nsegs) {
+    hype_blk_phys_nvme_t *a = (hype_blk_phys_nvme_t *)hw;
+    return hype_nvme_host_writev(a->abar_phys, lba, segs, nsegs);
+}
+
 void hype_blk_phys_nvme_init(hype_blk_phys_t *p, hype_blk_phys_nvme_t *hw, hype_blk_backend_t *be,
                              uint64_t abar_phys, uint64_t total_sectors) {
     hw->abar_phys = abar_phys;
     hype_blk_phys_init(p, be, nvme_read_adapter, nvme_write_adapter, hw, total_sectors);
+    /* #715: arm the vectored write path -- capped to what one bounce-buffer command can carry
+     * (HYPE_NVME_WRITEV_MAX_SECTORS), unlike AHCI's PRDT-count/4MiB caps, since NVMe's own limit
+     * here is the bounce buffer's size, not a hardware scatter-gather descriptor count. max_segs
+     * is bounded by max_sectors anyway (a segment is never 0 sectors), so the same value covers
+     * the worst case of every segment being exactly 1 sector. */
+    hype_blk_phys_enable_writev(p, be, nvme_writev_adapter, HYPE_NVME_WRITEV_MAX_SECTORS,
+                                HYPE_NVME_WRITEV_MAX_SECTORS);
 }

@@ -53,6 +53,33 @@ void hype_nvme_build_write_sqe(uint8_t sqe[64], uint16_t cid, uint32_t nsid, uin
     put_le32(sqe + 48, (uint32_t)nlb_0based); /* CDW12[15:0]: 0-based block count */
 }
 
+int hype_nvme_gather_segs(const hype_blk_seg_t *segs, uint32_t nsegs, uint64_t off, uint32_t len,
+                          void *dst) {
+    uint8_t *out = (uint8_t *)dst;
+    uint32_t i;
+    uint64_t pos = 0;
+
+    for (i = 0; i < nsegs && len != 0u; i++) {
+        uint64_t seg_bytes = (uint64_t)segs[i].count * HYPE_NVME_SECTOR_SIZE;
+        uint64_t seg_end = pos + seg_bytes;
+        if (off < seg_end) {
+            uint64_t seg_off = (off > pos) ? (off - pos) : 0u;
+            uint64_t avail = seg_bytes - seg_off;
+            uint64_t take = (avail < (uint64_t)len) ? avail : (uint64_t)len;
+            const uint8_t *src = (const uint8_t *)segs[i].buf + seg_off;
+            uint64_t k;
+            for (k = 0; k < take; k++) {
+                out[k] = src[k];
+            }
+            out += take;
+            off += take;
+            len -= (uint32_t)take;
+        }
+        pos = seg_end;
+    }
+    return (len == 0u) ? 0 : -1;
+}
+
 void hype_nvme_build_identify_sqe(uint8_t sqe[64], uint16_t cid, uint32_t cns, uint32_t nsid,
                                   uint64_t prp1) {
     zero_sqe(sqe);
