@@ -769,68 +769,19 @@ static uint64_t *gpr_ptr(struct hype_vcpu_ctx *real, uint8_t reg) {
     return &real->gprs[reg];
 }
 
-int hype_svm_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pit_emu_t *pit) {
-    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
-    hype_svm_ioio_t io;
-    int rc;
-
-    hype_svm_decode_ioio_info1(real->vmcb->control.exitinfo1, &io);
-
-    if (io.port == 0x20u || io.port == 0x21u || io.port == 0xA0u || io.port == 0xA1u) {
-        if (io.is_in) {
-            uint8_t value = 0;
-            rc = hype_pic_emu_io_read(pic, io.port, &value);
-            if (rc == 0) {
-                real->vmcb->save.rax = (real->vmcb->save.rax & ~0xFFULL) | value;
-            }
-        } else {
-            uint8_t pv = (uint8_t)(real->vmcb->save.rax & 0xFFu);
-            /* M4-6d7 DIAG: log OCW1 (IMR) writes whose IRQ4/IRQ3 mask bits
-             * CHANGE -- shows whether Linux ever wires the serial IRQ through
-             * the 8259 instead of the IO-APIC in APIC mode. */
-            if (io.port == 0x21u) {
-                uint8_t old = pic->master.imr;
-                if (((old ^ pv) & 0x1Au) != 0u) { /* IRQ1/3/4 mask-bit change */
-                    static unsigned imr_log_n = 0;
-                    if (imr_log_n < 32u) {
-                        imr_log_n++;
-                        hype_debug_print("fw-1 PICIMR 0x%x->0x%x rip=0x%llx\n", (unsigned)old,
-                                         (unsigned)pv, (unsigned long long)real->vmcb->save.rip);
-                    }
-                }
-            }
-            /*
-             * #455: ICW1 (command port, bit4 set) begins a full 8259 reinitialisation --
-             * both the loader and, later, the kernel each do this as they take ownership
-             * of the interrupt controller. hype's own request_interrupt() translates an
-             * acknowledged IRQ line into a CPU vector and queues it in pending_irr the
-             * instant the guest can't yet accept it (IF=0) -- eagerly, at acknowledge
-             * time, not at delivery time. A PIC reinit resets the CHIP's own IRR/IMR
-             * (hype_pic_emu_reset(), via chip_write_command() below) but never reached
-             * pending_irr, so a vector translated under the OLD irq_offset (raised by,
-             * say, the loader's own PS/2 handshake traffic while its IF was 0) survived
-             * untouched across the reinit and got delivered late, into whatever the
-             * vector now happens to mean under the NEW configuration -- observed as a
-             * spurious IRQ1 (vector 0x21, queued during the loader's own 8042 self-test)
-             * landing at the KERNEL's first `sti`, before it had registered a real
-             * handler for anything, which FreeBSD (correctly, by its own lights) treated
-             * as fatal. Capture the pre-reinit vector range on ICW1 and drop anything
-             * still queued there -- exactly the discard a real reinit's IRR/IMR reset
-             * already models one layer up, just extended to the vector this project
-             * translates the IRQ into.
-             */
-            if ((io.port == 0x20u || io.port == 0xA0u) && (pv & 0x10u) != 0u) {
-                uint8_t old_offset = (io.port == 0x20u) ? pic->master.irq_offset
-                                                        : pic->slave.irq_offset;
-                unsigned i;
-                for (i = 0; i < 8u; i++) {
-                    hype_svm_irr_clear(real->pending_irr, (uint8_t)(old_offset + i));
-                    hype_svm_irr_clear(real->pending_pic, (uint8_t)(old_offset + i)); /* #512 */
-                }
-            }
-            rc = hype_pic_emu_io_write(pic, io.port, pv);
-        }
-    } else if (io.port >= 0x40u && io.port <= 0x43u) {
+/*
+ * #712: the register/byte accessors behind hype_svm_vcpu_handle_ioio()'s PIC/PIT/port-0x61
+ * allow-list, split out so the string-IO path below can drive them once per transferred byte
+ * without duplicating the ICW1-cancellation, PICIMR, and CALTRACE side effects that used to
+ * live only in the single-access form. `port` must already be known to belong to this
+ * allow-list (svm_ioio_port_in_allowlist() below) -- these do not themselves reject a port.
+ */
+static int svm_ioio_pic_pit_read_byte(struct hype_vcpu_ctx *real, hype_pic_emu_t *pic,
+                                       hype_pit_emu_t *pit, uint16_t port, uint8_t *out) {
+    if (port == 0x20u || port == 0x21u || port == 0xA0u || port == 0xA1u) {
+        return hype_pic_emu_io_read(pic, port, out);
+    }
+    if (port >= 0x40u && port <= 0x43u) {
         /* #436 CALTRACE: cdboot's TSC calibration reads a hype timing source and
          * concludes a wildly wrong frequency (its Stall() deadlines then never
          * arrive). Trace the first PIT accesses from LOW (Windows) RIPs to see
@@ -842,51 +793,188 @@ int hype_svm_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pi
 #endif
             if (cal_n < 48u) {
                 cal_n++;
-                hype_debug_print("fw-1 #436 CALTRACE pit p=0x%x %s rax=0x%02x rip=0x%llx tsc=0x%llx\n",
-                                 (unsigned)io.port, io.is_in ? "IN" : "OUT",
-                                 (unsigned)(real->vmcb->save.rax & 0xFFu),
-                                 (unsigned long long)real->vmcb->save.rip,
+                hype_debug_print("fw-1 #436 CALTRACE pit p=0x%x IN rip=0x%llx tsc=0x%llx\n",
+                                 (unsigned)port, (unsigned long long)real->vmcb->save.rip,
                                  (unsigned long long)real_rdtsc());
             }
         }
-        if (io.is_in) {
-            uint8_t value = 0;
-            rc = hype_pit_emu_io_read(pit, io.port, &value);
-            if (rc == 0) {
-                real->vmcb->save.rax = (real->vmcb->save.rax & ~0xFFULL) | value;
-            }
-        } else {
-            rc = hype_pit_emu_io_write(pit, io.port, (uint8_t)(real->vmcb->save.rax & 0xFFu));
-        }
-    } else if (io.port == 0x61u) {
-        /* System Control Port B: PIT channel-2 gate (write) + OUT/refresh
-         * clock (read). A guest's PIT-based TSC/delay calibration
-         * (e.g. Linux pit_calibrate_tsc) sets the ch2 gate here then
-         * polls bit 5 for OUT; without it the poll spins forever. */
-        if (io.is_in) {
-            real->vmcb->save.rax =
-                (real->vmcb->save.rax & ~0xFFULL) | hype_pit_emu_port61_read(pit);
-        } else {
-            hype_pit_emu_port61_write(pit, (uint8_t)(real->vmcb->save.rax & 0xFFu));
-        }
-        /* #436 CALTRACE: same trace for port 0x61 (ch2 gate/OUT + refresh toggle). */
-        if (real->vmcb->save.rip < 0x80000000ull) {
-            static unsigned cal61_n = 0;
+        return hype_pit_emu_io_read(pit, port, out);
+    }
+    /* port == 0x61u: System Control Port B OUT/refresh clock read. */
+    *out = hype_pit_emu_port61_read(pit);
+    if (real->vmcb->save.rip < 0x80000000ull) {
+        static unsigned cal61_n = 0;
 #ifdef HYPE_QUIET
-            cal61_n = 48u;
+        cal61_n = 48u;
 #endif
-            if (cal61_n < 48u) {
-                cal61_n++;
-                hype_debug_print("fw-1 #436 CALTRACE p61 %s rax=0x%02x rip=0x%llx tsc=0x%llx\n",
-                                 io.is_in ? "IN" : "OUT",
-                                 (unsigned)(real->vmcb->save.rax & 0xFFu),
+        if (cal61_n < 48u) {
+            cal61_n++;
+            hype_debug_print("fw-1 #436 CALTRACE p61 IN rax=0x%02x rip=0x%llx tsc=0x%llx\n",
+                             (unsigned)*out, (unsigned long long)real->vmcb->save.rip,
+                             (unsigned long long)real_rdtsc());
+        }
+    }
+    return 0;
+}
+
+static int svm_ioio_pic_pit_write_byte(struct hype_vcpu_ctx *real, hype_pic_emu_t *pic,
+                                       hype_pit_emu_t *pit, uint16_t port, uint8_t pv) {
+    if (port == 0x20u || port == 0x21u || port == 0xA0u || port == 0xA1u) {
+        /* M4-6d7 DIAG: log OCW1 (IMR) writes whose IRQ4/IRQ3 mask bits
+         * CHANGE -- shows whether Linux ever wires the serial IRQ through
+         * the 8259 instead of the IO-APIC in APIC mode. */
+        if (port == 0x21u) {
+            uint8_t old = pic->master.imr;
+            if (((old ^ pv) & 0x1Au) != 0u) { /* IRQ1/3/4 mask-bit change */
+                static unsigned imr_log_n = 0;
+                if (imr_log_n < 32u) {
+                    imr_log_n++;
+                    hype_debug_print("fw-1 PICIMR 0x%x->0x%x rip=0x%llx\n", (unsigned)old,
+                                     (unsigned)pv, (unsigned long long)real->vmcb->save.rip);
+                }
+            }
+        }
+        /*
+         * #455: ICW1 (command port, bit4 set) begins a full 8259 reinitialisation --
+         * both the loader and, later, the kernel each do this as they take ownership
+         * of the interrupt controller. hype's own request_interrupt() translates an
+         * acknowledged IRQ line into a CPU vector and queues it in pending_irr the
+         * instant the guest can't yet accept it (IF=0) -- eagerly, at acknowledge
+         * time, not at delivery time. A PIC reinit resets the CHIP's own IRR/IMR
+         * (hype_pic_emu_reset(), via chip_write_command() below) but never reached
+         * pending_irr, so a vector translated under the OLD irq_offset (raised by,
+         * say, the loader's own PS/2 handshake traffic while its IF was 0) survived
+         * untouched across the reinit and got delivered late, into whatever the
+         * vector now happens to mean under the NEW configuration -- observed as a
+         * spurious IRQ1 (vector 0x21, queued during the loader's own 8042 self-test)
+         * landing at the KERNEL's first `sti`, before it had registered a real
+         * handler for anything, which FreeBSD (correctly, by its own lights) treated
+         * as fatal. Capture the pre-reinit vector range on ICW1 and drop anything
+         * still queued there -- exactly the discard a real reinit's IRR/IMR reset
+         * already models one layer up, just extended to the vector this project
+         * translates the IRQ into.
+         */
+        if ((port == 0x20u || port == 0xA0u) && (pv & 0x10u) != 0u) {
+            uint8_t old_offset = (port == 0x20u) ? pic->master.irq_offset : pic->slave.irq_offset;
+            unsigned i;
+            for (i = 0; i < 8u; i++) {
+                hype_svm_irr_clear(real->pending_irr, (uint8_t)(old_offset + i));
+                hype_svm_irr_clear(real->pending_pic, (uint8_t)(old_offset + i)); /* #512 */
+            }
+        }
+        return hype_pic_emu_io_write(pic, port, pv);
+    }
+    if (port >= 0x40u && port <= 0x43u) {
+        if (real->vmcb->save.rip < 0x80000000ull) {
+            static unsigned cal_n = 0;
+#ifdef HYPE_QUIET
+            cal_n = 48u;
+#endif
+            if (cal_n < 48u) {
+                cal_n++;
+                hype_debug_print("fw-1 #436 CALTRACE pit p=0x%x OUT rax=0x%02x rip=0x%llx tsc=0x%llx\n",
+                                 (unsigned)port, (unsigned)pv,
                                  (unsigned long long)real->vmcb->save.rip,
                                  (unsigned long long)real_rdtsc());
             }
         }
-        rc = 0;
-    } else {
+        return hype_pit_emu_io_write(pit, port, pv);
+    }
+    /* port == 0x61u */
+    if (real->vmcb->save.rip < 0x80000000ull) {
+        static unsigned cal61_n = 0;
+#ifdef HYPE_QUIET
+        cal61_n = 48u;
+#endif
+        if (cal61_n < 48u) {
+            cal61_n++;
+            hype_debug_print("fw-1 #436 CALTRACE p61 OUT rax=0x%02x rip=0x%llx tsc=0x%llx\n",
+                             (unsigned)pv, (unsigned long long)real->vmcb->save.rip,
+                             (unsigned long long)real_rdtsc());
+        }
+    }
+    hype_pit_emu_port61_write(pit, pv);
+    return 0;
+}
+
+static int svm_ioio_port_in_allowlist(uint16_t port) {
+    return port == 0x20u || port == 0x21u || port == 0xA0u || port == 0xA1u ||
+           (port >= 0x40u && port <= 0x43u) || port == 0x61u;
+}
+
+int hype_svm_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pit_emu_t *pit,
+                              const hype_gpa_map_t *dma_map) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_svm_ioio_t io;
+    int rc;
+
+    hype_svm_decode_ioio_info1(real->vmcb->control.exitinfo1, &io);
+
+    if (!svm_ioio_port_in_allowlist(io.port)) {
         return -1;
+    }
+
+    if (io.is_string) {
+        /*
+         * #712: a rep-prefixed IN/OUT to one of these register-modelled ports takes exactly
+         * one intercept for the WHOLE transfer, same as the fw_cfg data port's own `rep insb`
+         * (hype_svm_vcpu_handle_fw_cfg_ioio) -- EXITINFO2 is already the post-instruction RIP.
+         * This branch used to not exist at all: is_string was never checked, so a `rep insb`
+         * fell straight into the single-byte path below, which reads/writes RAX once and never
+         * touches guest memory -- the destination buffer for every iteration past the first
+         * was left holding whatever the guest already had there. Drive the same per-port
+         * accessor once per transferred byte instead, exactly as fw_cfg drives its FIFO.
+         */
+        hype_svm_string_io_plan_t plan;
+        uint64_t host;
+        uint64_t u;
+
+        if (hype_svm_build_string_io_plan(&io, real->gprs[7] /* RDI */, real->gprs[1] /* RCX */,
+                                          real->vmcb->save.es.base, real->vmcb->save.rflags,
+                                          &plan) != 0) {
+            return -1;
+        }
+        if (plan.byte_count != 0) {
+            host = hype_guest_dma_xlate(dma_map, plan.low_gpa, plan.byte_count);
+            if (host == 0) {
+                return -1; /* guest buffer out of range -> reject, don't scribble host memory */
+            }
+            for (u = 0; u < plan.count; u++) {
+                uint64_t addr = plan.descending ? (plan.start_gpa - u * (uint64_t)plan.unit_bytes)
+                                                 : (plan.start_gpa + u * (uint64_t)plan.unit_bytes);
+                uint64_t off = addr - plan.low_gpa;
+                uint8_t b;
+                for (b = 0; b < plan.unit_bytes; b++) {
+                    if (io.is_in) {
+                        uint8_t value = 0;
+                        if (svm_ioio_pic_pit_read_byte(real, pic, pit, io.port, &value) != 0) {
+                            return -1;
+                        }
+                        ((uint8_t *)(uintptr_t)host)[off + b] = value;
+                    } else {
+                        uint8_t value = ((const uint8_t *)(uintptr_t)host)[off + b];
+                        if (svm_ioio_pic_pit_write_byte(real, pic, pit, io.port, value) != 0) {
+                            return -1;
+                        }
+                    }
+                }
+            }
+        }
+        real->gprs[7] = plan.new_index_reg; /* RDI */
+        real->gprs[1] = plan.new_count_reg; /* RCX */
+        real->vmcb->save.rip = real->vmcb->control.exitinfo2;
+        return 0;
+    }
+
+    if (io.is_in) {
+        uint8_t value = 0;
+        rc = svm_ioio_pic_pit_read_byte(real, pic, pit, io.port, &value);
+        if (rc == 0) {
+            real->vmcb->save.rax = (real->vmcb->save.rax & ~0xFFULL) | value;
+        }
+    } else {
+        rc = svm_ioio_pic_pit_write_byte(real, pic, pit, io.port,
+                                         (uint8_t)(real->vmcb->save.rax & 0xFFu));
     }
 
     if (rc != 0) {

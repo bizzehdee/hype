@@ -102,6 +102,10 @@ static int g_vmx_ack_intr_on_exit = 0;
 static void vmx_sync_long_mode(void);
 static void vmx_make_fs_gs_usable(void);
 static void vmx_decode_ioio(hype_vmm_ioio_t *out);
+/* #712: defined beside hype_vmx_vcpu_handle_fw_cfg_ioio(), which owns the guest-DMA
+ * translation this backend uses; hype_vmx_vcpu_handle_ioio()'s string-IO path above it
+ * needs the same translation for its non-fw_cfg register ports. */
+static uint64_t vmx_dma_xlate(const hype_gpa_map_t *map, uint64_t gpa, uint64_t len);
 /* #251: defined beside hype_vmx_vcpu_set_pvclock(), which owns the scale globals
  * they read; the MSR handler above needs them. */
 static void vmx_pvclock_arm_system_time(struct hype_vcpu_ctx *real, uint64_t msr_value);
@@ -2298,59 +2302,134 @@ void hype_vmx_vcpu_set_rsi(hype_vcpu_ctx_t *ctx, uint64_t rsi) {
  * side. Dispatches to the identical PIC/PIT device models, then advances RIP.
  * Returns 0 if handled, -1 for an unmodelled port.
  */
-int hype_vmx_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pit_emu_t *pit) {
+/*
+ * #712: split out of hype_vmx_vcpu_handle_ioio() so its string-IO path (below) can drive
+ * these once per transferred byte without duplicating the ICW1-cancellation side effect --
+ * mirrors svm_vcpu.c's svm_ioio_pic_pit_read_byte()/write_byte() split for the same reason.
+ * `port` must already be known to belong to the allow-list these two cover.
+ */
+static int vmx_ioio_pic_pit_read_byte(hype_pic_emu_t *pic, hype_pit_emu_t *pit, uint16_t port,
+                                      uint8_t *out) {
+    if (port == 0x20u || port == 0x21u || port == 0xA0u || port == 0xA1u) {
+        return hype_pic_emu_io_read(pic, port, out);
+    }
+    if (port >= 0x40u && port <= 0x43u) {
+        return hype_pit_emu_io_read(pit, port, out);
+    }
+    *out = hype_pit_emu_port61_read(pit); /* port == 0x61u */
+    return 0;
+}
+
+static int vmx_ioio_pic_pit_write_byte(struct hype_vcpu_ctx *real, hype_pic_emu_t *pic,
+                                       hype_pit_emu_t *pit, uint16_t port, uint8_t pv) {
+    if (port == 0x20u || port == 0x21u || port == 0xA0u || port == 0xA1u) {
+        /* #455: mirror hype_svm_vcpu_handle_ioio's ICW1 cancellation -- see that
+         * function's comment for the full reasoning. A PIC reinit (ICW1, bit4 of
+         * a command-port write) discards the chip's own IRR/IMR but, without
+         * this, left any ALREADY-TRANSLATED vector sitting in pending_irr (staged
+         * eagerly at acknowledge time under the OLD irq_offset) to survive
+         * untouched and deliver late under a since-changed configuration. */
+        if ((port == 0x20u || port == 0xA0u) && (pv & 0x10u) != 0u) {
+            uint8_t old_offset = (port == 0x20u) ? pic->master.irq_offset : pic->slave.irq_offset;
+            unsigned i;
+            for (i = 0; i < 8u; i++) {
+                hype_svm_irr_clear(real->pending_irr, (uint8_t)(old_offset + i));
+                hype_svm_irr_clear(real->pending_pic, (uint8_t)(old_offset + i)); /* #512 */
+            }
+        }
+        return hype_pic_emu_io_write(pic, port, pv);
+    }
+    if (port >= 0x40u && port <= 0x43u) {
+        return hype_pit_emu_io_write(pit, port, pv);
+    }
+    hype_pit_emu_port61_write(pit, pv); /* port == 0x61u */
+    return 0;
+}
+
+static int vmx_ioio_port_in_allowlist(uint16_t port) {
+    return port == 0x20u || port == 0x21u || port == 0xA0u || port == 0xA1u ||
+           (port >= 0x40u && port <= 0x43u) || port == 0x61u;
+}
+
+int hype_vmx_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pit_emu_t *pit,
+                              const hype_gpa_map_t *dma_map) {
     vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     int ok, rc;
     uint64_t qual = vmread(HYPE_VMCS_EXIT_QUALIFICATION, &ok);
     uint16_t port = (uint16_t)((qual >> 16) & 0xFFFFu);
     int is_in = (int)((qual >> 3) & 1u);
+    int is_string = (int)((qual >> 4) & 1u);
     uint8_t rax = (uint8_t)(real->gprs[0] & 0xFFu);
 
-    if (port == 0x20u || port == 0x21u || port == 0xA0u || port == 0xA1u) {
-        if (is_in) {
-            uint8_t value = 0;
-            rc = hype_pic_emu_io_read(pic, port, &value);
-            if (rc == 0) {
-                real->gprs[0] = (real->gprs[0] & ~0xFFULL) | value;
+    if (!vmx_ioio_port_in_allowlist(port)) {
+        return -1;
+    }
+
+    if (is_string) {
+        /*
+         * #712: same shape as hype_vmx_vcpu_handle_fw_cfg_ioio()'s own string-IO branch --
+         * one intercept per WHOLE transfer, vmx_advance_rip() already the post-instruction
+         * RIP. This branch never existed here: is_string went unchecked, so a `rep insb`
+         * to one of these register-modelled ports fell into the single-byte path below,
+         * which reads/writes RAX once and never touches guest memory -- every iteration
+         * past the first left the destination buffer holding whatever was already there.
+         */
+        hype_vmm_ioio_t io;
+        hype_svm_string_io_plan_t plan;
+        uint64_t es_base;
+        uint64_t rflags;
+        uint64_t host;
+        uint64_t u;
+
+        vmx_decode_ioio(&io);
+        es_base = vmread(HYPE_VMCS_GUEST_ES_BASE, &ok);
+        rflags = vmread(HYPE_VMCS_GUEST_RFLAGS, &ok);
+        if (hype_svm_build_string_io_plan(&io, real->gprs[7] /* RDI */, real->gprs[1] /* RCX */,
+                                          es_base, rflags, &plan) != 0) {
+            return -1;
+        }
+        if (plan.byte_count != 0u) {
+            host = vmx_dma_xlate(dma_map, plan.low_gpa, plan.byte_count);
+            if (host == 0u) {
+                return -1;
             }
-        } else {
-            /* #455: mirror hype_svm_vcpu_handle_ioio's ICW1 cancellation -- see that
-             * function's comment for the full reasoning. A PIC reinit (ICW1, bit4 of
-             * a command-port write) discards the chip's own IRR/IMR but, without
-             * this, left any ALREADY-TRANSLATED vector sitting in pending_irr (staged
-             * eagerly at acknowledge time under the OLD irq_offset) to survive
-             * untouched and deliver late under a since-changed configuration. */
-            if ((port == 0x20u || port == 0xA0u) && (rax & 0x10u) != 0u) {
-                uint8_t old_offset = (port == 0x20u) ? pic->master.irq_offset
-                                                     : pic->slave.irq_offset;
-                unsigned i;
-                for (i = 0; i < 8u; i++) {
-                    hype_svm_irr_clear(real->pending_irr, (uint8_t)(old_offset + i));
-                    hype_svm_irr_clear(real->pending_pic, (uint8_t)(old_offset + i)); /* #512 */
+            for (u = 0; u < plan.count; u++) {
+                uint64_t address = plan.descending
+                                       ? plan.start_gpa - u * (uint64_t)plan.unit_bytes
+                                       : plan.start_gpa + u * (uint64_t)plan.unit_bytes;
+                uint64_t offset = address - plan.low_gpa;
+                uint8_t b;
+                for (b = 0; b < plan.unit_bytes; b++) {
+                    if (is_in) {
+                        uint8_t value = 0;
+                        if (vmx_ioio_pic_pit_read_byte(pic, pit, port, &value) != 0) {
+                            return -1;
+                        }
+                        ((uint8_t *)(uintptr_t)host)[offset + b] = value;
+                    } else {
+                        uint8_t value = ((const uint8_t *)(uintptr_t)host)[offset + b];
+                        if (vmx_ioio_pic_pit_write_byte(real, pic, pit, port, value) != 0) {
+                            return -1;
+                        }
+                    }
                 }
             }
-            rc = hype_pic_emu_io_write(pic, port, rax);
         }
-    } else if (port >= 0x40u && port <= 0x43u) {
-        if (is_in) {
-            uint8_t value = 0;
-            rc = hype_pit_emu_io_read(pit, port, &value);
-            if (rc == 0) {
-                real->gprs[0] = (real->gprs[0] & ~0xFFULL) | value;
-            }
-        } else {
-            rc = hype_pit_emu_io_write(pit, port, rax);
+        real->gprs[7] = plan.new_index_reg;
+        real->gprs[1] = plan.new_count_reg;
+        vmx_advance_rip();
+        return 0;
+    }
+
+    if (is_in) {
+        uint8_t value = 0;
+        rc = vmx_ioio_pic_pit_read_byte(pic, pit, port, &value);
+        if (rc == 0) {
+            real->gprs[0] = (real->gprs[0] & ~0xFFULL) | value;
         }
-    } else if (port == 0x61u) {
-        if (is_in) {
-            real->gprs[0] = (real->gprs[0] & ~0xFFULL) | hype_pit_emu_port61_read(pit);
-        } else {
-            hype_pit_emu_port61_write(pit, rax);
-        }
-        rc = 0;
     } else {
-        return -1;
+        rc = vmx_ioio_pic_pit_write_byte(real, pic, pit, port, rax);
     }
 
     if (rc != 0) {

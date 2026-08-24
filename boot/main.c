@@ -4144,7 +4144,7 @@ static int vmm_handle_msr(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t r
                           hype_guest_lapic_t *lapic);
 static void vmm_set_rsi(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t rsi);
 static int vmm_handle_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic,
-                           hype_pit_emu_t *pit);
+                           hype_pit_emu_t *pit, const hype_gpa_map_t *dma_map);
 static int vmm_reason_is_npf(hype_vmm_kind_t kind, uint64_t reason);
 static int vmm_handle_bochs_vbe_npf(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_bochs_vbe_t *dev,
                                     uint64_t mmio_base_phys, const uint8_t *insn);
@@ -4404,11 +4404,11 @@ static void vmm_set_rsi(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint64_t rsi
     }
 }
 static int vmm_handle_ioio(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic,
-                           hype_pit_emu_t *pit) {
+                           hype_pit_emu_t *pit, const hype_gpa_map_t *dma_map) {
     if (kind == HYPE_VMM_KIND_VMX) {
-        return hype_vmx_vcpu_handle_ioio(ctx, pic, pit);
+        return hype_vmx_vcpu_handle_ioio(ctx, pic, pit, dma_map);
     }
-    return hype_svm_vcpu_handle_ioio(ctx, pic, pit);
+    return hype_svm_vcpu_handle_ioio(ctx, pic, pit, dma_map);
 }
 static int vmm_reason_is_npf(hype_vmm_kind_t kind, uint64_t reason) {
     return kind == HYPE_VMM_KIND_VMX ? (reason == HYPE_VMX_EXIT_REASON_EPT_VIOLATION)
@@ -11995,7 +11995,7 @@ wait_for_sipi:
              */
             } else if (vmm_handle_pci_cf8_ioio(kind, ctx, &vm->pci) == 0) {
                 /* handled */
-            } else if (vmm_handle_ioio(kind, ctx, &vm->pic, &vm->pit) == 0) {
+            } else if (vmm_handle_ioio(kind, ctx, &vm->pic, &vm->pit, &vm->dma_map) == 0) {
                 /* handled */
             /*
              * #482: the rest of the shared port-I/O models, under the same device lock. The AP
@@ -18215,7 +18215,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 hype_io_hist_record(g_fw_1_io_hist[vm - g_vms], HYPE_IO_HIST_PORTS, io_peek.port);
             }
 #endif
-            if (vmm_handle_ioio(kind, ctx, &g_fw_1_pic, &g_fw_1_pit) == 0) {
+            if (vmm_handle_ioio(kind, ctx, &g_fw_1_pic, &g_fw_1_pit, &g_fw_1_dma_map) == 0) {
                 continue;
             }
             {   /* #440: the legacy 0xCFC window feeds the same access ring as ECAM. */

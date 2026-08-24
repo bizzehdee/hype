@@ -333,7 +333,8 @@ void hype_svm_vcpu_enable_intr_intercept(hype_vcpu_ctx_t *ctx);
  * hype_pic_emu_io_*()/hype_pit_emu_io_*() call this dispatches to are
  * already fully tested in isolation.
  */
-int hype_svm_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pit_emu_t *pit);
+int hype_svm_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pit_emu_t *pit,
+                              const hype_gpa_map_t *dma_map);
 
 /*
  * Handles a CPUID (CPUMSR-1) VM-exit: reads the guest's requested

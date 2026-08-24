@@ -118,7 +118,8 @@ int hype_vmx_vcpu_handle_hypercall(hype_vcpu_ctx_t *ctx);
 /* set_rsi seeds guest RSI before entry (Linux zero-page ptr, m3-5). handle_ioio
  * emulates a port-I/O exit (reason 30) against the PIC/PIT models. */
 void hype_vmx_vcpu_set_rsi(hype_vcpu_ctx_t *ctx, uint64_t rsi);
-int hype_vmx_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pit_emu_t *pit);
+int hype_vmx_vcpu_handle_ioio(hype_vcpu_ctx_t *ctx, hype_pic_emu_t *pic, hype_pit_emu_t *pit,
+                              const hype_gpa_map_t *dma_map);
 /* fw_cfg IOIO (DMA interface): select/data/DMA ports (0x510/0x511/0x514/0x518). */
 int hype_vmx_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw,
                                      const hype_gpa_map_t *dma_map);
