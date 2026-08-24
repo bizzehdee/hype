@@ -1,5 +1,6 @@
 #include "../core/efi_types.h"
 #include "../core/console.h"
+#include "../core/stack_protector.h"
 #include "../core/fatal.h"
 #include "../core/gop.h"
 #include "../core/gop_mode.h"
@@ -24196,6 +24197,7 @@ static void fw_alloc_vm_aux_arena(EFI_BOOT_SERVICES *bs) {
 }
 
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
+    hype_stack_protector_init(); /* #604/#711: reseed before any local array is touched */
     EFI_MEMORY_DESCRIPTOR *map = 0;
     UINTN map_size = 0, desc_size = 0, map_key = 0;
     EFI_STATUS status;

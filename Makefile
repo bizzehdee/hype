@@ -23,6 +23,7 @@ HYPE_BUILD_ID := $(shell git describe --always --dirty --abbrev=7 2>/dev/null ||
 CFLAGS  := --target=$(TARGET) -ffreestanding -fshort-wchar -mno-red-zone \
            -Wall -Wextra -g -O1 -std=c11 -MMD -MP \
            -Werror=constant-conversion \
+           -fstack-protector-strong \
            -DHYPE_BUILD_ID='"$(HYPE_BUILD_ID)"' $(EXTRA_CFLAGS)
 LDFLAGS := -flavor link -subsystem:efi_application -entry:efi_main
 
@@ -31,7 +32,7 @@ CORE_SRCS := core/format.c core/console.c core/halt.c core/memmap.c \
              core/serial.c core/serial_hw.c core/font8x8.c core/gop.c core/gop_text.c core/gop_mode.c core/gop_mode_hw.c \
              core/png_write.c \
              core/fatal.c core/strutil.c core/guest_ram.c core/mp.c core/linux_boot.c \
-             core/admission.c core/file_io.c core/guest_mem.c core/logbuf.c \
+             core/admission.c core/file_io.c core/guest_mem.c core/logbuf.c core/stack_protector.c \
              core/clockfacts.c core/io_histogram.c core/log_drain.c core/log_level.c core/kboot.c core/ram_pool.c core/vm_create.c core/avic.c core/vm_delete.c core/l2switch.c core/qcow2_create.c core/sha256.c core/tpm2.c core/render_budget.c core/scancode_queue.c core/ticket_lock.c \
              core/host_pci.c core/host_pci_hw.c core/host_pci_dma.c core/host_pci_irq.c core/host_nic.c core/ahci_host.c core/ahci_host_hw.c \
              core/gpt.c core/iso_stream.c core/fat.c core/file_range.c core/fs_ops.c core/ntfs.c core/ntfs_journal.c core/fs_owner_guard.c core/ext2_alloc.c core/jbd2.c core/ext_jalloc.c core/ext_csum.c core/ext.c core/ext_write.c core/ext_dirent.c core/ext_namespace.c core/ext2_namespace.c core/extj_namespace.c core/blk_image.c core/blk_qcow2.c core/nvme_host.c core/nvme_host_hw.c core/blk_backend.c core/blk_phys.c core/blk_phys_hw.c core/phys_guard.c \

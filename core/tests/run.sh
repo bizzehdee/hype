@@ -17,7 +17,7 @@ LIB_DIRS="../ ../../arch/x86_64/ ../../arch/x86_64/cpu/ ../../arch/x86_64/svm/ .
 # AGENTS.md. Still linked below; just not reported on.
 is_exempt() {
     case "$1" in
-        */halt.c|*/gdt_load.c|*/idt_load.c|*/paging_load.c|*/serial_hw.c|*/cpu/pic.c|*/pit_hw.c|*/timer_isr.c|*/cpu_features_hw.c|*/fpu_state_hw.c|*/svm_enable_hw.c|*/vmx_enable_hw.c|*/vmcs_hw.c|*/svm_vcpu.c|*/ps2_host_hw.c|*/host_pci_hw.c|*/ahci_host_hw.c|*/nvme_host_hw.c|*/blk_phys_hw.c|*/e1000_hw.c|*/xhci_hw.c|*/blk_usb.c|*/rtc_hw.c|*/mtrr_hw.c|*/ap_boot.c|*/gop_mode_hw.c) return 0 ;;
+        */halt.c|*/gdt_load.c|*/idt_load.c|*/paging_load.c|*/serial_hw.c|*/cpu/pic.c|*/pit_hw.c|*/timer_isr.c|*/cpu_features_hw.c|*/fpu_state_hw.c|*/svm_enable_hw.c|*/vmx_enable_hw.c|*/vmcs_hw.c|*/svm_vcpu.c|*/ps2_host_hw.c|*/host_pci_hw.c|*/ahci_host_hw.c|*/nvme_host_hw.c|*/blk_phys_hw.c|*/e1000_hw.c|*/xhci_hw.c|*/blk_usb.c|*/rtc_hw.c|*/mtrr_hw.c|*/ap_boot.c|*/gop_mode_hw.c|*/stack_protector.c) return 0 ;;
         *) return 1 ;;
     esac
 }
