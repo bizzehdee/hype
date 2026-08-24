@@ -146,4 +146,16 @@ int hype_cpu_has_ibpb(hype_cpu_vendor_t vendor, uint32_t leaf7_edx, uint32_t lea
  * own reported max extended leaf). Exempt hw shim. */
 uint32_t hype_cpu_leaf80000008_ebx(void);
 
+/*
+ * #604: NX/XD (No-Execute), CPUID.8000_0001H:EDX bit 20. Both vendors gate the SAME EFER.NXE
+ * (MSR 0xC0000080) bit 11 behind this same extended-leaf bit -- Intel calls it XD, AMD calls it
+ * NX, but the CPUID enumeration and the EFER bit it unlocks are identical, unlike SMEP/SPEC_CTRL
+ * above where the two vendors enumerate through different leaves. A CPU old enough to lack it
+ * just does not get the mitigation.
+ */
+int hype_cpu_has_nx(uint32_t leaf80000001_edx);
+
+/* Real CPUID.8000_0001H:EDX read. Exempt hw shim. */
+uint32_t hype_cpu_leaf80000001_edx(void);
+
 #endif /* HYPE_ARCH_CPU_FEATURES_H */

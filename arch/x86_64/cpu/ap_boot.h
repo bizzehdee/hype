@@ -28,6 +28,14 @@
  *                RCX). Pass hype_ap_entry for the bare bring-up smoketest, or a
  *                caller-provided AP-main to run a guest on the AP (M8-0b-ii).
  *   entry_arg  : opaque argument passed to `entry` (RCX per the MS x64 ABI).
+ *   nxe        : #604: set EFER.NXE on this AP (bit 11, MSR 0xC0000080) before
+ *                entering long mode. EFER is per-core -- the BSP setting its own
+ *                NXE never reaches an AP, but `cr3`'s tables may already carry
+ *                NX-marked (bit 63) entries the instant they exist, and bit 63
+ *                is a RESERVED bit (not an ignored one) when NXE=0. Pass 1 only
+ *                when the caller already confirmed CPUID grants NX (the same
+ *                condition that decided whether `cr3`'s tables carry NX bits at
+ *                all); passing 1 when the CPU lacks NX support #GPs on the wrmsr.
  * Returns 0 if the AP reached the trampoline's long-mode stage within the
  * timeout, -1 otherwise. */
 /* The default 64-bit C landing for a bare AP bring-up: sets g_hype_ap_c_alive
@@ -36,7 +44,8 @@
 void hype_ap_entry(void *arg);
 
 int hype_ap_start(volatile uint32_t *lapic_base, uint8_t apic_id, void *tramp_page, uint64_t cr3,
-                  uint64_t stack_top, uint64_t tsc_hz, void (*entry)(void *), void *entry_arg);
+                  uint64_t stack_top, uint64_t tsc_hz, void (*entry)(void *), void *entry_arg,
+                  int nxe);
 
 /* Set to 1 once an AP has actually entered hype_ap_entry() -- i.e. the 64-bit
  * C landing ran (proves the whole mode-switch + stack + call worked, a step

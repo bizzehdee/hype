@@ -137,6 +137,45 @@ void hype_paging_mark_region_wc(hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_T
     }
 }
 
+void hype_paging_apply_nx(hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_TABLE],
+                          unsigned int gb_mapped, uint64_t exec_base, uint64_t exec_size,
+                          uint64_t exec2_base, uint64_t exec2_size) {
+    uint64_t exec_first, exec_last, exec2_first, exec2_last;
+    unsigned int gb, j;
+
+    if (exec_size != 0) {
+        exec_first = exec_base & ~(HYPE_PAGING_2MB - 1ULL);
+        exec_last = (exec_base + exec_size - 1ULL) & ~(HYPE_PAGING_2MB - 1ULL);
+    } else {
+        /* No exempt range: exec_first > exec_last so the overlap check below never matches. */
+        exec_first = 1ULL;
+        exec_last = 0ULL;
+    }
+    if (exec2_size != 0) {
+        exec2_first = exec2_base & ~(HYPE_PAGING_2MB - 1ULL);
+        exec2_last = (exec2_base + exec2_size - 1ULL) & ~(HYPE_PAGING_2MB - 1ULL);
+    } else {
+        exec2_first = 1ULL;
+        exec2_last = 0ULL;
+    }
+
+    for (gb = 0; gb < gb_mapped; gb++) {
+        for (j = 0; j < HYPE_PAGING_ENTRIES_PER_TABLE; j++) {
+            uint64_t phys = (uint64_t)gb * HYPE_PAGING_1GB + (uint64_t)j * HYPE_PAGING_2MB;
+            if ((pd_tables[gb][j] & HYPE_PAGING_PRESENT) == 0) {
+                continue;
+            }
+            if (phys >= exec_first && phys <= exec_last) {
+                continue; /* overlaps hype's own image -- must stay executable */
+            }
+            if (phys >= exec2_first && phys <= exec2_last) {
+                continue; /* overlaps the AP trampoline page -- must stay executable */
+            }
+            pd_tables[gb][j] |= HYPE_PAGING_NX;
+        }
+    }
+}
+
 unsigned int hype_paging_map_region_2mb(hype_pte_t *pdpt,
                                          hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_TABLE],
                                          uint64_t phys_base, uint64_t size) {

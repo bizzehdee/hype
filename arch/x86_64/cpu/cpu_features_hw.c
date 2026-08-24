@@ -93,3 +93,12 @@ uint32_t hype_cpu_leaf80000008_ebx(void) {
     cpuid(0x80000008u, &a, &b, &c, &d);
     return b;
 }
+
+/* #604: CPUID.8000_0001H:EDX -- NX/XD is bit 20. */
+uint32_t hype_cpu_leaf80000001_edx(void) {
+    uint32_t a = 0, b = 0, c = 0, d = 0;
+    cpuid(0x80000000u, &a, &b, &c, &d);
+    if (a < 0x80000001u) return 0u;
+    cpuid(0x80000001u, &a, &b, &c, &d);
+    return d;
+}

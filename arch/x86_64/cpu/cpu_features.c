@@ -104,3 +104,8 @@ int hype_cpu_has_ibpb(hype_cpu_vendor_t vendor, uint32_t leaf7_edx, uint32_t lea
     if (vendor == HYPE_CPU_VENDOR_AMD) return (int)((leaf80000008_ebx >> 12) & 1u);
     return 0;
 }
+
+/* #604: NX/XD, vendor-agnostic -- see the header. */
+int hype_cpu_has_nx(uint32_t leaf80000001_edx) {
+    return (int)((leaf80000001_edx >> 20) & 1u);
+}

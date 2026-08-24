@@ -35,6 +35,7 @@
 #define HYPE_PAGING_PWT (1ULL << 3)
 #define HYPE_PAGING_PCD (1ULL << 4) /* page cache disable -- uncacheable (MMIO) */
 #define HYPE_PAGING_PS (1ULL << 7)
+#define HYPE_PAGING_NX (1ULL << 63) /* requires EFER.NXE=1 -- see hype_paging_apply_nx()'s caller */
 
 typedef uint64_t hype_pte_t;
 
@@ -170,6 +171,33 @@ void hype_paging_load(const hype_pte_t *pml4);
  * Only touches PDEs already present (built as PS 2MB pages). Pure. */
 void hype_paging_mark_region_wc(hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_TABLE],
                                 uint64_t base, uint64_t size, unsigned int gb_mapped);
+
+/*
+ * #604: marks NX (bit 63) on every PRESENT 2MB leaf in pd_tables[0..gb_mapped-1] EXCEPT the
+ * 2MB-aligned pages overlapping [exec_base, exec_base+exec_size) or [exec2_base, exec2_size) --
+ * guest RAM, DMA buffers, stacks and every other host mapping become non-executable; the one
+ * or two ranges the CPU must still be able to fetch instructions from are left alone. The
+ * second range exists for the AP identity map: hype's own image is the BSP's only exec range,
+ * but an AP's trampoline blob (ap_trampoline.S, copied to a page below 1MB) keeps executing
+ * FROM THAT PAGE for several instructions after it loads CR3 and sets CR0.PG -- every
+ * instruction fetch from that point is already walking these very tables, so that page must
+ * stay executable too, in the AP's table only (pass exec2_size = 0 for the BSP's own g_pd,
+ * which the trampoline never runs under). 2MB granularity only -- W^X (making even the image's
+ * OWN .data/.rodata non-executable at section granularity) is a separate, finer-grained
+ * follow-up. exec_size == 0 exempts nothing from the first range; the caller (efi_main) treats
+ * a failure to determine its own image extent as fatal rather than reaching this with
+ * exec_size == 0 by accident.
+ *
+ * The caller MUST have EFER.NXE set (via wrmsr) BEFORE the CR3 carrying these tables is ever
+ * loaded -- with NXE=0, bit 63 is a RESERVED bit in a paging-structure entry, not an ignored
+ * one, and any entry with it set faults with a reserved-bit violation the instant it is used to
+ * translate anything at all. This function does not touch EFER; it only encodes the bit.
+ *
+ * Pure table-editing, no CPU state touched -- same shape as hype_paging_mark_region_wc.
+ */
+void hype_paging_apply_nx(hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_TABLE],
+                          unsigned int gb_mapped, uint64_t exec_base, uint64_t exec_size,
+                          uint64_t exec2_base, uint64_t exec2_size);
 
 /* Programs IA32_PAT (MSR 0x277) so slot 1 = WC (the default, but with PA1 changed
  * from WT to WC): 0x0007040600070106. Selected by a PDE/PTE with PWT=1,PCD=0,

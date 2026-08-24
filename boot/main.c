@@ -415,6 +415,20 @@ static hype_pte_t g_fb_pd[2][HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((align
  * the AP page-table build (earlier) and the BSP paging build can mark it WC. */
 static uint64_t g_fb_base;
 static uint64_t g_fb_size;
+/* #604: hype's own loaded PE image extent (EFI_LOADED_IMAGE_PROTOCOL.ImageBase/ImageSize),
+ * captured while Boot Services are still live -- the only NX-except-this range the host NX
+ * pass (below) needs. 0/0 if the query fails, which hype_paging_apply_nx() treats as "exempt
+ * nothing," i.e. every page gets NX and the image itself would fault -- so a failed query here
+ * must be treated as fatal by the caller rather than silently booting non-executable. */
+static uint64_t g_hype_image_base;
+static uint64_t g_hype_image_size;
+/* #604: whether EFER.NXE was actually armed on the BSP (CPUID.8000_0001H:EDX[20]).
+ * Gates every hype_paging_apply_nx() call AND every AP's own per-core EFER.NXE (via
+ * hype_ap_start's nxe arg) -- on a CPU that lacks NX, bit 63 must never be set in any
+ * PTE at all (that CPU may treat it as reserved regardless of EFER.NXE's own state on
+ * some old parts), so apply_nx is skipped entirely rather than called with a
+ * best-effort exempt range. */
+static int g_hype_nx_supported;
 /* M10-1b: page tables to map a host NVMe controller's BAR when firmware placed
  * it in high 64-bit MMIO above the low identity map (QEMU q35 parks it ~56 TiB). */
 static hype_pte_t g_nvme_pdpt[HYPE_PAGING_ENTRIES_PER_TABLE] __attribute__((aligned(4096)));
@@ -22105,7 +22119,8 @@ static int fw_1_start_new_vm(unsigned vi) {
         rc = hype_ap_start((volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE,
                            (uint8_t)sel, (void *)(uintptr_t)g_ap_tramp_page, g_ap_cr3,
                            (uint64_t)(uintptr_t)(g_ap_stacks[slot] + HYPE_AP_STACK_BYTES),
-                           g_vms[0].host_tsc_hz, fw_1_ap_main, (void *)FW_1_AP_ARG(vi, cv));
+                           g_vms[0].host_tsc_hz, fw_1_ap_main, (void *)FW_1_AP_ARG(vi, cv),
+                           g_hype_nx_supported);
         HYPE_LOGF(HYPE_LOG_INFO, "fw-1 CREATE: vm%u vCPU %u on apic=%d -> rc=%d [#486]\n", vi, cv, sel, rc);
         if (rc == 0) {
             started++;
@@ -24271,6 +24286,51 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         hype_debug_print("hype: CR4.SMEP not available on this CPU -- skipped [#604]\n");
     }
 
+    /*
+     * #604: EFER.NXE, set here (well before the identity map that will actually USE the NX bit
+     * is built and switched to, ~line 25014's hype_paging_build_identity()/hype_paging_apply_nx()
+     * pair). Order matters: if EFER.NXE is 0, bit 63 of every paging-structure entry is a
+     * RESERVED bit, not an ignored one -- an entry with it set faults with a reserved-bit
+     * violation the instant that entry is used to translate ANYTHING, not just an execute. NXE
+     * has to be live before hype's own CR3 (carrying NX-marked entries) is ever loaded, so it is
+     * set here, alongside CR4.SMEP, rather than next to the paging code that consumes it.
+     * Harmless to set this early: it only changes how a PTE's bit 63 is interpreted, and
+     * firmware's own page tables (still live at this point) do not set it.
+     */
+    if (hype_cpu_has_nx(hype_cpu_leaf80000001_edx())) {
+        uint32_t efer_lo, efer_hi;
+        __asm__ volatile("rdmsr" : "=a"(efer_lo), "=d"(efer_hi) : "c"(HYPE_MSR_EFER));
+        efer_lo |= (1u << 11); /* EFER.NXE */
+        __asm__ volatile("wrmsr" : : "c"(HYPE_MSR_EFER), "a"(efer_lo), "d"(efer_hi) : "memory");
+        g_hype_nx_supported = 1;
+        hype_debug_print("hype: EFER.NXE enabled on the BSP [#604]\n");
+    } else {
+        hype_debug_print("hype: EFER.NXE not available on this CPU -- host NX skipped [#604]\n");
+    }
+
+    /*
+     * #604: hype's own image extent, queried now while Boot Services can still answer
+     * HandleProtocol -- the host NX pass (~line 25040, after the identity map is built) needs
+     * to know what NOT to mark NX. A failed query here is fatal rather than silently degrading:
+     * the alternative is applying NX to hype.efi's own .text, which would fault on the very
+     * first instruction fetch after the CR3 switch that activates it.
+     */
+    {
+        EFI_GUID loaded_image_guid = EFI_LOADED_IMAGE_PROTOCOL_GUID;
+        EFI_LOADED_IMAGE_PROTOCOL *loaded_image = 0;
+        if (SystemTable->BootServices->HandleProtocol(ImageHandle, &loaded_image_guid,
+                                                       (void **)&loaded_image) != EFI_SUCCESS ||
+            loaded_image == 0 || loaded_image->ImageSize == 0) {
+            hype_fatal("#604: could not determine hype's own loaded-image extent -- refusing to "
+                      "boot rather than risk marking hype's own .text NX\n");
+        }
+        g_hype_image_base = (uint64_t)(uintptr_t)loaded_image->ImageBase;
+        g_hype_image_size = loaded_image->ImageSize;
+        hype_debug_print("hype: own image base=0x%llx size=0x%llx [#604]\n",
+                         (unsigned long long)g_hype_image_base,
+                         (unsigned long long)g_hype_image_size);
+    }
+
     /* M9-2 (#175): keep Runtime Services reachable post-EBS for the host reboot/off action.
      * Legal at physical addresses because hype never calls SetVirtualAddressMap. */
     g_runtime_services = SystemTable->RuntimeServices;
@@ -24857,6 +24917,22 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 (hype_pte_t(*)[HYPE_PAGING_ENTRIES_PER_TABLE])(uintptr_t)(base + 8192ULL);
             hype_guest_ram_zero((void *)(uintptr_t)base, ap_pt_pages * 4096ULL);
             hype_paging_build_identity(ap_pml4, ap_pdpt, ap_pd, HYPE_PAGING_MAX_GB);
+            /*
+             * #604: same NX pass as the BSP's own table below -- an AP that took a SIPI onto
+             * this root must not get an executable identity map either. The SECOND exempt
+             * range is g_ap_tramp_page (already allocated above): ap_trampoline.S keeps
+             * executing FROM that page for several instructions after it loads THIS CR3 and
+             * sets CR0.PG (the ljmpl into long_entry, and long_entry itself, both still run
+             * off the trampoline page before the callq into hype's own C code) -- marking it
+             * NX here faults the AP the instant paging activates, before it ever reaches
+             * anything this project's own #UD/#PF handlers could catch. Gated on
+             * g_hype_nx_supported like the BSP's own pass below: on hardware without NX, no
+             * PTE anywhere may carry bit 63.
+             */
+            if (g_hype_nx_supported) {
+                hype_paging_apply_nx(ap_pd, HYPE_PAGING_MAX_GB, g_hype_image_base,
+                                     g_hype_image_size, g_ap_tramp_page, 4096ULL);
+            }
             /* PERF-2 (#234): mark the FB pages WC in the AP's own table too (the
              * AP also programs PAT slot 1 = WC in fw_1_ap_main).
              *
@@ -25057,6 +25133,22 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             hype_debug_print("paging: framebuffer 0x%llx+0x%llx marked write-combining (PERF-2)\n",
                               (unsigned long long)fb_base, (unsigned long long)fb_size);
         }
+    }
+    /*
+     * #604: NX on every present page in the low identity map EXCEPT hype's own image -- guest
+     * RAM, DMA buffers, stacks, the framebuffer, everything else becomes non-executable. Must
+     * run AFTER every region-specific mapping above (they can only add/modify entries within
+     * g_pd) and BEFORE the CR3 load below activates these tables -- EFER.NXE is already set
+     * (near the top of efi_main, well before Boot Services work began), so this is the first
+     * point an NX-marked entry actually gets walked. Gated on g_hype_nx_supported: on hardware
+     * without NX, no PTE anywhere may carry bit 63 -- it is a reserved bit there, not an
+     * ignored one, regardless of what EFER.NXE (never set on such a CPU) says.
+     */
+    if (g_hype_nx_supported) {
+        hype_paging_apply_nx(g_pd, HYPE_PAGING_MAX_GB, g_hype_image_base, g_hype_image_size, 0, 0);
+        hype_debug_print("paging: NX applied to every host page except hype's own image "
+                         "(0x%llx+0x%llx) [#604]\n", (unsigned long long)g_hype_image_base,
+                         (unsigned long long)g_hype_image_size);
     }
     hype_paging_load(g_pml4);
     hype_paging_set_pat_wc(); /* PERF-2: PAT slot 1 = WC (this core) */
@@ -26643,7 +26735,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                 (void *)(uintptr_t)g_ap_tramp_page, g_ap_cr3,
                                 (uint64_t)(uintptr_t)(g_ap_stacks[slot] + HYPE_AP_STACK_BYTES),
                                 g_fw_1_host_tsc_hz, fw_1_ap_main,
-                                (void *)FW_1_AP_ARG(vi, cv));
+                                (void *)FW_1_AP_ARG(vi, cv), g_hype_nx_supported);
                             if (cv == 0u) {
                                 if (vi == 0u) g_fw_1_ap_rc = rc;
                                 else if (vi == 1u) g_fw_1_ap2_rc = rc;

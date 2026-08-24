@@ -267,6 +267,80 @@ static void test_mark_region_wc(void) {
               pd[gb][first] & HYPE_PAGING_PWT);
 }
 
+static void test_apply_nx_exempts_image_range(void) {
+    hype_pte_t pd[4][HYPE_PAGING_ENTRIES_PER_TABLE];
+    /* Image spans the tail of GB0 into the head of GB1 -- exercises the
+     * cross-GB overlap arithmetic, not just a single-GB case. */
+    uint64_t image_base = HYPE_PAGING_1GB - HYPE_PAGING_2MB;
+    uint64_t image_size = 3 * HYPE_PAGING_2MB; /* covers GB0's last page + GB1's first two */
+    unsigned int gb, j;
+
+    hype_paging_build_identity(g_pml4, g_pdpt, pd, 4);
+    hype_paging_apply_nx(pd, 4, image_base, image_size, 0, 0);
+
+    for (gb = 0; gb < 4; gb++) {
+        for (j = 0; j < HYPE_PAGING_ENTRIES_PER_TABLE; j++) {
+            int in_image = (gb == 0 && j == 511) || (gb == 1 && (j == 0 || j == 1));
+            uint64_t nx = pd[gb][j] & HYPE_PAGING_NX;
+            if (in_image) {
+                CHECK_HEX("apply_nx: image page stays executable", 0, nx);
+            } else {
+                CHECK_HEX("apply_nx: non-image page gets NX", HYPE_PAGING_NX, nx);
+            }
+            /* NX must never disturb PRESENT/WRITE/PS -- otherwise a caller that
+             * only wanted "not executable" would also silently unmap or read-only
+             * pages it never asked to touch. */
+            CHECK_HEX("apply_nx: PRESENT/WRITE/PS untouched",
+                      HYPE_PAGING_PRESENT | HYPE_PAGING_WRITE | HYPE_PAGING_PS,
+                      pd[gb][j] & (HYPE_PAGING_PRESENT | HYPE_PAGING_WRITE | HYPE_PAGING_PS));
+        }
+    }
+}
+
+static void test_apply_nx_zero_size_exempts_nothing(void) {
+    /* exec_size == 0 -- e.g. a failed image-base query the caller should have
+     * already treated as fatal, but the function itself must not silently
+     * exempt some arbitrary page if it is ever reached with this input. */
+    hype_pte_t pd[2][HYPE_PAGING_ENTRIES_PER_TABLE];
+    unsigned int j;
+
+    hype_paging_build_identity(g_pml4, g_pdpt, pd, 2);
+    hype_paging_apply_nx(pd, 2, 0, 0, 0, 0);
+
+    for (j = 0; j < HYPE_PAGING_ENTRIES_PER_TABLE; j++) {
+        CHECK_HEX("apply_nx: zero exec_size marks every page NX", HYPE_PAGING_NX,
+                  pd[0][j] & HYPE_PAGING_NX);
+        CHECK_HEX("apply_nx: zero exec_size marks every page NX (gb1)", HYPE_PAGING_NX,
+                  pd[1][j] & HYPE_PAGING_NX);
+    }
+}
+
+static void test_apply_nx_stops_at_gb_mapped(void) {
+    /* Only pd_tables[0..gb_mapped-1] is caller-owned; entries beyond that
+     * bound must never be touched (same discipline as hype_paging_mark_region_wc's
+     * gb_mapped bound). */
+    hype_pte_t pd[2][HYPE_PAGING_ENTRIES_PER_TABLE];
+
+    hype_paging_build_identity(g_pml4, g_pdpt, pd, 2);
+    hype_paging_apply_nx(pd, 1, 0, 0, 0, 0);
+
+    CHECK_HEX("apply_nx: gb0 (within bound) gets NX", HYPE_PAGING_NX, pd[0][0] & HYPE_PAGING_NX);
+    CHECK_HEX("apply_nx: gb1 (beyond gb_mapped) left alone", 0, pd[1][0] & HYPE_PAGING_NX);
+}
+
+static void test_apply_nx_exempts_second_range(void) {
+    /* The AP trampoline page: a second, independent exempt range distinct from the image. */
+    hype_pte_t pd[2][HYPE_PAGING_ENTRIES_PER_TABLE];
+    uint64_t tramp_page = 5 * HYPE_PAGING_2MB; /* gb0, index 5 */
+
+    hype_paging_build_identity(g_pml4, g_pdpt, pd, 2);
+    hype_paging_apply_nx(pd, 2, HYPE_PAGING_1GB, HYPE_PAGING_2MB, tramp_page, 4096ULL);
+
+    CHECK_HEX("apply_nx: second-range page stays executable", 0, pd[0][5] & HYPE_PAGING_NX);
+    CHECK_HEX("apply_nx: first-range page stays executable", 0, pd[1][0] & HYPE_PAGING_NX);
+    CHECK_HEX("apply_nx: page in neither range gets NX", HYPE_PAGING_NX, pd[0][4] & HYPE_PAGING_NX);
+}
+
 int main(void) {
     test_encode_entry();
     test_mark_region_wc();
@@ -280,6 +354,10 @@ int main(void) {
     test_map_region_high_framebuffer();
     test_map_region_straddling_gb_boundary();
     test_map_region_out_of_range_and_empty();
+    test_apply_nx_exempts_image_range();
+    test_apply_nx_zero_size_exempts_nothing();
+    test_apply_nx_stops_at_gb_mapped();
+    test_apply_nx_exempts_second_range();
 
     if (failures == 0) {
         printf("all tests passed\n");

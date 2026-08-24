@@ -66,7 +66,10 @@ prot_entry:
     movl $0xC0000080, %ecx      # IA32_EFER
     rdmsr
     orl $0x100, %eax            # EFER.LME
-    wrmsr
+    cmpb $0, (tramp_nxe - hype_ap_tramp_start)(%ebx)
+    je 1f
+    orl $0x800, %eax            # EFER.NXE (bit 11) -- see tramp_nxe's own comment
+1:  wrmsr
 
     movl %cr0, %eax
     orl $0x80000001, %eax       # CR0.PG | CR0.PE  -> activates long mode
@@ -156,6 +159,23 @@ tramp_alive:
 hype_ap_tramp_phase:
 tramp_phase:
     .long 0                     # last stage reached: 1=real 2=protected 3=long
+# #604: EFER is per-core, not a shared platform state -- the BSP setting EFER.NXE on
+# itself (efi_main) never reaches an AP freshly landed via SIPI, whose EFER starts at
+# whatever the vendor's real-mode reset default is. Meanwhile this AP's OWN identity
+# map (built on the BSP, same as g_pd) already carries NX-marked (bit 63) entries the
+# instant it exists -- and with EFER.NXE=0, bit 63 is a RESERVED bit in a paging-
+# structure entry, not an ignored one. The AP's very first translation through ANY
+# NX-marked entry (its own stack, set up two instructions after long_entry) then
+# faults with a reserved-bit violation, cascades to a double/triple fault with no IDT
+# yet loaded, and resets the whole machine -- silent from the BSP's point of view: no
+# diagnostic ever fires because the fault happens before this AP could produce one.
+# The BSP writes 1 here only when it already confirmed CPUID grants NX; 0 leaves this
+# AP's EFER.NXE alone (matching a from-#604 build's PTEs, which never set bit 63 when
+# CPUID lacks it either -- see hype_paging_apply_nx()'s caller in boot/main.c).
+.globl hype_ap_tramp_nxe
+hype_ap_tramp_nxe:
+tramp_nxe:
+    .byte 0
 
 .globl hype_ap_tramp_end
 hype_ap_tramp_end:
