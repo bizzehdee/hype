@@ -171,18 +171,54 @@ int hype_svm_enable_on_page(void *percore_page);
  * page-aligned, zeroed 4 KiB pages. */
 void hype_svm_vcpu_pool_alloc(unsigned count, uint64_t (*alloc_zeroed_pages)(unsigned pages));
 
+/* #640 (cause 2): upper bound on AVIC backing-page pool slots, matching the same
+ * HYPE_CPU_TOPOLOGY_MAX-derived ceiling boot/main.c already computes `total_vcpus` from for
+ * hype_svm_vcpu_pool_alloc(). A build-time constant (rather than threading HYPE_CPU_TOPOLOGY_MAX
+ * into this backend) because AVIC's per-slot tracking arrays (svm_bits.c) need a fixed size. */
+#define HYPE_SVM_AVIC_MAX_SLOTS 64u
+
+/* #640 (cause 2): allocate `count` per-vCPU AVIC backing pages (one 4 KiB page each), same
+ * calling convention as hype_svm_vcpu_pool_alloc() -- called once from boot, only in a
+ * HYPE_ENABLE_AVIC build (a default build never calls this and pays nothing for it). */
+void hype_svm_avic_pool_alloc(unsigned count, uint64_t (*alloc_zeroed_pages)(unsigned pages));
+
 /*
- * Enables AVIC on `vmcb` (M2-4) using this project's own statically-
- * reserved AVIC backing/logical/physical ID table pages and the
- * platform's real LAPIC MMIO base as the guest-visible APIC_BAR
- * (single-vCPU scope for now -- see vmcb.h's HYPE_SVM_INT_CTL_AVIC_ENABLE
- * comment for why `vmcb` must already have NP_ENABLE=1, and why this is
- * NOT called from hype_vmcb_build_realmode_guest()). Pure struct
- * mutation over fixed static-buffer addresses -- no privileged
- * instructions, so unlike most of this backend's "enable" code, this
- * is fully unit-testable.
+ * Enables AVIC on `vmcb` for the vCPU occupying pool slot `slot` (M2-4, #640 cause 2). Wires in
+ * that slot's own AVIC backing page (its APIC register file -- never shared, matching
+ * VMX APICv's per-vCPU virtual-APIC page) and `vm_idx`'s shared physical/logical ID tables
+ * (plan.md decision 67: one pair per VM, not per vCPU or global), writing this vCPU's own entry
+ * into the physical table at index `guest_apic_id` (the SAME index
+ * hype_guest_lapic_set_apic_id() assigned this vCPU within its VM). `host_apic_id` is the
+ * physical APIC ID of the core THIS vCPU runs on -- the caller's job to read (the real LAPIC ID
+ * register is privileged MMIO this function must stay free of; see
+ * hype_svm_vcpu_enable_apic_accel_ops(), the exempt caller that reads it), not derived from
+ * anything guest-visible. `max_physical_id` is the VM's total configured vCPU count minus 1 (not
+ * "how many have started so far" -- entries for a not-yet-started vCPU stay correctly invalid
+ * until ITS OWN call writes them). See vmcb.h's HYPE_SVM_INT_CTL_AVIC_ENABLE comment for why
+ * `vmcb` must already have NP_ENABLE=1. A slot/vm_idx/guest_apic_id out of range is refused
+ * silently (logged by the caller, which already has the context to say why) rather than risking
+ * a write past a table or over a neighboring VM's row. Pure struct/table mutation over
+ * caller-supplied values -- no privileged instructions, so (like the rest of this backend's
+ * "enable" code that isn't literally a `wrmsr`/`vmrun`) it is fully unit-testable.
  */
-void hype_svm_vcpu_enable_apic_accel(hype_vmcb_t *vmcb);
+void hype_svm_vcpu_enable_apic_accel(hype_vmcb_t *vmcb, unsigned slot, unsigned vm_idx,
+                                     unsigned guest_apic_id, uint32_t host_apic_id,
+                                     unsigned max_physical_id);
+
+/* #640 (cause 2): this pool slot's own AVIC backing page, or 0 if AVIC was never enabled for it
+ * (pool not allocated, slot out of range, or hype_svm_vcpu_enable_apic_accel() never ran for
+ * it). Decision 67's backing-page accessor: once AVIC is active for a vCPU, the backing page is
+ * authoritative for its guest-visible LAPIC state, not g_fw_1_lapic -- any host-side code that
+ * needs that state once AVIC is active reads it through here. */
+void *hype_svm_avic_backing_page_by_slot(unsigned slot);
+
+/* #640 (cause 2): applies a flat-mode Logical Destination Register write (AMD APM Vol 2
+ * §15.29.5.3) to slot `slot`'s VM's shared logical ID table -- called from the AVIC_NOACCEL
+ * handler after an LDR write completes against the backing page, since LDR is a "trap" (not
+ * "fault") register: the write is already applied there by the time the exit is seen. A no-op
+ * if `slot` never had AVIC enabled, or `new_ldr` does not encode a single flat-mode logical ID
+ * (hype_avic_ldr_flat_index()) -- cluster mode is not implemented. */
+void hype_svm_avic_update_logical_by_slot(unsigned slot, uint32_t new_ldr);
 
 /*
  * M2-7: creates this backend's (single, static -- M2's scope is one
@@ -1374,9 +1410,40 @@ int hype_svm_vcpu_handle_virtio_net_npf(hype_vcpu_ctx_t *ctx, hype_virtio_net_t 
                                         unsigned int scratch_len,
                                         hype_virtio_net_ring_stats_t *stats, const uint8_t *insn);
 
-/* Adapts hype_svm_vcpu_enable_apic_accel() to the hype_vmm_ops_t
- * vcpu_enable_apic_accel signature. */
-void hype_svm_vcpu_enable_apic_accel_ops(hype_vcpu_ctx_t *ctx);
+/*
+ * Adapts hype_svm_vcpu_enable_apic_accel() to a plain (ctx, ...) call from boot/main.c's
+ * fw_1_maybe_enable_avic() -- NOT hype_vmm_ops_t's own same-named field, which stays
+ * deliberately NULL/unused (see vmx_ops.c's comment on it; nothing dispatches through it for
+ * either backend). Resolves `ctx`'s own pool slot internally.
+ */
+void hype_svm_vcpu_enable_apic_accel_ops(hype_vcpu_ctx_t *ctx, unsigned vm_idx,
+                                         unsigned guest_apic_id, unsigned max_physical_id);
+
+/*
+ * #640 (cause 2): handles an AVIC_INCOMPLETE_IPI exit -- hardware could not complete an IPI
+ * itself (AMD APM Vol 2 §15.29.9.1: the target's IsRunning bit was clear, an invalid target, or
+ * an invalid backing-page pointer). Replays the guest's own ICRH/ICRL write through
+ * `lapic` (the ISSUING vCPU's own hype_guest_lapic_t) via hype_guest_lapic_write() -- the exact
+ * decode/stage path the non-AVIC IOIO/MMIO ICR write already uses, so this is software-path
+ * fallback delivery, not new IPI-routing logic. Always returns 0: there is no unmodelled case
+ * to refuse (every ICR encoding hype_guest_lapic_write() doesn't understand, it already drops
+ * silently, exactly as the non-AVIC path does today).
+ */
+int hype_svm_vcpu_handle_avic_incomplete_ipi(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lapic);
+
+/*
+ * #640 (cause 2): handles an AVIC_NOACCEL exit -- a guest access to a vAPIC register AVIC does
+ * not accelerate (AMD APM Vol 2 §15.29.9.2 / Table 15-22). Decodes the faulting instruction
+ * (same hype_mmio_decode()-based shape as hype_svm_vcpu_handle_lapic_npf()) and reads/writes
+ * this vCPU's own AVIC backing page directly at the offset EXITINFO1 names -- decision 67 makes
+ * the backing page authoritative once AVIC is active, so this must never touch g_fw_1_lapic. A
+ * write to the EOI offset additionally clears the backing page's own highest-set ISR bit
+ * (hype_avic_bitmap_highest()); a write to the LDR offset additionally updates this vCPU's VM's
+ * logical ID table (hype_svm_avic_update_logical_by_slot()). Returns 0 if handled (advances RIP
+ * by the decoded instruction length), -1 if the instruction couldn't be decoded or AVIC was
+ * never enabled for this vCPU.
+ */
+int hype_svm_vcpu_handle_avic_noaccel(hype_vcpu_ctx_t *ctx, const uint8_t *guest_insn_bytes);
 
 /*
  * Runs the vCPU until the next #VMEXIT: CLGI (blocks host interrupt

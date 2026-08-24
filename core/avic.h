@@ -59,4 +59,26 @@ unsigned int hype_avic_build_physical_table(uint64_t *table, unsigned int table_
                                             const uint64_t *backing_page_phys, unsigned int count,
                                             uint8_t *max_index_out);
 
+/*
+ * #640 (cause 2): highest set bit across an 8x32-bit register bitmap -- the shape the AVIC
+ * backing page's ISR/IRR/TMR ranges use (word i at byte offset base + 16*i within the page),
+ * which is the plain x86 local-APIC register layout Chapter 16 defines and every local APIC
+ * since the first one has used, not an AVIC-specific guess. -1 if every word is 0. Mirrors
+ * devices/guest_lapic.c's own hype_guest_lapic_isr_highest() bit-scan exactly, but over raw
+ * words instead of a hype_guest_lapic_t, so it can run directly against the backing page's own
+ * bytes: decision 67 (plan.md #67) makes the backing page authoritative once AVIC is active,
+ * so this must never read/write g_fw_1_lapic's separate software model.
+ */
+int hype_avic_bitmap_highest(const uint32_t words[8]);
+
+/*
+ * #640 (cause 2): decodes a flat-mode Logical Destination Register write into the Logical APIC
+ * ID Table's bit index. AMD APM Vol 2 §15.29.5.3: flat mode uses only the table's first 8
+ * entries, and "supported encodings must be of the form 2^i" -- i.e. bits [31:24] of LDR must
+ * have exactly one bit set. Returns that bit's index (0-7), or -1 if LDR does not encode a
+ * single flat-mode logical ID (cluster mode, or an all-zero/multi-bit value no real guest
+ * driver produces in flat mode). Pure bit test.
+ */
+int hype_avic_ldr_flat_index(uint32_t ldr);
+
 #endif /* HYPE_CORE_AVIC_H */

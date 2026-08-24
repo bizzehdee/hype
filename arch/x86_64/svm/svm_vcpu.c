@@ -2,8 +2,10 @@
 #include "../cpu/cpu_features.h"
 #include "../cpu/fpu_state.h"
 #include "../cpu/hyperv.h"
+#include "../cpu/lapic.h" /* #640 cause 2: HYPE_LAPIC_DEFAULT_BASE, for this core's own APIC ID */
 
 #include "../../../core/guest_mem.h"
+#include "../../../core/avic.h" /* #640 cause 2: hype_avic_bitmap_highest() for the NOACCEL EOI path */
 
 #include "../../../core/fatal.h"
 
@@ -4134,9 +4136,105 @@ int hype_svm_vcpu_handle_fw_cfg_ioio(hype_vcpu_ctx_t *ctx, hype_fw_cfg_t *fw,
     return 0;
 }
 
-void hype_svm_vcpu_enable_apic_accel_ops(hype_vcpu_ctx_t *ctx) {
+void hype_svm_vcpu_enable_apic_accel_ops(hype_vcpu_ctx_t *ctx, unsigned vm_idx,
+                                         unsigned guest_apic_id, unsigned max_physical_id) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
-    hype_svm_vcpu_enable_apic_accel(real->vmcb);
+    unsigned slot = svm_ctx_slot(real);
+    /* This core's own physical APIC ID -- the doorbell target hardware delivers to. Read
+     * directly off the real LAPIC (same expression hype_ap_lapic_timer_isr already uses for
+     * the same purpose); this is the privileged-MMIO boundary hype_svm_vcpu_enable_apic_accel()
+     * itself must stay free of to remain pure/unit-testable. */
+    uint32_t host_apic_id =
+        (*(volatile uint32_t *)(uintptr_t)(HYPE_LAPIC_DEFAULT_BASE + 0x20u)) >> 24;
+    hype_svm_vcpu_enable_apic_accel(real->vmcb, slot, vm_idx, guest_apic_id, host_apic_id,
+                                    max_physical_id);
+}
+
+int hype_svm_vcpu_handle_avic_incomplete_ipi(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lapic) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_svm_avic_ipi_t ipi;
+
+    hype_svm_decode_avic_incomplete_ipi(real->vmcb->control.exitinfo1, &ipi);
+    /*
+     * #640: hype's own vCPUs are pinned 1:1 to a physical core for their whole life once
+     * started (no scheduler yet -- SMP-11..22 are all still To Do), so a target's IsRunning
+     * bit, once set by hype_svm_vcpu_enable_apic_accel(), never clears again. AVIC hardware
+     * reporting a target not-running therefore means the SAME thing the software routing
+     * below would find: staging the request there cannot double-deliver to a target hardware
+     * already reached, because a target hardware COULD reach is, by that same pinning
+     * argument, never the one this exit fires for. Revisit this reasoning if/when a scheduler
+     * ever lets IsRunning go back to 0 for a still-alive vCPU.
+     */
+    (void)hype_guest_lapic_write(lapic, HYPE_GUEST_LAPIC_REG_ICR_HIGH, 4u, ipi.icrh);
+    (void)hype_guest_lapic_write(lapic, HYPE_GUEST_LAPIC_REG_ICR_LOW, 4u, ipi.icrl);
+    return 0;
+}
+
+int hype_svm_vcpu_handle_avic_noaccel(hype_vcpu_ctx_t *ctx, const uint8_t *guest_insn_bytes) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    hype_svm_avic_noaccel_t na;
+    unsigned slot = svm_ctx_slot(real);
+    uint8_t *backing;
+    hype_mmio_decode_t decoded;
+    uint64_t *reg;
+
+    hype_svm_decode_avic_noaccel(real->vmcb->control.exitinfo1, &na);
+    backing = (uint8_t *)hype_svm_avic_backing_page_by_slot(slot);
+    if (backing == 0) {
+        return -1;
+    }
+
+    if (guest_insn_bytes == 0 ||
+        hype_mmio_decode(guest_insn_bytes, HYPE_MMIO_MAX_INSTR_BYTES, &decoded) != 0) {
+        return -1;
+    }
+    if (decoded.is_write != na.is_write || decoded.size_bytes != 4u) {
+        return -1;
+    }
+    reg = decoded.has_imm ? 0 : gpr_ptr(real, decoded.reg);
+    if (reg == 0 && !decoded.has_imm) {
+        return -1;
+    }
+
+    if (decoded.is_write) {
+        uint32_t value;
+        if (decoded.mem_is_dst) {
+            uint32_t cur = *(volatile uint32_t *)(backing + na.offset);
+            value = hype_mmio_rmw_value(&decoded, reg ? *reg : 0u, cur, &real->vmcb->save.rflags);
+        } else {
+            value = hype_mmio_store_value(&decoded, reg ? *reg : 0u);
+        }
+        *(volatile uint32_t *)(backing + na.offset) = value;
+        if (na.offset == HYPE_GUEST_LAPIC_REG_EOI) {
+            /*
+             * #640: AVIC hardware clears the ISR bit itself for an edge-triggered EOI (that
+             * case never reaches here -- Table 15-22); this exit only fires for the
+             * level-triggered case, where the VMM owns the clear. Read/write the backing
+             * page's own ISR words directly -- decision 67 forbids touching g_fw_1_lapic once
+             * AVIC is active for this vCPU.
+             */
+            uint32_t isr[8];
+            int v;
+            unsigned i;
+            for (i = 0; i < 8u; i++) {
+                isr[i] = *(volatile uint32_t *)(backing + HYPE_GUEST_LAPIC_REG_ISR_BASE + i * 16u);
+            }
+            v = hype_avic_bitmap_highest(isr);
+            if (v >= 0) {
+                volatile uint32_t *word = (volatile uint32_t *)(void *)(
+                    backing + HYPE_GUEST_LAPIC_REG_ISR_BASE + ((unsigned)v >> 5) * 16u);
+                *word &= ~(1u << ((unsigned)v & 31u));
+            }
+        } else if (na.offset == HYPE_GUEST_LAPIC_REG_LDR) {
+            hype_svm_avic_update_logical_by_slot(slot, value);
+        }
+    } else {
+        uint32_t value = *(volatile uint32_t *)(backing + na.offset);
+        hype_mmio_complete_read(&decoded, reg, value, &real->vmcb->save.rflags);
+    }
+
+    real->vmcb->save.rip += decoded.instr_len;
+    return 0;
 }
 
 /* FW-1e: the per-VM-exit CLGI/VMLOAD/VMRUN trace below brackets the riskiest

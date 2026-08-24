@@ -28,11 +28,25 @@ static void test_efer_with_svme_idempotent(void) {
     CHECK_HEX("already-set SVME stays set, nothing else changes", efer, result);
 }
 
+/* #640 (cause 2): the backing-page pool is dynamically allocated, same shape as
+ * hype_svm_vcpu_pool_alloc's own test double elsewhere (core/tests/test_iso_stream.c's
+ * test_alloc_zeroed_pages). Sized for a handful of slots -- these tests only ever need 2. */
+static uint8_t g_avic_pool_arena[4u * 4096u] __attribute__((aligned(4096)));
+static uint64_t test_avic_alloc_zeroed_pages(unsigned pages) {
+    if ((uint64_t)pages * 4096ull > sizeof(g_avic_pool_arena)) {
+        return 0;
+    }
+    return (uint64_t)(uintptr_t)g_avic_pool_arena;
+}
+
 static void test_vcpu_enable_apic_accel(void) {
     hype_vmcb_t vmcb;
 
+    hype_svm_avic_pool_alloc(2u, test_avic_alloc_zeroed_pages);
     hype_vmcb_build_realmode_guest(&vmcb, 0, 0, 0, 0);
-    hype_svm_vcpu_enable_apic_accel(&vmcb);
+    hype_svm_vcpu_enable_apic_accel(&vmcb, 0u /* slot */, 0u /* vm_idx */, 0u /* guest_apic_id */,
+                                    3u /* host_apic_id */,
+                                    0u /* max_physical_id: single-vCPU VM */);
 
     CHECK_HEX("AVIC enable bit set", HYPE_SVM_INT_CTL_AVIC_ENABLE,
               vmcb.control.vintr & HYPE_SVM_INT_CTL_AVIC_ENABLE);
@@ -41,7 +55,7 @@ static void test_vcpu_enable_apic_accel(void) {
     int backing_nonzero = vmcb.control.avic_backing_page_ptr != 0;
     int logical_nonzero = vmcb.control.avic_logical_table_ptr != 0;
     int physical_nonzero = (vmcb.control.avic_physical_table_ptr & HYPE_SVM_AVIC_ADDR_MASK) != 0;
-    CHECK_HEX("backing page pointer wired to a real static buffer", 1, backing_nonzero);
+    CHECK_HEX("backing page pointer wired to a real allocated slot", 1, backing_nonzero);
     CHECK_HEX("logical table pointer wired to a real static buffer", 1, logical_nonzero);
     CHECK_HEX("physical table pointer wired to a real static buffer", 1, physical_nonzero);
 
@@ -56,6 +70,95 @@ static void test_vcpu_enable_apic_accel(void) {
                         (vmcb.control.avic_logical_table_ptr & 0xFFFULL) == 0 &&
                         (vmcb.control.avic_physical_table_ptr & 0xFFFULL) == 0;
     CHECK_HEX("all table pointers are 4KB-aligned", 1, page_aligned);
+
+    {
+        /* A second slot on the SAME vm_idx must land in the SAME logical/physical table but a
+         * DIFFERENT backing page (decision 67's whole point). */
+        hype_vmcb_t vmcb2;
+        hype_vmcb_build_realmode_guest(&vmcb2, 0, 0, 0, 0);
+        hype_svm_vcpu_enable_apic_accel(&vmcb2, 1u /* slot */, 0u /* same vm_idx */,
+                                        1u /* guest_apic_id */, 4u /* host_apic_id */,
+                                        1u /* max_physical_id: 2 vCPUs */);
+        /* Masked: avic_physical_table_ptr's low byte carries max_physical_id (which the two
+         * calls deliberately gave different values), not part of the pointer itself. */
+        CHECK_HEX("same VM -> same physical table",
+                  vmcb.control.avic_physical_table_ptr & HYPE_SVM_AVIC_ADDR_MASK,
+                  vmcb2.control.avic_physical_table_ptr & HYPE_SVM_AVIC_ADDR_MASK);
+        CHECK_HEX("same VM -> same logical table", vmcb.control.avic_logical_table_ptr,
+                  vmcb2.control.avic_logical_table_ptr);
+        CHECK_HEX("different slot -> different backing page", 1,
+                  vmcb.control.avic_backing_page_ptr != vmcb2.control.avic_backing_page_ptr);
+    }
+    {
+        /* A vCPU in a DIFFERENT VM must land in a DIFFERENT physical/logical table pair --
+         * the #691 finding this whole redesign exists for (colliding guest APIC ID 0 across
+         * two VMs must never alias one table). */
+        hype_vmcb_t vmcb3;
+        hype_vmcb_build_realmode_guest(&vmcb3, 0, 0, 0, 0);
+        hype_svm_vcpu_enable_apic_accel(&vmcb3, 0u /* slot -- reusing slot 0 is fine, different
+                                                       VM's row */,
+                                        1u /* different vm_idx */, 0u, 3u /* host_apic_id */, 0u);
+        CHECK_HEX("different VM -> different physical table", 1,
+                  vmcb.control.avic_physical_table_ptr != vmcb3.control.avic_physical_table_ptr);
+        CHECK_HEX("different VM -> different logical table", 1,
+                  vmcb.control.avic_logical_table_ptr != vmcb3.control.avic_logical_table_ptr);
+    }
+
+    {
+        /* Out-of-range vm_idx/guest_apic_id/slot must be refused, not write past a table or
+         * alias a neighbor -- confirmed by re-enabling the SAME vmcb with a bad vm_idx and
+         * checking its own state is untouched (the refuse path returns before touching vmcb). */
+        hype_vmcb_t untouched;
+        uint64_t before;
+        hype_vmcb_build_realmode_guest(&untouched, 0, 0, 0, 0);
+        untouched.control.vintr = 0x12345678u; /* a sentinel a real call would always change */
+        before = untouched.control.vintr;
+        hype_svm_vcpu_enable_apic_accel(&untouched, 99u /* slot beyond the 2-slot pool */, 0u, 0u,
+                                        3u, 0u);
+        CHECK_HEX("out-of-range slot leaves the VMCB untouched", before, untouched.control.vintr);
+        hype_svm_vcpu_enable_apic_accel(&untouched, 0u, 9999u /* far past HYPE_CFG_MAX_VMS */, 0u,
+                                        3u, 0u);
+        CHECK_HEX("out-of-range vm_idx leaves the VMCB untouched", before, untouched.control.vintr);
+        hype_svm_vcpu_enable_apic_accel(&untouched, 0u, 0u, 512u /* one past the end */, 3u, 0u);
+        CHECK_HEX("out-of-range guest_apic_id leaves the VMCB untouched", before,
+                  untouched.control.vintr);
+    }
+}
+
+static void test_avic_backing_page_by_slot(void) {
+    void *p;
+    CHECK_HEX("slot 0, enabled above -> a real page", 1,
+              hype_svm_avic_backing_page_by_slot(0u) != 0);
+    CHECK_HEX("slot 1, also enabled above -> a real, DIFFERENT page", 1,
+              hype_svm_avic_backing_page_by_slot(1u) != hype_svm_avic_backing_page_by_slot(0u));
+    p = hype_svm_avic_backing_page_by_slot(99u); /* past the pool */
+    CHECK_HEX("out-of-range slot -> 0", 0, p != 0);
+}
+
+static void test_avic_update_logical_by_slot(void) {
+    /* Slot 0 was last enabled (by test_vcpu_enable_apic_accel's own final block) on vm_idx=1,
+     * guest_apic_id=0 -- update its logical table and read the entry back through the SAME
+     * physical-table-pointer route the VMCB itself uses, so this proves the real row, not a
+     * hand-computed one. */
+    hype_vmcb_t vmcb;
+    uint32_t *logical_row;
+
+    hype_vmcb_build_realmode_guest(&vmcb, 0, 0, 0, 0);
+    hype_svm_vcpu_enable_apic_accel(&vmcb, 0u, 5u /* a fresh vm_idx this test owns */, 2u, 7u, 2u);
+    logical_row = (uint32_t *)(uintptr_t)vmcb.control.avic_logical_table_ptr;
+
+    hype_svm_avic_update_logical_by_slot(0u, 0x04000000u /* flat logical id 0x04 -> index 2 */);
+    CHECK_HEX("LDR write lands in the right logical-table slot", 1,
+              (logical_row[2] >> 31) & 1u); /* valid bit */
+    CHECK_HEX("logical entry names this vCPU's own guest_apic_id", 2u, logical_row[2] & 0xFFu);
+
+    /* A cluster-mode-shaped (multi-bit) LDR must not touch the table at all. */
+    logical_row[3] = 0xDEADBEEFu;
+    hype_svm_avic_update_logical_by_slot(0u, 0x03000000u /* two bits set -- not flat mode */);
+    CHECK_HEX("non-flat-mode LDR leaves the table alone", 0xDEADBEEFu, logical_row[3]);
+
+    /* A slot AVIC was never enabled for is a no-op, not a crash. */
+    hype_svm_avic_update_logical_by_slot(50u, 0x01000000u);
 }
 
 static void test_asid_for_slot(void) {
@@ -333,6 +436,8 @@ int main(void) {
     test_efer_with_svme();
     test_efer_with_svme_idempotent();
     test_vcpu_enable_apic_accel();
+    test_avic_backing_page_by_slot();
+    test_avic_update_logical_by_slot();
 
     test_asid_for_slot();
     test_nasid_from_cpuid();

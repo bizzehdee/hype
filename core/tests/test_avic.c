@@ -73,11 +73,39 @@ static void test_build_physical_table(void) {
     CHECK_INT("count clamped to table size", 2, n);
 }
 
+static void test_bitmap_highest(void) {
+    uint32_t words[8];
+    unsigned int i;
+    for (i = 0; i < 8u; i++) words[i] = 0u;
+    CHECK_INT("empty bitmap -> -1", -1, hype_avic_bitmap_highest(words));
+    words[0] = 1u; /* vector 0 */
+    CHECK_INT("only vector 0 set", 0, hype_avic_bitmap_highest(words));
+    words[3] = 1u << 5; /* vector 3*32+5 = 101 */
+    CHECK_INT("higher word wins over lower", 101, hype_avic_bitmap_highest(words));
+    words[7] = 1u << 31; /* vector 255, the highest possible */
+    CHECK_INT("top word top bit -> 255", 255, hype_avic_bitmap_highest(words));
+    words[7] |= 1u << 3; /* an even lower bit in the SAME top word */
+    CHECK_INT("highest bit within the top word wins", 255, hype_avic_bitmap_highest(words));
+}
+
+static void test_ldr_flat_index(void) {
+    CHECK_INT("logical id 0x01 -> index 0", 0, hype_avic_ldr_flat_index(0x01000000u));
+    CHECK_INT("logical id 0x80 -> index 7", 7, hype_avic_ldr_flat_index(0x80000000u));
+    CHECK_INT("logical id 0x10 -> index 4", 4, hype_avic_ldr_flat_index(0x10000000u));
+    CHECK_INT("all-zero logical id -> -1", -1, hype_avic_ldr_flat_index(0u));
+    CHECK_INT("multi-bit logical id (cluster-mode-shaped) -> -1", -1,
+              hype_avic_ldr_flat_index(0x03000000u));
+    /* low 24 bits (reserved in the register, or garbage from a sloppy write) never matter */
+    CHECK_INT("low bits ignored", 0, hype_avic_ldr_flat_index(0x010000FFu));
+}
+
 int main(void) {
     test_capability_decode();
     test_physical_entry();
     test_logical_entry();
     test_build_physical_table();
+    test_bitmap_highest();
+    test_ldr_flat_index();
     if (failures == 0) { printf("all tests passed\n"); return 0; }
     printf("%d test(s) failed\n", failures);
     return 1;

@@ -4653,12 +4653,13 @@ static void vmm_enable_pause_filter(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, 
  * hardware. This helper only fixes AVIC's own enable being unreachable; it does not implement the
  * rest of #640.
  */
-static void fw_1_maybe_enable_avic(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
+static void fw_1_maybe_enable_avic(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, hype_fw_vm_t *vm,
+                                   unsigned vcpu_idx) {
     if (kind != HYPE_VMM_KIND_SVM) {
         return;
     }
 #if !(defined(HYPE_ENABLE_AVIC) && HYPE_ENABLE_AVIC)
-    (void)ctx; /* only used to enable AVIC, which a default build never does */
+    (void)ctx; (void)vm; (void)vcpu_idx; /* only used to enable AVIC, which a default build never does */
 #endif
     {
         static int avic_logged = 0;
@@ -4676,7 +4677,19 @@ static void fw_1_maybe_enable_avic(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
         }
 #if defined(HYPE_ENABLE_AVIC) && HYPE_ENABLE_AVIC
         if (avic_hw) {
-            hype_svm_vcpu_enable_apic_accel_ops(ctx);
+            /*
+             * #640 (cause 2): vm_idx groups this vCPU's AVIC ID-table entry with the rest of
+             * its own VM (plan.md decision 67) -- guest-visible APIC IDs are NOT globally
+             * unique (every VM's LAPIC init starts numbering at 0), so the table this vCPU's
+             * entry lands in must be per-VM. max_physical_id bounds the WHOLE VM's table by its
+             * total configured vCPU count, not by how many have started so far, so an
+             * out-of-order SIPI (a later vCPU starting before an earlier one) still gets a
+             * correctly-sized table.
+             */
+            unsigned vm_idx = (unsigned)(vm - g_vms);
+            unsigned nv = fw_1_guest_visible_vcpus(vm);
+            unsigned max_physical_id = (nv > 0u) ? (nv - 1u) : 0u;
+            hype_svm_vcpu_enable_apic_accel_ops(ctx, vm_idx, vcpu_idx, max_physical_id);
         }
 #endif
     }
@@ -10710,7 +10723,7 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
     if (hype_cpu_has_pause_filter(hype_cpu_svm_feature_edx())) {
         vmm_enable_pause_filter(kind, ctx, 65535u, 4096u);
     }
-    fw_1_maybe_enable_avic(kind, ctx); /* #193/#640 */
+    fw_1_maybe_enable_avic(kind, ctx, vm, 0u); /* #193/#640: restart only ever resets vCPU 0 */
     vmm_enable_intr_intercept(kind, ctx);
     vm->shutdown_deadline_tsc = 0;
     vm->pm1a_cnt = 0;
@@ -11647,7 +11660,7 @@ wait_for_sipi:
     if (hype_cpu_has_pause_filter(hype_cpu_svm_feature_edx())) {
         vmm_enable_pause_filter(kind, ctx, 65535u, 4096u);
     }
-    fw_1_maybe_enable_avic(kind, ctx); /* #193/#640: every SIPI rebuilds this VMCB */
+    fw_1_maybe_enable_avic(kind, ctx, vm, vi); /* #193/#640: every SIPI rebuilds this VMCB */
     hype_debug_print("fw-1 vm%u vCPU %u: SIPI received, entering guest [#190]\n", vm_idx, vi);
     fw_1_dev_lock(vm); /* SMP-7: enter the loop in the "outside the guest" state */
     ap_locked = 1;
@@ -12057,6 +12070,18 @@ wait_for_sipi:
             vmm_handle_intr_window(kind, ctx, lapic);
         } else if (vmm_reason_is_intr(kind, info.reason)) {
             /* A host interrupt interrupted the guest; nothing to do but re-enter. */
+        } else if (kind == HYPE_VMM_KIND_SVM &&
+                   (info.reason == HYPE_SVM_EXITCODE_AVIC_INCOMPLETE_IPI ||
+                    info.reason == HYPE_SVM_EXITCODE_AVIC_NOACCEL)) {
+            /* #193/#640 (cause 2): the AP-loop twin of the BSP loop's own AVIC exit branch --
+             * see its comment for the full reasoning. Only reachable when AVIC was opted in
+             * and this AP's own vCPU had it enabled (fw_1_maybe_enable_avic(), every SIPI). */
+            if (info.reason == HYPE_SVM_EXITCODE_AVIC_INCOMPLETE_IPI) {
+                (void)hype_svm_vcpu_handle_avic_incomplete_ipi(ctx, lapic);
+            } else {
+                const uint8_t *insn = fw_1_insn_bytes_via_ptwalk(vm, ctx, info.guest_rip);
+                (void)hype_svm_vcpu_handle_avic_noaccel(ctx, insn);
+            }
         } else if (vmm_reason_is_any_exception(kind, info.reason)) {
             /*
              * hype intercepts EVERY guest exception (vmcb.c sets intercept_exceptions to all
@@ -13924,7 +13949,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         hype_debug_print("fw-1: pause-filtering unavailable -- a long guest spin can still starve "
                           "its own tick here\n");
     }
-    fw_1_maybe_enable_avic(kind, ctx); /* #193/#640 */
+    fw_1_maybe_enable_avic(kind, ctx, vm, 0u); /* #193/#640: initial launch is always vCPU 0 */
 
     /* RT-2b: the real preemption mechanism (pause-filtering above proved
      * inert on real HW -- the 40s spins execute no PAUSE). Intercept physical
@@ -14638,21 +14663,34 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                    (info.reason == HYPE_SVM_EXITCODE_AVIC_INCOMPLETE_IPI ||
                     info.reason == HYPE_SVM_EXITCODE_AVIC_NOACCEL)) {
             /*
-             * #193 (SMP-9): an AVIC exit. Only reachable when AVIC was opted in and enabled.
-             * INCOMPLETE_IPI = the CPU could not deliver a guest IPI itself; the per-iteration
-             * guest-LAPIC drain below plus AVIC's own retry on re-entry carry it. NOACCEL = an
-             * APIC-register access AVIC does not virtualise. Both are re-entered rather than
-             * faulted; the backing-page-driven fast path is refined on AVIC hardware. Bounded log
-             * so an AVIC bring-up run is legible without flooding a working boot.
+             * #193/#640 (SMP-9, cause 2): an AVIC exit. Only reachable when AVIC was opted in
+             * and enabled. INCOMPLETE_IPI replays the guest's ICR write through the software
+             * IPI path (hype_svm_vcpu_handle_avic_incomplete_ipi()); NOACCEL emulates the
+             * un-accelerated register access directly against this vCPU's own AVIC backing
+             * page (hype_svm_vcpu_handle_avic_noaccel()) -- decision 67 (plan.md #67) makes
+             * that page authoritative once AVIC is active, so neither path touches
+             * g_fw_1_lapic. A bounded log budget keeps an AVIC bring-up run legible without
+             * flooding a working boot; the worst a race costs is a couple of extra lines
+             * (one-per-host intended, #563).
              */
-            /* A bounded bring-up log budget shared by every VM keeps an AVIC session legible;
-             * the worst a race costs is a couple of extra lines: one-per-host intended (#563). */
             static unsigned avic_exit_logged;
+            int avic_ok;
+            if (info.reason == HYPE_SVM_EXITCODE_AVIC_INCOMPLETE_IPI) {
+                avic_ok = hype_svm_vcpu_handle_avic_incomplete_ipi(ctx, &g_fw_1_lapic) == 0;
+            } else {
+                uint8_t insn_n = 0;
+                const uint8_t *insn = vmm_guest_insn_bytes(kind, ctx, &insn_n);
+                if (insn_n == 0) {
+                    insn = fw_1_insn_bytes_via_ptwalk(vm, ctx, info.guest_rip);
+                }
+                avic_ok = hype_svm_vcpu_handle_avic_noaccel(ctx, insn) == 0;
+            }
             if (avic_exit_logged < 8u) {
                 avic_exit_logged++;
-                hype_debug_print("fw-1: AVIC exit 0x%llx (guest_rip=0x%llx) -- re-entering [#193]\n",
+                hype_debug_print("fw-1: AVIC exit 0x%llx (guest_rip=0x%llx) -- %s [#193/#640]\n",
                                  (unsigned long long)info.reason,
-                                 (unsigned long long)info.guest_rip);
+                                 (unsigned long long)info.guest_rip,
+                                 avic_ok ? "handled" : "could not decode -- re-entering anyway");
             }
             prev_cost_bucket = 8;
         } else if (vmm_reason_is_shutdown(kind, info.reason)) {
@@ -24579,6 +24617,12 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                          "%u VM(s) [#185 #450]\n", total_vcpus, g_max_vms);
         hype_svm_vcpu_pool_alloc(total_vcpus, fw_alloc_zeroed_pages);
         hype_vmx_vcpu_pool_alloc(total_vcpus, fw_alloc_zeroed_pages);
+#if defined(HYPE_ENABLE_AVIC) && HYPE_ENABLE_AVIC
+        /* #640 (cause 2): one AVIC backing page per vCPU pool slot, same sizing as the VMCB/ctx
+         * pools above -- only allocated in a build that can ever enable AVIC, so a default
+         * build pays nothing for it. */
+        hype_svm_avic_pool_alloc(total_vcpus, fw_alloc_zeroed_pages);
+#endif
     }
     /* #428: one ISO-stream bounce buffer per VM. The old fixed 2-slot array
      * silently aliased vm2+ onto vm0's buffer, which served one VM's CD

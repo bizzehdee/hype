@@ -55,3 +55,36 @@ unsigned int hype_avic_build_physical_table(uint64_t *table, unsigned int table_
     }
     return count;
 }
+
+int hype_avic_bitmap_highest(const uint32_t words[8]) {
+    unsigned int word = 8u;
+
+    while (word-- > 0u) {
+        uint32_t bits = words[word];
+        unsigned int bit = 32u;
+        if (bits == 0u) {
+            continue;
+        }
+        while (bit-- > 0u) {
+            if ((bits & (1u << bit)) != 0u) {
+                return (int)(word * 32u + bit);
+            }
+        }
+    }
+    return -1;
+}
+
+int hype_avic_ldr_flat_index(uint32_t ldr) {
+    uint32_t logical_id = ldr >> 24;
+    unsigned int i;
+
+    if (logical_id == 0u) {
+        return -1;
+    }
+    for (i = 0; i < 8u; i++) {
+        if (logical_id == (1u << i)) {
+            return (int)i;
+        }
+    }
+    return -1; /* multiple bits set, or a bit above 7 -- not a flat-mode single ID */
+}

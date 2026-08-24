@@ -454,6 +454,38 @@ static void test_decode_npf_info_read(void) {
     CHECK_HEX("decoded guest-physical fault address", exitinfo2, npf.guest_phys_addr);
 }
 
+static void test_decode_avic_incomplete_ipi(void) {
+    hype_svm_avic_ipi_t ipi;
+    uint64_t exitinfo1 = (0xAABBCCDDULL << 32) | 0x00040100ULL; /* ICRH:ICRL */
+
+    hype_svm_decode_avic_incomplete_ipi(exitinfo1, &ipi);
+
+    CHECK_HEX("ICRH is the upper dword", 0xAABBCCDDu, ipi.icrh);
+    CHECK_HEX("ICRL is the lower dword", 0x00040100u, ipi.icrl);
+}
+
+static void test_decode_avic_noaccel_write(void) {
+    hype_svm_avic_noaccel_t na;
+    /* offset 0xB0 (EOI), R/W (bit 32) set -- a write */
+    uint64_t exitinfo1 = (1ULL << 32) | 0xB0ULL;
+
+    hype_svm_decode_avic_noaccel(exitinfo1, &na);
+
+    CHECK_HEX("decoded as write", 1, na.is_write);
+    CHECK_HEX("decoded offset", 0xB0u, na.offset);
+}
+
+static void test_decode_avic_noaccel_read(void) {
+    hype_svm_avic_noaccel_t na;
+    /* offset 0x20 (APIC ID), R/W clear -- a read; low reserved bits set must not leak into offset */
+    uint64_t exitinfo1 = 0x20ULL | 0xFULL;
+
+    hype_svm_decode_avic_noaccel(exitinfo1, &na);
+
+    CHECK_HEX("decoded as read", 0, na.is_write);
+    CHECK_HEX("low 4 reserved bits masked off", 0x20u, na.offset);
+}
+
 static void test_encode_eventinj_intr(void) {
     uint64_t value = hype_svm_encode_eventinj_intr(0x31u);
 
@@ -663,6 +695,9 @@ int main(void) {
     test_string_plan_descending_underflow_rejected();
     test_decode_npf_info_write();
     test_decode_npf_info_read();
+    test_decode_avic_incomplete_ipi();
+    test_decode_avic_noaccel_write();
+    test_decode_avic_noaccel_read();
     test_configure_avic();
     test_configure_avic_masks_low_bits_and_sets_max_index();
     test_encode_eventinj_intr();

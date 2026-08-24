@@ -314,6 +314,16 @@ void hype_svm_decode_npf_info(uint64_t exitinfo1, uint64_t exitinfo2, hype_svm_n
     out->guest_phys_addr = exitinfo2;
 }
 
+void hype_svm_decode_avic_incomplete_ipi(uint64_t exitinfo1, hype_svm_avic_ipi_t *out) {
+    out->icrh = (uint32_t)(exitinfo1 >> 32);
+    out->icrl = (uint32_t)exitinfo1;
+}
+
+void hype_svm_decode_avic_noaccel(uint64_t exitinfo1, hype_svm_avic_noaccel_t *out) {
+    out->is_write = (int)((exitinfo1 >> 32) & 1ULL);
+    out->offset = (uint32_t)(exitinfo1 & 0xFF0ULL);
+}
+
 uint64_t hype_svm_encode_eventinj_intr(uint8_t vector) {
     return HYPE_SVM_EVENTINJ_V | (HYPE_SVM_EVENTINJ_TYPE_INTR << HYPE_SVM_EVENTINJ_TYPE_SHIFT) |
            ((uint64_t)vector & HYPE_SVM_EVENTINJ_VECTOR_MASK);

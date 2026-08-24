@@ -397,6 +397,33 @@ _Static_assert(__builtin_offsetof(hype_vmcb_t, control.exitintinfo) == 0x088, "c
  * enabled (which hype does only on AVIC-capable hardware). */
 #define HYPE_SVM_EXITCODE_AVIC_INCOMPLETE_IPI 0x401ULL
 #define HYPE_SVM_EXITCODE_AVIC_NOACCEL 0x402ULL
+
+/*
+ * #640 (cause 2): AVIC_INCOMPLETE_IPI's EXITINFO1 -- AMD APM Vol 2 §15.29.9.1, Table 15-25.
+ * The vAPIC ICRH/ICRL values the guest wrote (the IPI hardware could not fully deliver), replayed
+ * verbatim so the software IPI path can stage the same request hype_guest_lapic_write() already
+ * decodes for the non-AVIC case.
+ */
+typedef struct {
+    uint32_t icrh;
+    uint32_t icrl;
+} hype_svm_avic_ipi_t;
+
+void hype_svm_decode_avic_incomplete_ipi(uint64_t exitinfo1, hype_svm_avic_ipi_t *out);
+
+/*
+ * #640 (cause 2): AVIC_NOACCEL's EXITINFO1 -- AMD APM Vol 2 §15.29.9.2, Table 15-28. `offset` is
+ * the un-accelerated vAPIC register's byte offset within the 4 KiB backing page (bits 11:4 of
+ * EXITINFO1, already 16-byte aligned per the spec -- bits 3:0 are always 0). `is_write` is
+ * EXITINFO1 bit 32.
+ */
+typedef struct {
+    int is_write;
+    uint32_t offset;
+} hype_svm_avic_noaccel_t;
+
+void hype_svm_decode_avic_noaccel(uint64_t exitinfo1, hype_svm_avic_noaccel_t *out);
+
 /*
  * #317: the SVM-instruction #VMEXITs (APM Appendix C, exit-code table). Reached only because
  * hype now intercepts them; the handler injects #UD, which is precisely what the guest would
