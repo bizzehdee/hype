@@ -4617,6 +4617,56 @@ static void vmm_enable_pause_filter(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, 
         hype_svm_vcpu_enable_pause_filter(ctx, count, threshold);
     }
 }
+/*
+ * #193 (SMP-9) / #640: AMD AVIC (hardware-accelerated IPI delivery). Detected always and logged
+ * once; ACTIVATED only when explicitly opted in at build time (-DHYPE_ENABLE_AVIC=1) AND the host
+ * supports it. Default OFF is deliberate: turning AVIC on changes guest IPI delivery, and the
+ * proven trap-and-emulate path (SMP-3..5) must remain the default until AVIC is validated on real
+ * hardware -- a bare-metal SMP guest that works today must not regress on the next run.
+ *
+ * #640: this used to be inlined only in the VM-restart path (fw_1_vm_reinit()), which is why a
+ * normal boot -- the initial BSP launch, and every AP's SIPI-driven VMCB rebuild -- never logged
+ * the one-shot banner or enabled AVIC at all: #600's hardware run found NO AVIC line whatsoever in
+ * a flag-on build's log. One shared helper now, called from all three vCPU-launch paths, so the
+ * three copies this file's own #9972 comment already flagged as byte-identical setup cannot drift
+ * on this block specifically. `avic_logged` stays function-static so the banner still prints
+ * exactly once per boot regardless of which of the three call sites reaches it first.
+ *
+ * Enabling this flag STILL does not make AVIC safe to use per vCPU/per VM: the backing page and
+ * ID tables it points at (arch/x86_64/svm/svm_bits.c) are a single, process-wide static shared by
+ * every vCPU of every VM -- see plan.md decision 67 and this ticket's own acceptance criteria for
+ * what per-vCPU state and exit handling AVIC still needs before #600 can validate it on real
+ * hardware. This helper only fixes AVIC's own enable being unreachable; it does not implement the
+ * rest of #640.
+ */
+static void fw_1_maybe_enable_avic(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
+    if (kind != HYPE_VMM_KIND_SVM) {
+        return;
+    }
+#if !(defined(HYPE_ENABLE_AVIC) && HYPE_ENABLE_AVIC)
+    (void)ctx; /* only used to enable AVIC, which a default build never does */
+#endif
+    {
+        static int avic_logged = 0;
+        int avic_hw = hype_avic_supported(hype_cpu_svm_feature_edx());
+        if (!avic_logged) {
+            const char *note;
+#if defined(HYPE_ENABLE_AVIC) && HYPE_ENABLE_AVIC
+            note = avic_hw ? " -- ENABLING (HYPE_ENABLE_AVIC set)" : " -- opted in but unsupported";
+#else
+            note = avic_hw ? " -- not enabled (build -DHYPE_ENABLE_AVIC=1 to use it)" : "";
+#endif
+            avic_logged = 1;
+            hype_debug_print("fw-1: AMD AVIC %s on this host%s [#193]\n",
+                             avic_hw ? "AVAILABLE" : "not available", note);
+        }
+#if defined(HYPE_ENABLE_AVIC) && HYPE_ENABLE_AVIC
+        if (avic_hw) {
+            hype_svm_vcpu_enable_apic_accel_ops(ctx);
+        }
+#endif
+    }
+}
 static void vmm_reinject_exception(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx, uint8_t vector,
                                    int has_error_code, uint32_t error_code) {
     if (kind == HYPE_VMM_KIND_VMX) {
@@ -10646,33 +10696,7 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
     if (hype_cpu_has_pause_filter(hype_cpu_svm_feature_edx())) {
         vmm_enable_pause_filter(kind, ctx, 65535u, 4096u);
     }
-    /*
-     * #193 (SMP-9): AMD AVIC (hardware-accelerated IPI delivery). Detected always and logged once;
-     * ACTIVATED only when explicitly opted in at build time (-DHYPE_ENABLE_AVIC=1) AND the host
-     * supports it. Default OFF is deliberate: turning AVIC on changes guest IPI delivery, and the
-     * proven trap-and-emulate path (SMP-3..5) must remain the default until AVIC is validated on
-     * real hardware -- a bare-metal SMP guest that works today must not regress on the next run.
-     */
-    if (kind == HYPE_VMM_KIND_SVM) {
-        static int avic_logged = 0;
-        int avic_hw = hype_avic_supported(hype_cpu_svm_feature_edx());
-        if (!avic_logged) {
-            const char *note;
-#if defined(HYPE_ENABLE_AVIC) && HYPE_ENABLE_AVIC
-            note = avic_hw ? " -- ENABLING (HYPE_ENABLE_AVIC set)" : " -- opted in but unsupported";
-#else
-            note = avic_hw ? " -- not enabled (build -DHYPE_ENABLE_AVIC=1 to use it)" : "";
-#endif
-            avic_logged = 1;
-            hype_debug_print("fw-1: AMD AVIC %s on this host%s [#193]\n",
-                             avic_hw ? "AVAILABLE" : "not available", note);
-        }
-#if defined(HYPE_ENABLE_AVIC) && HYPE_ENABLE_AVIC
-        if (avic_hw) {
-            hype_svm_vcpu_enable_apic_accel_ops(ctx);
-        }
-#endif
-    }
+    fw_1_maybe_enable_avic(kind, ctx); /* #193/#640 */
     vmm_enable_intr_intercept(kind, ctx);
     vm->shutdown_deadline_tsc = 0;
     vm->pm1a_cnt = 0;
@@ -11609,6 +11633,7 @@ wait_for_sipi:
     if (hype_cpu_has_pause_filter(hype_cpu_svm_feature_edx())) {
         vmm_enable_pause_filter(kind, ctx, 65535u, 4096u);
     }
+    fw_1_maybe_enable_avic(kind, ctx); /* #193/#640: every SIPI rebuilds this VMCB */
     hype_debug_print("fw-1 vm%u vCPU %u: SIPI received, entering guest [#190]\n", vm_idx, vi);
     fw_1_dev_lock(vm); /* SMP-7: enter the loop in the "outside the guest" state */
     ap_locked = 1;
@@ -13885,6 +13910,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         hype_debug_print("fw-1: pause-filtering unavailable -- a long guest spin can still starve "
                           "its own tick here\n");
     }
+    fw_1_maybe_enable_avic(kind, ctx); /* #193/#640 */
 
     /* RT-2b: the real preemption mechanism (pause-filtering above proved
      * inert on real HW -- the 40s spins execute no PAUSE). Intercept physical
