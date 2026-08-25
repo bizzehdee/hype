@@ -16,16 +16,48 @@ set -x
 say() { echo "### HYPE232-BRIDGE: $*"; }
 
 say "bridge starting -- looking for a separate hype-additions medium"
+
+# Alpine's live-init only auto-mounts the medium it actually BOOTED from --
+# a second attached CD-ROM is a real /dev/sr* block device but nothing mounts
+# it automatically (#232's own first real bug here: /media only ever showed
+# the boot medium). modloop is needed before sr_mod/isofs/cdrom exist at all,
+# same "modloop is the whole ballgame" lesson #228 already paid for -- just
+# needed a second time, earlier, since this script runs before
+# install-linux.sh's own modloop start does.
+rc-service modloop start 2>&1
+for m in sr_mod cdrom isofs nls_iso8859-1; do
+    modprobe "$m" 2>/dev/null && say "modprobe $m ok" || say "modprobe $m failed"
+done
+
 BRIDGE=""
+# First, the cheap case: already auto-mounted under /media (works if Alpine
+# ever changes to mount every optical device, not just the boot one).
 for m in /media/sr0 /media/sr1 /media/cdrom /media/cdrom1 /media/vdb /media/usb; do
     [ -x "$m/linux/install-linux.sh" ] && { BRIDGE="$m"; break; }
 done
 if [ -z "$BRIDGE" ]; then
     for d in /media/*/linux; do [ -x "$d/install-linux.sh" ] && { BRIDGE=$(dirname "$d"); break; }; done
 fi
+# Otherwise, mount every /dev/sr* block device ourselves and look there.
+if [ -z "$BRIDGE" ]; then
+    say "not found under /media -- probing /dev/sr* block devices directly"
+    i=0
+    for dev in /dev/sr0 /dev/sr1 /dev/sr2 /dev/sr3; do
+        [ -b "$dev" ] || continue
+        mp="/mnt/hype-addons-$i"; i=$((i + 1))
+        mkdir -p "$mp"
+        if mount -t iso9660 -o ro "$dev" "$mp" 2>&1; then
+            say "mounted $dev at $mp: $(ls "$mp" 2>/dev/null | tr '\n' ' ')"
+            [ -x "$mp/linux/install-linux.sh" ] && { BRIDGE="$mp"; break; }
+        else
+            say "could not mount $dev as iso9660 (not present, or already mounted elsewhere)"
+        fi
+    done
+fi
 if [ -z "$BRIDGE" ]; then
     say "FATAL no hype-additions linux/install-linux.sh found on any attached medium"
-    say "attached media: $(ls /media 2>/dev/null | tr '\n' ' ')"
+    say "attached media under /media: $(ls /media 2>/dev/null | tr '\n' ' ')"
+    say "block devices: $(ls /dev/sr* 2>/dev/null | tr '\n' ' ')"
     exit 1
 fi
 say "found additions medium at $BRIDGE -- handing off"
