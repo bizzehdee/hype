@@ -1,0 +1,189 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  #232: Windows unattended-install answer file.
+
+  Windows Setup scans the root of EVERY attached medium for a file named
+  exactly `autounattend.xml`  -  like FreeBSD's installerconfig and unlike
+  Alpine's live boot, this is the mechanism's OWN "scan everything" behavior,
+  so this file can live at the root of the hype-additions ISO and the primary
+  Windows install ISO (cdroms[0]) stays completely stock.
+
+  `os_hint = windows` deliberately defaults hype's guest disk to `ahci-sata`
+  and its NIC to `e1000` (docs/hype-cfg-spec.md §5.6)  -  both inbox on every
+  Windows version hype targets, specifically BECAUSE Windows has no inbox
+  virtio-blk driver ("a virtio system disk is invisible at Windows install").
+  So unlike other hypervisors' `virtio-win`, this answer file needs NO driver
+  injection (no DriverPaths, no PnpCustomizationsWinPE)  -  the opposite of the
+  usual problem.
+
+  What Windows DOES need that Linux/BSD do not: hype's whole diagnostic
+  pipeline (\HYPEFULL.LOG, input scripts) depends on ttyS0, and Setup is
+  silent on the serial line without an explicit boot-config step  -  done via
+  RunSynchronous in the specialize pass below (bcdedit /ems + /emssettings).
+
+  NOT YET VALIDATED against hype (tools/232/README.md's status note). The
+  ProductKey/ImageInstall index below is a PLACEHOLDER  -  it must match
+  whatever edition/index the target Windows ISO actually offers; there is no
+  way to make this fully ISO-agnostic without inspecting the specific image.
+-->
+<unattend xmlns="urn:schemas-microsoft-com:unattend"
+          xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-International-Core-WinPE" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <SetupUILanguage><UILanguage>en-US</UILanguage></SetupUILanguage>
+      <InputLocale>en-US</InputLocale>
+      <SystemLocale>en-US</SystemLocale>
+      <UILanguage>en-US</UILanguage>
+      <UserLocale>en-US</UserLocale>
+    </component>
+    <component name="Microsoft-Windows-Setup" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <DiskConfiguration>
+        <Disk wcm:action="add">
+          <DiskID>0</DiskID>
+          <WillWipeDisk>true</WillWipeDisk>
+          <!-- UEFI/GPT layout: EFI system partition + MSR + one primary NTFS
+               volume. hype's guest OVMF has no NVRAM entry across a restart
+               (#120's own lesson)  -  Setup itself writes the removable
+               \EFI\Boot\bootx64.efi fallback for a GPT+UEFI install, so no
+               extra bootloader step is needed here the way Linux/BSD need. -->
+          <CreatePartitions>
+            <CreatePartition wcm:action="add">
+              <Order>1</Order>
+              <Type>EFI</Type>
+              <Size>260</Size>
+            </CreatePartition>
+            <CreatePartition wcm:action="add">
+              <Order>2</Order>
+              <Type>MSR</Type>
+              <Size>16</Size>
+            </CreatePartition>
+            <CreatePartition wcm:action="add">
+              <Order>3</Order>
+              <Type>Primary</Type>
+              <Extend>true</Extend>
+            </CreatePartition>
+          </CreatePartitions>
+          <ModifyPartitions>
+            <ModifyPartition wcm:action="add">
+              <Order>1</Order>
+              <PartitionID>1</PartitionID>
+              <Label>System</Label>
+              <Format>FAT32</Format>
+            </ModifyPartition>
+            <ModifyPartition wcm:action="add">
+              <Order>2</Order>
+              <PartitionID>2</PartitionID>
+            </ModifyPartition>
+            <ModifyPartition wcm:action="add">
+              <Order>3</Order>
+              <PartitionID>3</PartitionID>
+              <Label>Windows</Label>
+              <Format>NTFS</Format>
+              <Letter>C</Letter>
+            </ModifyPartition>
+          </ModifyPartitions>
+        </Disk>
+        <WillShowUI>OnError</WillShowUI>
+      </DiskConfiguration>
+      <ImageInstall>
+        <OSImage>
+          <InstallFrom>
+            <!-- PLACEHOLDER: must match the target ISO's own index (check
+                 with `dism /Get-WimInfo` against its install.wim/install.esd)
+                  -  this cannot be made image-agnostic. -->
+            <MetaData wcm:action="add">
+              <Key>/IMAGE/INDEX</Key>
+              <Value>1</Value>
+            </MetaData>
+          </InstallFrom>
+          <InstallTo>
+            <DiskID>0</DiskID>
+            <PartitionID>3</PartitionID>
+          </InstallTo>
+        </OSImage>
+        <WillShowUI>OnError</WillShowUI>
+      </ImageInstall>
+      <UserData>
+        <AcceptEula>true</AcceptEula>
+        <!-- Retail/VL media still prompts for a key without this present;
+             leave empty for a KMS/volume image that does not need one. -->
+        <ProductKey><Key></Key></ProductKey>
+      </UserData>
+    </component>
+  </settings>
+
+  <settings pass="specialize">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <ComputerName>hype-guest</ComputerName>
+    </component>
+    <component name="Microsoft-Windows-Deployment" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <RunSynchronous>
+        <!-- The step neither Linux nor BSD need: Setup is silent on ttyS0
+             without this, and hype's whole diagnostic pipeline
+             (\HYPEFULL.LOG, input scripts) is built on that serial line. -->
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>bcdedit /ems {current} on</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Path>bcdedit /emssettings EMSPORT:1 EMSBAUDRATE:115200</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Path>bcdedit /set {bootmgr} displaybootmenu yes</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>4</Order>
+          <Path>bcdedit /set {bootmgr} bootems yes</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
+    </component>
+  </settings>
+
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-Shell-Setup" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <OOBE>
+        <HideEULAPage>true</HideEULAPage>
+        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <NetworkLocation>Work</NetworkLocation>
+        <ProtectYourPC>3</ProtectYourPC>
+        <SkipMachineOOBE>true</SkipMachineOOBE>
+        <SkipUserOOBE>true</SkipUserOOBE>
+      </OOBE>
+      <UserAccounts>
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Name>hypeuser</Name>
+            <Group>Administrators</Group>
+            <Password>
+              <!-- Unattended-validation password only, same posture as the
+                   BSD leg's root password  -  a real deployment should inject
+                   a per-image credential, not this file. -->
+              <Value>Hype!232pass</Value>
+              <PlainText>true</PlainText>
+            </Password>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
+      <AutoLogon>
+        <Enabled>false</Enabled>
+      </AutoLogon>
+    </component>
+    <component name="Microsoft-Windows-International-Core" processorArchitecture="amd64"
+               publicKeyToken="31bf3856ad364e35" language="neutral" versionScope="nonSxS">
+      <InputLocale>en-US</InputLocale>
+      <SystemLocale>en-US</SystemLocale>
+      <UILanguage>en-US</UILanguage>
+      <UserLocale>en-US</UserLocale>
+    </component>
+  </settings>
+</unattend>

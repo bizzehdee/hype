@@ -1,0 +1,93 @@
+# #232: FreeBSD unattended-install answer file.
+#
+# `bsdinstall`'s boot-time script checks every attached medium for a
+# top-level file named exactly `installerconfig`; if found, it runs THIS file
+# via `bsdinstall script` instead of the interactive menu UI. Unlike Alpine's
+# apkovl (tools/232/linux/), this is the mechanism's OWN "scan everything"
+# behavior, so the additions ISO can just carry this at its root -- the
+# primary FreeBSD install ISO (cdroms[0]) stays completely stock. This is a
+# real, documented FreeBSD mechanism (the same one used for PXE/unattended
+# FreeBSD deployments), but has NOT been run against hype yet -- see
+# tools/232/README.md's status note.
+#
+# `os_hint = bsd` defaults hype's guest disk to virtio-blk (docs/hype-cfg-spec.md
+# §5.6), which FreeBSD's GENERIC kernel has driven inbox since long before any
+# release hype targets -- the disk enumerates as /dev/vtbd0. No driver payload
+# needed on this medium at all, unlike the Linux leg.
+#
+# Re-wipe guard: hype keeps CDs attached across a restart (#228's own lesson),
+# so a script that ALWAYS wipes vtbd0 would re-install on every subsequent
+# boot of the live medium. Check for this install's own marker first.
+if mount -o ro /dev/vtbd0p2 /mnt 2>/dev/null; then
+    if [ -f /mnt/etc/hype-232-installed ]; then
+        umount /mnt
+        echo "### HYPE232-BSD: /dev/vtbd0 already carries a completed install -- refusing to re-wipe"
+        echo "### HYPE232-BSD: powering off"
+        sync
+        shutdown -p now
+        exit 0
+    fi
+    umount /mnt
+fi
+
+echo "### HYPE232-BSD: partitioning /dev/vtbd0 (GPT: EFI + freebsd-ufs)"
+gpart destroy -F vtbd0 2>/dev/null || true
+gpart create -s gpt vtbd0
+gpart add -t efi -s 260m -l efiboot0 vtbd0
+gpart add -t freebsd-ufs -l rootfs0 vtbd0
+newfs_msdos -F 32 -c 1 /dev/vtbd0p1
+newfs -U -L rootfs /dev/vtbd0p2
+
+echo "### HYPE232-BSD: mounting target + extracting distribution"
+mount /dev/vtbd0p2 /mnt
+mkdir -p /mnt/boot/efi
+mount -t msdosfs /dev/vtbd0p1 /mnt/boot/efi
+
+# BSDINSTALL_DISTDIR is set by bsdinstall to wherever the install media's
+# distribution sets (base.txz, kernel.txz, ...) live -- the additions medium
+# does not need to carry these, the primary FreeBSD ISO already does.
+export BSDINSTALL_DISTDIR=${BSDINSTALL_DISTDIR:-/usr/freebsd-dist}
+export DISTRIBUTIONS="base.txz kernel.txz"
+export BSDINSTALL_CHROOT=/mnt
+bsdinstall distextract
+
+echo "### HYPE232-BSD: EFI bootloader -- UEFI-spec fallback path"
+# hype's guest OVMF carries no NVRAM boot entry across a restart (#120/#228's
+# shared lesson) -- only \EFI\BOOT\BOOTX64.EFI is ever tried. FreeBSD's own
+# installer normally writes \EFI\freebsd\, which a fresh OVMF would never find.
+mkdir -p /mnt/boot/efi/EFI/BOOT
+cp /mnt/boot/loader.efi /mnt/boot/efi/EFI/BOOT/BOOTX64.EFI
+
+echo "### HYPE232-BSD: fstab, hostname, root password, serial console"
+cat > /mnt/etc/fstab <<'EOF'
+/dev/vtbd0p2   /           ufs     rw          1  1
+/dev/vtbd0p1   /boot/efi   msdosfs rw          2  2
+EOF
+
+echo "hype-guest" > /mnt/etc/hostname
+cat >> /mnt/etc/rc.conf <<'EOF'
+hostname="hype-guest"
+ifconfig_vtnet0="DHCP"
+sshd_enable="YES"
+EOF
+
+# Serial console, unconditionally -- hype's whole diagnostic pipeline
+# (\HYPEFULL.LOG, input scripts) depends on ttyS0, same requirement #228's
+# Linux leg has via its GRUB_TERMINAL=serial setting.
+cat >> /mnt/boot/loader.conf <<'EOF'
+console="comconsole"
+comconsole_speed="115200"
+EOF
+sed -i '' 's/^ttyu0.*/ttyu0	"\/usr\/libexec\/getty 3wire"	vt100	onifconsole	secure/' /mnt/etc/ttys
+
+# Root gets a known password for unattended validation; a real deployment
+# should inject a public key instead via a per-image seed, not this file.
+echo 'hype' | pw -R /mnt usermod root -h 0
+
+: > /mnt/etc/hype-232-installed
+
+echo "### HYPE232-BSD: install complete, powering off"
+umount /mnt/boot/efi
+umount /mnt
+sync
+shutdown -p now

@@ -3502,6 +3502,69 @@ isn't lost.
     as zero, UNWRITTEN reads as zero but is allocated, a write into either needs a capability this
     layer does not have" to keep in sync, for no benefit over reusing the one that already exists.
 
+70. **#232: the `hype-additions` companion ISO is a SEPARATE disc from the OS installer, per
+    platform family, attached as a second `cdroms` entry (`docs/hype-cfg-spec.md` §5.7 already
+    allows up to ~4 per VM -- no hype-side capability needed, only content) -- decided
+    (2026-08-25).** #228 proved the underlying mechanics (offline package repo, unattended answer
+    file, post-install bootloader/initramfs fixups) but baked all three into a REMASTERED Alpine
+    ISO. That does not generalize to #146's mixed-distro case or to BSD/Windows, which is exactly
+    the open question #232's own comments left unresolved. Splitting into a stock, unmodified OS
+    installer (`cdroms[0]`) plus a small per-platform `hype-additions.iso` (`cdroms[1]`) is what
+    every other hypervisor's equivalent (Guest Additions, VMware Tools, `virtio-win`) already does,
+    and lets the additions content be versioned/rebuilt independently of whatever OS ISO an
+    operator supplies.
+
+    **Content manifest, by platform family** (`os_hint` already exists per-VM,
+    `docs/hype-cfg-spec.md` §5.6, so the additions ISO can carry all three trees and let each
+    platform's own bootstrap pick its own):
+
+    - **`linux/`** -- generalizes #228's proven Alpine recipe rather than replacing it: an offline
+      apk repo (`apks-hype/x86_64/` ONLY -- §the #232 ticket comment already corrects the original
+      "needs x86_64/ and noarch/" instruction; apk reads one arch dir's `APKINDEX.tar.gz` and every
+      package, `noarch` included, must be indexed there, matching a real Alpine mirror), a
+      `local.d`-runlevel unattended driver script (`tools/228/autoinstall.start`'s pattern:
+      explicit `modloop` start + a watchdog, since it does not survive `setup-alpine` re-entering
+      the default runlevel), and an `mkinitfs.conf` carrying Alpine's own stock `sys-install`
+      feature list verbatim (`ata base cdrom ext4 keymap kms mmc nvme raid scsi usb virtio`) --
+      curating a smaller list against hype's OWN virtual disk (`virtio` alone boots under hype)
+      was #232's own real regression once the disk moved to bare metal for #226. Other distros
+      (#146) get their own subtree with their own package-manager equivalent; the apk tree is not
+      assumed to be the only one forever.
+    - **`bsd/`** -- FreeBSD's native unattended mechanism is `bsdinstall`'s `installerconfig`
+      (a shell script bsdinstall sources instead of running its menu UI when found at a known
+      path on the install media), not a remaster. The additions ISO carries an `installerconfig`
+      plus an offline `pkg` repo mirror ONLY if packages beyond base/kernel are needed -- `bsd`'s
+      `os_hint` already defaults to `virtio-blk` + virtio-net (§5.6), both inbox in FreeBSD's
+      GENERIC kernel since well before any FreeBSD release hype targets, so **no driver payload is
+      needed for BSD at all**, unlike Alpine's initramfs-feature-list problem. The one bootloader
+      lesson #120/#228 both already paid for still applies: FreeBSD's own EFI installer must land
+      at the UEFI-spec fallback path (`\EFI\BOOT\BOOTX64.EFI`), since hype's guest OVMF carries no
+      NVRAM boot entry across a restart.
+    - **`windows/`** -- Windows Setup's native unattended mechanism is `autounattend.xml` at the
+      root of ANY attached media (Setup scans every drive for it). **No driver payload either**:
+      `windows`'s `os_hint` deliberately defaults to `ahci-sata` (§5.6's own reasoning -- "a virtio
+      system disk is invisible at Windows install") + `e1000` (§ NIC-derivation table), and both
+      are inbox on every Windows version hype targets -- the exact opposite of the usual
+      `virtio-win` problem other hypervisors solve, because hype's own bus defaults for `windows`
+      were already chosen to avoid it. What Windows DOES need that neither other platform does:
+      an explicit boot-config step (`bcdedit /ems {default} on` + `bcdedit /emssettings COM1
+      115200`, run from `autounattend.xml`'s specialize pass) to get ANY guest console output onto
+      the serial port hype's whole diagnostic pipeline (`\HYPEFULL.LOG`, input scripts, #698-style
+      debugging) depends on -- Windows Setup itself is silent on a serial line without this, unlike
+      Linux/BSD where the installer's own console already defaults to what the kernel command line
+      says.
+
+    **Open and NOT resolved by this decision: how the primary OS installer boot medium learns to
+    look at the second CD at all.** #228's remaster works because the seed lives ON the medium that
+    boots. A genuinely separate-ISO Alpine flow needs either (a) Alpine's own live-boot kernel
+    parameters (`alpine_repo=`, `apkovl=`) pointed at the second CD-ROM device, which is standard,
+    documented Alpine functionality and would let `cdroms[0]` stay a bone-stock ISO, or (b) hype
+    generating a tiny custom boot medium of its own. FreeBSD's `installerconfig` and Windows'
+    `autounattend.xml` do not have this problem -- both mechanisms scan every attached medium for
+    their answer file by design, so the stock ISO can stay `cdroms[0]` unmodified with no
+    kernel-parameter bridging required. This is real remaining design work for the Linux leg,
+    tracked as follow-up rather than settled here.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what
