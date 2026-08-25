@@ -18,7 +18,17 @@ already. Safety rules (targets by serial only, standing exclusions) as
 
 ---
 
-## Run 1 — AMD laptop (3 usable physical cores after BSP reservation)
+## Run 1 — AMD dev machine (5950X, 16 cores) — not the AMD laptop
+
+Moved off the AMD laptop (3 usable physical cores after BSP reservation) onto
+this 5950X box, which removes Boot 1b's core-count blocker entirely (16 cores
+is well past the 4 `suite-603.cfg` needs).
+
+**Log-rotation workflow note:** run all three boots below back-to-back first,
+then ingest all three logs together in one pass at the end — not
+incrementally after each boot. Reviewing mid-sequence competes with log
+rotation for the same window and risks losing the earlier boots' evidence
+before it's read.
 
 ### Boot 1a: one long-lived 2-vCPU Alpine session, three signals at once
 Bring up a genuine 2-vCPU (non-SMT) Alpine guest and, in one continuous
@@ -40,16 +50,23 @@ probe, then pin the reboot to the non-BSP vCPU.
   WARN so it survives any `log_level`) is already in the build — just watch
   the log for a `fw-1 TIMERSTALL` line after the reboot completes.
 
-### Boot 1b: `tests/micro/suite-603.cfg` — blocked on a sizing decision
+### Boot 1b: `tests/micro/suite-603.cfg`
 **#603**'s AMD leg needs 4 physical cores (`vmexit`=2, `vmexitstorm`=1,
-`hello`=1); this laptop has 3 usable after BSP reservation. Decide before this
-boot: trim the suite to fit 3, or borrow a bigger AMD box. Not resolvable by
-running harder.
+`hello`=1) — no longer a blocker on the 5950X (16 cores). Run as originally
+scoped (`SMP=8` or higher, well inside budget), no trimming needed.
 
 ### Boot 1c: exFAT on-medium self-test battery
 **#653** — `tools/exfat-e2e` (the underlying battery, #692, is already
 complete). Needs both vendors; this is the AMD half. Quick, self-contained —
 tack onto the end of this session rather than scheduling separately.
+
+### After all three boots: ingest logs together
+Pull `\HYPEFULL.LOG` and each boot's per-VM logs from all three boots in one
+pass. Cross-check in this order: #698's `TIMERSTALL` line (1a), the
+`suite-603.cfg` verdict lines for `hello`/`vmexit`/`vmexitstorm` (1b), then
+the exFAT battery's own pass/fail summary (1c) — same order the boots ran in,
+so a truncated or rotated-out early section is easy to notice against what
+should be there.
 
 ---
 
@@ -173,7 +190,7 @@ stated blocker.
 
 | run | machine | boots | tickets closed (or advanced) |
 |---|---|---|---|
-| 1 | AMD laptop | 3 | #641, #712 (AMD), #653 (AMD half), #603 (AMD — blocked on a sizing decision), *(#698, not On Hold)* |
+| 1 | AMD dev machine (5950X) | 3 | #641, #712 (AMD), #653 (AMD half), #603 (AMD), *(#698, not On Hold)* |
 | 2 | Intel laptop (i5-13420H) | 6 | #708, #525, #599, #605, #637, #603 (Intel), #604 (Intel), #712 (Intel), #577, #653 (Intel half) |
 | 3 | either | 3 | #387, #388, #688, #689, #715, #660, #713, #426 |
 | 4 | either | up to 2 | #442, #695, #634, #635, #636 |
