@@ -5503,6 +5503,76 @@ static void fw_1_timer_latency_note(unsigned vmi, unsigned vi, const hype_guest_
         }
     }
 }
+
+/*
+ * #698 bring-up probe: hype_guest_lapic_take_timer_irq() just refused a tick because
+ * timer_in_service was still 1 -- i.e. #698's freeze may be happening on this exact
+ * vCPU right now. Dumps this vCPU's own interrupt-injection state so a vector that
+ * is STILL STUCK IN pending_irr (never delivered) can be told apart from one that
+ * was delivered/injected but never generated a guest EOI (int_eventinj advanced,
+ * pending_valid now false, yet eoi_count stopped moving).
+ *
+ * Gated on WALL-CLOCK time, not a poll count: a first cut at 20 consecutive polls
+ * false-positived on the BSP with rflags_if=0 -- a perfectly normal few-microsecond
+ * critical section that resolved on its own next tick (deliveries kept climbing
+ * right after). The AP loop and BSP loop both spin far faster than real time, so a
+ * poll count says nothing about how long the guest has actually been stuck. Only a
+ * stall sustained for several real SECONDS is the thing #698 is actually about.
+ * fw_1_clear_timer_stall() resets the clock the moment a tick succeeds, so a
+ * transient stall never accumulates toward the threshold.
+ */
+static uint64_t g_timer_stall_start_tsc[16][HYPE_MAX_VCPUS_PER_VM];
+static uint8_t g_timer_stall_latched[16][HYPE_MAX_VCPUS_PER_VM];
+
+static void fw_1_clear_timer_stall(unsigned vmi, unsigned vi) {
+    if (vmi >= 16u || vi >= HYPE_MAX_VCPUS_PER_VM) {
+        return;
+    }
+    g_timer_stall_start_tsc[vmi][vi] = 0ull;
+}
+
+static void fw_1_note_timer_stall(unsigned vmi, unsigned vi, hype_vmm_kind_t kind,
+                                  hype_vcpu_ctx_t *ctx, const hype_guest_lapic_t *lp,
+                                  uint64_t hz) {
+    hype_vmm_intr_state_t st;
+    unsigned long long einj, defer, window, overwrite, collisions;
+    uint64_t now, elapsed_us;
+
+    if (vmi >= 16u || vi >= HYPE_MAX_VCPUS_PER_VM || g_timer_stall_latched[vmi][vi]) {
+        return;
+    }
+    now = hype_rdtsc();
+    if (g_timer_stall_start_tsc[vmi][vi] == 0ull) {
+        g_timer_stall_start_tsc[vmi][vi] = now;
+        return;
+    }
+    if (hz < 1000000ull) {
+        return; /* host_tsc_hz not established yet -- nothing to scale against */
+    }
+    elapsed_us = (now - g_timer_stall_start_tsc[vmi][vi]) / (hz / 1000000ull);
+    if (elapsed_us < 5000000ull) {
+        return; /* under 5 real seconds -- indistinguishable from a normal IF=0 window */
+    }
+    g_timer_stall_latched[vmi][vi] = 1;
+    vmm_get_intr_state(kind, ctx, &st);
+    (void)vmm_get_int_diag(kind, ctx, &einj, &defer, &window, &overwrite);
+    collisions = vmm_get_eventinj_collisions(kind, ctx);
+    /* WARN, not the unmarked hype_debug_print() default: this must survive whatever log_level
+     * tonight's real-hardware validation run actually uses. It fires at most once per vCPU, ever,
+     * and only after 5 real seconds of a confirmed stuck LAPIC timer -- the opposite of the noise
+     * HYPE_LOGF()'s level filtering exists to drop (#533). An unmarked DEBUG-only line here would
+     * have meant this exact catch silently never printing outside a debug-level run. */
+    HYPE_LOGF(HYPE_LOG_WARN,
+        "fw-1 TIMERSTALL vm%u/%u [#698]: latched after %llu.%llus stuck -- "
+        "eoi_count=%u pending_valid=%d pending_vector=0x%x rflags_if=%d "
+        "eventinj_valid=%d vintr_armed=0x%llx einj=%llu defer=%llu window=%llu "
+        "overwrite=%llu collision=%llu\n",
+        vmi, vi, (unsigned long long)(elapsed_us / 1000000ull),
+        (unsigned long long)((elapsed_us / 100000ull) % 10ull), (unsigned)lp->eoi_count,
+        st.pending_valid, (unsigned)st.pending_vector, (int)((st.rflags >> 9) & 1ull),
+        (int)((st.eventinj >> 31) & 1ull), (unsigned long long)st.vintr, einj, defer,
+        window, overwrite, collisions);
+}
 /* #482: how much shared-device work an AP actually serves. The ATAPI read stream freezes at
  * 282 reads under 2 vCPUs against 3899 under 1, and #229 already established that host-backed
  * guest I/O issued from an AP core is its own failure mode -- so whether the AP is serving the
@@ -12739,6 +12809,12 @@ wait_for_sipi:
                 g_ap_timer_injected[vm_idx][vi]++;
                 fw_1_timer_latency_note(vm_idx, vi, lapic, vm->host_tsc_hz);
                 ap_injected_something = 1;
+                fw_1_clear_timer_stall(vm_idx, vi); /* #698 bring-up probe */
+            } else if (lapic->timer_irq_pending && lapic->timer_in_service) {
+                fw_1_note_timer_stall(vm_idx, vi, kind, ctx, lapic,
+                                      vm->host_tsc_hz); /* #698 bring-up probe */
+            } else {
+                fw_1_clear_timer_stall(vm_idx, vi); /* #698: not stuck right now */
             }
             /* Deliver anything queued for THIS vCPU -- its own LAPIC timer self-IPIs and the
              * cross-vCPU IPIs SMP-5 routes here. */
@@ -16835,6 +16911,12 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             fw_1_timer_latency_note((unsigned)(vm - g_vms), vm->cur_vcpu, &g_fw_1_lapic,
                                     vm->host_tsc_hz);
             timer_irqs++;
+            fw_1_clear_timer_stall((unsigned)(vm - g_vms), vm->cur_vcpu); /* #698 bring-up probe */
+        } else if (g_fw_1_lapic.timer_irq_pending && g_fw_1_lapic.timer_in_service) {
+            fw_1_note_timer_stall((unsigned)(vm - g_vms), vm->cur_vcpu, kind, ctx,
+                                  &g_fw_1_lapic, vm->host_tsc_hz); /* #698 bring-up probe */
+        } else {
+            fw_1_clear_timer_stall((unsigned)(vm - g_vms), vm->cur_vcpu); /* #698: not stuck now */
         }
         /* GLADDER-6c: deliver guest self-IPIs (ICR fixed-delivery writes aimed
          * at the local CPU). Linux >= 6.16 starts every SRCU grace period from
