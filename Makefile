@@ -20,11 +20,24 @@ TARGET  := x86_64-unknown-uefi
 # "-dirty" flags uncommitted changes, so an unreproducible build is obvious.
 HYPE_BUILD_ID := $(shell git describe --always --dirty --abbrev=7 2>/dev/null || echo unknown)
 
+# #716 (plan.md §10 decision 68): the date-based version string shown on the dashboard and
+# startup banner, YYYY.MM.DD[-tag] (#commit-id). HYPE_BUILD_DATE is the BUILD machine's clock at
+# build time, not the commit date -- see decision 68's rejected-alternative note for why (a
+# rebuild of an old commit must show the day it was rebuilt, not the day it was committed).
+# No leading zero on month/day (`date`'s `%-m`/`%-d`, GNU date), matching the ticket's own
+# worked example. HYPE_BUILD_TAG follows CC/LD's own override convention -- a plain `:=`
+# default, overridable on the command line (`make HYPE_BUILD_TAG=ci`, what the CI pipeline
+# passes; `make HYPE_BUILD_TAG=` empty, for a release build with no tag suffix at all).
+HYPE_BUILD_DATE := $(shell date +'%Y.%-m.%-d')
+HYPE_BUILD_TAG := alpha
+
 CFLAGS  := --target=$(TARGET) -ffreestanding -fshort-wchar -mno-red-zone \
            -Wall -Wextra -g -O1 -std=c11 -MMD -MP \
            -Werror=constant-conversion \
            -fstack-protector-strong \
-           -DHYPE_BUILD_ID='"$(HYPE_BUILD_ID)"' $(EXTRA_CFLAGS)
+           -DHYPE_BUILD_ID='"$(HYPE_BUILD_ID)"' \
+           -DHYPE_BUILD_DATE='"$(HYPE_BUILD_DATE)"' \
+           -DHYPE_BUILD_TAG='"$(HYPE_BUILD_TAG)"' $(EXTRA_CFLAGS)
 LDFLAGS := -flavor link -subsystem:efi_application -entry:efi_main
 
 BUILD_DIR := build

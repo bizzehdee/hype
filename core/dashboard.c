@@ -256,7 +256,7 @@ void hype_dashboard_render(hype_vt_screen_t *s,
                            const hype_vm_dash_info_t *vms, unsigned n,
                            uint64_t host_uptime_s,
                            const char *cmdline, const hype_dash_text_t *result,
-                           const char *alert) {
+                           const char *alert, const char *version) {
     char line[160];
     char up[16];
     /* #460: rows consumed so far, so the result panel knows how much of the grid is left.
@@ -267,7 +267,12 @@ void hype_dashboard_render(hype_vt_screen_t *s,
     hype_vt_screen_write(s, (const uint8_t *)"\x1b[H\x1b[2J", 7);
 
     hype_dashboard_fmt_uptime(up, host_uptime_s);
-    hype_snprintf(line, sizeof(line), "hype - VM dashboard        host up %s", up);
+    if (version != (const char *)0 && version[0] != '\0') {
+        hype_snprintf(line, sizeof(line), "hype - VM dashboard        host up %s        %s", up,
+                      version);
+    } else {
+        hype_snprintf(line, sizeof(line), "hype - VM dashboard        host up %s", up);
+    }
     emit_line(s, line);
     if (alert != (const char *)0 && alert[0] != '\0') {
         emit_line(s, alert);

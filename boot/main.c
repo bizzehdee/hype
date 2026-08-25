@@ -148,6 +148,29 @@ static inline uint64_t hype_dbg_read_cr3(void) {
 #define HYPE_BUILD_ID "unknown"
 #endif
 
+/* #716 (plan.md §10 decision 68): the date-based version string's other two pieces, same
+ * defaulting convention as HYPE_BUILD_ID above. */
+#ifndef HYPE_BUILD_DATE
+#define HYPE_BUILD_DATE "unknown"
+#endif
+#ifndef HYPE_BUILD_TAG
+#define HYPE_BUILD_TAG "alpha"
+#endif
+
+/*
+ * #716: composes "YYYY.MM.DD[-tag] (#commit-id)" -- e.g. "2026.8.24-alpha (#aaaaaaaa)", or
+ * "2026.8.24 (#aaaaaaaa)" for a release build (HYPE_BUILD_TAG passed empty). Runtime
+ * composition, not further preprocessor pasting, because the trailing "-tag" is conditional on
+ * HYPE_BUILD_TAG being non-empty and the three pieces already arrive as three separate defines.
+ */
+static void fw_1_build_version_str(char *buf, unsigned cap) {
+    if (HYPE_BUILD_TAG[0] != '\0') {
+        hype_snprintf(buf, cap, "%s-%s (#%s)", HYPE_BUILD_DATE, HYPE_BUILD_TAG, HYPE_BUILD_ID);
+    } else {
+        hype_snprintf(buf, cap, "%s (#%s)", HYPE_BUILD_DATE, HYPE_BUILD_ID);
+    }
+}
+
 /* VMX-1 (#35): run the self-contained VMX round-trip smoke test (CPUID->HLT
  * guest via the VMLAUNCH/VMRESUME trampoline) right after the VMM enables, on
  * an Intel/VMX backend. Off by default; flip to 1 (or -DHYPE_VMX_SMOKE_TEST=1)
@@ -8679,12 +8702,16 @@ static void fw_1_render_console(void) {
                 }
             }
             bsp_phase(BSP_PHASE_DASH);
-            hype_dashboard_render(&g_dashboard_term, info, ninfo,
-                                  (g_host_time_tsc != 0 && g_vms[0].host_tsc_hz != 0)
-                                      ? (unsigned)((hype_rdtsc() - g_host_time_tsc) /
-                                                   g_vms[0].host_tsc_hz)
-                                      : 0u,
-                                  g_cmdline, result_text, alert);
+            {
+                static char dash_ver[64]; /* #716 */
+                fw_1_build_version_str(dash_ver, sizeof(dash_ver));
+                hype_dashboard_render(&g_dashboard_term, info, ninfo,
+                                      (g_host_time_tsc != 0 && g_vms[0].host_tsc_hz != 0)
+                                          ? (unsigned)((hype_rdtsc() - g_host_time_tsc) /
+                                                       g_vms[0].host_tsc_hz)
+                                          : 0u,
+                                      g_cmdline, result_text, alert, dash_ver);
+            }
         }
         /* PERF-2 (#234): same diffing treatment for the dashboard. It only
          * changes when a stat/second ticks, so most frames push nothing. */
@@ -24659,6 +24686,12 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     /* First thing in every log: which build this is. Captures from a
      * serial-less machine otherwise all start with identical boilerplate. */
     hype_debug_print("hype: build " HYPE_BUILD_ID "\n");
+    /* #716: the date-based version string, on the same startup banner. */
+    {
+        char ver[64];
+        fw_1_build_version_str(ver, sizeof(ver));
+        hype_debug_print("hype: version %s\n", ver);
+    }
 
     /*
      * #604: CR4.SMEP on the BSP, where hype's own dispatch/administrative code runs. Safe to set

@@ -62,12 +62,17 @@ void hype_dash_text_add(hype_dash_text_t *t, const char *s);
  * exists for the one thing the dashboard could not previously say -- that a core has died. A
  * core that takes an unhandled fault halts alone, so the remaining cores keep rendering a
  * perfectly healthy-looking table for a VM whose vCPU is gone.
+ *
+ * #716: `version`, when non-NULL/non-empty, renders right-justified on the header line
+ * alongside "host up %s" -- e.g. "hype - VM dashboard  host up 00:04:12  2026.8.24-alpha
+ * (#aaaaaaaa)". NULL/"" (a build with no HYPE_BUILD_DATE define, or a caller that just does not
+ * care, e.g. most of this file's own tests) renders the header exactly as before.
  */
 void hype_dashboard_render(hype_vt_screen_t *s,
                            const hype_vm_dash_info_t *vms, unsigned n,
                            uint64_t host_uptime_s,
                            const char *cmdline, const hype_dash_text_t *result,
-                           const char *alert);
+                           const char *alert, const char *version);
 
 /* Format `secs` as HH:MM:SS into buf (>= 9 bytes). Exposed for tests. */
 void hype_dashboard_fmt_uptime(char *buf, unsigned long long secs);
