@@ -208,6 +208,42 @@ declaring "fixed" on a guest that was simply still climbing toward the same wall
 - Neither hangs -> #599 bar met; #605 can consider recommending the default
   flip.
 
+> **RESULT (2026-08-25): Boot 2c HUNG — "only this one hangs" branch, so the
+> APICv regression is confirmed.** Logs at `tools/hw-val-2026-08-25/logs/2c/`.
+> Same config and same tree as 2a (`976e71a-dirty` both), only the build flag
+> differing; `apicv=ON` verified in the log before trusting the result.
+>
+> | | 2a (default) | 2c (APICv) |
+> |---|---|---|
+> | GRUB → kernel | t=118s | t=172s |
+> | login prompt | **t=155s** | **never** |
+> | `TIMERSTALL` | 0 over ~900s | 1, at t=216s |
+>
+> ```
+> TIMERSTALL vm0/0 [#698]: latched after 5.0s stuck -- eoi_count=273
+>     pending_valid=0 pending_vector=0x0 rflags_if=1 vintr_armed=0x0
+> vmx apicv-state: gis=0x30ec  virr: [1]=0x10000 [7]=0x1000  isr: [1]=0x10000
+>     -- frozen identically at t=264s, t=336s, t=406s
+> ```
+> RVI=0xec / SVI=0x30; vector 0x30 stuck in-service and never EOI'd (last
+> reason-45 exit t=191s); the timer vector 0xec pending in vIRR. **hype's own
+> model disagrees with the page** — it reports nothing pending while the page
+> holds 0xec — and the vCPU sits in a HLT loop at a fixed RIP with the guest
+> polling TMCCT (`apicv-acc: qual=0x390`). Detail and suggested direction on
+> #599; #708 updated.
+>
+> **This section's `lvt=0x30005` lead does not hold up.** Bit 16 is the LVT mask
+> bit and bit 17 is periodic mode, so that is a *masked periodic* LVT, not
+> TSC-deadline (bit 18). It is the AP's (`timer_irqs=0`, `init=0xFFFFFFFF`),
+> which never finished configuring its timer — a consequence of the BSP stall.
+> The BSP's LVT is healthy throughout: `lvt=0x200ec(periodic) init=207887` with
+> `cur` still cycling.
+>
+> Per this section's own decision tree, the outcome is "**only this one hangs**":
+> #599's bar is not met, and #605 must not recommend flipping the default.
+>
+> **Before 2d: copy `hype-default.efi` back over `EFI\BOOT\BOOTX64.EFI`.**
+
 ### Boot 2d: `tests/micro/suite-603.cfg` (default build, this is Intel's first-ever run of it) — min 10 min [build: default]
 Same floor and reasoning as Boot 1b. Three tickets from one boot:
 - **#603** — Intel/VMX leg (this environment has never had VMX at all before now).
