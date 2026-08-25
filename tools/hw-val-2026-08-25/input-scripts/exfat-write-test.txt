@@ -1,16 +1,28 @@
 # Shared by hype1c.cfg (AMD) and hype2f.cfg (Intel): #653's real-hardware
 # exFAT pass, same shape as docs/hw-val-386.md's own exFAT section --
-# short-VDL (write a prefix, truncate UP past it) and a plain write-past-EOF,
-# both against the exFAT volume attached as this VM's SECOND disk (/dev/vdb
-# or /dev/sdb depending on bus -- check which one attaches before relying on
-# the device name below).
+# short-VDL (write a prefix, truncate UP past it) and a plain write-past-EOF.
+#
+# DEVICE NAME: /dev/vda, and it is the WHOLE device, not a partition.
+#   - the cfg's [disk.exfatscratch] has no `bus`, and os_hint = linux, so
+#     hype_cfg_resolve_bus() gives virtio-blk (boot/main.c ~9098) -> vd*;
+#   - it is the VM's FIRST attached disk (disks = exfatscratch), so it is
+#     slot 0 -> /dev/vda, not vdb: nothing else occupies a virtio slot, the
+#     install ISO is an ATAPI device (/dev/sr0);
+#   - `partition = 1` exposes THAT PARTITION as a bare disk to the guest, so
+#     there is no partition table inside it and no /dev/vda1 to mount.
+# The probe below prints what actually appeared before anything depends on
+# it -- a wrong guess here is what made the first Boot 2a attempt useless.
 timeout 600000
 fail-if soft lockup
 
 expect localhost login:
 send root\n
 expect ~#
-send mkdir -p /mnt/exfat && mount /dev/vdb1 /mnt/exfat 2>&1; echo MOUNT-$?\n
+send echo BLK-$(ls /dev/vd* /dev/sd* /dev/nvme* 2>/dev/null | tr '\n' ' ')\n
+expect BLK-
+send modprobe exfat 2>&1; echo MOD-$?\n
+expect MOD-
+send mkdir -p /mnt/exfat && mount -t exfat /dev/vda /mnt/exfat 2>&1; echo MOUNT-$?\n
 expect MOUNT-
 send dd if=/dev/urandom of=/mnt/exfat/prefix.bin bs=4096 count=4 2>&1; echo WRITE1-$?\n
 expect WRITE1-

@@ -1,7 +1,8 @@
 # Staging layout for the 2026-08-25 on-hold clear-down
 
 **Status: staged onto the real drive on 2026-08-25.** `/dev/sdd` (serial
-`115E0735191800123920`) is a two-partition drive: `sdd1` FAT32 (label
+`DB9876543214E` — see the serial note below, it is NOT what Linux reports)
+is a two-partition drive: `sdd1` FAT32 (label
 `HYPEBOOT`, boot ESP) + `sdd2` exFAT (label `EADE-CA36`, all vdisks/ISOs).
 Full reasoning for every boot is in `docs/hw-val-runbook-2026-08-25.md` —
 this directory is the artifacts that runbook points at, and this file is
@@ -44,6 +45,39 @@ cp -r \input-NN \input      # e.g. \input-1a -> \input for hype1a.cfg
 | 3c | yes, TWO scripts | `input-3c/vm0.txt` (nvme-dd-write) + `input-3c/vm1.txt` (ahci-dd-write) -- vm0/vm1 order matches the `[vm.run3c-nvme]`/`[vm.run3c-ahci]` order in hype3c.cfg itself |
 | 4a, 4b | no (interactive: Setup/OOBE, console-switching) | — |
 
+## Guest device names in the input-scripts -- also corrected after Boot 2a
+
+The same class of mistake as the serial: the scripts named guest block devices
+by assumption (`/dev/vdb` everywhere) instead of deriving them from how hype
+actually presents each disk. Derived from `boot/main.c` and now recorded in
+each script's own header:
+
+| boot | cfg entry | front-end | guest device |
+|---|---|---|---|
+| 1c, 2f | `[disk.exfatscratch]`, no `bus`, `partition = 1` | virtio-blk (os_hint=linux default) | `/dev/vda` — the WHOLE device; a `partition =` exposure has no table inside it, so there is no `vda1` |
+| 3b | `[disk.usbwhole]`, no `bus`, `partition = whole` | virtio-blk | `/dev/vda1`, `vda2`, `vda3` |
+| 3c vm0 | `[disk.nvmescratch]`, `bus = nvme` | NVMe (PCI dev 5) | `/dev/nvme0n1` |
+| 3c vm1 | `[disk.ahciscratch]`, `bus = ahci-sata` | ICH9 AHCI, plain-ATA sig | `/dev/sda` (the install ISO is a separate ATAPI HBA → `sr0`) |
+
+Slot 0 in every case: an explicit `bus` on the VM's **first** attached disk
+wins (`fw_1_target_bus`, #202), and `disks = <one entry>` makes it slot 0.
+Each script now prints a `BLK-` line listing what actually appeared before
+anything depends on the name, so a wrong guess shows up in the log instead of
+producing a silent no-op `dd`.
+
+**hype3b.cfg was restructured, not just renamed.** It attached three physical
+`[disk.*]` entries; hype presents at most ONE physical-backed disk per VM —
+`boot/main.c`'s extra-slot loop skips any slot past 0 whose backing is
+physical ("only the FIRST attached disk may be physical … NOT presented"), so
+ext4 and NTFS would have been silently absent and two thirds of #688/#689's
+bar unproven. It now attaches the drive whole.
+
+**`allow_overwrite = true` added to every physical entry** (1c, 2f, 3b, 3c):
+#124's non-empty-partition-table guard refuses a real drive without it. That
+is *on top of* the runtime dashboard confirm (#125) — expect to approve each
+physical target by hand at boot; no input-script can do that step, so budget
+for it in those boots' run times.
+
 ## No pre-installed disk images needed -- corrected from this file's first draft
 
 Every Alpine/FreeBSD boot below (1a, 1c, 2a, 2b, 2c, 2e, 2f, 3b, 3c, and the
@@ -74,7 +108,7 @@ sdd1 (HYPEBOOT, FAT32):
   \RUNBOOK-README.md, \hw-val-runbook-2026-08-25.md  <- reference copies
 
 sdd2 (EADE-CA36, exFAT), referenced from every cfg via source_disk/media_disk
-= 115E0735191800123920 (the DRIVE's serial -- hype's own resolver walks that
+= DB9876543214E (the DRIVE's serial -- hype's own resolver walks that
 drive's partitions to find the path, no partition number needed):
   \iso\test.iso             <- Alpine standard 3.21.7
   \iso\windows.iso           <- Win11 24H2
@@ -83,6 +117,32 @@ drive's partitions to find the path, no partition number needed):
                                 config; windows.img is the one hype4a.cfg
                                 creates deliberately and hype4b.cfg keeps
 ```
+
+## The drive serial is the BRIDGE's, not the disk's -- this broke Boot 2a
+
+First attempt at Boot 2a failed with `No bootable option or device was found`
+in the guest. Cause: every cfg had `media_disk`/`source_disk` set to
+`115E0735191800123920`, the serial `lsblk`/`udev` report for `/dev/sdd`.
+hype does not see that number at all. It identifies a USB mass-storage device
+by **SCSI INQUIRY VPD page 0x80**, and this is a USB-SATA bridge, so the
+*enclosure* answers, not the disk behind it:
+
+```
+host-xhci: MSC identity serial='DB9876543214E' source=inquiry-vpd80 [#340]
+host-media: vm[0] 'run2a': media_disk = '115E0735191800123920' is not present
+            -- refusing to stream media from a different drive
+m5-8: media_disk = '115E0735191800123920' is not present -- refusing to
+      resolve \hype\disks\run2a-scratch.img from a different drive
+```
+
+Neither the ISO nor the scratch disk resolved, so the VM came up with no boot
+device — hype behaved correctly and said so twice; the config was simply
+wrong. All cfgs now use `DB9876543214E`.
+
+**Take the serial from hype's own log, never from the host OS.** Boot once,
+read `media: registered host device N = ...` and the `MSC identity serial=`
+line, and use exactly that string. The same applies to every placeholder
+below: if a drive is behind any USB bridge, `lsblk`'s serial is the wrong one.
 
 ## Real hardware serials still needed -- genuinely can't be filled in from here
 
@@ -95,7 +155,7 @@ drive's partitions to find the path, no partition number needed):
 | `<AHCI-SCRATCH-SERIAL>` | `hype3c.cfg` | a sanctioned AHCI/SATA scratch drive |
 
 `5ME3N005713803V2W` in `hype3c.cfg` is real (#715's own hwstick) and
-`115E0735191800123920` (this drive's own serial) is real and already filled
+`DB9876543214E` (this drive's own serial) is real and already filled
 in everywhere else. **Standing exclusions from `docs/hw-val-211.md` apply to
 every placeholder above**: never the BitLocker NVMe, never a known-dying
 drive, by serial only, never by index.
