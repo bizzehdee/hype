@@ -1,21 +1,47 @@
 # Shared by hype1a.cfg (AMD) and hype2b.cfg (Intel/VMX): pin the guest reboot
 # to the non-BSP vCPU and prove exactly one clean restart back to login.
-# Same script content as tools/input-scripts/smp525-reboot-vm0.txt (#525),
-# retimed for real hardware being slower than the QEMU runs that script was
-# proven against -- see docs/hw-val-runbook-2026-08-25.md's own min-run-time
+# Derived from tools/input-scripts/smp525-reboot-vm0.txt (#525), retimed for
+# real hardware -- see docs/hw-val-runbook-2026-08-25.md's own min-run-time
 # reasoning for boots 1a/2b.
+#
+# DO NOT gate the restart on a kernel "Brought up N CPUs" line. Boot 2a's log
+# settles both halves of why that inherited directive could never work here:
+#
+#   1. Kernel messages never reach the serial console on this live-ISO shape.
+#      2a's guest log goes straight from GRUB's "Booting `Linux lts'" to the
+#      agetty banner -- the Alpine ISO's cmdline sends kernel output to tty0,
+#      and the ttyS0/ttyS1 prompts come from inittab. No smpboot line is ever
+#      emitted on the wire the matcher sees.
+#   2. Even if it were, the count would be wrong: hype's `vcpus` is PHYSICAL
+#      CORES and the guest gets cores x threads_per_core logical CPUs. 2a on
+#      Intel logged "granted 2 whole physical core(s) -> 4 logical CPU(s),
+#      2 thread(s)/core (SMT bonus)". #525's "2 CPUs" came from a QEMU rig
+#      with no SMT bonus.
+#
+# Either way the script would have sat there for the full timeout and looked
+# exactly like the #698 hang it exists to detect. The restart is proven by the
+# second login prompt instead, and the things that line was meant to tell us
+# -- did it come back, with how many CPUs -- are read back explicitly after
+# it, where a surprise is a logged value rather than a silent timeout. Uptime
+# is included because a low value is what distinguishes a genuine restart from
+# a prompt that was never actually replaced.
 timeout 1800000
 fail-if soft lockup
 
 expect localhost login:
 send root\n
 expect ~#
+send echo CPUS-BEFORE-$(nproc)-UP-$(cut -d. -f1 /proc/uptime)\n
+expect CPUS-BEFORE-
 send echo 1 > /sys/kernel/reboot/cpu && echo CPU-PINNED-$(cat /sys/kernel/reboot/cpu)\n
 expect CPU-PINNED-1
 send reboot\n
 
-# The second kernel's own SMP line gates the restart; a guest that comes back
-# 1-vCPU (or never comes back) times out here -- itself evidence for #698.
-expect Brought up 1 node, 2 CPUs
+# The SECOND login prompt is the restart gate. A guest that never comes back
+# times out here -- itself the evidence #698 asks for.
 expect localhost login:
+send root\n
+expect ~#
+send echo CPUS-AFTER-$(nproc)-UP-$(cut -d. -f1 /proc/uptime)\n
+expect CPUS-AFTER-
 pass reboot-pin-nonbsp

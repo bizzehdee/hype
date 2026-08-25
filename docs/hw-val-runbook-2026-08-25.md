@@ -104,9 +104,24 @@ should be there.
 ## Run 2 — Intel laptop (i5-13420H) — the VMX/APICv cluster
 
 Nine tickets share one root cause area (AP-vCPU interrupt/timer delivery
-under VMX) or one physical setup. Reuse the **same already-boot-verified
-2-vCPU (2 physical cores, non-SMT) Alpine disk image** across as many of these
-as possible rather than re-imaging between them.
+under VMX) or one physical setup. Reuse the **same live Alpine ISO** across as
+many of these as possible rather than re-imaging between them.
+
+> **Correction (2026-08-25, after Boot 2a's first attempt).** "2-vCPU non-SMT"
+> is not something a config can ask for. `vcpus` counts PHYSICAL CORES and the
+> guest is given `vcpus x threads_per_core` logical CPUs — the spec calls SMT
+> "a bonus it was never promised", and `isolation_group` allocates whole cores
+> rather than disabling SMT. So `vcpus = 2` on this Intel box produced **4**
+> logical CPUs (log: `granted 2 whole physical core(s) -> 4 logical CPU(s),
+> 2 thread(s)/core (SMT bonus)`, APIC IDs 8/9/16/17 — two sibling pairs).
+>
+> That is still informative for #708 — there IS a genuine second physical
+> core's AP in play — but it is not the clean read the "non-SMT" wording
+> promised: if it hangs, an SMT sibling cannot be ruled out as the confound.
+> To get the clean shape without a build change, either disable HT in the host
+> BIOS for 2a/2b/2c (at the cost of comparability with Run 1's AMD boots), or
+> set `host_cpu_budget` to this CPU's E-cores, which have no SMT, and confirm
+> from the log that logical CPUs == cores granted.
 
 ### Boot 2a: DEFAULT build, fresh boot, no restart — min 20 min [build: default]
 This is **#708's own open question**, asked first because #605 cannot proceed
@@ -123,6 +138,28 @@ whole point of this boot is telling those apart.
 - Boots clean to login -> squarely an APICv-introduced regression, and this
   same clean boot is also the **#637** repro window (Alpine login shell dying
   between motd and first prompt) — check for that right here before moving on.
+
+> **RESULT (2026-08-25): Boot 2a PASSED.** Logs archived at
+> `tools/hw-val-2026-08-25/logs/2a/`.
+> ```
+> fw-1 SCRIPT vm0: PASS pass (8 directive(s), 56523ms)
+>   at line 13: fresh-boot-login
+> ```
+> Guest reached `localhost login:` at t=155s and idled to ~900s with **zero
+> `TIMERSTALL`** lines; `apicv=off` throughout, 2 cores -> 4 logical CPUs.
+> Per this section's own decision tree that is the "boots clean to login"
+> branch: **#708 is an APICv-introduced regression, not a general VMX AP-timer
+> defect** — Boot 2c is now the confirming test, not an open question.
+> **#637 did not reproduce**: motd, prompt and the echoed command all came
+> through intact. The `#94 RTCRATE delivered=0/5s programmed=1024Hz` lines are
+> a non-finding — `regB=0x02` has the PIE bit clear, so the guest never asked
+> for periodic interrupts.
+>
+> Two harness facts this boot settled, both of which would have cost a full
+> 30-minute timeout on 1a/2b (see `input-scripts/reboot-pin.txt`'s header):
+> kernel messages never reach the serial console on this live-ISO shape (the
+> log jumps straight from GRUB to the agetty banner), and `vcpus` is physical
+> cores, so no `Brought up N CPUs` directive can work here on either count.
 
 ### Boot 2b: same image, same build, pin reboot to the non-BSP vCPU — min 20 min [build: default]
 **#525**'s VMX leg (SVM side already proven). Bar: reset served by the AP,
