@@ -252,6 +252,31 @@ Same floor and reasoning as Boot 1b. Three tickets from one boot:
 - **#712** — Intel leg of the REP INSB/OUTSB fix (the same `probe ok` line
   Run 1's AMD boot checks, this time on VMX).
 
+> **RESULT (2026-08-25): Boot 2d — #604 and #712 PASS, #603 one probe short.**
+> Logs at `tools/hw-val-2026-08-25/logs/2d/`.
+>
+> - **#712 PASS** — `probe ok -- register IN/OUT and REP OUTSB/INSB (string
+>   I/O) were all intercepted and serviced`.
+> - **#604 PASS** — `EFER.NXE enabled on the BSP`, `NX applied to every host
+>   page except hype's own image`, and **7** AP smoketests across 3 VMs all
+>   `long-mode=yes ap_vmm_ok=1` (the ticket asked for four).
+> - **#603 — one failure**, everything else green:
+>   ```
+>   MSR round-trip (MTRR var0 base) wrote 0x123456000, read back 0x0
+>   PROBE FAIL -- a modelled MSR did not round-trip
+>   ```
+>   Filed as **#729**. `arch/x86_64/vmx/vmcs_hw.c:1925` already says the
+>   pvclock/MTRR/PAT special-casing is omitted on VMX and that "a full guest OS
+>   on VMX would need those ported too" — deferred work that was never
+>   ticketed. Isolation results from the same boot are all good:
+>   `WATCHDOG vm1: faulted: unhandled-exit storm at one RIP (reason=0x30
+>   rip=0x100055f, 4096 repeats) -- forcing THIS vm off; others keep running`,
+>   the paired healthy VM still reached `MICRO PASS: hello`, and vmexit's
+>   deliberate triple-fault took only itself down. INIT/SIPI, GLADDER-1 absorb
+>   and the seven SVM-instruction #UD probes all passed.
+>
+> **This changes Run 4's machine choice — see that section.**
+
 ### Boot 2e: FreeBSD image, instrumented timer-calibration sampling — min 15 min [build: default, or the extra build if new sampling instrumentation is needed]
 **#577** — a different guest entirely, so its own boot. Per the ticket's own
 next step: sample how many real-world ms elapse per `hype_guest_lapic_advance()`
@@ -315,6 +340,15 @@ lucky sample.
 ---
 
 ## Run 4 — Windows session (either laptop; needs `ahci-sata`, Windows' own `os_hint` default)
+
+> **Run this on the AMD 5950X, not the Intel box (added 2026-08-25).** Boot 2d
+> found that VMX does not model the MTRR MSRs (**#729**): writes drop, reads
+> return 0, while MTRRcap still advertises variable MTRRs. Per #436's own
+> notes, OVMF's MtrrLib is invoked by **Windows winload's SetMemoryAttributes**
+> — so a Windows install on Intel is expected to fail the same way AMD did
+> before #436. Linux and BSD never call MtrrLib, which is why Boot 2a's Alpine
+> guest booted clean on the same build. Until #729 lands, "either laptop" in
+> the heading above does not hold for Windows.
 
 ### Boot 4a: fresh Windows install — min 45 min [build: default]
 `SECS=300 tools/436/run-win.sh` at HEAD — #436 (the upstream install-media
