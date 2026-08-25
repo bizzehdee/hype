@@ -1,0 +1,76 @@
+# #120 boot 1: unattended Alpine install to /dev/vda via setup-alpine's answerfile mode, so the
+# guest disk carries a REAL bootloader (GRUB, per setup-disk's own default for a `sys` mode
+# install) for boot 2 to load with no installer/ISO involved at all.
+#
+# The answerfile is built one short line at a time -- HYPE_INPUT_SCRIPT_MAX_ARG caps a single
+# send's payload at 128 bytes, which one line carrying the whole file blew through (silently:
+# a directive over the cap fails to parse, and per boot/main.c's arming gate, ONE bad directive
+# means the WHOLE script never arms -- nothing typed, nothing seen, no error visible without
+# reading this comment). Every line here stays comfortably under that cap.
+timeout 480000
+fail-if Kernel panic
+expect localhost login:
+send root\n
+expect ~#
+send echo 'KEYMAPOPTS="us us"' > /tmp/answerfile\n
+expect ~#
+send echo 'HOSTNAMEOPTS="-n alpine"' >> /tmp/answerfile\n
+expect ~#
+# #120: hype has no guest-facing DHCP server at all (proxy-ARP + static NAT only, see
+# hype-boot1.cfg's own comment) -- eth0 needs a STATIC address/gateway, and the whole
+# INTERFACESOPTS value is too long for one 128-byte send payload. Split across two: the first
+# leaves the shell mid-quote (a real embedded Enter, same trick the rest of this file uses for
+# the lo/eth0 stanza split), so the busybox ash PS2 continuation prompt ("> ") is what to expect
+# next, not the normal "~#" prompt.
+send echo 'INTERFACESOPTS="auto lo\niface lo inet loopback\n\nauto eth0\niface eth0 inet static\n
+expect >
+send address 192.168.100.2/24\ngateway 192.168.100.1\n"' >> /tmp/answerfile\n
+expect ~#
+send echo 'DNSOPTS="-d localdomain 8.8.8.8"' >> /tmp/answerfile\n
+expect ~#
+send echo 'TIMEZONEOPTS="-z UTC"' >> /tmp/answerfile\n
+expect ~#
+send echo 'PROXYOPTS="none"' >> /tmp/answerfile\n
+expect ~#
+send echo 'APKREPOSOPTS="http://dl-cdn.alpinelinux.org/alpine/v3.21/main"' >> /tmp/answerfile\n
+expect ~#
+send echo 'SSHDOPTS="-c openssh"' >> /tmp/answerfile\n
+expect ~#
+send echo 'NTPOPTS="-c chrony"' >> /tmp/answerfile\n
+expect ~#
+send echo 'DISKOPTS="-m sys /dev/vda"' >> /tmp/answerfile\n
+expect ~#
+send echo 'LBUOPTS="none"' >> /tmp/answerfile\n
+expect ~#
+send echo 'APKCACHEOPTS="none"' >> /tmp/answerfile\n
+expect ~#
+send cat /tmp/answerfile; echo ANSWERFILE-DONE\n
+expect ANSWERFILE-DONE
+send printf 'alpine\nalpine\nno\ny\n' | setup-alpine -f /tmp/answerfile 2>&1 | tee /tmp/install.log; echo SETUP-EXIT-$?\n
+expect SETUP-EXIT-
+send echo INSTALL-MARKER-$(grep -c . /tmp/install.log)\n
+expect INSTALL-MARKER-
+send echo BLK-CHECK-$(blkid /dev/vda* 2>/dev/null | grep -c vda)\n
+expect BLK-CHECK-
+# setup-disk's grub-install registers an NVRAM boot entry, which does NOT survive into boot 2 --
+# each hype VM gets a fresh OVMF_VARS.fd. Guarantee the UEFI-spec fallback path exists too
+# (\EFI\BOOT\BOOTX64.EFI) rather than trust whether Alpine's installer already wrote one; this
+# is what a firmware with no NVRAM boot entries falls back to scanning for.
+#
+# setup-disk just repartitioned /dev/vda from under this still-running live session -- the
+# kernel's own in-memory partition table is stale until told to re-read it (BLKRRPART); mdev -s
+# alone only re-syncs /dev against whatever /sys/block already knows, which is still nothing
+# without this first.
+send blockdev --rereadpt /dev/vda; echo REREADPT-$?\n
+expect REREADPT-
+send mdev -s; echo MDEV-DONE\n
+expect MDEV-DONE
+send mkdir -p /mnt/esp && mount /dev/vda1 /mnt/esp 2>&1; echo MOUNT-$?\n
+expect MOUNT-
+send ls /mnt/esp/EFI/ 2>&1; echo LS-DONE\n
+expect LS-DONE
+send mkdir -p /mnt/esp/EFI/BOOT && cp /mnt/esp/EFI/*/grubx64.efi /mnt/esp/EFI/BOOT/BOOTX64.EFI 2>&1; echo FALLBACK-COPY-$?\n
+expect FALLBACK-COPY-
+send umount /mnt/esp; echo UMOUNT-$?\n
+expect UMOUNT-
+pass alpine-install-120

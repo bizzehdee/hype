@@ -1,0 +1,12 @@
+# #120 boot 2: the disk booted directly (boot = disk, no installer) -- log in and prove it is
+# the SAME installed system (hostname "alpine", set during boot 1's unattended install).
+timeout 300000
+fail-if Kernel panic
+expect alpine login:
+send root\n
+expect Password:
+send alpine\n
+expect ~#
+send echo BOOT2-OK-$(hostname)\n
+expect BOOT2-OK-alpine
+pass disk-boot-120
