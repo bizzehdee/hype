@@ -3503,9 +3503,14 @@ isn't lost.
     layer does not have" to keep in sync, for no benefit over reusing the one that already exists.
 
 70. **#232: the `hype-additions` companion ISO is a SEPARATE disc from the OS installer, per
-    platform family, attached as a second `cdroms` entry (`docs/hype-cfg-spec.md` §5.7 already
-    allows up to ~4 per VM -- no hype-side capability needed, only content) -- decided
-    (2026-08-25).** #228 proved the underlying mechanics (offline package repo, unattended answer
+    platform family, attached as a second `cdroms` entry -- decided (2026-08-25).**
+
+    **Correction (2026-08-26, #727):** this entry originally said `docs/hype-cfg-spec.md`
+    "already allows up to ~4 per VM -- no hype-side capability needed, only content".
+    That was reading the SPEC, not the code. `cdroms =` is parsed, admission-checked and
+    displayed, but nothing ever attaches it to a guest device: a VM with `install_media`
+    plus `cdroms = addons` boots with one optical device, not two. The capability is
+    genuinely missing and is decision 71 below; #232 is blocked on it. #228 proved the underlying mechanics (offline package repo, unattended answer
     file, post-install bootloader/initramfs fixups) but baked all three into a REMASTERED Alpine
     ISO. That does not generalize to #146's mixed-distro case or to BSD/Windows, which is exactly
     the open question #232's own comments left unresolved. Splitting into a stock, unmodified OS
@@ -3589,6 +3594,52 @@ isn't lost.
     this correction; every other family is unbuilt and tracked as follow-up (#725 and likely
     per-family sub-issues once the Alpine pattern is proven enough to generalize from), not
     silently assumed covered by "linux/" or "bsd/" as directory names might imply.
+
+71. **Any number of guest optical drives: one AHCI HBA per drive, all sharing ONE level-triggered
+    GSI, capped by free PCI device numbers rather than by IO-APIC pins -- decided (2026-08-26).**
+    #727 found `cdroms =` documented but never attached. The reason it was never a small fix:
+    `hype_ahci_t` (`devices/ahci.h`) holds ONE port's registers as scalars, not an array --
+    `HYPE_AHCI_PORT_COUNT 6` is only the readable aperture, and the header says port zero is the
+    only active medium. A second disc cannot be a second port on the existing HBA.
+
+    **Chosen: one HBA (one PCI function) per optical drive**, following the precedent #262 set for
+    the ATA disk (`g_fw_1_ata_ahci`) and #329 for extra disk slots (`vm->disk[slot].ata_ahci`).
+    The multi-HBA NPF dispatch that needs already exists and is proven; what is new is a per-VM
+    array of `{hype_ahci_t, hype_atapi_t, hype_iso_stream_t}` and the resolve/attach loop.
+
+    **Interrupts: all optical HBAs share one GSI.** The 24-pin IO-APIC is fully allocated already
+    (16-19 the dev-2 block, 20 virtio-blk/NVMe/virtio-net, 21 the ICH9 SATA function, 22-23 the
+    extra disk slots), which is exactly what caps disks at 3 (`HYPE_FW_1_MAX_DISKS`). Rather than
+    let that cap the disc count too, every optical HBA shares the dev-2 CD line (GSI 16) and the
+    LINE is treated as the OR of its devices -- the same arrangement decision 58's neighbours
+    already use for GSI 20 (`vblk_pending || nvme_pending || vnet_pending`, computed inline in the
+    dispatch loop). #440's warning applies and is the whole reason this must be an OR: hype's
+    per-device deassert would otherwise drop a still-pending interrupt from another HBA on the same
+    pin, which is why #440 moved the SATA function OFF GSI 16 in the first place. The OR must cover
+    the primary ATAPI HBA and every extra optical HBA before any deassert.
+
+    **The cap becomes PCI device numbers, which is why "any number" is honest.** Bus 0 has 32 slots;
+    2/3/4/5/6/7/8/9/31 are spoken for, leaving roughly 20 free. `devices/dsdt.asl` gets `_PRT`
+    entries for that range routed to the shared GSI, added ONCE and unconditionally -- a `_PRT`
+    entry for an absent device is inert, which is the same reasoning the extra-disk and virtio-net
+    entries already record. So no per-config DSDT, and adding drives later needs no ACPI change.
+
+    **Rejected: widening the IO-APIC past 24 pins.** Same reasoning decision 58's neighbour records
+    -- the pin count is a guest-visible property of the chipset hype claims to be, every VM would
+    inherit it, and the blast radius dwarfs one shared line.
+
+    **Rejected: a media-swap on the single existing drive.** Cheaper, and enough for #232's
+    post-install bridge alone, but it cannot serve the case the spec explicitly documents (an
+    installer ISO plus a Windows storage-driver ISO visible *simultaneously* during setup), and
+    building the cheap thing first would leave the documented behaviour still unimplemented.
+
+    **Known coupling to fix in the same change:** the ISO bounce pool is one slot per VM
+    (`bounce_slot = vi`, four sites in `boot/main.c`, pool sized to the VM count by #428). Two
+    streams on one VM would share a buffer and corrupt each other's reads, so the pool resizes to
+    `vm_count * max_optical` with distinct slots. #428's own lesson -- a silently-clamped per-VM
+    index caused a real bug three times in this code -- says compute the slot explicitly and let an
+    out-of-range value fail loudly rather than clamp.
+
 
 ## 11. Pre-M0 readiness checklist
 
