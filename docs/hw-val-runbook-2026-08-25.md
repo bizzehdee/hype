@@ -16,6 +16,28 @@ already. Safety rules (targets by serial only, standing exclusions) as
 | #709 | blocked on a **human decision** (link `fs_battery.c` into the shipped binary, or duplicate its logic firmware-side) — decide first, the run is cheap after |
 | #692 | its own last comment says the ticket is complete — housekeeping only: move to Done, not a run |
 
+## Build changes needed
+
+Checked every fix's own commit against `main` before writing this: **every
+landed fix referenced below (#641, #637, #712, #660, #715, #604's item 1,
+#698's `TIMERSTALL` probe, #577's HPET fix) is already on `main`.** One
+default build covers **12 of the 14 boots** below with configuration-only
+differences (`hype.cfg`, which VM/guest image, which physical device by
+serial). Only two boots are exceptions:
+
+| boot | change | why unavoidable |
+|---|---|---|
+| **2c** | `-DHYPE_ENABLE_APICV=1` at compile time | #599/#605/#708's whole comparison IS "does the same guest behave differently with the flag on vs. off" — a compile-time-gated feature can't be A/B'd from one binary, by construction. This is not a build change to try to minimize away. |
+| **2e** (possible) | new instrumentation for `hype_guest_lapic_advance()` call cadence, if needed | #577's existing diagnostic (RT-2c `KRIPHIST`) was already found "empty during the hang" per the ticket's own Aug 21 comment — the HPET-layer fix (2d2e40f) landed and is confirmed working, but this SECOND, deeper layer (LAPIC calibration itself) still needs real measurement the current build may not produce. **Decide before Run 2**: either confirm an existing diagnostic already gives enough resolution (then this boot is config-only too), or write the sampling instrumentation ahead of time and fold it into the SAME extra build as the APICv flag below — not a third build, and not a rebuild mid-session. |
+
+**Practical shape for tonight: bring exactly two `hype.efi` builds, built once,
+ahead of time** — the default build (used everywhere except 2c), and one
+extra build carrying `-DHYPE_ENABLE_APICV=1` (and #577's sampling
+instrumentation too, if that turns out to be needed, since it can ride the
+same rebuild rather than forcing a separate one). Every other difference
+between boots below is `hype.cfg` alone: `vcpus`, `os_hint`, `disks=`/`cdroms=`
+by serial, and which guest image/ISO is attached.
+
 ---
 
 ## Run 1 — AMD dev machine (5950X, 16 cores) — not the AMD laptop
@@ -30,7 +52,7 @@ incrementally after each boot. Reviewing mid-sequence competes with log
 rotation for the same window and risks losing the earlier boots' evidence
 before it's read.
 
-### Boot 1a: one long-lived 2-vCPU Alpine session, three signals at once — min 30 min
+### Boot 1a: one long-lived 2-vCPU Alpine session, three signals at once — min 30 min [build: default]
 Bring up a genuine 2-vCPU (non-SMT) Alpine guest and, in one continuous
 session: let it idle to gather HLT-rate data, run the REP INSB/OUTSB string-IO
 probe, then pin the reboot to the non-BSP vCPU. 30 min floor because #641's
@@ -52,7 +74,7 @@ own numeric thresholds were originally measured over a 26-minute idle window
   WARN so it survives any `log_level`) is already in the build — just watch
   the log for a `fw-1 TIMERSTALL` line after the reboot completes.
 
-### Boot 1b: `tests/micro/suite-603.cfg` — min 10 min
+### Boot 1b: `tests/micro/suite-603.cfg` — min 10 min [build: default]
 **#603**'s AMD leg needs 4 physical cores (`vmexit`=2, `vmexitstorm`=1,
 `hello`=1) — no longer a blocker on the 5950X (16 cores). Run as originally
 scoped (`SMP=8` or higher, well inside budget), no trimming needed. 10 min
@@ -62,7 +84,7 @@ plus a 150-180s outer buffer, and this suite runs three VMs (`hello`,
 comfortably fits inside 10 min, but budget the full window rather than
 cutting it the moment `hello` passes.
 
-### Boot 1c: exFAT on-medium self-test battery — min 10 min
+### Boot 1c: exFAT on-medium self-test battery — min 10 min [build: default]
 **#653** — `tools/exfat-e2e` (the underlying battery, #692, is already
 complete). Needs both vendors; this is the AMD half. Quick, self-contained —
 tack onto the end of this session rather than scheduling separately. 10 min
@@ -86,7 +108,7 @@ under VMX) or one physical setup. Reuse the **same already-boot-verified
 2-vCPU (2 physical cores, non-SMT) Alpine disk image** across as many of these
 as possible rather than re-imaging between them.
 
-### Boot 2a: DEFAULT build, fresh boot, no restart — min 20 min
+### Boot 2a: DEFAULT build, fresh boot, no restart — min 20 min [build: default]
 This is **#708's own open question**, asked first because #605 cannot proceed
 without the answer: does a genuine 2-vCPU non-SMT Linux guest's AP ever get a
 timer interrupt on the DEFAULT (non-APICv) build, on a fresh boot with no
@@ -102,7 +124,7 @@ whole point of this boot is telling those apart.
   same clean boot is also the **#637** repro window (Alpine login shell dying
   between motd and first prompt) — check for that right here before moving on.
 
-### Boot 2b: same image, same build, pin reboot to the non-BSP vCPU — min 20 min
+### Boot 2b: same image, same build, pin reboot to the non-BSP vCPU — min 20 min [build: default]
 **#525**'s VMX leg (SVM side already proven). Bar: reset served by the AP,
 exactly once, clean restart to login. If 2a hung, this boot cannot proceed
 meaningfully — resolve 2a's finding first. 20 min floor: the SVM leg's own
@@ -110,7 +132,7 @@ bare-metal run took ~12 min end to end (login, pin, reboot, second login);
 budget extra on the VMX leg's first-ever real-hardware attempt rather than
 cutting it at the SVM timing.
 
-### Boot 2c: APICv build (`-DHYPE_ENABLE_APICV=1`), same image, fresh boot — min 20 min
+### Boot 2c: APICv build (`-DHYPE_ENABLE_APICV=1`), same image, fresh boot — min 20 min [build: APICv extra build]
 **#599**'s own bar (2-vCPU login with the flag on) and the direct follow-up to
 **#708**/**#605**. Compare directly against 2a — same 20 min floor and the
 same reasoning: this is exactly the boot #708 already ran once and found
@@ -125,7 +147,7 @@ declaring "fixed" on a guest that was simply still climbing toward the same wall
 - Neither hangs -> #599 bar met; #605 can consider recommending the default
   flip.
 
-### Boot 2d: `tests/micro/suite-603.cfg` (default build, this is Intel's first-ever run of it) — min 10 min
+### Boot 2d: `tests/micro/suite-603.cfg` (default build, this is Intel's first-ever run of it) — min 10 min [build: default]
 Same floor and reasoning as Boot 1b. Three tickets from one boot:
 - **#603** — Intel/VMX leg (this environment has never had VMX at all before now).
 - **#604** — Intel leg of the NX/W^X hardening pass (SMP=8, four AP cores
@@ -133,7 +155,7 @@ Same floor and reasoning as Boot 1b. Three tickets from one boot:
 - **#712** — Intel leg of the REP INSB/OUTSB fix (the same `probe ok` line
   Run 1's AMD boot checks, this time on VMX).
 
-### Boot 2e: FreeBSD image, instrumented timer-calibration sampling — min 15 min
+### Boot 2e: FreeBSD image, instrumented timer-calibration sampling — min 15 min [build: default, or the extra build if new sampling instrumentation is needed]
 **#577** — a different guest entirely, so its own boot. Per the ticket's own
 next step: sample how many real-world ms elapse per `hype_guest_lapic_advance()`
 call while the guest sits in its LAPIC calibration loop at `lapic_et_start`,
@@ -141,14 +163,14 @@ to confirm or refute the rate/cadence theory. 15 min floor: the ticket's own
 title says this guest HANGS at calibration, so the boot needs enough sustained
 samples post-hang to characterize the cadence, not just confirm the hang exists.
 
-### Boot 2f: exFAT self-test battery (Intel half of #653) — min 10 min
+### Boot 2f: exFAT self-test battery (Intel half of #653) — min 10 min [build: default]
 Same as Run 1's tack-on, the other vendor. Quick, tack onto the end of this session.
 
 ---
 
 ## Run 3 — physical storage cluster (either laptop; vendor-agnostic)
 
-### Boot 3a: two serialized USB sticks on one root hub — min 15 min
+### Boot 3a: two serialized USB sticks on one root hub — min 15 min [build: default]
 **#387** + **#388** together, exactly as #387's own comment already scopes
 it: stage the standard stick as the boot medium, insert a second serialized
 stick, set `media_disk = <second's serial>` on a VM, assert the same four log
@@ -158,7 +180,7 @@ floor: `tools/387/run-387.sh`'s own QEMU default is 300s (5 min) for the
 whole scripted install+assert sequence; real USB hardware enumeration and a
 real installer boot both run slower than QEMU's emulated xHCI, so budget 3x.
 
-### Boot 3b: one USB-SATA drive, ALL the partitions at once — min 25 min
+### Boot 3b: one USB-SATA drive, ALL the partitions at once — min 25 min [build: default]
 **#688** + **#689** name the same drive class (a USB-SATA stick) with two
 different data-partition filesystems. Nothing requires them on separate
 sticks or separate boots — partition it once as ESP (FAT32) + an ext4 data
@@ -169,7 +191,7 @@ per-format shape) takes real minutes on a physical USB-SATA bridge; doing
 both formats' passes in one boot means budgeting for both in sequence, not
 just the slower of the two.
 
-### Boot 3c: physical NVMe + physical AHCI, concurrent two-VM write load — min 45 min
+### Boot 3c: physical NVMe + physical AHCI, concurrent two-VM write load — min 45 min [build: default]
 Four tickets, one extended session:
 - **#715** — NVMe vectored-write path, on the actual hwstick this was found
   on (serial `5ME3N005713803V2W`).
@@ -197,7 +219,7 @@ lucky sample.
 
 ## Run 4 — Windows session (either laptop; needs `ahci-sata`, Windows' own `os_hint` default)
 
-### Boot 4a: fresh Windows install — min 45 min
+### Boot 4a: fresh Windows install — min 45 min [build: default]
 `SECS=300 tools/436/run-win.sh` at HEAD — #436 (the upstream install-media
 blocker) is now closed, so this is the cheap first test of whether the path
 is clear at all. 45 min floor: `tools/436`'s own `SECS=240` (4 min) default is
@@ -212,7 +234,7 @@ even starts.
   artifact IS **#695**'s own deliverable (a reusable installed Windows guest
   image), which is the one thing blocking the next boot.
 
-### Boot 4b: tri-OS concurrent run, using the image Boot 4a just produced — min 30 min
+### Boot 4b: tri-OS concurrent run, using the image Boot 4a just produced — min 30 min [build: default]
 Three tickets collapse into this one boot, since #635/#636 both just read off
 the same running session #634 establishes — no extra boot needed for them.
 30 min floor: #635's isolation/pinning proof and #636's dashboard-stats
@@ -246,3 +268,10 @@ and any retry a failed or ambiguous boot needs. The remaining 5 (#232, #399,
 #400, #709, #692) are excluded above with a one-line reason each — none of
 them need a boot tonight, they need a code fix, unbuilt driver work, a human
 decision, or a board-status correction respectively.
+
+**Builds needed tonight: 1, possibly 2 — not 14.** 13 of 14 boots run the
+same default `hype.efi` (current `main`, every referenced fix already
+landed); only Boot 2c's `-DHYPE_ENABLE_APICV=1` comparison genuinely can't be
+done from that same binary. See "Build changes needed" above for the one
+open question (Boot 2e) that could make it 2 extra builds instead of 1 —
+resolve that before Run 2 starts, not mid-session.
