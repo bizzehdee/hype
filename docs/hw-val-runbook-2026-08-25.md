@@ -169,6 +169,30 @@ bare-metal run took ~12 min end to end (login, pin, reboot, second login);
 budget extra on the VMX leg's first-ever real-hardware attempt rather than
 cutting it at the SVM timing.
 
+> **RESULT (2026-08-25): Boot 2b FAILED — a real finding, logged on #525.**
+> Logs at `tools/hw-val-2026-08-25/logs/2b/`. The guest reached Linux's
+> `Requesting system reboot` with `/sys/kernel/reboot/cpu = 1` confirmed
+> (`CPU-PINNED-1`) and wedged there. **`0xCF9` never appears in the log** — the
+> reset register was never written.
+> ```
+> ATAPIOPS vm0: ... cmds=2297   at t=481s, 492s, 497s -- frozen, identical
+> APLOOP vm0: iter=439319 -> 443019, reason=0xc, grip=0xffffffffb2c81c2e (const)
+> ```
+> ATAPI idle rules out Alpine live-mode's modloop teardown blocking on the
+> streamed ISO (the `ERROR: modloop failed to stop` on screen is the cosmetic
+> warning, not the cause). The vCPU is spinning on HLT (VMX exit reason 12) at
+> a fixed kernel RIP, which places the hang in `machine_shutdown()` /
+> `smp_send_stop()`: the reboot work was handed to the AP and the handoff never
+> completed. Same AP interrupt-delivery family as #698, one layer earlier.
+>
+> **The first attempt at this boot reported a false PASS** 124ms after `reboot`
+> was sent, on a guest that had not restarted — hype's screen-scan matcher
+> (#302) satisfying `expect localhost login:` from the previous boot's banner
+> still on screen. Filed as **#728**. `reboot-pin.txt` is now hardened against
+> it (screen cleared before reboot; tmpfs marker armed as a `fail-if` so a
+> stale shell fails loudly rather than passing). Any prior PASS from a
+> restart-class script anywhere in this repo is suspect for the same reason.
+
 ### Boot 2c: APICv build (`-DHYPE_ENABLE_APICV=1`), same image, fresh boot — min 20 min [build: APICv extra build]
 **#599**'s own bar (2-vCPU login with the flag on) and the direct follow-up to
 **#708**/**#605**. Compare directly against 2a — same 20 min floor and the

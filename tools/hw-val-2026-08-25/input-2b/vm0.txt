@@ -4,44 +4,61 @@
 # real hardware -- see docs/hw-val-runbook-2026-08-25.md's own min-run-time
 # reasoning for boots 1a/2b.
 #
-# DO NOT gate the restart on a kernel "Brought up N CPUs" line. Boot 2a's log
-# settles both halves of why that inherited directive could never work here:
+# ---------------------------------------------------------------------------
+# THIS SCRIPT CANNOT TRUST `expect localhost login:` ON ITS OWN. See #728.
 #
-#   1. Kernel messages never reach the serial console on this live-ISO shape.
-#      2a's guest log goes straight from GRUB's "Booting `Linux lts'" to the
-#      agetty banner -- the Alpine ISO's cmdline sends kernel output to tty0,
-#      and the ttyS0/ttyS1 prompts come from inittab. No smpboot line is ever
-#      emitted on the wire the matcher sees.
-#   2. Even if it were, the count would be wrong: hype's `vcpus` is PHYSICAL
-#      CORES and the guest gets cores x threads_per_core logical CPUs. 2a on
-#      Intel logged "granted 2 whole physical core(s) -> 4 logical CPU(s),
-#      2 thread(s)/core (SMT bonus)". #525's "2 CPUs" came from a QEMU rig
-#      with no SMT bonus.
+# hype feeds the whole reconstructed screen to the matcher every ~100ms (#302,
+# boot/main.c ~17545) so GRUB-style painted menus can be matched. The scan
+# pushes every byte of that snapshot through the same ends-with window, which
+# makes any expect a substring search over EVERYTHING CURRENTLY DISPLAYED --
+# including the previous boot's banner. Boot 2b's first attempt PASSED 124ms
+# after `reboot` was sent, matching the first boot's login prompt still on
+# screen, on a guest that never restarted (CPUS-AFTER-4-UP-72, identical
+# uptime, and `root` landing on a live shell: "-sh: root: not found").
 #
-# Either way the script would have sat there for the full timeout and looked
-# exactly like the #698 hang it exists to detect. The restart is proven by the
-# second login prompt instead, and the things that line was meant to tell us
-# -- did it come back, with how many CPUs -- are read back explicitly after
-# it, where a surprise is a logged value rather than a silent timeout. Uptime
-# is included because a low value is what distinguishes a genuine restart from
-# a prompt that was never actually replaced.
+# Two defences below, because a false PASS is worse than any hang:
+#   1. `clear` before rebooting, so the stale banner is not on screen to match.
+#   2. a tmpfs marker that CANNOT survive a restart. If the shell after the
+#      login match is the pre-reboot one, it prints STALE-SHELL, which is armed
+#      as a fail-if -- so the run ends in a fast loud FAIL instead of a PASS.
+#      The markers are written STALE-S''HELL / FRESH-B''OOT so the shell's own
+#      ECHO of the command line does not contain them -- otherwise the fail-if
+#      would trip on the echo before the command ever ran. Same trick as
+#      tools/input-scripts/nvme519-vm0.txt's WROTE-O''K.
+# The uptime readbacks stay as the human-readable confirmation.
+#
+# Also: do NOT gate the restart on a kernel "Brought up N CPUs" line. Boot 2a's
+# log settles both halves of why that inherited directive could never work --
+# kernel messages never reach the serial console on this live-ISO shape (the
+# log jumps straight from GRUB to the agetty banner; Alpine's ISO cmdline
+# sends kernel output to tty0 and the serial prompts come from inittab), and
+# the count would be wrong anyway because `vcpus` is PHYSICAL CORES and the
+# guest gets cores x threads_per_core logical CPUs ("granted 2 whole physical
+# core(s) -> 4 logical CPU(s), 2 thread(s)/core (SMT bonus)"). #525's "2 CPUs"
+# came from a QEMU rig with no SMT bonus.
+# ---------------------------------------------------------------------------
 timeout 1800000
 fail-if soft lockup
+fail-if STALE-SHELL
 
 expect localhost login:
 send root\n
 expect ~#
-send echo CPUS-BEFORE-$(nproc)-UP-$(cut -d. -f1 /proc/uptime)\n
+send touch /tmp/preboot-marker; echo CPUS-BEFORE-$(nproc)-UP-$(cut -d. -f1 /proc/uptime)\n
 expect CPUS-BEFORE-
 send echo 1 > /sys/kernel/reboot/cpu && echo CPU-PINNED-$(cat /sys/kernel/reboot/cpu)\n
 expect CPU-PINNED-1
+send clear\n
 send reboot\n
 
-# The SECOND login prompt is the restart gate. A guest that never comes back
-# times out here -- itself the evidence #698 asks for.
+# The SECOND login prompt is the restart gate, but it is only believed once
+# the marker check below confirms this is not the same shell. A guest that
+# never comes back times out here -- itself the evidence #698 asks for.
 expect localhost login:
 send root\n
 expect ~#
+send test -e /tmp/preboot-marker && echo STALE-S''HELL || echo FRESH-B''OOT\n
+expect FRESH-BOOT
 send echo CPUS-AFTER-$(nproc)-UP-$(cut -d. -f1 /proc/uptime)\n
 expect CPUS-AFTER-
 pass reboot-pin-nonbsp
