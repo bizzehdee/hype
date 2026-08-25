@@ -285,6 +285,29 @@ to confirm or refute the rate/cadence theory. 15 min floor: the ticket's own
 title says this guest HANGS at calibration, so the boot needs enough sustained
 samples post-hang to characterize the cadence, not just confirm the hang exists.
 
+> **RESULT (2026-08-25): Boot 2e — #577 DOES NOT REPRODUCE.** Logs at
+> `tools/hw-val-2026-08-25/logs/2e/`. FreeBSD 15.0 booted the live ISO to
+> multi-user and a root login.
+> ```
+> Event timer "LAPIC" quality 600
+> FreeBSD/SMP: Multiprocessor System Detected: 4 CPUs
+> FreeBSD/SMP: 1 package(s) x 2 core(s) x 2 hardware threads
+> Timecounter "TSC-low" frequency 1305730787 Hz quality 1000
+> ```
+> LAPIC outranks i8254 (100) and RTC (0), so FreeBSD **selected** it —
+> `lapic_et_start` ran and returned. The guest did not dodge onto HPET.
+> Hype-side: **zero `TIMERSTALL`**, and `KRIPHIST` populated with a varied RIP
+> spread where #577's own 2026-08-21 comment recorded it **empty during the
+> hang**.
+>
+> **The "possible extra build" for this boot was never needed** — the sampling
+> instrumentation this section called for has nothing to sample, because there
+> is no calibration loop to catch. The *decide before Run 2* question in the
+> Build changes table resolves to "no second build", after the fact.
+>
+> Recommended: close #577, with the caveat that this is one run and one clean
+> boot does not exclude an intermittent fault.
+
 ### Boot 2f: exFAT self-test battery (Intel half of #653) — min 10 min [build: default]
 Same as Run 1's tack-on, the other vendor. Quick, tack onto the end of this session.
 

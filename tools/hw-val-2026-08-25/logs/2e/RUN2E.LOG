@@ -1,0 +1,988 @@
+[0000063593] ttyS0| BdsDxe: loading Boot0002 "UEFI HYPE VIRTUAL CD-ROM HYPE0000000000000001" from PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)
+[0000063734] ttyS1| BdsDxe: loading Boot0002 "UEFI HYPE VIRTUAL CD-ROM HYPE0000000000000001" from PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)
+[0000063875] ttyS0| BdsDxe: starting Boot0002 "UEFI HYPE VIRTUAL CD-ROM HYPE0000000000000001" from PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)
+[0000064017] ttyS1| BdsDxe: starting Boot0002 "UEFI HYPE VIRTUAL CD-ROM HYPE0000000000000001" from PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)
+[0000064159] ttyS0| Consoles: EFI console  
+[0000064199] ttyS1| Consoles: EFI console  
+[0000064239] ttyS0|     Reading loader env vars from /efi/freebsd/loader.env
+[0000064312] ttyS1|     Reading loader env vars from /efi/freebsd/loader.env
+[0000064385] ttyS0| Setting currdev to cd1:
+[0000064425] ttyS1| Setting currdev to cd1:
+[0000064465] ttyS0| FreeBSD/amd64 EFI loader, Revision 3.0
+[0000064520] ttyS1| FreeBSD/amd64 EFI loader, Revision 3.0
+[0000064575] ttyS0| 
+[0000064592] ttyS1| 
+[0000064609] ttyS0|    Command line arguments: loader.efi
+[0000064663] ttyS1|    Command line arguments: loader.efi
+[0000064717] ttyS0|    Image base: 0x3e6cd000
+[0000064759] ttyS1|    Image base: 0x3e6cd000
+[0000064801] ttyS0|    EFI version: 2.70
+[0000064838] ttyS1|    EFI version: 2.70
+[0000064875] ttyS0|    EFI Firmware: EDK II (rev 1.00)
+[0000064926] ttyS1|    EFI Firmware: EDK II (rev 1.00)
+[0000064977] ttyS0|    Console: efi (0x20001000)
+[0000065022] ttyS1|    Console: efi (0x20001000)
+[0000065067] ttyS0|    Load Path: \EFI\BOOT\BOOTX64.EFI
+[0000065119] ttyS1|    Load Path: \EFI\BOOT\BOOTX64.EFI
+[0000065171] ttyS0|    Load Device: PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)/CDROM(0x1)
+[0000065261] ttyS1|    Load Device: PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)/CDROM(0x1)
+[0000065351] ttyS0|    BootCurrent: 0002
+[0000065388] ttyS1|    BootCurrent: 0002
+[0000065425] ttyS0|    BootOrder: 0000 0001 0002[*] 0003
+[0000065478] ttyS1|    BootOrder: 0000 0001 0002[*] 0003
+[0000065531] ttyS0|    BootInfo Path: PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)
+[0000065612] ttyS1|    BootInfo Path: PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)
+[0000065693] ttyS0| Ignoring Boot0002: Only one DP found
+[0000065746] ttyS1| Ignoring Boot0002: Only one DP found
+[0000065799] ttyS0| Trying ESP: PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)/CDROM(0x1)
+[0000065885] ttyS1| Trying ESP: PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)/CDROM(0x1)
+[0000065971] ttyS0| Setting currdev to cd1:
+[0000066011] ttyS1| Setting currdev to cd1:
+[0000066051] ttyS0| Trying: PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)/CDROM(0x0)
+[0000066133] ttyS1| Trying: PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)/CDROM(0x0)
+[0000066215] ttyS0| Setting currdev to cd0:
+[0000066255] ttyS1| Setting currdev to cd0:
+[0000066610] ttyS0| |/-\|/-\|/-\|/-\|/-\|/-\|/Loading /boot/defaults/loader.conf
+[0000066687] ttyS1| |/-\|/-\|/-\|/-\|/-\|/-\|/Loading /boot/defaults/loader.conf
+[0000066764] ttyS0| -Loading /boot/defaults/loader.conf
+[0000066816] ttyS1| -Loading /boot/defaults/loader.conf
+[0000066868] ttyS0| Loading /boot/device.hints
+[0000066911] ttyS1| Loading /boot/device.hints
+[0000066954] ttyS0| Loading /boot/loader.conf
+[0000066996] ttyS1| Loading /boot/loader.conf
+[0000067038] ttyS0| \Loading /boot/loader.conf.d/iwlwifi-22000.conf
+[0000067102] ttyS1| \Loading /boot/loader.conf.d/iwlwifi-22000.conf
+[0000067166] ttyS0| |Loading /boot/loader.conf.d/iwlwifi-ax210.conf
+[0000067230] ttyS1| |Loading /boot/loader.conf.d/iwlwifi-ax210.conf
+[0000067294] ttyS0| /Loading /boot/loader.conf.d/iwlwifi-bz.conf
+[0000067355] ttyS1| /Loading /boot/loader.conf.d/iwlwifi-bz.conf
+[0000067416] ttyS0| Loading /boot/loader.conf.d/rtw8703b.conf
+[0000067474] ttyS1| Loading /boot/loader.conf.d/rtw8703b.conf
+[0000067532] ttyS0| -Loading /boot/loader.conf.d/rtw8723d.conf
+[0000067591] ttyS1| -Loading /boot/loader.conf.d/rtw8723d.conf
+[0000067650] ttyS0| \Loading /boot/loader.conf.d/rtw8821c.conf
+[0000067709] ttyS1| \Loading /boot/loader.conf.d/rtw8821c.conf
+[0000067768] ttyS0| |Loading /boot/loader.conf.d/rtw8822b.conf
+[0000067827] ttyS1| |Loading /boot/loader.conf.d/rtw8822b.conf
+[0000067886] ttyS0| Loading /boot/loader.conf.d/rtw8822c.conf
+[0000067944] ttyS1| Loading /boot/loader.conf.d/rtw8822c.conf
+[0000068002] ttyS0| /Loading /boot/loader.conf.d/rtw8851b.conf
+[0000068061] ttyS1| /Loading /boot/loader.conf.d/rtw8851b.conf
+[0000068120] ttyS0| -Loading /boot/loader.conf.d/rtw8852a.conf
+[0000068179] ttyS1| -Loading /boot/loader.conf.d/rtw8852a.conf
+[0000068238] ttyS0| \Loading /boot/loader.conf.d/rtw8852b.conf
+[0000068297] ttyS1| \Loading /boot/loader.conf.d/rtw8852b.conf
+[0000068356] ttyS0| Loading /boot/loader.conf.d/rtw8852c.conf
+[0000068414] ttyS1| Loading /boot/loader.conf.d/rtw8852c.conf
+[0000068472] ttyS0| |Loading /boot/loader.conf.d/rtw8922a.conf
+[0000068531] ttyS1| |Loading /boot/loader.conf.d/rtw8922a.conf
+[0000068590] ttyS0| Loading /boot/loader.conf.local
+[0000068638] ttyS1| Loading /boot/loader.conf.local
+[0000068686] ttyS0| /-\|/-\  ```                        ` s` `.....---.......--.```   -/ +o   .--`         /y:`      +.  yo`:.            :o      `+-   y/               -/`   -o/  .-                  ::/sy+:.  /                     `--  / `:                          :` `:   
+[0000068958] ttyS1| /-\|/-\  ```                        ` s` `.....---.......--.```   -/ +o   .--`         /y:`      +.  yo`:.            :o      `+-   y/               -/`   -o/  .-                  ::/sy+:.  /                     `--  / `:                          :` `:   
+[0000069230] ttyS0|                        :`  /                          /  .-                        -.   --                      -.    `:`                  `:`      .--             `--.         .---.....----.| _____              ____ ____  ____     ___           _        
+[0000069502] ttyS1|                        :`  /                          /  .-                        -.   --                      -.    `:`                  `:`      .--             `--.         .---.....----.| _____              ____ ____  ____     ___           _        
+[0000069774] ttyS0| _ _|  ___| __ ___  ___| __ ) ___||  _ \   |_ _|_ __  ___| |_ __ _| | | ___ _ __| |_ | '__/ _ \/ _ \  _ \___ \| | | |   | || '_ \/ __| __/ _` | | |/ _ \ '__||  _|| | |  __/  __/ |_) |__) | |_| |   | || | | \__ \ || (_| | | |  __/ ||_|  |_|  \___|\___|____/
+[0000070046] ttyS1| _ _|  ___| __ ___  ___| __ ) ___||  _ \   |_ _|_ __  ___| |_ __ _| | | ___ _ __| |_ | '__/ _ \/ _ \  _ \___ \| | | |   | || '_ \/ __| __/ _` | | |/ _ \ '__||  _|| | |  __/  __/ |_) |__) | |_| |   | || | | \__ \ || (_| | | |  __/ ||_|  |_|  \___|\___|____/
+[0000070318] ttyS0| ____/|____/   |___|_| |_|___/\__\__,_|_|_|\___|_| Welcome to FreeBSD 1. Boot Installer [Enter]2. Boot Single user3. Escape to loader prompt4. Reboot5. Cons: Dual (Serial primary)Kernel:/6. kernel (1 of 1)Options:7. Boot OptionsAutoboot in 10 seconds. [Spa
+[0000070590] ttyS1| ____/|____/   |___|_| |_|___/\__\__,_|_|_|\___|_| Welcome to FreeBSD 1. Boot Installer [Enter]2. Boot Single user3. Escape to loader prompt4. Reboot5. Cons: Dual (Serial primary)Kernel:/6. kernel (1 of 1)Options:7. Boot OptionsAutoboot in 10 seconds. [Spa
+[0000076467] ttyS0| ce] to pause Autoboot in 9 seconds. [Space] to pause Autoboot in 8 seconds. [Space] to pause Autoboot in 7 seconds. [Space] to pause Autoboot in 6 seconds. [Space] to pause Autoboot in 5 seconds. [Space] to pause Autoboot in 4 seconds. [Space] to pause Au
+[0000076739] ttyS1| ce] to pause Autoboot in 9 seconds. [Space] to pause Autoboot in 8 seconds. [Space] to pause Autoboot in 7 seconds. [Space] to pause Autoboot in 6 seconds. [Space] to pause Autoboot in 5 seconds. [Space] to pause Autoboot in 4 seconds. [Space] to pause Au
+[0000080773] ttyS0| toboot in 3 seconds. [Space] to pause Autoboot in 2 seconds. [Space] to pause Autoboot in 1 seconds. [Space] to pause Autoboot in 0 seconds. [Space] to pause Loading kernel...
+[0000080965] ttyS1| toboot in 3 seconds. [Space] to pause Autoboot in 2 seconds. [Space] to pause Autoboot in 1 seconds. [Space] to pause Autoboot in 0 seconds. [Space] to pause Loading kernel...
+[0000081804] ttyS0| -\|/-\|/-\|/-/boot/kernel/kernel text=0x1865e8 \|/text=0xdbf5d4 -\|/-\|/-\|/-\|/-\|/-\|/-\|/text=0x4474db -\|/-\|/data=0x180+0xe80 data=0x1972e0+0x468d20 -\|0x8+0x1949a0/-\|+0x8+0x1b90eb/-\
+[0000082010] ttyS1| -\|/-\|/-\|/-/boot/kernel/kernel text=0x1865e8 \|/text=0xdbf5d4 -\|/-\|/-\|/-\|/-\|/-\|/-\|/text=0x4474db -\|/-\|/data=0x180+0xe80 data=0x1972e0+0x468d20 -\|0x8+0x1949a0/-\|+0x8+0x1b90eb/-\
+[0000082216] ttyS0| Loading configured modules...
+[0000082262] ttyS1| Loading configured modules...
+[0000082308] ttyS0| |can't find '/boot/entropy'
+[0000082352] ttyS1| |can't find '/boot/entropy'
+[0000082396] ttyS0| /-can't find '/etc/hostid'
+[0000082439] ttyS1| /-can't find '/etc/hostid'
+[0000082482] ttyS0| staging 0x34000000 (not copying) tramp 0x3e152000 PT4 0x3e149000
+[0000082563] ttyS1| staging 0x34000000 (not copying) tramp 0x3e152000 PT4 0x3e149000
+[0000082644] ttyS0| Start @ 0xffffffff80387000 ...
+[0000082691] ttyS1| Start @ 0xffffffff80387000 ...
+[0000082738] ttyS0| \Loading splash ok
+[0000082773] ttyS1| \Loading splash ok
+[0000082808] ttyS0| EFI framebuffer information:
+[0000082853] ttyS1| EFI framebuffer information:
+[0000082898] ttyS0| addr, size     0x3ecb4000, 0x300000
+[0000082950] ttyS1| addr, size     0x3ecb4000, 0x300000
+[0000083002] ttyS0| dimensions     800 x 600
+[0000083043] ttyS1| dimensions     800 x 600
+[0000083084] ttyS0| stride         800
+[0000083119] ttyS1| stride         800
+[0000083154] ttyS0| masks          0x00ff0000, 0x0000ff00, 0x000000ff, 0xff000000
+[0000083232] ttyS1| masks          0x00ff0000, 0x0000ff00, 0x000000ff, 0xff000000
+[0000092943] ttyS0| ---<<BOOT>>---
+[0000094688] ttyS0| Copyright (c) 1992-2025 The FreeBSD Project.
+[0000095093] ttyS0| Copyright (c) 1979, 1980, 1983, 1986, 1988, 1989, 1991, 1992, 1993, 1994
+[0000095703] ttyS0|  The Regents of the University of California. All rights reserved.
+[0000095786] ttyS0| FreeBSD is a registered trademark of The FreeBSD Foundation.
+[0000095863] ttyS0| FreeBSD 15.0-RELEASE releng/15.0-n280995-7aedc8de6446 GENERIC amd64
+[0000095947] ttyS0| FreeBSD clang version 19.1.7 (https://github.com/llvm/llvm-project.git llvmorg-19.1.7-0-gcd708029e0b2)
+[0000096066] ttyS0| VT(efifb): resolution 800x600
+[0000096112] ttyS0| CPU: 13th Gen Intel(R) Core(TM) i5-13420H (2645.34-MHz K8-class CPU)
+[0000096197] ttyS0|   Origin="GenuineIntel"  Id=0xb06a2  Family=0x6  Model=0xba  Stepping=2
+[0000096631] ttyS0|   Features=0xbfe3fbff<FPU,VME,DE,PSE,TSC,MSR,PAE,MCE,CX8,APIC,SEP,MTRR,PGE,MCA,CMOV,PAT,PSE36,DTS,ACPI,MMX,FXSR,SSE,SSE2,SS,HTT,TM,PBE>
+[0000096783] ttyS0|   Features2=0xfedafbd7<SSE3,PCLMULQDQ,DTES64,DS_CPL,SMX,EST,TM2,SSSE3,SDBG,FMA,CX16,xTPR,PDCM,PCID,SSE4.1,SSE4.2,MOVBE,POPCNT,AESNI,XSAVE,OSXSAVE,AVX,F16C,RDRAND,HV>
+[0000096965] ttyS0|   AMD Features=0x2c100800<SYSCALL,NX,Page1GB,RDTSCP,LM>
+[0000097037] ttyS0|   AMD Features2=0x121<LAHF,ABM,Prefetch>
+[0000097094] ttyS0|   Structured Extended Features=0x239c27eb<FSGSBASE,TSCADJ,BMI1,AVX2,FDPEXC,SMEP,BMI2,ERMS,INVPCID,NFPUSG,RDSEED,ADX,SMAP,CLFLUSHOPT,CLWB,PROCTRACE,SHA>
+[0000097262] ttyS0|   Structured Extended Features2=0x9840078c<UMIP,PKU,GFNI,VAES,VPCLMULQDQ,RDPID,MOVDIRI,MOVDIR64B>
+[0000097376] ttyS0|   Structured Extended Features3=0x8c18c410<FSRM,MD_CLEAR,IBT,IBPB,STIBP,SSBD>
+[0000097470] ttyS0|   XSAVE Features=0x7<XSAVEOPT,XSAVEC,XINUSE>
+[0000097531] ttyS0|   TSC: P-state invariant
+[0000097572] ttyS0| Hypervisor: Origin = "KVMKVMKVM"
+[0000097621] ttyS0| real memory  = 1073741824 (1024 MB)
+[0000097673] ttyS0| avail memory = 996466688 (950 MB)
+[0000097723] ttyS0| Event timer "LAPIC" quality 600
+[0000098708] ttyS0| ACPI APIC Table: <HYPE   HYPEMADT>
+[0000099956] ttyS0| FreeBSD/SMP: Multiprocessor System Detected: 4 CPUs
+[0000100024] ttyS0| FreeBSD/SMP: 1 package(s) x 2 core(s) x 2 hardware threads
+[0000100348] ttyS0| random: registering fast source Intel Secure Key Seed
+[0000100418] ttyS0| random: fast provider: "Intel Secure Key Seed"
+[0000100481] ttyS0| random: unblocking device.
+[0000100524] ttyS0| MADT: Forcing active-low polarity and level trigger for SCI
+[0000100600] ttyS0| ioapic0 <Version 1.1> irqs 0-23
+[0000102340] ttyS0| Launching APs: 1 3 2
+[0000115332] screen|   _____              ____ ____  ____     ___           _        _ _
+[0000115417] screen|  |  ___| __ ___  ___| __ ) ___||  _ \   |_ _|_ __  ___| |_ __ _| | | ___ _ __
+[0000115512] screen|  | |_ | '__/ _ \/ _ \  _ \___ \| | | |   | || '_ \/ __| __/ _` | | |/ _ \ '__|
+[0000115608] screen|  |  _|| | |  __/  __/ |_) |__) | |_| |   | || | | \__ \ || (_| | | |  __/ |
+[0000115701] screen|  |_|  |_|  \___|\___|____/____/|____/   |___|_| |_|___/\__\__,_|_|_|\___|_|
+[0000115794] screen|            Welcome to FreeBSD                 ```                        `
+[0000115886] screen|                                              s` `.....---.......--.```   -/
+[0000115979] screen|     1. Boot Installer [Enter]                +o   .--`         /y:`      +.
+[0000116072] screen|     2. Boot Single user                       yo`:.            :o      `+-
+[0000116164] screen|     3. Escape to loader prompt                 y/               -/`   -o/
+[0000116255] screen|     4. Reboot                                 .-                  ::/sy+:.
+[0000116347] screen|     5. Cons: Dual (Serial primary)            /                     `--  /
+[0000116439] screen|                                              `:                          :`
+[0000116532] screen|     Kernel:                                  `:                          :`
+[0000116625] screen|     6. kernel (1 of 1)                        /                          /
+[0000116717] screen|                                               .-                        -.
+[0000116809] screen|     Options:                                   --                      -.
+[0000116900] screen|     7. Boot Options                             `:`                  `:`
+[0000116990] screen|                                                   .--             `--.
+[0000117078] screen|                                                      .---.....----.|
+[0000117164] screen|    Autoboot in 0 seconds. [Space] to pause
+[0000117224] screen| Loading kernel...
+[0000117259] screen| /boot/kernel/kernel text=0x1865e8 text=0xdbf5d4 text=0x4474db data=0x180+0xe80 data=0x1972e0+0x468d20 0x8+0x1949a0+0x8+0x1b90eb\
+[0000117405] screen| Loading configured modules...
+[0000117452] screen| can't find '/boot/entropy'
+[0000117496] screen| can't find '/etc/hostid'
+[0000117538] screen| staging 0x34000000 (not copying) tramp 0x3e152000 PT4 0x3e149000
+[0000117620] screen| Start @ 0xffffffff80387000 ...
+[0000117668] screen| Loading splash ok
+[0000117703] screen| EFI framebuffer information:
+[0000117749] screen| addr, size     0x3ecb4000, 0x300000
+[0000117802] screen| dimensions     800 x 600
+[0000117844] screen| stride         800
+[0000117880] screen| masks          0x00ff0000, 0x0000ff00, 0x000000ff, 0xff000000
+[0000117959] screen| ---<<BOOT>>---
+[0000117991] screen| Copyright (c) 1992-2025 The FreeBSD Project.
+[0000118053] screen| Copyright (c) 1979, 1980, 1983, 1986, 1988, 1989, 1991, 1992, 1993, 1994
+[0000118143] screen|         The Regents of the University of California. All rights reserved.
+[0000118234] screen| FreeBSD is a registered trademark of The FreeBSD Foundation.
+[0000118312] screen| FreeBSD 15.0-RELEASE releng/15.0-n280995-7aedc8de6446 GENERIC amd64
+[0000118397] screen| FreeBSD clang version 19.1.7 (https://github.com/llvm/llvm-project.git llvmorg-19.1.7-0-gcd708029e0b2)
+[0000118517] screen| VT(efifb): resolution 800x600
+[0000118564] screen| CPU: 13th Gen Intel(R) Core(TM) i5-13420H (2645.34-MHz K8-class CPU)
+[0000118650] screen|   Origin="GenuineIntel"  Id=0xb06a2  Family=0x6  Model=0xba  Stepping=2
+[0000118739] screen|   Features=0xbfe3fbff<FPU,VME,DE,PSE,TSC,MSR,PAE,MCE,CX8,APIC,SEP,MTRR,PGE,MCA,CMOV,PAT,PSE36,DTS,ACPI,MMX,FXSR,SSE,SSE2,SS,HTT,TM,PBE>
+[0000118892] screen|   Features2=0xfedafbd7<SSE3,PCLMULQDQ,DTES64,DS_CPL,SMX,EST,TM2,SSSE3,SDBG,FMA,CX16,xTPR,PDCM,PCID,SSE4.1,SSE4.2,MOVBE,POPCNT,AESNI,XSAVE,OSXSAVE,AVX,F16C,RDRAND,HV>
+[0000119075] screen|   AMD Features=0x2c100800<SYSCALL,NX,Page1GB,RDTSCP,LM>
+[0000119148] screen|   AMD Features2=0x121<LAHF,ABM,Prefetch>
+[0000119206] screen|   Structured Extended Features=0x239c27eb<FSGSBASE,TSCADJ,BMI1,AVX2,FDPEXC,SMEP,BMI2,ERMS,INVPCID,NFPUSG,RDSEED,ADX,SMAP,CLFLUSHOPT,CLWB,PROCTRACE,SHA>
+[0000119375] screen|   Structured Extended Features2=0x9840078c<UMIP,PKU,GFNI,VAES,VPCLMULQDQ,RDPID,MOVDIRI,MOVDIR64B>
+[0000119490] screen|   Structured Extended Features3=0x8c18c410<FSRM,MD_CLEAR,IBT,IBPB,STIBP,SSBD>
+[0000119585] screen|   XSAVE Features=0x7<XSAVEOPT,XSAVEC,XINUSE>
+[0000119647] screen|   TSC: P-state invariant
+[0000119689] screen| Hypervisor: Origin = "KVMKVMKVM"
+[0000119739] screen| real memory  = 1073741824 (1024 MB)
+[0000119792] screen| avail memory = 996466688 (950 MB)
+[0000119843] screen| Event timer "LAPIC" quality 600
+[0000119892] screen| ACPI APIC Table: <HYPE   HYPEMADT>
+[0000119944] screen| FreeBSD/SMP: Multiprocessor System Detected: 4 CPUs
+[0000120013] screen| FreeBSD/SMP: 1 package(s) x 2 core(s) x 2 hardware threads
+[0000120089] screen| random: registering fast source Intel Secure Key Seed
+[0000120160] screen| random: fast provider: "Intel Secure Key Seed"
+[0000120224] screen| random: unblocking device.
+[0000120268] screen| MADT: Forcing active-low polarity and level trigger for SCI
+[0000120345] screen| ioapic0 <Version 1.1> irqs 0-23
+[0000120394] screen| Launching APs: 1 3 2
+[0000127289] ttyS0| random: entropy device external interface
+[0000127347] ttyS0| kbd1 at kbdmux0
+[0000127541] ttyS0| efirtc0: <EFI Realtime Clock>
+[0000127587] ttyS0| efirtc0: registered as a time-of-day clock, resolution 1.000000s
+[0000127668] ttyS0| kvmclock0: <KVM paravirtual clock>
+[0000128065] ttyS0| Timecounter "kvmclock" frequency 1000000000 Hz quality 975
+[0000128140] ttyS0| kvmclock0: registered as a time-of-day clock, resolution 0.000001s
+[0000128223] ttyS0| smbios0: <System Management BIOS> at iomem 0x3f938000-0x3f938017
+[0000128459] ttyS0| smbios0: Entry point: v3 (64-bit), Version: 3.0
+[0000128523] ttyS0| aesni0: <AES-CBC,AES-CCM,AES-GCM,AES-ICM,AES-XTS,SHA1,SHA256>
+[0000128601] ttyS0| acpi0: <HYPE HYPEFADT>
+[0000128861] ttyS0| hpet0: <High Precision Event Timer> iomem 0xfed00000-0xfed003ff on acpi0
+[0000128950] ttyS0| Timecounter "HPET" frequency 10000000 Hz quality 950
+[0000129019] ttyS0| atrtc0: <AT realtime clock> port 0x70-0x71 irq 8 on acpi0
+[0000129202] ttyS0| atrtc0: registered as a time-of-day clock, resolution 1.000000s
+[0000129282] ttyS0| Event timer "RTC" frequency 32768 Hz quality 0
+[0000129345] ttyS0| Timecounter "ACPI-fast" frequency 3579545 Hz quality 900
+[0000129418] ttyS0| acpi_timer0: <24-bit timer at 3.579545MHz> port 0x608-0x60b on acpi0
+[0000129503] ttyS0| cpu0: <ACPI CPU> on acpi0
+[0000129545] ttyS0| pcib0: <ACPI Host-PCI bridge> on acpi0
+[0000129600] ttyS0| pci0: <ACPI PCI bus> on pcib0
+[0000129646] ttyS0| ahci0: <AHCI SATA controller> mem 0x80004000-0x80004fff irq 16 at device 2.0 on pci0
+[0000129747] ttyS0| ahci0: Failed to allocate MSI/MSI-x, falling back to INTx
+[0000129821] ttyS0| ahci0: AHCI v1.31 with 6 ?Gbps ports, Port Multiplier not supported
+[0000129905] ttyS0| ahcich0: <AHCI channel> at channel 0 on ahci0
+[0000129967] ttyS0| ahcich1: <AHCI channel> at channel 1 on ahci0
+[0000130029] ttyS0| ahcich2: <AHCI channel> at channel 2 on ahci0
+[0000130210] ttyS0| ahcich3: <AHCI channel> at channel 3 on ahci0
+[0000130389] ttyS0| ahcich4: <AHCI channel> at channel 4 on ahci0
+[0000130561] ttyS0| ahcich5: <AHCI channel> at channel 5 on ahci0
+[0000130623] ttyS0| virtio_pci0: <VirtIO PCI (modern) Block adapter> mem 0x80000000-0x80003fff irq 20 at device 3.0 on pci0
+[0000130743] ttyS0| vtblk0: <VirtIO Block Adapter> on virtio_pci0
+[0000130858] ttyS0| vtblk0: 64MB (131072 512 byte sectors)
+[0000131337] ttyS0| isab0: <PCI-ISA bridge> at device 31.0 on pci0
+[0000131400] ttyS0| isa0: <ISA bus> on isab0
+[0000131441] ttyS0| uart0: <8250 or 16450 or compatible> port 0x3f8-0x3ff irq 4 flags 0x10 on acpi0
+[0000131537] ttyS0| uart0: console (115200,n,8,1)
+[0000131583] ttyS0| uart1: <8250 or 16450 or compatible> port 0x2f8-0x2ff irq 3 on acpi0
+[0000131721] ttyS0| atkbdc0: <Keyboard controller (i8042)> port 0x60,0x64 irq 1 on acpi0
+[0000131806] ttyS0| atkbd0: <AT Keyboard> irq 1 on atkbdc0
+[0000131914] ttyS0| kbd0 at atkbd0
+[0000131945] ttyS0| atkbd0: [GIANT-LOCKED]
+[0000138227] ttyS0| psm0: <PS/2 Mouse> irq 12 on atkbdc0
+[0000138585] ttyS0| psm0: [GIANT-LOCKED]
+[0000138622] ttyS0| WARNING: Device "psm" is Giant locked and may be deleted before FreeBSD 16.0.
+[0000138716] ttyS0| psm0: model Generic PS/2 mouse, device ID 0
+[0000138962] ttyS0| vga0: <Generic ISA VGA> at port 0x3b0-0x3bb iomem 0xb0000-0xb7fff pnpid PNP0900 on isa0
+[0000139066] ttyS0| attimer0: <AT timer> at port 0x40 on isa0
+[0000139124] ttyS0| Timecounter "i8254" frequency 1193182 Hz quality 0
+[0000139265] ttyS0| Event timer "i8254" frequency 1193182 Hz quality 100
+[0000139334] ttyS0| attimer0: non-PNP ISA device will be removed from GENERIC in FreeBSD 16.
+[0000139423] ttyS0| est0: failed to enable SpeedStep
+[0000139472] ttyS0| Timecounter "TSC-low" frequency 1305730787 Hz quality 1000
+[0000139547] ttyS0| Timecounters tick every 10.000 msec
+[0000139599] ttyS0| usb_needs_explore_all: no devclass
+[0000139650] ttyS0| Trying to mount root from cd9660:/dev/iso9660/15_0_RELEASE_AMD64_CD [ro]...
+[0000139742] ttyS0| cd0 at ahcich0 bus 0 scbus0 target 0 lun 0
+[0000139801] ttyS0| cd0: <HYPE VIRTUAL CD-ROM 1.0> Removable CD-ROM SCSI device
+[0000139877] ttyS0| cd0: Serial Number HYPE0000000000000001
+[0000139933] ttyS0| cd0: 300.000MB/s transfers (SATA 2.x, UDMA5, ATAPI 12bytes, PIO 8192bytes)
+[0000140024] ttyS0| cd0: 1296MB (664014 2048 byte sectors)
+[0000145077] ttyS0| Dual Console: Serial Primary, Video Secondary
+[0000168094] screen|   _____              ____ ____  ____     ___           _        _ _
+[0000168179] screen|  |  ___| __ ___  ___| __ ) ___||  _ \   |_ _|_ __  ___| |_ __ _| | | ___ _ __
+[0000168274] screen|  | |_ | '__/ _ \/ _ \  _ \___ \| | | |   | || '_ \/ __| __/ _` | | |/ _ \ '__|
+[0000168370] screen|  |  _|| | |  __/  __/ |_) |__) | |_| |   | || | | \__ \ || (_| | | |  __/ |
+[0000168463] screen|  |_|  |_|  \___|\___|____/____/|____/   |___|_| |_|___/\__\__,_|_|_|\___|_|
+[0000168556] screen|            Welcome to FreeBSD                 ```                        `
+[0000168648] screen|                                              s` `.....---.......--.```   -/
+[0000168741] screen|     1. Boot Installer [Enter]                +o   .--`         /y:`      +.
+[0000168834] screen|     2. Boot Single user                       yo`:.            :o      `+-
+[0000168926] screen|     3. Escape to loader prompt                 y/               -/`   -o/
+[0000169017] screen|     4. Reboot                                 .-                  ::/sy+:.
+[0000169109] screen|     5. Cons: Dual (Serial primary)            /                     `--  /
+[0000169201] screen|                                              `:                          :`
+[0000169294] screen|     Kernel:                                  `:                          :`
+[0000169387] screen|     6. kernel (1 of 1)                        /                          /
+[0000169479] screen|                                               .-                        -.
+[0000169571] screen|     Options:                                   --                      -.
+[0000169662] screen|     7. Boot Options                             `:`                  `:`
+[0000169752] screen|                                                   .--             `--.
+[0000169840] screen|                                                      .---.....----.|
+[0000169926] screen|    Autoboot in 0 seconds. [Space] to pause
+[0000169986] screen| Loading kernel...
+[0000170021] screen| /boot/kernel/kernel text=0x1865e8 text=0xdbf5d4 text=0x4474db data=0x180+0xe80 data=0x1972e0+0x468d20 0x8+0x1949a0+0x8+0x1b90eb\
+[0000170167] screen| Loading configured modules...
+[0000170214] screen| can't find '/boot/entropy'
+[0000170258] screen| can't find '/etc/hostid'
+[0000170300] screen| staging 0x34000000 (not copying) tramp 0x3e152000 PT4 0x3e149000
+[0000170382] screen| Start @ 0xffffffff80387000 ...
+[0000170430] screen| Loading splash ok
+[0000170465] screen| EFI framebuffer information:
+[0000170511] screen| addr, size     0x3ecb4000, 0x300000
+[0000170564] screen| dimensions     800 x 600
+[0000170606] screen| stride         800
+[0000170642] screen| masks          0x00ff0000, 0x0000ff00, 0x000000ff, 0xff000000
+[0000170721] screen| ---<<BOOT>>---
+[0000170753] screen| Copyright (c) 1992-2025 The FreeBSD Project.
+[0000170815] screen| Copyright (c) 1979, 1980, 1983, 1986, 1988, 1989, 1991, 1992, 1993, 1994
+[0000170905] screen|         The Regents of the University of California. All rights reserved.
+[0000170996] screen| FreeBSD is a registered trademark of The FreeBSD Foundation.
+[0000171074] screen| FreeBSD 15.0-RELEASE releng/15.0-n280995-7aedc8de6446 GENERIC amd64
+[0000171159] screen| FreeBSD clang version 19.1.7 (https://github.com/llvm/llvm-project.git llvmorg-19.1.7-0-gcd708029e0b2)
+[0000171279] screen| VT(efifb): resolution 800x600
+[0000171326] screen| CPU: 13th Gen Intel(R) Core(TM) i5-13420H (2645.34-MHz K8-class CPU)
+[0000171412] screen|   Origin="GenuineIntel"  Id=0xb06a2  Family=0x6  Model=0xba  Stepping=2
+[0000171501] screen|   Features=0xbfe3fbff<FPU,VME,DE,PSE,TSC,MSR,PAE,MCE,CX8,APIC,SEP,MTRR,PGE,MCA,CMOV,PAT,PSE36,DTS,ACPI,MMX,FXSR,SSE,SSE2,SS,HTT,TM,PBE>
+[0000171654] screen|   Features2=0xfedafbd7<SSE3,PCLMULQDQ,DTES64,DS_CPL,SMX,EST,TM2,SSSE3,SDBG,FMA,CX16,xTPR,PDCM,PCID,SSE4.1,SSE4.2,MOVBE,POPCNT,AESNI,XSAVE,OSXSAVE,AVX,F16C,RDRAND,HV>
+[0000171837] screen|   AMD Features=0x2c100800<SYSCALL,NX,Page1GB,RDTSCP,LM>
+[0000171910] screen|   AMD Features2=0x121<LAHF,ABM,Prefetch>
+[0000171968] screen|   Structured Extended Features=0x239c27eb<FSGSBASE,TSCADJ,BMI1,AVX2,FDPEXC,SMEP,BMI2,ERMS,INVPCID,NFPUSG,RDSEED,ADX,SMAP,CLFLUSHOPT,CLWB,PROCTRACE,SHA>
+[0000172137] screen|   Structured Extended Features2=0x9840078c<UMIP,PKU,GFNI,VAES,VPCLMULQDQ,RDPID,MOVDIRI,MOVDIR64B>
+[0000172252] screen|   Structured Extended Features3=0x8c18c410<FSRM,MD_CLEAR,IBT,IBPB,STIBP,SSBD>
+[0000172347] screen|   XSAVE Features=0x7<XSAVEOPT,XSAVEC,XINUSE>
+[0000172409] screen|   TSC: P-state invariant
+[0000172451] screen| Hypervisor: Origin = "KVMKVMKVM"
+[0000172501] screen| real memory  = 1073741824 (1024 MB)
+[0000172554] screen| avail memory = 996466688 (950 MB)
+[0000172605] screen| Event timer "LAPIC" quality 600
+[0000172654] screen| ACPI APIC Table: <HYPE   HYPEMADT>
+[0000172706] screen| FreeBSD/SMP: Multiprocessor System Detected: 4 CPUs
+[0000172775] screen| FreeBSD/SMP: 1 package(s) x 2 core(s) x 2 hardware threads
+[0000172851] screen| random: registering fast source Intel Secure Key Seed
+[0000172922] screen| random: fast provider: "Intel Secure Key Seed"
+[0000172986] screen| random: unblocking device.
+[0000173030] screen| MADT: Forcing active-low polarity and level trigger for SCI
+[0000173107] screen| ioapic0 <Version 1.1> irqs 0-23
+[0000173156] screen| Launching APs: 1 3 2
+[0000173194] screen| random: entropy device external interface
+[0000173253] screen| kbd1 at kbdmux0
+[0000173286] screen| efirtc0: <EFI Realtime Clock>
+[0000173333] screen| efirtc0: registered as a time-of-day clock, resolution 1.000000s
+[0000173415] screen| kvmclock0: <KVM paravirtual clock>
+[0000173467] screen| Timecounter "kvmclock" frequency 1000000000 Hz quality 975
+[0000173543] screen| kvmclock0: registered as a time-of-day clock, resolution 0.000001s
+[0000173627] screen| smbios0: <System Management BIOS> at iomem 0x3f938000-0x3f938017
+[0000173709] screen| smbios0: Entry point: v3 (64-bit), Version: 3.0
+[0000173774] screen| aesni0: <AES-CBC,AES-CCM,AES-GCM,AES-ICM,AES-XTS,SHA1,SHA256>
+[0000173853] screen| acpi0: <HYPE HYPEFADT>
+[0000173893] screen| hpet0: <High Precision Event Timer> iomem 0xfed00000-0xfed003ff on acpi0
+[0000173983] screen| Timecounter "HPET" frequency 10000000 Hz quality 950
+[0000174053] screen| atrtc0: <AT realtime clock> port 0x70-0x71 irq 8 on acpi0
+[0000174128] screen| atrtc0: registered as a time-of-day clock, resolution 1.000000s
+[0000174209] screen| Event timer "RTC" frequency 32768 Hz quality 0
+[0000174273] screen| Timecounter "ACPI-fast" frequency 3579545 Hz quality 900
+[0000174347] screen| acpi_timer0: <24-bit timer at 3.579545MHz> port 0x608-0x60b on acpi0
+[0000174433] screen| cpu0: <ACPI CPU> on acpi0
+[0000174476] screen| pcib0: <ACPI Host-PCI bridge> on acpi0
+[0000174532] screen| pci0: <ACPI PCI bus> on pcib0
+[0000174579] screen| ahci0: <AHCI SATA controller> mem 0x80004000-0x80004fff irq 16 at device 2.0 on pci0
+[0000174681] screen| ahci0: Failed to allocate MSI/MSI-x, falling back to INTx
+[0000174756] screen| ahci0: AHCI v1.31 with 6 ?Gbps ports, Port Multiplier not supported
+[0000174841] screen| ahcich0: <AHCI channel> at channel 0 on ahci0
+[0000174904] screen| ahcich1: <AHCI channel> at channel 1 on ahci0
+[0000174967] screen| ahcich2: <AHCI channel> at channel 2 on ahci0
+[0000175030] screen| ahcich3: <AHCI channel> at channel 3 on ahci0
+[0000175093] screen| ahcich4: <AHCI channel> at channel 4 on ahci0
+[0000175156] screen| ahcich5: <AHCI channel> at channel 5 on ahci0
+[0000175219] screen| virtio_pci0: <VirtIO PCI (modern) Block adapter> mem 0x80000000-0x80003fff irq 20 at device 3.0 on pci0
+[0000175340] screen| vtblk0: <VirtIO Block Adapter> on virtio_pci0
+[0000175403] screen| vtblk0: 64MB (131072 512 byte sectors)
+[0000175459] screen| isab0: <PCI-ISA bridge> at device 31.0 on pci0
+[0000175523] screen| isa0: <ISA bus> on isab0
+[0000175565] screen| uart0: <8250 or 16450 or compatible> port 0x3f8-0x3ff irq 4 flags 0x10 on acpi0
+[0000175662] screen| uart0: console (115200,n,8,1)
+[0000175709] screen| uart1: <8250 or 16450 or compatible> port 0x2f8-0x2ff irq 3 on acpi0
+[0000175795] screen| atkbdc0: <Keyboard controller (i8042)> port 0x60,0x64 irq 1 on acpi0
+[0000175881] screen| atkbd0: <AT Keyboard> irq 1 on atkbdc0
+[0000175937] screen| kbd0 at atkbd0
+[0000175969] screen| atkbd0: [GIANT-LOCKED]
+[0000176009] screen| psm0: <PS/2 Mouse> irq 12 on atkbdc0
+[0000176063] screen| psm0: [GIANT-LOCKED]
+[0000176101] screen| WARNING: Device "psm" is Giant locked and may be deleted before FreeBSD 16.0.
+[0000176196] screen| psm0: model Generic PS/2 mouse, device ID 0
+[0000176257] screen| vga0: <Generic ISA VGA> at port 0x3b0-0x3bb iomem 0xb0000-0xb7fff pnpid PNP0900 on isa0
+[0000176362] screen| attimer0: <AT timer> at port 0x40 on isa0
+[0000176421] screen| Timecounter "i8254" frequency 1193182 Hz quality 0
+[0000176489] screen| Event timer "i8254" frequency 1193182 Hz quality 100
+[0000176559] screen| attimer0: non-PNP ISA device will be removed from GENERIC in FreeBSD 16.
+[0000176649] screen| est0: failed to enable SpeedStep
+[0000176699] screen| Timecounter "TSC-low" frequency 1305730787 Hz quality 1000
+[0000176775] screen| Timecounters tick every 10.000 msec
+[0000176828] screen| usb_needs_explore_all: no devclass
+[0000176880] screen| Trying to mount root from cd9660:/dev/iso9660/15_0_RELEASE_AMD64_CD [ro]...
+[0000176973] screen| cd0 at ahcich0 bus 0 scbus0 target 0 lun 0
+[0000177033] screen| cd0: <HYPE VIRTUAL CD-ROM 1.0> Removable CD-ROM SCSI device
+[0000177110] screen| cd0: Serial Number HYPE0000000000000001
+[0000177167] screen| cd0: 300.000MB/s transfers (SATA 2.x, UDMA5, ATAPI 12bytes, PIO 8192bytes)
+[0000177259] screen| cd0: 1296MB (664014 2048 byte sectors)
+[0000177315] screen| Dual Console: Serial Primary, Video Secondary
+[0000197999] ttyS0| Starting file system checks:
+[0000202722] ttyS0| Mounting local filesystems:.
+[0000207899] ttyS0| mkdir: /tmp/.diskless.fbc401e4d94fb846548fa5a5a4b93ebbe6d462af13fdfa355b17ab843a9566a2: Read-only file system
+[0000219439] ttyS0| ELF ldconfig path: /lib /usr/lib /usr/lib/compat /usr/local/lib /usr/local/lib/compat/pkg /usr/local/lib/compat/pkg
+[0000219571] screen|  |  ___| __ ___  ___| __ ) ___||  _ \   |_ _|_ __  ___| |_ __ _| | | ___ _ __
+[0000219666] screen|  | |_ | '__/ _ \/ _ \  _ \___ \| | | |   | || '_ \/ __| __/ _` | | |/ _ \ '__|
+[0000219762] screen|  |  _|| | |  __/  __/ |_) |__) | |_| |   | || | | \__ \ || (_| | | |  __/ |
+[0000219855] screen|  |_|  |_|  \___|\___|____/____/|____/   |___|_| |_|___/\__\__,_|_|_|\___|_|
+[0000219948] screen|            Welcome to FreeBSD                 ```                        `
+[0000220040] screen|                                              s` `.....---.......--.```   -/
+[0000220133] screen|     1. Boot Installer [Enter]                +o   .--`         /y:`      +.
+[0000220226] screen|     2. Boot Single user                       yo`:.            :o      `+-
+[0000220318] screen|     3. Escape to loader prompt                 y/               -/`   -o/
+[0000220409] screen|     4. Reboot                                 .-                  ::/sy+:.
+[0000220501] screen|     5. Cons: Dual (Serial primary)            /                     `--  /
+[0000220593] screen|                                              `:                          :`
+[0000220686] screen|     Kernel:                                  `:                          :`
+[0000220779] screen|     6. kernel (1 of 1)                        /                          /
+[0000220871] screen|                                               .-                        -.
+[0000220963] screen|     Options:                                   --                      -.
+[0000221054] screen|     7. Boot Options                             `:`                  `:`
+[0000221144] screen|                                                   .--             `--.
+[0000221232] screen|                                                      .---.....----.|
+[0000221318] screen|    Autoboot in 0 seconds. [Space] to pause
+[0000221378] screen| Loading kernel...
+[0000221413] screen| /boot/kernel/kernel text=0x1865e8 text=0xdbf5d4 text=0x4474db data=0x180+0xe80 data=0x1972e0+0x468d20 0x8+0x1949a0+0x8+0x1b90eb\
+[0000221559] screen| Loading configured modules...
+[0000221606] screen| can't find '/boot/entropy'
+[0000221650] screen| can't find '/etc/hostid'
+[0000221692] screen| staging 0x34000000 (not copying) tramp 0x3e152000 PT4 0x3e149000
+[0000221774] screen| Start @ 0xffffffff80387000 ...
+[0000221822] screen| Loading splash ok
+[0000221857] screen| EFI framebuffer information:
+[0000221903] screen| addr, size     0x3ecb4000, 0x300000
+[0000221956] screen| dimensions     800 x 600
+[0000221998] screen| stride         800
+[0000222034] screen| masks          0x00ff0000, 0x0000ff00, 0x000000ff, 0xff000000
+[0000222113] screen| ---<<BOOT>>---
+[0000222145] screen| Copyright (c) 1992-2025 The FreeBSD Project.
+[0000222207] screen| Copyright (c) 1979, 1980, 1983, 1986, 1988, 1989, 1991, 1992, 1993, 1994
+[0000222297] screen|         The Regents of the University of California. All rights reserved.
+[0000222388] screen| FreeBSD is a registered trademark of The FreeBSD Foundation.
+[0000222466] screen| FreeBSD 15.0-RELEASE releng/15.0-n280995-7aedc8de6446 GENERIC amd64
+[0000222551] screen| FreeBSD clang version 19.1.7 (https://github.com/llvm/llvm-project.git llvmorg-19.1.7-0-gcd708029e0b2)
+[0000222671] screen| VT(efifb): resolution 800x600
+[0000222718] screen| CPU: 13th Gen Intel(R) Core(TM) i5-13420H (2645.34-MHz K8-class CPU)
+[0000222804] screen|   Origin="GenuineIntel"  Id=0xb06a2  Family=0x6  Model=0xba  Stepping=2
+[0000222893] screen|   Features=0xbfe3fbff<FPU,VME,DE,PSE,TSC,MSR,PAE,MCE,CX8,APIC,SEP,MTRR,PGE,MCA,CMOV,PAT,PSE36,DTS,ACPI,MMX,FXSR,SSE,SSE2,SS,HTT,TM,PBE>
+[0000223046] screen|   Features2=0xfedafbd7<SSE3,PCLMULQDQ,DTES64,DS_CPL,SMX,EST,TM2,SSSE3,SDBG,FMA,CX16,xTPR,PDCM,PCID,SSE4.1,SSE4.2,MOVBE,POPCNT,AESNI,XSAVE,OSXSAVE,AVX,F16C,RDRAND,HV>
+[0000223229] screen|   AMD Features=0x2c100800<SYSCALL,NX,Page1GB,RDTSCP,LM>
+[0000223302] screen|   AMD Features2=0x121<LAHF,ABM,Prefetch>
+[0000223360] screen|   Structured Extended Features=0x239c27eb<FSGSBASE,TSCADJ,BMI1,AVX2,FDPEXC,SMEP,BMI2,ERMS,INVPCID,NFPUSG,RDSEED,ADX,SMAP,CLFLUSHOPT,CLWB,PROCTRACE,SHA>
+[0000223529] screen|   Structured Extended Features2=0x9840078c<UMIP,PKU,GFNI,VAES,VPCLMULQDQ,RDPID,MOVDIRI,MOVDIR64B>
+[0000223644] screen|   Structured Extended Features3=0x8c18c410<FSRM,MD_CLEAR,IBT,IBPB,STIBP,SSBD>
+[0000223739] screen|   XSAVE Features=0x7<XSAVEOPT,XSAVEC,XINUSE>
+[0000223801] screen|   TSC: P-state invariant
+[0000223843] screen| Hypervisor: Origin = "KVMKVMKVM"
+[0000223893] screen| real memory  = 1073741824 (1024 MB)
+[0000223946] screen| avail memory = 996466688 (950 MB)
+[0000223997] screen| Event timer "LAPIC" quality 600
+[0000224046] screen| ACPI APIC Table: <HYPE   HYPEMADT>
+[0000224098] screen| FreeBSD/SMP: Multiprocessor System Detected: 4 CPUs
+[0000224167] screen| FreeBSD/SMP: 1 package(s) x 2 core(s) x 2 hardware threads
+[0000224243] screen| random: registering fast source Intel Secure Key Seed
+[0000224314] screen| random: fast provider: "Intel Secure Key Seed"
+[0000224378] screen| random: unblocking device.
+[0000224422] screen| MADT: Forcing active-low polarity and level trigger for SCI
+[0000224499] screen| ioapic0 <Version 1.1> irqs 0-23
+[0000224548] screen| Launching APs: 1 3 2
+[0000224586] screen| random: entropy device external interface
+[0000224645] screen| kbd1 at kbdmux0
+[0000224678] screen| efirtc0: <EFI Realtime Clock>
+[0000224725] screen| efirtc0: registered as a time-of-day clock, resolution 1.000000s
+[0000224807] screen| kvmclock0: <KVM paravirtual clock>
+[0000224859] screen| Timecounter "kvmclock" frequency 1000000000 Hz quality 975
+[0000224935] screen| kvmclock0: registered as a time-of-day clock, resolution 0.000001s
+[0000225019] screen| smbios0: <System Management BIOS> at iomem 0x3f938000-0x3f938017
+[0000225101] screen| smbios0: Entry point: v3 (64-bit), Version: 3.0
+[0000225166] screen| aesni0: <AES-CBC,AES-CCM,AES-GCM,AES-ICM,AES-XTS,SHA1,SHA256>
+[0000225245] screen| acpi0: <HYPE HYPEFADT>
+[0000225285] screen| hpet0: <High Precision Event Timer> iomem 0xfed00000-0xfed003ff on acpi0
+[0000225375] screen| Timecounter "HPET" frequency 10000000 Hz quality 950
+[0000225445] screen| atrtc0: <AT realtime clock> port 0x70-0x71 irq 8 on acpi0
+[0000225520] screen| atrtc0: registered as a time-of-day clock, resolution 1.000000s
+[0000225601] screen| Event timer "RTC" frequency 32768 Hz quality 0
+[0000225665] screen| Timecounter "ACPI-fast" frequency 3579545 Hz quality 900
+[0000225739] screen| acpi_timer0: <24-bit timer at 3.579545MHz> port 0x608-0x60b on acpi0
+[0000225825] screen| cpu0: <ACPI CPU> on acpi0
+[0000225868] screen| pcib0: <ACPI Host-PCI bridge> on acpi0
+[0000225924] screen| pci0: <ACPI PCI bus> on pcib0
+[0000225971] screen| ahci0: <AHCI SATA controller> mem 0x80004000-0x80004fff irq 16 at device 2.0 on pci0
+[0000226073] screen| ahci0: Failed to allocate MSI/MSI-x, falling back to INTx
+[0000226148] screen| ahci0: AHCI v1.31 with 6 ?Gbps ports, Port Multiplier not supported
+[0000226233] screen| ahcich0: <AHCI channel> at channel 0 on ahci0
+[0000226296] screen| ahcich1: <AHCI channel> at channel 1 on ahci0
+[0000226359] screen| ahcich2: <AHCI channel> at channel 2 on ahci0
+[0000226422] screen| ahcich3: <AHCI channel> at channel 3 on ahci0
+[0000226485] screen| ahcich4: <AHCI channel> at channel 4 on ahci0
+[0000226548] screen| ahcich5: <AHCI channel> at channel 5 on ahci0
+[0000226611] screen| virtio_pci0: <VirtIO PCI (modern) Block adapter> mem 0x80000000-0x80003fff irq 20 at device 3.0 on pci0
+[0000226732] screen| vtblk0: <VirtIO Block Adapter> on virtio_pci0
+[0000226795] screen| vtblk0: 64MB (131072 512 byte sectors)
+[0000226851] screen| isab0: <PCI-ISA bridge> at device 31.0 on pci0
+[0000226915] screen| isa0: <ISA bus> on isab0
+[0000226957] screen| uart0: <8250 or 16450 or compatible> port 0x3f8-0x3ff irq 4 flags 0x10 on acpi0
+[0000227054] screen| uart0: console (115200,n,8,1)
+[0000227101] screen| uart1: <8250 or 16450 or compatible> port 0x2f8-0x2ff irq 3 on acpi0
+[0000227187] screen| atkbdc0: <Keyboard controller (i8042)> port 0x60,0x64 irq 1 on acpi0
+[0000227273] screen| atkbd0: <AT Keyboard> irq 1 on atkbdc0
+[0000227329] screen| kbd0 at atkbd0
+[0000227361] screen| atkbd0: [GIANT-LOCKED]
+[0000227401] screen| psm0: <PS/2 Mouse> irq 12 on atkbdc0
+[0000227455] screen| psm0: [GIANT-LOCKED]
+[0000227493] screen| WARNING: Device "psm" is Giant locked and may be deleted before FreeBSD 16.0.
+[0000227588] screen| psm0: model Generic PS/2 mouse, device ID 0
+[0000227649] screen| vga0: <Generic ISA VGA> at port 0x3b0-0x3bb iomem 0xb0000-0xb7fff pnpid PNP0900 on isa0
+[0000227754] screen| attimer0: <AT timer> at port 0x40 on isa0
+[0000227813] screen| Timecounter "i8254" frequency 1193182 Hz quality 0
+[0000227881] screen| Event timer "i8254" frequency 1193182 Hz quality 100
+[0000227951] screen| attimer0: non-PNP ISA device will be removed from GENERIC in FreeBSD 16.
+[0000228041] screen| est0: failed to enable SpeedStep
+[0000228091] screen| Timecounter "TSC-low" frequency 1305730787 Hz quality 1000
+[0000228167] screen| Timecounters tick every 10.000 msec
+[0000228220] screen| usb_needs_explore_all: no devclass
+[0000228272] screen| Trying to mount root from cd9660:/dev/iso9660/15_0_RELEASE_AMD64_CD [ro]...
+[0000228365] screen| cd0 at ahcich0 bus 0 scbus0 target 0 lun 0
+[0000228425] screen| cd0: <HYPE VIRTUAL CD-ROM 1.0> Removable CD-ROM SCSI device
+[0000228502] screen| cd0: Serial Number HYPE0000000000000001
+[0000228559] screen| cd0: 300.000MB/s transfers (SATA 2.x, UDMA5, ATAPI 12bytes, PIO 8192bytes)
+[0000228651] screen| cd0: 1296MB (664014 2048 byte sectors)
+[0000228707] screen| Dual Console: Serial Primary, Video Secondary
+[0000228770] screen| Starting file system checks:
+[0000228816] screen| Mounting local filesystems:.
+[0000228862] screen| mkdir: /tmp/.diskless.fbc401e4d94fb846548fa5a5a4b93ebbe6d462af13fdfa355b17ab843a9566a2: Read-only file system
+[0000228989] screen| ELF ldconfig path: /lib /usr/lib /usr/lib/compat /usr/local/lib /usr/local/lib/compat/pkg /usr/local/lib/compat/pkg
+[0000235593] ttyS0| 32-bit compatibility ldconfig path:
+[0000242198] ttyS0| /etc/rc: WARNING: $hostname is not set -- see rc.conf(5).
+[0000243122] ttyS0| Setting up harvesting: PURE_RDSEED,RANDOMDEV,[CALLOUT],[UMA],[FS_ATIME],SWI,INTERRUPT,NET_NG,[NET_ETHER],NET_TUN,MOUSE,KEYBOARD,ATTACH,CACHED
+[0000245489] ttyS0| Feeding entropy: dd: /entropy: Read-only file system
+[0000246663] ttyS0| dd: /boot/entropy: Read-only file system
+[0000246720] ttyS0| .
+[0000247086] ttyS0| lo0: link state changed to UP
+[0000247468] ttyS0| Starting Network: lo0.
+[0000248009] ttyS0| lo0: flags=1008049<UP,LOOPBACK,RUNNING,MULTICAST,LOWER_UP> metric 0 mtu 16384
+[0000248450] ttyS0|  options=680003<RXCSUM,TXCSUM,LINKSTATE,RXCSUM_IPV6,TXCSUM_IPV6>
+[0000248531] ttyS0|  inet 127.0.0.1 netmask 0xff000000
+[0000248929] ttyS0|  inet6 ::1 prefixlen 128
+[0000248970] ttyS0|  inet6 fe80::1%lo0 prefixlen 64 scopeid 0x1
+[0000251830] ttyS0|  groups: lo
+[0000252371] ttyS0|  nd6 options=21<PERFORMNUD,AUTO_LINKLOCAL>
+[0000253807] ttyS0| Starting devd.
+[0000269066] screen|     6. kernel (1 of 1)                        /                          /
+[0000269158] screen|                                               .-                        -.
+[0000269250] screen|     Options:                                   --                      -.
+[0000269341] screen|     7. Boot Options                             `:`                  `:`
+[0000269431] screen|                                                   .--             `--.
+[0000269519] screen|                                                      .---.....----.|
+[0000269605] screen|    Autoboot in 0 seconds. [Space] to pause
+[0000269665] screen| Loading kernel...
+[0000269700] screen| /boot/kernel/kernel text=0x1865e8 text=0xdbf5d4 text=0x4474db data=0x180+0xe80 data=0x1972e0+0x468d20 0x8+0x1949a0+0x8+0x1b90eb\
+[0000269846] screen| Loading configured modules...
+[0000269893] screen| can't find '/boot/entropy'
+[0000269937] screen| can't find '/etc/hostid'
+[0000269979] screen| staging 0x34000000 (not copying) tramp 0x3e152000 PT4 0x3e149000
+[0000270061] screen| Start @ 0xffffffff80387000 ...
+[0000270109] screen| Loading splash ok
+[0000270144] screen| EFI framebuffer information:
+[0000270190] screen| addr, size     0x3ecb4000, 0x300000
+[0000270243] screen| dimensions     800 x 600
+[0000270285] screen| stride         800
+[0000270321] screen| masks          0x00ff0000, 0x0000ff00, 0x000000ff, 0xff000000
+[0000270400] screen| ---<<BOOT>>---
+[0000270432] screen| Copyright (c) 1992-2025 The FreeBSD Project.
+[0000270494] screen| Copyright (c) 1979, 1980, 1983, 1986, 1988, 1989, 1991, 1992, 1993, 1994
+[0000270584] screen|         The Regents of the University of California. All rights reserved.
+[0000270675] screen| FreeBSD is a registered trademark of The FreeBSD Foundation.
+[0000270753] screen| FreeBSD 15.0-RELEASE releng/15.0-n280995-7aedc8de6446 GENERIC amd64
+[0000270838] screen| FreeBSD clang version 19.1.7 (https://github.com/llvm/llvm-project.git llvmorg-19.1.7-0-gcd708029e0b2)
+[0000270958] screen| VT(efifb): resolution 800x600
+[0000271005] screen| CPU: 13th Gen Intel(R) Core(TM) i5-13420H (2645.34-MHz K8-class CPU)
+[0000271091] screen|   Origin="GenuineIntel"  Id=0xb06a2  Family=0x6  Model=0xba  Stepping=2
+[0000271180] screen|   Features=0xbfe3fbff<FPU,VME,DE,PSE,TSC,MSR,PAE,MCE,CX8,APIC,SEP,MTRR,PGE,MCA,CMOV,PAT,PSE36,DTS,ACPI,MMX,FXSR,SSE,SSE2,SS,HTT,TM,PBE>
+[0000271333] screen|   Features2=0xfedafbd7<SSE3,PCLMULQDQ,DTES64,DS_CPL,SMX,EST,TM2,SSSE3,SDBG,FMA,CX16,xTPR,PDCM,PCID,SSE4.1,SSE4.2,MOVBE,POPCNT,AESNI,XSAVE,OSXSAVE,AVX,F16C,RDRAND,HV>
+[0000271516] screen|   AMD Features=0x2c100800<SYSCALL,NX,Page1GB,RDTSCP,LM>
+[0000271589] screen|   AMD Features2=0x121<LAHF,ABM,Prefetch>
+[0000271647] screen|   Structured Extended Features=0x239c27eb<FSGSBASE,TSCADJ,BMI1,AVX2,FDPEXC,SMEP,BMI2,ERMS,INVPCID,NFPUSG,RDSEED,ADX,SMAP,CLFLUSHOPT,CLWB,PROCTRACE,SHA>
+[0000271816] screen|   Structured Extended Features2=0x9840078c<UMIP,PKU,GFNI,VAES,VPCLMULQDQ,RDPID,MOVDIRI,MOVDIR64B>
+[0000271931] screen|   Structured Extended Features3=0x8c18c410<FSRM,MD_CLEAR,IBT,IBPB,STIBP,SSBD>
+[0000272026] screen|   XSAVE Features=0x7<XSAVEOPT,XSAVEC,XINUSE>
+[0000272088] screen|   TSC: P-state invariant
+[0000272130] screen| Hypervisor: Origin = "KVMKVMKVM"
+[0000272180] screen| real memory  = 1073741824 (1024 MB)
+[0000272233] screen| avail memory = 996466688 (950 MB)
+[0000272284] screen| Event timer "LAPIC" quality 600
+[0000272333] screen| ACPI APIC Table: <HYPE   HYPEMADT>
+[0000272385] screen| FreeBSD/SMP: Multiprocessor System Detected: 4 CPUs
+[0000272454] screen| FreeBSD/SMP: 1 package(s) x 2 core(s) x 2 hardware threads
+[0000272530] screen| random: registering fast source Intel Secure Key Seed
+[0000272601] screen| random: fast provider: "Intel Secure Key Seed"
+[0000272665] screen| random: unblocking device.
+[0000272709] screen| MADT: Forcing active-low polarity and level trigger for SCI
+[0000272786] screen| ioapic0 <Version 1.1> irqs 0-23
+[0000272835] screen| Launching APs: 1 3 2
+[0000272873] screen| random: entropy device external interface
+[0000272932] screen| kbd1 at kbdmux0
+[0000272965] screen| efirtc0: <EFI Realtime Clock>
+[0000273012] screen| efirtc0: registered as a time-of-day clock, resolution 1.000000s
+[0000273094] screen| kvmclock0: <KVM paravirtual clock>
+[0000273146] screen| Timecounter "kvmclock" frequency 1000000000 Hz quality 975
+[0000273222] screen| kvmclock0: registered as a time-of-day clock, resolution 0.000001s
+[0000273306] screen| smbios0: <System Management BIOS> at iomem 0x3f938000-0x3f938017
+[0000273388] screen| smbios0: Entry point: v3 (64-bit), Version: 3.0
+[0000273453] screen| aesni0: <AES-CBC,AES-CCM,AES-GCM,AES-ICM,AES-XTS,SHA1,SHA256>
+[0000273532] screen| acpi0: <HYPE HYPEFADT>
+[0000273572] screen| hpet0: <High Precision Event Timer> iomem 0xfed00000-0xfed003ff on acpi0
+[0000273662] screen| Timecounter "HPET" frequency 10000000 Hz quality 950
+[0000273732] screen| atrtc0: <AT realtime clock> port 0x70-0x71 irq 8 on acpi0
+[0000273807] screen| atrtc0: registered as a time-of-day clock, resolution 1.000000s
+[0000273888] screen| Event timer "RTC" frequency 32768 Hz quality 0
+[0000273952] screen| Timecounter "ACPI-fast" frequency 3579545 Hz quality 900
+[0000274026] screen| acpi_timer0: <24-bit timer at 3.579545MHz> port 0x608-0x60b on acpi0
+[0000274112] screen| cpu0: <ACPI CPU> on acpi0
+[0000274155] screen| pcib0: <ACPI Host-PCI bridge> on acpi0
+[0000274211] screen| pci0: <ACPI PCI bus> on pcib0
+[0000274258] screen| ahci0: <AHCI SATA controller> mem 0x80004000-0x80004fff irq 16 at device 2.0 on pci0
+[0000274360] screen| ahci0: Failed to allocate MSI/MSI-x, falling back to INTx
+[0000274435] screen| ahci0: AHCI v1.31 with 6 ?Gbps ports, Port Multiplier not supported
+[0000274520] screen| ahcich0: <AHCI channel> at channel 0 on ahci0
+[0000274583] screen| ahcich1: <AHCI channel> at channel 1 on ahci0
+[0000274646] screen| ahcich2: <AHCI channel> at channel 2 on ahci0
+[0000274709] screen| ahcich3: <AHCI channel> at channel 3 on ahci0
+[0000274772] screen| ahcich4: <AHCI channel> at channel 4 on ahci0
+[0000274835] screen| ahcich5: <AHCI channel> at channel 5 on ahci0
+[0000274898] screen| virtio_pci0: <VirtIO PCI (modern) Block adapter> mem 0x80000000-0x80003fff irq 20 at device 3.0 on pci0
+[0000275019] screen| vtblk0: <VirtIO Block Adapter> on virtio_pci0
+[0000275082] screen| vtblk0: 64MB (131072 512 byte sectors)
+[0000275138] screen| isab0: <PCI-ISA bridge> at device 31.0 on pci0
+[0000275202] screen| isa0: <ISA bus> on isab0
+[0000275244] screen| uart0: <8250 or 16450 or compatible> port 0x3f8-0x3ff irq 4 flags 0x10 on acpi0
+[0000275341] screen| uart0: console (115200,n,8,1)
+[0000275388] screen| uart1: <8250 or 16450 or compatible> port 0x2f8-0x2ff irq 3 on acpi0
+[0000275474] screen| atkbdc0: <Keyboard controller (i8042)> port 0x60,0x64 irq 1 on acpi0
+[0000275560] screen| atkbd0: <AT Keyboard> irq 1 on atkbdc0
+[0000275616] screen| kbd0 at atkbd0
+[0000275648] screen| atkbd0: [GIANT-LOCKED]
+[0000275688] screen| psm0: <PS/2 Mouse> irq 12 on atkbdc0
+[0000275742] screen| psm0: [GIANT-LOCKED]
+[0000275780] screen| WARNING: Device "psm" is Giant locked and may be deleted before FreeBSD 16.0.
+[0000275875] screen| psm0: model Generic PS/2 mouse, device ID 0
+[0000275936] screen| vga0: <Generic ISA VGA> at port 0x3b0-0x3bb iomem 0xb0000-0xb7fff pnpid PNP0900 on isa0
+[0000276041] screen| attimer0: <AT timer> at port 0x40 on isa0
+[0000276100] screen| Timecounter "i8254" frequency 1193182 Hz quality 0
+[0000276168] screen| Event timer "i8254" frequency 1193182 Hz quality 100
+[0000276238] screen| attimer0: non-PNP ISA device will be removed from GENERIC in FreeBSD 16.
+[0000276328] screen| est0: failed to enable SpeedStep
+[0000276378] screen| Timecounter "TSC-low" frequency 1305730787 Hz quality 1000
+[0000276454] screen| Timecounters tick every 10.000 msec
+[0000276507] screen| usb_needs_explore_all: no devclass
+[0000276559] screen| Trying to mount root from cd9660:/dev/iso9660/15_0_RELEASE_AMD64_CD [ro]...
+[0000276652] screen| cd0 at ahcich0 bus 0 scbus0 target 0 lun 0
+[0000276712] screen| cd0: <HYPE VIRTUAL CD-ROM 1.0> Removable CD-ROM SCSI device
+[0000276789] screen| cd0: Serial Number HYPE0000000000000001
+[0000276846] screen| cd0: 300.000MB/s transfers (SATA 2.x, UDMA5, ATAPI 12bytes, PIO 8192bytes)
+[0000276938] screen| cd0: 1296MB (664014 2048 byte sectors)
+[0000276994] screen| Dual Console: Serial Primary, Video Secondary
+[0000277057] screen| Starting file system checks:
+[0000277103] screen| Mounting local filesystems:.
+[0000277149] screen| mkdir: /tmp/.diskless.fbc401e4d94fb846548fa5a5a4b93ebbe6d462af13fdfa355b17ab843a9566a2: Read-only file system
+[0000277276] screen| ELF ldconfig path: /lib /usr/lib /usr/lib/compat /usr/local/lib /usr/local/lib/compat/pkg /usr/local/lib/compat/pkg
+[0000277409] screen| 32-bit compatibility ldconfig path:
+[0000277462] screen| /etc/rc: WARNING: $hostname is not set -- see rc.conf(5).
+[0000277537] screen| Setting up harvesting: PURE_RDSEED,RANDOMDEV,[CALLOUT],[UMA],[FS_ATIME],SWI,INTERRUPT,NET_NG,[NET_ETHER],NET_TUN,MOUSE,KEYBOARD,ATTACH,CACHED
+[0000277696] screen| Feeding entropy: dd: /entropy: Read-only file system
+[0000277766] screen| dd: /boot/entropy: Read-only file system
+[0000277824] screen| .
+[0000277843] screen| lo0: link state changed to UP
+[0000277890] screen| Starting Network: lo0.
+[0000277930] screen| lo0: flags=1008049<UP,LOOPBACK,RUNNING,MULTICAST,LOWER_UP> metric 0 mtu 16384
+[0000278025] screen|         options=680003<RXCSUM,TXCSUM,LINKSTATE,RXCSUM_IPV6,TXCSUM_IPV6>
+[0000278114] screen|         inet 127.0.0.1 netmask 0xff000000
+[0000278173] screen|         inet6 ::1 prefixlen 128
+[0000278222] screen|         inet6 fe80::1%lo0 prefixlen 64 scopeid 0x1
+[0000278290] screen|         groups: lo
+[0000278326] screen|         nd6 options=21<PERFORMNUD,AUTO_LINKLOCAL>
+[0000278393] screen| Starting devd.
+[0000285006] ttyS0| route: message indicates error: File exists
+[0000285413] ttyS0| add host 127.0.0.1: gateway lo0 fib 0: route already in table
+[0000286521] ttyS0| route: message indicates error: File exists
+[0000287086] ttyS0| add host ::1: gateway lo0 fib 0: route already in table
+[0000287158] ttyS0| add net fe80::: gateway ::1
+[0000290004] ttyS0| add net ff02::: gateway ::1
+[0000290567] ttyS0| add net ::ffff:0.0.0.0: gateway ::1
+[0000290966] ttyS0| add net ::0.0.0.0: gateway ::1
+[0000291013] ttyS0| Clearing /tmp (X related).
+[0000291558] ttyS0| Updating motd:ln: /etc/motd: Read-only file system
+[0000291972] ttyS0| .
+[0000297516] ttyS0| Updating /var/run/os-release done.
+[0000298261] ttyS0| Creating and/or trimming log files.
+[0000298650] ttyS0| Starting syslogd.
+[0000302351] ttyS0| Starting local daemons:
+[0000303075] ttyS0| Starting secondary installer on ttyv0
+[0000303476] ttyS0| Starting primary installer on ttyu0
+[0000303528] ttyS0| 
+[0000303892] ttyS0| Welcome to FreeBSD!
+[0000303928] ttyS0| 
+[0000303945] ttyS0| Please choose the appropriate terminal type for your system.
+[0000306825] ttyS0| Common console types are:
+[0000307380] ttyS0|    ansi     Standard ANSI terminal
+[0000307778] ttyS0|    vt100    VT100 or compatible terminal
+[0000307835] ttyS0|    xterm    xterm terminal emulator (or compatible)
+[0000307903] ttyS0| 
+[0000310127] ttyS0| Console type [vt100]: 
+[0000319178] screen| FreeBSD clang version 19.1.7 (https://github.com/llvm/llvm-project.git llvmorg-19.1.7-0-gcd708029e0b2)
+[0000319298] screen| VT(efifb): resolution 800x600
+[0000319345] screen| CPU: 13th Gen Intel(R) Core(TM) i5-13420H (2645.34-MHz K8-class CPU)
+[0000319431] screen|   Origin="GenuineIntel"  Id=0xb06a2  Family=0x6  Model=0xba  Stepping=2
+[0000319520] screen|   Features=0xbfe3fbff<FPU,VME,DE,PSE,TSC,MSR,PAE,MCE,CX8,APIC,SEP,MTRR,PGE,MCA,CMOV,PAT,PSE36,DTS,ACPI,MMX,FXSR,SSE,SSE2,SS,HTT,TM,PBE>
+[0000319673] screen|   Features2=0xfedafbd7<SSE3,PCLMULQDQ,DTES64,DS_CPL,SMX,EST,TM2,SSSE3,SDBG,FMA,CX16,xTPR,PDCM,PCID,SSE4.1,SSE4.2,MOVBE,POPCNT,AESNI,XSAVE,OSXSAVE,AVX,F16C,RDRAND,HV>
+[0000319856] screen|   AMD Features=0x2c100800<SYSCALL,NX,Page1GB,RDTSCP,LM>
+[0000319929] screen|   AMD Features2=0x121<LAHF,ABM,Prefetch>
+[0000319987] screen|   Structured Extended Features=0x239c27eb<FSGSBASE,TSCADJ,BMI1,AVX2,FDPEXC,SMEP,BMI2,ERMS,INVPCID,NFPUSG,RDSEED,ADX,SMAP,CLFLUSHOPT,CLWB,PROCTRACE,SHA>
+[0000320156] screen|   Structured Extended Features2=0x9840078c<UMIP,PKU,GFNI,VAES,VPCLMULQDQ,RDPID,MOVDIRI,MOVDIR64B>
+[0000320271] screen|   Structured Extended Features3=0x8c18c410<FSRM,MD_CLEAR,IBT,IBPB,STIBP,SSBD>
+[0000320366] screen|   XSAVE Features=0x7<XSAVEOPT,XSAVEC,XINUSE>
+[0000320428] screen|   TSC: P-state invariant
+[0000320470] screen| Hypervisor: Origin = "KVMKVMKVM"
+[0000320520] screen| real memory  = 1073741824 (1024 MB)
+[0000320573] screen| avail memory = 996466688 (950 MB)
+[0000320624] screen| Event timer "LAPIC" quality 600
+[0000320673] screen| ACPI APIC Table: <HYPE   HYPEMADT>
+[0000320725] screen| FreeBSD/SMP: Multiprocessor System Detected: 4 CPUs
+[0000320794] screen| FreeBSD/SMP: 1 package(s) x 2 core(s) x 2 hardware threads
+[0000320870] screen| random: registering fast source Intel Secure Key Seed
+[0000320941] screen| random: fast provider: "Intel Secure Key Seed"
+[0000321005] screen| random: unblocking device.
+[0000321049] screen| MADT: Forcing active-low polarity and level trigger for SCI
+[0000321126] screen| ioapic0 <Version 1.1> irqs 0-23
+[0000321175] screen| Launching APs: 1 3 2
+[0000321213] screen| random: entropy device external interface
+[0000321272] screen| kbd1 at kbdmux0
+[0000321305] screen| efirtc0: <EFI Realtime Clock>
+[0000321352] screen| efirtc0: registered as a time-of-day clock, resolution 1.000000s
+[0000321434] screen| kvmclock0: <KVM paravirtual clock>
+[0000321486] screen| Timecounter "kvmclock" frequency 1000000000 Hz quality 975
+[0000321562] screen| kvmclock0: registered as a time-of-day clock, resolution 0.000001s
+[0000321646] screen| smbios0: <System Management BIOS> at iomem 0x3f938000-0x3f938017
+[0000321728] screen| smbios0: Entry point: v3 (64-bit), Version: 3.0
+[0000321793] screen| aesni0: <AES-CBC,AES-CCM,AES-GCM,AES-ICM,AES-XTS,SHA1,SHA256>
+[0000321872] screen| acpi0: <HYPE HYPEFADT>
+[0000321912] screen| hpet0: <High Precision Event Timer> iomem 0xfed00000-0xfed003ff on acpi0
+[0000322002] screen| Timecounter "HPET" frequency 10000000 Hz quality 950
+[0000322072] screen| atrtc0: <AT realtime clock> port 0x70-0x71 irq 8 on acpi0
+[0000322147] screen| atrtc0: registered as a time-of-day clock, resolution 1.000000s
+[0000322228] screen| Event timer "RTC" frequency 32768 Hz quality 0
+[0000322292] screen| Timecounter "ACPI-fast" frequency 3579545 Hz quality 900
+[0000322366] screen| acpi_timer0: <24-bit timer at 3.579545MHz> port 0x608-0x60b on acpi0
+[0000322452] screen| cpu0: <ACPI CPU> on acpi0
+[0000322495] screen| pcib0: <ACPI Host-PCI bridge> on acpi0
+[0000322551] screen| pci0: <ACPI PCI bus> on pcib0
+[0000322598] screen| ahci0: <AHCI SATA controller> mem 0x80004000-0x80004fff irq 16 at device 2.0 on pci0
+[0000322700] screen| ahci0: Failed to allocate MSI/MSI-x, falling back to INTx
+[0000322775] screen| ahci0: AHCI v1.31 with 6 ?Gbps ports, Port Multiplier not supported
+[0000322860] screen| ahcich0: <AHCI channel> at channel 0 on ahci0
+[0000322923] screen| ahcich1: <AHCI channel> at channel 1 on ahci0
+[0000322986] screen| ahcich2: <AHCI channel> at channel 2 on ahci0
+[0000323049] screen| ahcich3: <AHCI channel> at channel 3 on ahci0
+[0000323112] screen| ahcich4: <AHCI channel> at channel 4 on ahci0
+[0000323175] screen| ahcich5: <AHCI channel> at channel 5 on ahci0
+[0000323238] screen| virtio_pci0: <VirtIO PCI (modern) Block adapter> mem 0x80000000-0x80003fff irq 20 at device 3.0 on pci0
+[0000323359] screen| vtblk0: <VirtIO Block Adapter> on virtio_pci0
+[0000323422] screen| vtblk0: 64MB (131072 512 byte sectors)
+[0000323478] screen| isab0: <PCI-ISA bridge> at device 31.0 on pci0
+[0000323542] screen| isa0: <ISA bus> on isab0
+[0000323584] screen| uart0: <8250 or 16450 or compatible> port 0x3f8-0x3ff irq 4 flags 0x10 on acpi0
+[0000323681] screen| uart0: console (115200,n,8,1)
+[0000323728] screen| uart1: <8250 or 16450 or compatible> port 0x2f8-0x2ff irq 3 on acpi0
+[0000323814] screen| atkbdc0: <Keyboard controller (i8042)> port 0x60,0x64 irq 1 on acpi0
+[0000323900] screen| atkbd0: <AT Keyboard> irq 1 on atkbdc0
+[0000323956] screen| kbd0 at atkbd0
+[0000323988] screen| atkbd0: [GIANT-LOCKED]
+[0000324028] screen| psm0: <PS/2 Mouse> irq 12 on atkbdc0
+[0000324082] screen| psm0: [GIANT-LOCKED]
+[0000324120] screen| WARNING: Device "psm" is Giant locked and may be deleted before FreeBSD 16.0.
+[0000324215] screen| psm0: model Generic PS/2 mouse, device ID 0
+[0000324276] screen| vga0: <Generic ISA VGA> at port 0x3b0-0x3bb iomem 0xb0000-0xb7fff pnpid PNP0900 on isa0
+[0000324381] screen| attimer0: <AT timer> at port 0x40 on isa0
+[0000324440] screen| Timecounter "i8254" frequency 1193182 Hz quality 0
+[0000324508] screen| Event timer "i8254" frequency 1193182 Hz quality 100
+[0000324578] screen| attimer0: non-PNP ISA device will be removed from GENERIC in FreeBSD 16.
+[0000324668] screen| est0: failed to enable SpeedStep
+[0000324718] screen| Timecounter "TSC-low" frequency 1305730787 Hz quality 1000
+[0000324794] screen| Timecounters tick every 10.000 msec
+[0000324847] screen| usb_needs_explore_all: no devclass
+[0000324899] screen| Trying to mount root from cd9660:/dev/iso9660/15_0_RELEASE_AMD64_CD [ro]...
+[0000324992] screen| cd0 at ahcich0 bus 0 scbus0 target 0 lun 0
+[0000325052] screen| cd0: <HYPE VIRTUAL CD-ROM 1.0> Removable CD-ROM SCSI device
+[0000325129] screen| cd0: Serial Number HYPE0000000000000001
+[0000325186] screen| cd0: 300.000MB/s transfers (SATA 2.x, UDMA5, ATAPI 12bytes, PIO 8192bytes)
+[0000325278] screen| cd0: 1296MB (664014 2048 byte sectors)
+[0000325334] screen| Dual Console: Serial Primary, Video Secondary
+[0000325397] screen| Starting file system checks:
+[0000325443] screen| Mounting local filesystems:.
+[0000325489] screen| mkdir: /tmp/.diskless.fbc401e4d94fb846548fa5a5a4b93ebbe6d462af13fdfa355b17ab843a9566a2: Read-only file system
+[0000325616] screen| ELF ldconfig path: /lib /usr/lib /usr/lib/compat /usr/local/lib /usr/local/lib/compat/pkg /usr/local/lib/compat/pkg
+[0000325749] screen| 32-bit compatibility ldconfig path:
+[0000325802] screen| /etc/rc: WARNING: $hostname is not set -- see rc.conf(5).
+[0000325877] screen| Setting up harvesting: PURE_RDSEED,RANDOMDEV,[CALLOUT],[UMA],[FS_ATIME],SWI,INTERRUPT,NET_NG,[NET_ETHER],NET_TUN,MOUSE,KEYBOARD,ATTACH,CACHED
+[0000326036] screen| Feeding entropy: dd: /entropy: Read-only file system
+[0000326106] screen| dd: /boot/entropy: Read-only file system
+[0000326164] screen| .
+[0000326183] screen| lo0: link state changed to UP
+[0000326230] screen| Starting Network: lo0.
+[0000326270] screen| lo0: flags=1008049<UP,LOOPBACK,RUNNING,MULTICAST,LOWER_UP> metric 0 mtu 16384
+[0000326365] screen|         options=680003<RXCSUM,TXCSUM,LINKSTATE,RXCSUM_IPV6,TXCSUM_IPV6>
+[0000326454] screen|         inet 127.0.0.1 netmask 0xff000000
+[0000326513] screen|         inet6 ::1 prefixlen 128
+[0000326562] screen|         inet6 fe80::1%lo0 prefixlen 64 scopeid 0x1
+[0000326630] screen|         groups: lo
+[0000326666] screen|         nd6 options=21<PERFORMNUD,AUTO_LINKLOCAL>
+[0000326733] screen| Starting devd.
+[0000326765] screen| route: message indicates error: File exists
+[0000326826] screen| add host 127.0.0.1: gateway lo0 fib 0: route already in table
+[0000326905] screen| route: message indicates error: File exists
+[0000326966] screen| add host ::1: gateway lo0 fib 0: route already in table
+[0000327039] screen| add net fe80::: gateway ::1
+[0000327084] screen| add net ff02::: gateway ::1
+[0000327129] screen| add net ::ffff:0.0.0.0: gateway ::1
+[0000327182] screen| add net ::0.0.0.0: gateway ::1
+[0000327230] screen| Clearing /tmp (X related).
+[0000327274] screen| Updating motd:ln: /etc/motd: Read-only file system
+[0000327342] screen| .
+[0000327361] screen| Updating /var/run/os-release done.
+[0000327413] screen| Creating and/or trimming log files.
+[0000327466] screen| Starting syslogd.
+[0000327501] screen| Starting local daemons:
+[0000327542] screen| Starting secondary installer on ttyv0
+[0000327597] screen| Starting primary installer on ttyu0
+[0000327650] screen| Welcome to FreeBSD!
+[0000327687] screen| Please choose the appropriate terminal type for your system.
+[0000327765] screen| Common console types are:
+[0000327808] screen|    ansi     Standard ANSI terminal
+[0000327860] screen|    vt100    VT100 or compatible terminal
+[0000327918] screen|    xterm    xterm terminal emulator (or compatible)
+[0000327987] screen| Console type [vt100]:
+[0000449682] ttyS0| .
+[0000449700] ttyS0| read: read error: Input/output error
+[0000452551] ttyS0| Mounting late filesystems:.
+[0000453461] ttyS0| Starting cron.
+[0000453839] ttyS0| Starting background file system checks in 60 seconds.
+[0000453909] ttyS0| 
+[0000454611] ttyS0| T
+[0000454629] ttyS0| FreeBSD/amd64 (Amnesiac) (ttyu0)
+[0000454678] ttyS0| 
+[0000454695] ttyS0| login: 
+[0000458735] ttyS0| Jan  1 00:04:32  login[954]: ROOT LOGIN (root) ON ttyv0
+[0000467310] screen|   Structured Extended Features3=0x8c18c410<FSRM,MD_CLEAR,IBT,IBPB,STIBP,SSBD>
+[0000467405] screen|   XSAVE Features=0x7<XSAVEOPT,XSAVEC,XINUSE>
+[0000467467] screen|   TSC: P-state invariant
+[0000467509] screen| Hypervisor: Origin = "KVMKVMKVM"
+[0000467559] screen| real memory  = 1073741824 (1024 MB)
+[0000467612] screen| avail memory = 996466688 (950 MB)
+[0000467663] screen| Event timer "LAPIC" quality 600
+[0000467712] screen| ACPI APIC Table: <HYPE   HYPEMADT>
+[0000467764] screen| FreeBSD/SMP: Multiprocessor System Detected: 4 CPUs
+[0000467833] screen| FreeBSD/SMP: 1 package(s) x 2 core(s) x 2 hardware threads
+[0000467909] screen| random: registering fast source Intel Secure Key Seed
+[0000467980] screen| random: fast provider: "Intel Secure Key Seed"
+[0000468044] screen| random: unblocking device.
+[0000468088] screen| MADT: Forcing active-low polarity and level trigger for SCI
+[0000468165] screen| ioapic0 <Version 1.1> irqs 0-23
+[0000468214] screen| Launching APs: 1 3 2
+[0000468252] screen| random: entropy device external interface
+[0000468311] screen| kbd1 at kbdmux0
+[0000468344] screen| efirtc0: <EFI Realtime Clock>
+[0000468391] screen| efirtc0: registered as a time-of-day clock, resolution 1.000000s
+[0000468473] screen| kvmclock0: <KVM paravirtual clock>
+[0000468525] screen| Timecounter "kvmclock" frequency 1000000000 Hz quality 975
+[0000468601] screen| kvmclock0: registered as a time-of-day clock, resolution 0.000001s
+[0000468685] screen| smbios0: <System Management BIOS> at iomem 0x3f938000-0x3f938017
+[0000468767] screen| smbios0: Entry point: v3 (64-bit), Version: 3.0
+[0000468832] screen| aesni0: <AES-CBC,AES-CCM,AES-GCM,AES-ICM,AES-XTS,SHA1,SHA256>
+[0000468911] screen| acpi0: <HYPE HYPEFADT>
+[0000468951] screen| hpet0: <High Precision Event Timer> iomem 0xfed00000-0xfed003ff on acpi0
+[0000469041] screen| Timecounter "HPET" frequency 10000000 Hz quality 950
+[0000469111] screen| atrtc0: <AT realtime clock> port 0x70-0x71 irq 8 on acpi0
+[0000469186] screen| atrtc0: registered as a time-of-day clock, resolution 1.000000s
+[0000469267] screen| Event timer "RTC" frequency 32768 Hz quality 0
+[0000469331] screen| Timecounter "ACPI-fast" frequency 3579545 Hz quality 900
+[0000469405] screen| acpi_timer0: <24-bit timer at 3.579545MHz> port 0x608-0x60b on acpi0
+[0000469491] screen| cpu0: <ACPI CPU> on acpi0
+[0000469534] screen| pcib0: <ACPI Host-PCI bridge> on acpi0
+[0000469590] screen| pci0: <ACPI PCI bus> on pcib0
+[0000469637] screen| ahci0: <AHCI SATA controller> mem 0x80004000-0x80004fff irq 16 at device 2.0 on pci0
+[0000469739] screen| ahci0: Failed to allocate MSI/MSI-x, falling back to INTx
+[0000469814] screen| ahci0: AHCI v1.31 with 6 ?Gbps ports, Port Multiplier not supported
+[0000469899] screen| ahcich0: <AHCI channel> at channel 0 on ahci0
+[0000469962] screen| ahcich1: <AHCI channel> at channel 1 on ahci0
+[0000470025] screen| ahcich2: <AHCI channel> at channel 2 on ahci0
+[0000470088] screen| ahcich3: <AHCI channel> at channel 3 on ahci0
+[0000470151] screen| ahcich4: <AHCI channel> at channel 4 on ahci0
+[0000470214] screen| ahcich5: <AHCI channel> at channel 5 on ahci0
+[0000470277] screen| virtio_pci0: <VirtIO PCI (modern) Block adapter> mem 0x80000000-0x80003fff irq 20 at device 3.0 on pci0
+[0000470398] screen| vtblk0: <VirtIO Block Adapter> on virtio_pci0
+[0000470461] screen| vtblk0: 64MB (131072 512 byte sectors)
+[0000470517] screen| isab0: <PCI-ISA bridge> at device 31.0 on pci0
+[0000470581] screen| isa0: <ISA bus> on isab0
+[0000470623] screen| uart0: <8250 or 16450 or compatible> port 0x3f8-0x3ff irq 4 flags 0x10 on acpi0
+[0000470720] screen| uart0: console (115200,n,8,1)
+[0000470767] screen| uart1: <8250 or 16450 or compatible> port 0x2f8-0x2ff irq 3 on acpi0
+[0000470853] screen| atkbdc0: <Keyboard controller (i8042)> port 0x60,0x64 irq 1 on acpi0
+[0000470939] screen| atkbd0: <AT Keyboard> irq 1 on atkbdc0
+[0000470995] screen| kbd0 at atkbd0
+[0000471027] screen| atkbd0: [GIANT-LOCKED]
+[0000471067] screen| psm0: <PS/2 Mouse> irq 12 on atkbdc0
+[0000471121] screen| psm0: [GIANT-LOCKED]
+[0000471159] screen| WARNING: Device "psm" is Giant locked and may be deleted before FreeBSD 16.0.
+[0000471254] screen| psm0: model Generic PS/2 mouse, device ID 0
+[0000471315] screen| vga0: <Generic ISA VGA> at port 0x3b0-0x3bb iomem 0xb0000-0xb7fff pnpid PNP0900 on isa0
+[0000471420] screen| attimer0: <AT timer> at port 0x40 on isa0
+[0000471479] screen| Timecounter "i8254" frequency 1193182 Hz quality 0
+[0000471547] screen| Event timer "i8254" frequency 1193182 Hz quality 100
+[0000471617] screen| attimer0: non-PNP ISA device will be removed from GENERIC in FreeBSD 16.
+[0000471707] screen| est0: failed to enable SpeedStep
+[0000471757] screen| Timecounter "TSC-low" frequency 1305730787 Hz quality 1000
+[0000471833] screen| Timecounters tick every 10.000 msec
+[0000471886] screen| usb_needs_explore_all: no devclass
+[0000471938] screen| Trying to mount root from cd9660:/dev/iso9660/15_0_RELEASE_AMD64_CD [ro]...
+[0000472031] screen| cd0 at ahcich0 bus 0 scbus0 target 0 lun 0
+[0000472091] screen| cd0: <HYPE VIRTUAL CD-ROM 1.0> Removable CD-ROM SCSI device
+[0000472168] screen| cd0: Serial Number HYPE0000000000000001
+[0000472225] screen| cd0: 300.000MB/s transfers (SATA 2.x, UDMA5, ATAPI 12bytes, PIO 8192bytes)
+[0000472317] screen| cd0: 1296MB (664014 2048 byte sectors)
+[0000472373] screen| Dual Console: Serial Primary, Video Secondary
+[0000472436] screen| Starting file system checks:
+[0000472482] screen| Mounting local filesystems:.
+[0000472528] screen| mkdir: /tmp/.diskless.fbc401e4d94fb846548fa5a5a4b93ebbe6d462af13fdfa355b17ab843a9566a2: Read-only file system
+[0000472655] screen| ELF ldconfig path: /lib /usr/lib /usr/lib/compat /usr/local/lib /usr/local/lib/compat/pkg /usr/local/lib/compat/pkg
+[0000472788] screen| 32-bit compatibility ldconfig path:
+[0000472841] screen| /etc/rc: WARNING: $hostname is not set -- see rc.conf(5).
+[0000472916] screen| Setting up harvesting: PURE_RDSEED,RANDOMDEV,[CALLOUT],[UMA],[FS_ATIME],SWI,INTERRUPT,NET_NG,[NET_ETHER],NET_TUN,MOUSE,KEYBOARD,ATTACH,CACHED
+[0000473075] screen| Feeding entropy: dd: /entropy: Read-only file system
+[0000473145] screen| dd: /boot/entropy: Read-only file system
+[0000473203] screen| .
+[0000473222] screen| lo0: link state changed to UP
+[0000473269] screen| Starting Network: lo0.
+[0000473309] screen| lo0: flags=1008049<UP,LOOPBACK,RUNNING,MULTICAST,LOWER_UP> metric 0 mtu 16384
+[0000473404] screen|         options=680003<RXCSUM,TXCSUM,LINKSTATE,RXCSUM_IPV6,TXCSUM_IPV6>
+[0000473493] screen|         inet 127.0.0.1 netmask 0xff000000
+[0000473552] screen|         inet6 ::1 prefixlen 128
+[0000473601] screen|         inet6 fe80::1%lo0 prefixlen 64 scopeid 0x1
+[0000473669] screen|         groups: lo
+[0000473705] screen|         nd6 options=21<PERFORMNUD,AUTO_LINKLOCAL>
+[0000473772] screen| Starting devd.
+[0000473804] screen| route: message indicates error: File exists
+[0000473865] screen| add host 127.0.0.1: gateway lo0 fib 0: route already in table
+[0000473944] screen| route: message indicates error: File exists
+[0000474005] screen| add host ::1: gateway lo0 fib 0: route already in table
+[0000474078] screen| add net fe80::: gateway ::1
+[0000474123] screen| add net ff02::: gateway ::1
+[0000474168] screen| add net ::ffff:0.0.0.0: gateway ::1
+[0000474221] screen| add net ::0.0.0.0: gateway ::1
+[0000474269] screen| Clearing /tmp (X related).
+[0000474313] screen| Updating motd:ln: /etc/motd: Read-only file system
+[0000474381] screen| .
+[0000474400] screen| Updating /var/run/os-release done.
+[0000474452] screen| Creating and/or trimming log files.
+[0000474505] screen| Starting syslogd.
+[0000474540] screen| Starting local daemons:
+[0000474581] screen| Starting secondary installer on ttyv0
+[0000474636] screen| Starting primary installer on ttyu0
+[0000474689] screen| Welcome to FreeBSD!
+[0000474726] screen| Please choose the appropriate terminal type for your system.
+[0000474804] screen| Common console types are:
+[0000474847] screen|    ansi     Standard ANSI terminal
+[0000474899] screen|    vt100    VT100 or compatible terminal
+[0000474957] screen|    xterm    xterm terminal emulator (or compatible)
+[0000475026] screen| Console type [vt100]: .
+[0000475067] screen| read: read error: Input/output error
+[0000475121] screen| Mounting late filesystems:.
+[0000475166] screen| Starting cron.
+[0000475198] screen| Starting background file system checks in 60 seconds.
+[0000475269] screen| T
+[0000475288] screen| FreeBSD/amd64 (Amnesiac) (ttyu0)
+[0000475338] screen| login: Jan  1 00:04:32  login[954]: ROOT LOGIN (root) ON ttyv0
