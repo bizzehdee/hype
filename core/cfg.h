@@ -578,6 +578,16 @@ typedef struct {
     int has_format;
     hype_cfg_format_t format;
 
+    /*
+     * #506: backing=file only. When set, a sparse image is grown on demand as the guest writes
+     * into a region the host filesystem has not yet allocated (hype_blk_image_sparse_t), instead
+     * of the default hype_blk_image_t path, which requires the WHOLE image be preallocated
+     * before hype ever sees it. Rejected at admission (not silently ignored) on a host volume
+     * whose filesystem cannot grow a file's allocation (no HYPE_FS_CAP_WRITE_GROW) -- the same
+     * "caught at setup, not at the first hole" rule hype_blk_image_sparse_init itself enforces.
+     */
+    int sparse;
+
     int has_size_gb;
     unsigned int size_gb;
 

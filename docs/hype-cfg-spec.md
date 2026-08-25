@@ -196,6 +196,7 @@ is one device; a VM references them by id in `disks =` / `cdroms =`.
 | `bus` | disk: `virtio-blk`\|`ahci-sata`\|`nvme`\|`usb-msc`; cdrom: `ahci-atapi` | disk: per `os_hint` (§5.6); cdrom: `ahci-atapi` | guest-facing front-end (#196/#202). **`usb-msc`** (#593/#446): the disk is presented as REMOVABLE USB mass storage behind an emulated guest xHCI controller, so the guest sees a removable USB stick rather than a fixed disk. Only the VM's first disk may use it; the xHCI + MSC function is default-absent otherwise. Backed through the same block backend, so `backing = file` and `backing = physical` both work. |
 | `read_only` | bool | `false` (disk); always `true` (cdrom) | |
 | `allow_overwrite` | bool | `false` | `backing=physical`: explicit per-disk override of the non-empty-table guard (#124/#195). Still ALSO needs runtime confirm (§6). |
+| `sparse` | bool | `false` | `backing=file` only (#506): the image may contain unallocated holes, grown on demand as the guest writes into one, instead of requiring the whole file preallocated before hype ever sees it. Only an ext-family host volume can represent a hole today (#507); refused at VM setup on a host filesystem that cannot grow a file's allocation. |
 
 ### 5.4 Boot media / optical (CD/DVD)
 

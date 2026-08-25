@@ -68,6 +68,7 @@
 #include "../core/render_budget.h"
 #include "../core/blk_phys.h"
 #include "../core/blk_image.h"
+#include "../core/blk_image_sparse.h"
 #include "../core/blk_qcow2.h"
 #include "../core/ext.h"
 #include "../core/ntfs.h"
@@ -691,6 +692,13 @@ typedef struct hype_fw_disk {
     hype_blk_image_t image;
     hype_blk_backend_t raw_be;
     hype_qcow2_t qcow2;
+    /* #506: a sparse [disk.*] entry uses this trio instead of image/raw_be/qcow2 above -- the
+     * mounted fs + open file are the growth handle hype_blk_image_sparse_t needs for the whole
+     * VM's lifetime, not just at setup, so they cannot be locals. */
+    hype_blk_image_sparse_t sparse_image;
+    hype_fs_t sparse_fs;
+    hype_fs_file_t sparse_file;
+    char sparse_path[HYPE_CFG_PATH_MAX];
     uint64_t backing_phys; /* host-physical base of this slot's RAM scratch */
     hype_blk_phys_t phys;
     hype_blk_phys_nvme_t phys_nvme;
@@ -8855,6 +8863,7 @@ static int fw_1_vblk_use_physical_ahci(hype_fw_vm_t *vm) {
 static int hostdisk_read(void *ctx, uint64_t lba, uint32_t count, void *dst);
 static int hostdisk_write(void *ctx, uint64_t lba, uint32_t count, const void *src);
 static int fatvol_read(void *ctx, uint64_t lba, uint32_t count, void *dst);
+static int fatvol_write(void *ctx, uint64_t lba, uint32_t count, const void *src);
 
 /*
  * #366: try the three host filesystems in order, and KEEP the reason a failure gave.
@@ -9260,6 +9269,87 @@ static void media_scan_unlock(void) {
     __atomic_store_n(&g_media_scan_lock, 0, __ATOMIC_RELEASE);
 }
 
+/*
+ * #506: the sparse counterpart of the physical-extent scan below. Cannot reuse
+ * fw_1_resolve_on_any_fs() -- that path speaks hype_file_map_t and REFUSES a HOLE outright
+ * (ext's own physical resolver refuses a sparse file rather than reporting one; see
+ * core/file_range.h). This mounts the filesystem through the full hype_fs_t API instead
+ * (hype_fs_mount_auto/hype_fs_lookup/hype_fs_map_ranges), the same one mkdisk already uses, so
+ * it gets a hype_file_rmap_t (holes tolerated) plus a live fs+file handle it can hand to
+ * hype_blk_image_sparse_init as the growth handle -- that handle has to outlive this function
+ * (the whole VM's runtime), which is why it lives in *d, never on this stack.
+ *
+ * Returns 1 on attach, 0 if no sparse image was found there (caller does NOT fall back to the
+ * physical path -- a disk explicitly marked sparse that turns out not to be readable that way
+ * is a configuration error, not "try something else").
+ */
+static int fw_1_disk_use_sparse_image_file_unlocked(hype_fw_vm_t *vm, unsigned int slot,
+                                                     const char *path, int sel) {
+    hype_fw_disk_t *d = &vm->disk[slot];
+    static hype_file_rmap_t rmap; /* #366: static, not a 5+ KiB stack frame -- see the sibling
+                                   * hype_file_map_t local above for why that matters here. */
+    hype_gpt_partition_t part;
+    unsigned pidx, didx;
+    int found = 0;
+
+    for (didx = 0u; didx < g_media_dev_count && !found; didx++) {
+        if (sel >= 0 && didx != (unsigned)sel) {
+            continue;
+        }
+        if (media_use_dev(didx) != 0) {
+            continue;
+        }
+        usb_log_flush();
+        scan_budget_arm(5u);
+        for (pidx = 1u; pidx <= 4u && !found; pidx++) {
+            if (hype_gpt_find_partition(hostdisk_read, 0, pidx, &part) != 0) {
+                continue;
+            }
+            g_media.part_base_lba = part.first_lba;
+            if (hype_fs_mount_auto(&d->sparse_fs, fatvol_read, fatvol_write, 0) != 0) {
+                continue;
+            }
+            if (hype_fs_lookup(&d->sparse_fs, path, &d->sparse_file) != 0) {
+                continue;
+            }
+            if (hype_fs_map_ranges(&d->sparse_fs, path, &rmap) != 0) {
+                continue;
+            }
+            found = 1;
+        }
+        scan_budget_disarm();
+    }
+    if (!found) {
+        hype_debug_print("m5-8: sparse %s NOT FOUND (or not readable as a sparse-aware range map) "
+                         "on any registered host device\n",
+                         path);
+        return 0;
+    }
+    (void)hype_strlcpy(d->sparse_path, path, sizeof(d->sparse_path));
+    if (hype_blk_image_sparse_init(&d->sparse_image, &d->be, &rmap, g_media.part_base_lba,
+                                   hostdisk_read, hostdisk_write, 0, &d->sparse_fs, &d->sparse_file,
+                                   d->sparse_path) != 0) {
+        hype_debug_print("m5-8: %s on %s is NOT usable as a sparse disk (its filesystem cannot "
+                         "grow a file's allocation, or the range map is empty) [#506]\n",
+                         path, d->sparse_fs.ops->name);
+        return 0;
+    }
+    d->is_physical = 0;
+    {
+        const hype_cfg_disk_t *cd = fw_1_slot_cfg(vm, slot);
+        if (cd != 0 && cd->has_read_only && cd->read_only) {
+            d->be.write = 0;
+        }
+    }
+    hype_virtio_blk_reset(&d->vblk, d->be.total_sectors);
+    hype_debug_print("m5-8: SPARSE FILE-backed guest disk %s on %s -- %llu bytes virtual, "
+                     "grow-on-write [#506]\n",
+                     path, d->sparse_fs.ops->name,
+                     (unsigned long long)d->be.total_sectors * HYPE_BLK_SECTOR_SIZE);
+    usb_log_flush();
+    return 1;
+}
+
 static int fw_1_disk_use_image_file_unlocked(hype_fw_vm_t *vm, unsigned int slot) {
     hype_fw_disk_t *d = &vm->disk[slot];
     hype_gpt_partition_t part;
@@ -9273,6 +9363,7 @@ static int fw_1_disk_use_image_file_unlocked(hype_fw_vm_t *vm, unsigned int slot
     const char *path = HYPE_M5_8_IMAGE_PATH;
     const char *fs = 0;
     int frag_seen = 0; /* #366 */
+    int want_sparse = 0; /* #506 */
     unsigned pidx;
     unsigned didx; /* #324 */
     /*
@@ -9313,6 +9404,8 @@ static int fw_1_disk_use_image_file_unlocked(hype_fw_vm_t *vm, unsigned int slot
             cd->path[0] != '\0') {
             path = cd->path;
             path_configured = 1;
+            want_sparse = cd->sparse; /* #506: only a [disk.*] entry can ask for this -- the
+                                       * legacy target_disk sugar has no sparse key */
         }
     }
 
@@ -9344,6 +9437,9 @@ static int fw_1_disk_use_image_file_unlocked(hype_fw_vm_t *vm, unsigned int slot
                           "different drive\n",
                           g_hype_cfg.vms[vi].media_disk, path);
         return 0;
+    }
+    if (want_sparse) {
+        return fw_1_disk_use_sparse_image_file_unlocked(vm, slot, path, sel);
     }
     for (didx = 0u; didx < g_media_dev_count && fs == 0; didx++) {
         if (sel >= 0 && didx != (unsigned)sel) {
@@ -19836,6 +19932,17 @@ static int fatvol_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {
         return -1;
     }
     return g_media.read(g_media.ctx, g_media.part_base_lba + lba, count, dst);
+}
+
+/* #506: the write counterpart of fatvol_read, for mounting a filesystem writer
+ * (hype_fs_mount_auto) over the same volume-relative space -- needed for a sparse [disk.*]'s
+ * growth handle, which the existing disk-absolute hostdisk_write() cannot serve directly. */
+static int fatvol_write(void *ctx, uint64_t lba, uint32_t count, const void *src) {
+    (void)ctx;
+    if (!media_present() || g_media.write == 0) {
+        return -1;
+    }
+    return g_media.write(g_media.ctx, g_media.part_base_lba + lba, count, src);
 }
 
 /*

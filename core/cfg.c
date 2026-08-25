@@ -827,7 +827,8 @@ enum {
     D_BUS = 1u << 7,
     D_READ_ONLY = 1u << 8,
     D_ALLOW_OVERWRITE = 1u << 9,
-    D_SOURCE_DISK = 1u << 10
+    D_SOURCE_DISK = 1u << 10,
+    D_SPARSE = 1u << 11
 };
 
 static void zero_disk(hype_cfg_disk_t *d) {
@@ -1060,6 +1061,14 @@ static hype_cfg_status_t apply_disk_field(hype_cfg_disk_t *d, unsigned int *seen
         st = parse_bool_field(val, &d->allow_overwrite);
         if (st != HYPE_CFG_OK) return st;
         *seen |= D_ALLOW_OVERWRITE;
+        return HYPE_CFG_OK;
+    }
+    if (hype_streq(key, "sparse")) {
+        hype_cfg_status_t st;
+        if (*seen & D_SPARSE) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        st = parse_bool_field(val, &d->sparse);
+        if (st != HYPE_CFG_OK) return st;
+        *seen |= D_SPARSE;
         return HYPE_CFG_OK;
     }
     return HYPE_CFG_ERR_UNKNOWN_KEY;
@@ -2558,6 +2567,11 @@ static void serialize_disk(hype_cfg_w_t *w, const hype_cfg_disk_t *d) {
      * trips correctly by omission, since `allow_overwrite`'s only consumer is the physical path. */
     if (d->backing == HYPE_CFG_BACKING_PHYSICAL && d->allow_overwrite) {
         w_kv(w, "allow_overwrite", "true");
+    }
+    /* #506: meaningful only for backing=file (see cfg.h); round-trips by omission otherwise,
+     * same convention as allow_overwrite above. */
+    if (d->backing == HYPE_CFG_BACKING_FILE && d->sparse) {
+        w_kv(w, "sparse", "true");
     }
 }
 
