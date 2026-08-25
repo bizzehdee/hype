@@ -316,14 +316,41 @@ Same as Run 1's tack-on, the other vendor. Quick, tack onto the end of this sess
 ## Run 3 — physical storage cluster (either laptop; vendor-agnostic)
 
 ### Boot 3a: two serialized USB sticks on one root hub — min 15 min [build: default]
-**#387** + **#388** together, exactly as #387's own comment already scopes
-it: stage the standard stick as the boot medium, insert a second serialized
-stick, set `media_disk = <second's serial>` on a VM, assert the same four log
-lines #387's QEMU run already produced. #388 rides the same boot (its own bar
-is the `physical:` target write landing only on the named stick). 15 min
-floor: `tools/387/run-387.sh`'s own QEMU default is 300s (5 min) for the
-whole scripted install+assert sequence; real USB hardware enumeration and a
-real installer boot both run slower than QEMU's emulated xHCI, so budget 3x.
+**#387**, read-only. Stage the standard stick as the boot/log medium, insert a
+second serialized stick carrying `\iso\test.iso`, set `media_disk` to that
+second stick's serial, and assert #387's own three bars: both sticks register
+as `media: registered host device N = usb serial='...'`; the named stick
+resolves and streams the ISO without probing the other; and concurrent guest
+ISO reads off stick B stay corruption-free while the log drains to stick 0.
+15 min floor: `tools/387/run-387.sh`'s own QEMU default is 300s for the whole
+scripted sequence, and real USB enumeration plus a real installer boot both
+run slower than emulated xHCI, so budget 3x.
+
+> **Cheap first step (added 2026-08-25).** Bar 1 is satisfied by *any* boot
+> with both sticks present. Plugging stick B in and re-running an
+> already-proven config proves the bring-up limit is gone — that is what
+> `ceaa1a1` actually changed — and harvests stick B's serial from hype's own
+> log for the config above. Take the serial from
+> `media: registered host device N = usb serial='...'`, never from
+> `lsusb`/`blkid`/`lsblk`: hype reads SCSI INQUIRY VPD page 0x80, which behind
+> any USB bridge is the enclosure's serial. That mistake broke Boot 2a.
+
+### Boot 3d: `physical:` write target on a USB stick — min 15 min [build: default]
+**#388**, **split out of Boot 3a on 2026-08-25.** The original 3a config set
+`media_disk = <STICK-B-SERIAL>` *and* `target_disk = physical:<STICK-B-SERIAL>`
+on the same stick. The `physical:` sugar means `partition = whole` (spec §7),
+so hype would have streamed `\iso\test.iso` off a filesystem on stick B while
+the guest wrote raw sectors across the whole of that same stick — destroying
+the install media mid-install. The two tickets do not need one boot: #387's bar
+is entirely read-only, and separating them keeps 3a zero-risk (no
+partition-table guard, no `allow_overwrite`, no #125 confirm, nothing wiped).
+
+**This boot writes to a real USB stick and destroys its contents.** It needs a
+*third*, sanctioned scratch stick — not stick B (which carries the media), not
+the boot stick — with `allow_overwrite = true` for #124's non-empty-table
+guard and a manual #125 dashboard confirm at boot that no input-script can do.
+Install media comes from the boot stick, so source and target are different
+devices by construction.
 
 ### Boot 3b: one USB-SATA drive, ALL the partitions at once — min 25 min [build: default]
 **#688** + **#689** name the same drive class (a USB-SATA stick) with two
