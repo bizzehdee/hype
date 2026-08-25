@@ -1,0 +1,25 @@
+# Shared by hype1c.cfg (AMD) and hype2f.cfg (Intel): #653's real-hardware
+# exFAT pass, same shape as docs/hw-val-386.md's own exFAT section --
+# short-VDL (write a prefix, truncate UP past it) and a plain write-past-EOF,
+# both against the exFAT volume attached as this VM's SECOND disk (/dev/vdb
+# or /dev/sdb depending on bus -- check which one attaches before relying on
+# the device name below).
+timeout 600000
+fail-if soft lockup
+
+expect localhost login:
+send root\n
+expect ~#
+send mkdir -p /mnt/exfat && mount /dev/vdb1 /mnt/exfat 2>&1; echo MOUNT-$?\n
+expect MOUNT-
+send dd if=/dev/urandom of=/mnt/exfat/prefix.bin bs=4096 count=4 2>&1; echo WRITE1-$?\n
+expect WRITE1-
+send truncate -s 1048576 /mnt/exfat/prefix.bin; echo TRUNC-$?\n
+expect TRUNC-
+send dd if=/mnt/exfat/prefix.bin bs=4096 skip=64 count=1 2>/dev/null | od -An -tx1 | uniq -c\n
+expect ~#
+send dd if=/dev/urandom of=/mnt/exfat/big.bin bs=1M count=8 seek=8 2>&1; echo WRITE2-$?\n
+expect WRITE2-
+send sync && umount /mnt/exfat; echo DONE-$?\n
+expect DONE-
+pass exfat-write-test

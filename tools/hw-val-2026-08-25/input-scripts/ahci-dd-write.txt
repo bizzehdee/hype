@@ -1,0 +1,12 @@
+# hype3c.cfg vm1 (run3c-ahci): sustained dd write workload against the
+# physical AHCI scratch target, concurrent with vm0's NVMe workload -- see
+# nvme-dd-write.txt's own comment for why this loops.
+timeout 2700000
+fail-if soft lockup
+
+expect localhost login:
+send root\n
+expect ~#
+send i=0; while [ $i -lt 40 ]; do dd if=/dev/urandom of=/dev/vdb bs=1M count=32 seek=$((i*32)) oflag=direct 2>&1 | tail -1; i=$((i+1)); done; echo AHCI-LOOP-DONE\n
+expect AHCI-LOOP-DONE
+pass ahci-dd-write

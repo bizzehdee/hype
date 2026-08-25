@@ -1,0 +1,14 @@
+# hype3c.cfg vm0 (run3c-nvme): sustained dd write workload against the
+# physical NVMe scratch target, concurrent with vm1's AHCI workload --
+# #713 needs the stall pattern to actually RECUR (its own ~6-7s baseline
+# persisting after an initial 46s stall), so this loops rather than
+# writing once. Same dd bs=1M shape as tools/295/tools/715's own precedent.
+timeout 2700000
+fail-if soft lockup
+
+expect localhost login:
+send root\n
+expect ~#
+send i=0; while [ $i -lt 40 ]; do dd if=/dev/urandom of=/dev/vdb bs=1M count=32 seek=$((i*32)) oflag=direct 2>&1 | tail -1; i=$((i+1)); done; echo NVME-LOOP-DONE\n
+expect NVME-LOOP-DONE
+pass nvme-dd-write

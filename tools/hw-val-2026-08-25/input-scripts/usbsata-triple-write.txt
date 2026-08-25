@@ -1,0 +1,28 @@
+# hype3b.cfg (#688+#689): write-test pass across all three partitions of the
+# USB-SATA drive in one boot. Mirrors docs/hw-val-386.md's per-format shape:
+# FAT32 write-past-EOF, ext4 write-into-a-hole, NTFS in-place write.
+timeout 900000
+fail-if soft lockup
+
+expect localhost login:
+send root\n
+expect ~#
+send mkdir -p /mnt/fat32 /mnt/ext4 /mnt/ntfs\n
+expect ~#
+send mount /dev/vdb1 /mnt/fat32 2>&1; echo MOUNTFAT-$?\n
+expect MOUNTFAT-
+send mount /dev/vdb2 /mnt/ext4 2>&1; echo MOUNTEXT4-$?\n
+expect MOUNTEXT4-
+send mount /dev/vdb3 /mnt/ntfs 2>&1; echo MOUNTNTFS-$?\n
+expect MOUNTNTFS-
+send dd if=/dev/urandom of=/mnt/fat32/past-eof.bin bs=4096 count=1 seek=1024 2>&1; echo FATWRITE-$?\n
+expect FATWRITE-
+send dd if=/dev/urandom of=/mnt/ext4/hole.bin bs=1M count=1 seek=64 2>&1; echo EXT4WRITE-$?\n
+expect EXT4WRITE-
+send dd if=/dev/urandom of=/mnt/ntfs/inplace.bin bs=4096 count=16 2>&1; echo NTFSWRITE1-$?\n
+expect NTFSWRITE1-
+send dd if=/dev/urandom of=/mnt/ntfs/inplace.bin bs=4096 count=4 conv=notrunc 2>&1; echo NTFSWRITE2-$?\n
+expect NTFSWRITE2-
+send sync && umount /mnt/fat32 /mnt/ext4 /mnt/ntfs; echo DONE-$?\n
+expect DONE-
+pass usbsata-triple-write

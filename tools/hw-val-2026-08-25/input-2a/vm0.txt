@@ -1,0 +1,13 @@
+# Shared by hype2a.cfg and hype2c.cfg (Intel/VMX, #708/#599/#605): just prove
+# the guest reaches a login prompt at all -- no restart. A timeout here (never
+# reaching "localhost login:") IS the evidence #708 asks for, not a harness
+# failure -- do not treat a timeout on this script as "the run broke".
+timeout 1200000
+fail-if soft lockup
+
+expect localhost login:
+send root\n
+expect ~#
+send echo BOOT-OK-$(hostname)\n
+expect BOOT-OK-
+pass fresh-boot-login

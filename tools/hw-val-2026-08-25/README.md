@@ -1,12 +1,64 @@
 # Staging layout for the 2026-08-25 on-hold clear-down
 
-**Status: staged onto the real drive on 2026-08-25.** This is not a plan any
-more for the parts below marked done — `/dev/sdd` (serial
+**Status: staged onto the real drive on 2026-08-25.** `/dev/sdd` (serial
 `115E0735191800123920`) is a two-partition drive: `sdd1` FAT32 (label
-`HYPEBOOT`, boot ESP) + `sdd2` exFAT (label picked at format time, currently
-`EADE-CA36`, all vdisks/ISOs). Full reasoning for every boot is in
-`docs/hw-val-runbook-2026-08-25.md` — this directory is the artifacts that
-runbook points at, and this file is what actually landed where.
+`HYPEBOOT`, boot ESP) + `sdd2` exFAT (label `EADE-CA36`, all vdisks/ISOs).
+Full reasoning for every boot is in `docs/hw-val-runbook-2026-08-25.md` —
+this directory is the artifacts that runbook points at, and this file is
+what actually landed where.
+
+## Input-scripts: how they actually get picked up (read this before booting)
+
+**There is no cfg key for this at all.** hype auto-loads `\input\vm<N>.txt`
+per VM, where `<N>` is that VM's **0-based position in the config file** —
+NOT its `[vm.name]`. The first `[vm.*]` section is always `vm0`, regardless
+of what it's called. **Absent file = no scripted input at all, silently and
+harmlessly** (not an error) — the VM just runs with nothing typing into its
+console automatically.
+
+Because every one of these configs' input needs are different but the
+filename hype looks for is always the same (`vm0.txt`, or `vm0.txt`+`vm1.txt`
+for hype3c.cfg's two VMs), **the right script has to be copied into `\input\`
+fresh before each specific boot** — they can't all sit there under their
+real names at once. Staged as `input-<id>/` folders, one per boot that needs
+scripting:
+
+```sh
+# before booting hypeNN.cfg, on the actual machine:
+rm -rf \input
+cp -r \input-NN \input      # e.g. \input-1a -> \input for hype1a.cfg
+```
+
+| boot | needs scripting? | folder |
+|---|---|---|
+| 1a | yes | `input-1a/vm0.txt` (reboot-pin) |
+| 1b, 2d | no (suite-603.cfg's own microtests self-verify) | — |
+| 1c | yes | `input-1c/vm0.txt` (exfat-write-test) |
+| 2a | yes | `input-2a/vm0.txt` (login-only) |
+| 2b | yes | `input-2b/vm0.txt` (reboot-pin) |
+| 2c | yes | `input-2c/vm0.txt` (login-only) |
+| 2e | no (observed hang, not scripted) | — |
+| 2f | yes | `input-2f/vm0.txt` (exfat-write-test) |
+| 3a | no (interactive/self-contained) | — |
+| 3b | yes | `input-3b/vm0.txt` (usbsata-triple-write) |
+| 3c | yes, TWO scripts | `input-3c/vm0.txt` (nvme-dd-write) + `input-3c/vm1.txt` (ahci-dd-write) -- vm0/vm1 order matches the `[vm.run3c-nvme]`/`[vm.run3c-ahci]` order in hype3c.cfg itself |
+| 4a, 4b | no (interactive: Setup/OOBE, console-switching) | — |
+
+## No pre-installed disk images needed -- corrected from this file's first draft
+
+Every Alpine/FreeBSD boot below (1a, 1c, 2a, 2b, 2c, 2e, 2f, 3b, 3c, and the
+Linux/BSD legs of 4b) boots the **live install ISO fresh**, same proven shape
+as `tools/525`'s own rig (root login is passwordless in Alpine's live mode) —
+NOT a pre-installed disk. `input-scripts/reboot-pin.txt` is a direct copy of
+that proven script. This eliminates the earlier plan's biggest blocker
+entirely: there is nothing to "pre-install" for these two OSes at all. Each
+VM still carries a small `target_disk` scratch file (created on demand by
+hype itself, exFAT has `HYPE_FS_CAP_WRITE_GROW`) purely to satisfy
+admission's "needs a disk" check — never actually installed to.
+
+**Windows is the one real exception** (#442/#634/#635/#636's Windows leg):
+there is no live-boot equivalent that reaches OOBE, so `hype4a.cfg` performs
+a genuine install to `\hype\disks\windows.img`, which `hype4b.cfg` then reuses.
 
 ## Drive layout (as staged)
 
@@ -18,34 +70,19 @@ sdd1 (HYPEBOOT, FAT32):
   \EFI\hype\OVMF_CODE.fd, OVMF_VARS.fd
   \EFI\hype\micro\{vmexit,vmexitstorm,hello}.bin
   \hype1a.cfg ... \hype4b.cfg  <- copy whichever is next to \hype.cfg
-  \input\run1a.txt, run1c.txt, run2a.txt, run2b.txt, run2c.txt, run2f.txt
-  \RUNBOOK-README.md, \hw-val-runbook-2026-08-25.md  <- this file + the full runbook, for reference on-site
+  \input-1a\ ... \input-3c\    <- per-boot input-script folders, see table above
+  \RUNBOOK-README.md, \hw-val-runbook-2026-08-25.md  <- reference copies
 
 sdd2 (EADE-CA36, exFAT), referenced from every cfg via source_disk/media_disk
-= 115E0735191800123920 (the DRIVE's serial, not a partition number -- hype's
-own resolver walks that drive's partitions to find the path):
-  \iso\test.iso        <- DONE (Alpine standard 3.21.7, from this repo's own disk-images/)
-  \iso\windows.iso      <- DONE (Win11 24H2, from this repo's own disk-images/)
-  \iso\freebsd-install.iso  <- DONE (FreeBSD 15.0-RELEASE disc1, staged but NOT referenced
-                                by any cfg yet -- hype2e.cfg needs a disk IMAGE that has
-                                already reached the boot loader, not raw install media;
-                                use this ISO to produce \hype\disks\freebsd.img first)
-  \hype\disks\           <- directory created, EMPTY -- see "Still needed" below
+= 115E0735191800123920 (the DRIVE's serial -- hype's own resolver walks that
+drive's partitions to find the path, no partition number needed):
+  \iso\test.iso             <- Alpine standard 3.21.7
+  \iso\windows.iso           <- Win11 24H2
+  \iso\freebsd-install.iso   <- FreeBSD 15.0-RELEASE disc1
+  \hype\disks\               <- scratch files land here on first boot of each
+                                config; windows.img is the one hype4a.cfg
+                                creates deliberately and hype4b.cfg keeps
 ```
-
-## Still needed before Runs 1/2/4 can boot -- real installs, not staging
-
-These three images do not exist yet and need an actual install run each
-(none of this is achievable unattended from a dev sandbox):
-
-| image | needed by | how to produce it |
-|---|---|---|
-| `\hype\disks\alpine2vcpu.img` | 1a, 2a, 2b, 2c, 3b, 3c, 4b | install once with `boot=installer`, `vcpus=2`, against this path on `sdd2` (`source_disk = 115E0735191800123920`), then those configs' `boot=disk` reuses it |
-| `\hype\disks\alpine2vcpu-2.img` | 3c (second VM) | a second, independent install the same way -- two VMs can't share one backing file concurrently |
-| `\hype\disks\freebsd.img` | 2e, 4b | install (or at least reach the boot loader) from `\iso\freebsd-install.iso`, `os_hint=bsd` |
-
-`\hype\disks\windows.img` is NOT in this list -- Boot 4a creates it itself
-(`size_gb = 40` on its own `[disk.windisk]` entry).
 
 ## Real hardware serials still needed -- genuinely can't be filled in from here
 

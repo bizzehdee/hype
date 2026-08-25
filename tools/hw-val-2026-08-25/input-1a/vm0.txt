@@ -1,0 +1,21 @@
+# Shared by hype1a.cfg (AMD) and hype2b.cfg (Intel/VMX): pin the guest reboot
+# to the non-BSP vCPU and prove exactly one clean restart back to login.
+# Same script content as tools/input-scripts/smp525-reboot-vm0.txt (#525),
+# retimed for real hardware being slower than the QEMU runs that script was
+# proven against -- see docs/hw-val-runbook-2026-08-25.md's own min-run-time
+# reasoning for boots 1a/2b.
+timeout 1800000
+fail-if soft lockup
+
+expect localhost login:
+send root\n
+expect ~#
+send echo 1 > /sys/kernel/reboot/cpu && echo CPU-PINNED-$(cat /sys/kernel/reboot/cpu)\n
+expect CPU-PINNED-1
+send reboot\n
+
+# The second kernel's own SMP line gates the restart; a guest that comes back
+# 1-vCPU (or never comes back) times out here -- itself evidence for #698.
+expect Brought up 1 node, 2 CPUs
+expect localhost login:
+pass reboot-pin-nonbsp
