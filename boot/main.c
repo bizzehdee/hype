@@ -696,6 +696,7 @@ typedef struct hype_fw_disk {
      * mounted fs + open file are the growth handle hype_blk_image_sparse_t needs for the whole
      * VM's lifetime, not just at setup, so they cannot be locals. */
     hype_blk_image_sparse_t sparse_image;
+    hype_blk_backend_t sparse_raw_be; /* #508: qcow2's underlying file when it is ALSO sparse */
     hype_fs_t sparse_fs;
     hype_fs_file_t sparse_file;
     char sparse_path[HYPE_CFG_PATH_MAX];
@@ -9326,13 +9327,35 @@ static int fw_1_disk_use_sparse_image_file_unlocked(hype_fw_vm_t *vm, unsigned i
         return 0;
     }
     (void)hype_strlcpy(d->sparse_path, path, sizeof(d->sparse_path));
-    if (hype_blk_image_sparse_init(&d->sparse_image, &d->be, &rmap, g_media.part_base_lba,
-                                   hostdisk_read, hostdisk_write, 0, &d->sparse_fs, &d->sparse_file,
-                                   d->sparse_path) != 0) {
+    if (hype_blk_image_sparse_init(&d->sparse_image, &d->sparse_raw_be, &rmap,
+                                   g_media.part_base_lba, hostdisk_read, hostdisk_write, 0,
+                                   &d->sparse_fs, &d->sparse_file, d->sparse_path) != 0) {
         hype_debug_print("m5-8: %s on %s is NOT usable as a sparse disk (its filesystem cannot "
                          "grow a file's allocation, or the range map is empty) [#506]\n",
                          path, d->sparse_fs.ops->name);
         return 0;
+    }
+    /*
+     * #508: a sparse qcow2's metadata clusters are real DATA in the rmap (mkdisk wrote them);
+     * only the data clusters are a hole. hype_qcow2_init reads that metadata straight through
+     * d->sparse_raw_be exactly like the non-sparse path reads it through d->raw_be -- the format
+     * layer neither knows nor cares that the file underneath it can grow. Same detect-by-trying
+     * pattern as #200: a raw image never starts with "QFI\xfb" and passes full validation, so
+     * this cannot misidentify one.
+     */
+    if (hype_qcow2_init(&d->qcow2, &d->be, &d->sparse_raw_be, 0) == 0) {
+        hype_debug_print("m5-9: %s on %s is SPARSE QCOW2 v%u -- %llu-byte clusters, %llu virtual "
+                         "sectors [#508]\n",
+                         path, d->sparse_fs.ops->name, d->qcow2.version,
+                         (unsigned long long)d->qcow2.cluster_size,
+                         (unsigned long long)d->be.total_sectors);
+    } else {
+        /* Field-by-field: whole-struct assignment of anything that might hold an array is the
+         * freestanding memcpy trap this project has hit before. */
+        d->be.read = d->sparse_raw_be.read;
+        d->be.write = d->sparse_raw_be.write;
+        d->be.ctx = d->sparse_raw_be.ctx;
+        d->be.total_sectors = d->sparse_raw_be.total_sectors;
     }
     d->is_physical = 0;
     {
@@ -21312,8 +21335,23 @@ static void fw_1_arm_physical_targets(void) {
  * synchronously would park every guest this core serves for minutes. Progress lands on the
  * terminal's result line each percent, per the ticket: report progress rather than appearing
  * hung.
+ *
+ * #507 adds a THIRD option, raw-sparse: a raw image with a virtual size but almost nothing
+ * allocated, on the one host filesystem that can represent a hole today (ext, HYPE_FS_CAP_SPARSE
+ * -- refused elsewhere, naming the filesystem, rather than silently falling back to a fully
+ * preallocated file). Unlike the other two formats this completes in ONE write_at call, not a
+ * paced loop: writing a single sector at (virtual_size - sector_size) extends the file's logical
+ * size to the target while leaving everything before that sector an unallocated HOLE -- proven
+ * against a real mke2fs volume (see tools/507/run-507.sh) to cost exactly one filesystem block,
+ * not the whole virtual size. #506's growth path is what makes the result usable afterward; this
+ * ticket only makes it, and does not run the pump at all.
  */
-typedef enum { HYPE_MKDISK_FMT_QCOW2 = 0, HYPE_MKDISK_FMT_RAW } hype_mkdisk_fmt_t;
+typedef enum {
+    HYPE_MKDISK_FMT_QCOW2 = 0,
+    HYPE_MKDISK_FMT_RAW,
+    HYPE_MKDISK_FMT_RAW_SPARSE,  /* #507 */
+    HYPE_MKDISK_FMT_QCOW2_SPARSE /* #508 */
+} hype_mkdisk_fmt_t;
 
 static struct {
     int active;
@@ -21419,8 +21457,8 @@ static void term_mkdisk_begin(const char *serial, const char *path, const char *
         char line[96];
         int off = 0;
         (void)off;
-        term_resultf("mkdisk: usage mkdisk <disk-serial> <path> <GiB> [raw|qcow2] -- disks "
-                     "present:");
+        term_resultf("mkdisk: usage mkdisk <disk-serial> <path> <GiB> [raw|raw-sparse|qcow2] -- "
+                     "disks present:");
         for (i = 0; i < g_disk_inv.count; i++) {
             hype_snprintf(line, sizeof(line), "  %s '%s' %s %lluMiB",
                           g_disk_inv.disks[i].bus == HYPE_DISK_BUS_AHCI ? "ahci" : "nvme",
@@ -21434,14 +21472,21 @@ static void term_mkdisk_begin(const char *serial, const char *path, const char *
         gb = gb * 10u + (uint64_t)(*p2 - '0');
     }
     if (gb == 0u || *p2 != '\0' || path == 0 || path[0] == '\0') {
-        term_resultf("mkdisk: usage: mkdisk <disk-serial> <path> <GiB> [raw|qcow2]");
+        term_resultf("mkdisk: usage: mkdisk <disk-serial> <path> <GiB> "
+                     "[raw|raw-sparse|qcow2|qcow2-sparse]");
         return;
     }
     if (format_str != 0 && format_str[0] != '\0') {
         if (term_streq(format_str, "raw")) {
             format = HYPE_MKDISK_FMT_RAW;
+        } else if (term_streq(format_str, "raw-sparse")) {
+            format = HYPE_MKDISK_FMT_RAW_SPARSE;
+        } else if (term_streq(format_str, "qcow2-sparse")) {
+            format = HYPE_MKDISK_FMT_QCOW2_SPARSE;
         } else if (!term_streq(format_str, "qcow2")) {
-            term_resultf("mkdisk: unknown format '%s' -- expected raw or qcow2", format_str);
+            term_resultf("mkdisk: unknown format '%s' -- expected raw, raw-sparse, qcow2 or "
+                         "qcow2-sparse",
+                         format_str);
             return;
         }
     }
@@ -21457,9 +21502,78 @@ static void term_mkdisk_begin(const char *serial, const char *path, const char *
     if (mkdisk_mount_volume() != 0) {
         term_resultf("mkdisk: no writable, grow-capable volume (FAT32 or ext) found on '%s' -- "
                      "the create needs a filesystem that already exists there", serial);
+        /* #507/#508 debugging note: every mkdisk refusal past this point used to be visible only
+         * on the dashboard (term_resultf never touches the serial log) -- a real instance of the
+         * #285 class this project keeps flagging elsewhere. Logged from here down so a run
+         * driven headless (no display, serial-only) can diagnose which branch refused. */
+        HYPE_LOGF(HYPE_LOG_INFO, "fw-1 MKDISK: refused -- no grow-capable volume on '%s' [#487]\n",
+                  serial);
         return;
     }
     g_mkdisk.format = format;
+    if (format == HYPE_MKDISK_FMT_RAW_SPARSE) {
+        /* #507: one write_at establishes the whole create -- no pump, no g_mkdisk.active. See
+         * the doc comment above g_mkdisk's declaration for why this single call is enough. */
+        static hype_file_rmap_t rmap; /* #366: static -- see the sibling map locals nearby */
+        uint64_t virtual_bytes = gb << 30;
+        uint64_t allocated_bytes = 0;
+        uint8_t tail[HYPE_BLK_SECTOR_SIZE];
+        unsigned r;
+
+        if ((hype_fs_caps(&g_mkdisk.fs) & HYPE_FS_CAP_SPARSE) == 0u) {
+            term_resultf("mkdisk: raw-sparse refused -- the %s volume on '%s' cannot represent a "
+                         "hole (only ext can today)",
+                         g_mkdisk.fs.ops->name, serial);
+            HYPE_LOGF(HYPE_LOG_INFO, "fw-1 MKDISK: raw-sparse refused -- %s has no SPARSE cap "
+                      "[#507]\n", g_mkdisk.fs.ops->name);
+            return;
+        }
+        (void)hype_strlcpy(g_mkdisk.path, path, sizeof(g_mkdisk.path));
+        if (hype_fs_create(&g_mkdisk.fs, g_mkdisk.path, &g_mkdisk.file) != 0) {
+            term_resultf("mkdisk: cannot create '%s' on the %s volume", g_mkdisk.path,
+                         g_mkdisk.fs.ops->name);
+            HYPE_LOGF(HYPE_LOG_ERROR, "fw-1 MKDISK: create FAILED for %s on %s [#507]\n",
+                      g_mkdisk.path, g_mkdisk.fs.ops->name);
+            return;
+        }
+        for (r = 0; r < sizeof(tail); r++) tail[r] = 0u;
+        if (hype_fs_write_at(&g_mkdisk.file, virtual_bytes - sizeof(tail), tail, sizeof(tail)) !=
+            0) {
+            term_resultf("mkdisk: FAILED to establish size on '%s' -- the volume may be full",
+                         g_mkdisk.path);
+            HYPE_LOGF(HYPE_LOG_ERROR, "fw-1 MKDISK: tail-size write FAILED for %s [#507]\n",
+                      g_mkdisk.path);
+            return;
+        }
+        (void)hype_fs_sync(&g_mkdisk.fs);
+        if (hype_fs_map_ranges(&g_mkdisk.fs, g_mkdisk.path, &rmap) == 0) {
+            for (r = 0; r < rmap.count; r++) {
+                if (rmap.ranges[r].kind != (uint32_t)HYPE_RANGE_HOLE) {
+                    allocated_bytes += rmap.ranges[r].sector_count * (uint64_t)HYPE_BLK_SECTOR_SIZE;
+                }
+            }
+        }
+        term_resultf("mkdisk: DONE -- %s, %llu MiB virtual, %llu KiB allocated (raw, sparse). "
+                     "Attach it with a [disk.*] entry (sparse = true -- target_disk sugar cannot "
+                     "express sparse)",
+                     g_mkdisk.path, (unsigned long long)(virtual_bytes >> 20),
+                     (unsigned long long)(allocated_bytes >> 10));
+        HYPE_LOGF(HYPE_LOG_INFO,
+                  "fw-1 MKDISK: DONE -- %s (%llu virtual bytes, %llu allocated, raw-sparse) on %s "
+                  "'%s' [#507]\n",
+                  g_mkdisk.path, (unsigned long long)virtual_bytes,
+                  (unsigned long long)allocated_bytes, g_mkdisk.fs.ops->name, serial);
+        return;
+    }
+    if (format == HYPE_MKDISK_FMT_QCOW2_SPARSE &&
+        (hype_fs_caps(&g_mkdisk.fs) & HYPE_FS_CAP_SPARSE) == 0u) {
+        term_resultf("mkdisk: qcow2-sparse refused -- the %s volume on '%s' cannot represent a "
+                     "hole (only ext can today)",
+                     g_mkdisk.fs.ops->name, serial);
+        HYPE_LOGF(HYPE_LOG_INFO, "fw-1 MKDISK: qcow2-sparse refused -- %s has no SPARSE cap "
+                  "[#508]\n", g_mkdisk.fs.ops->name);
+        return;
+    }
     if (format == HYPE_MKDISK_FMT_RAW) {
         g_mkdisk.raw_total_bytes = gb << 30;
         g_mkdisk.total_units = g_mkdisk.raw_total_bytes / HYPE_QCOW2_CREATE_CLUSTER_SIZE;
@@ -21468,16 +21582,24 @@ static void term_mkdisk_begin(const char *serial, const char *path, const char *
             term_resultf("mkdisk: bad size");
             return;
         }
-        g_mkdisk.total_units = g_mkdisk.lo.total_clusters;
+        /* #508: a sparse qcow2 pumps only the METADATA clusters (0..data_start-1) through the
+         * loop below -- every data cluster stays an unallocated hole, reading as zero the same
+         * way hype_qcow2_create_cluster() would have rendered it explicitly. fw_1_mkdisk_pump()'s
+         * completion branch does the one extra write that establishes the file's full logical
+         * size once the metadata clusters are down. */
+        g_mkdisk.total_units =
+            (format == HYPE_MKDISK_FMT_QCOW2_SPARSE) ? g_mkdisk.lo.data_start : g_mkdisk.lo.total_clusters;
     }
     (void)hype_strlcpy(g_mkdisk.path, path, sizeof(g_mkdisk.path));
-    /* Create where the filesystem can (FAT32); on ext -- no namespace mutation -- the file must
-     * already exist and is OVERWRITTEN from offset 0, growing as needed. */
+    /* Create where the filesystem can (FAT32 or, since #498, ext too); falls back to an
+     * already-existing file on any volume whose writer permits create but not this specific
+     * path (e.g. a stale namespace entry from a previous partial run). */
     if (hype_fs_create(&g_mkdisk.fs, g_mkdisk.path, &g_mkdisk.file) != 0 &&
         hype_fs_lookup(&g_mkdisk.fs, g_mkdisk.path, &g_mkdisk.file) != 0) {
-        term_resultf("mkdisk: cannot create or open '%s' on the %s volume (ext volumes need the "
-                     "file to already exist -- no namespace mutation)", g_mkdisk.path,
+        term_resultf("mkdisk: cannot create or open '%s' on the %s volume", g_mkdisk.path,
                      g_mkdisk.fs.ops->name);
+        HYPE_LOGF(HYPE_LOG_ERROR, "fw-1 MKDISK: create-or-open FAILED for %s on %s [#487]\n",
+                  g_mkdisk.path, g_mkdisk.fs.ops->name);
         return;
     }
     g_mkdisk.next_unit = 0;
@@ -21517,7 +21639,10 @@ static int mkdisk_verify_raw_tail(void) {
 static void fw_1_mkdisk_pump(void) {
     static uint8_t cl[HYPE_QCOW2_CREATE_CLUSTER_SIZE];
     unsigned burst;
-    const char *fmt_name = (g_mkdisk.format == HYPE_MKDISK_FMT_RAW) ? "raw" : "qcow2";
+    const char *fmt_name =
+        (g_mkdisk.format == HYPE_MKDISK_FMT_RAW)
+            ? "raw"
+            : (g_mkdisk.format == HYPE_MKDISK_FMT_QCOW2_SPARSE) ? "qcow2-sparse" : "qcow2";
 
     if (!g_mkdisk.active) {
         return;
@@ -21561,8 +21686,51 @@ static void fw_1_mkdisk_pump(void) {
         }
     }
     if (g_mkdisk.next_unit >= g_mkdisk.total_units) {
-        (void)hype_fs_sync(&g_mkdisk.fs);
         g_mkdisk.active = 0;
+        if (g_mkdisk.format == HYPE_MKDISK_FMT_QCOW2_SPARSE) {
+            /* #508: every metadata cluster is down (the loop above wrote 0..data_start-1). One
+             * more write -- the LAST byte of the LAST cluster of the FULL layout -- establishes
+             * the file's logical size at what a fully-preallocated create would have used,
+             * leaving every data cluster an unallocated hole (reads as zero, identical to what
+             * hype_qcow2_create_cluster() would have rendered there explicitly). Same trick
+             * #507 uses for a sparse raw image, one layer up. */
+            static hype_file_rmap_t rmap; /* #366: static -- see the sibling map locals nearby */
+            uint64_t total_bytes = g_mkdisk.lo.total_clusters * (uint64_t)HYPE_QCOW2_CREATE_CLUSTER_SIZE;
+            uint64_t allocated_bytes = 0;
+            uint8_t tail[HYPE_BLK_SECTOR_SIZE];
+            unsigned r;
+
+            for (r = 0; r < sizeof(tail); r++) tail[r] = 0u;
+            if (hype_fs_write_at(&g_mkdisk.file, total_bytes - sizeof(tail), tail, sizeof(tail)) !=
+                0) {
+                term_resultf("mkdisk: FAILED to establish size on '%s' -- the volume may be full",
+                             g_mkdisk.path);
+                HYPE_LOGF(HYPE_LOG_ERROR, "fw-1 MKDISK: tail-size write FAILED for %s [#508]\n",
+                          g_mkdisk.path);
+                return;
+            }
+            (void)hype_fs_sync(&g_mkdisk.fs);
+            if (hype_fs_map_ranges(&g_mkdisk.fs, g_mkdisk.path, &rmap) == 0) {
+                for (r = 0; r < rmap.count; r++) {
+                    if (rmap.ranges[r].kind != (uint32_t)HYPE_RANGE_HOLE) {
+                        allocated_bytes +=
+                            rmap.ranges[r].sector_count * (uint64_t)HYPE_BLK_SECTOR_SIZE;
+                    }
+                }
+            }
+            term_resultf("mkdisk: DONE -- %s, %llu MiB virtual, %llu KiB allocated (qcow2, "
+                         "sparse). Attach it with a [disk.*] entry (sparse = true -- target_disk "
+                         "sugar cannot express sparse)",
+                         g_mkdisk.path, (unsigned long long)(g_mkdisk.lo.virtual_bytes >> 20),
+                         (unsigned long long)(allocated_bytes >> 10));
+            HYPE_LOGF(HYPE_LOG_INFO,
+                      "fw-1 MKDISK: DONE -- %s (%llu virtual bytes, %llu allocated, qcow2-sparse) "
+                      "[#508]\n",
+                      g_mkdisk.path, (unsigned long long)g_mkdisk.lo.virtual_bytes,
+                      (unsigned long long)allocated_bytes);
+            return;
+        }
+        (void)hype_fs_sync(&g_mkdisk.fs);
         if (g_mkdisk.format == HYPE_MKDISK_FMT_RAW && mkdisk_verify_raw_tail() != 0) {
             term_resultf("mkdisk: FAILED -- %s wrote %llu units but the tail sector did not read "
                          "back as written; the image is INCOMPLETE and not usable",

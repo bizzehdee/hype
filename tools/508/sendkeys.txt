@@ -1,0 +1,1 @@
+50:m,51:k,52:d,53:i,54:s,55:k,56:spc,57:shift-h,58:shift-y,59:shift-p,60:shift-e,61:5,62:0,63:8,64:shift-t,65:shift-g,66:shift-t,67:spc,68:backslash,69:d,70:i,71:s,72:k,73:s,74:backslash,75:v,76:m,77:dot,78:q,79:c,80:o,81:w,82:2,83:spc,84:1,85:spc,86:q,87:c,88:o,89:w,90:2,91:minus,92:s,93:p,94:a,95:r,96:s,97:e,98:ret

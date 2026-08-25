@@ -108,7 +108,7 @@ static const char *const g_cmd_usage[] = {
     "confirm <serial>",
     "create",
     "delete <vm>",
-    "mkdisk <disk-serial> <path> <GiB> [raw|qcow2]",
+    "mkdisk <disk-serial> <path> <GiB> [raw|raw-sparse|qcow2|qcow2-sparse]",
     "attach <vm> <usb-msc|sata|usb-phys>:<path-or-serial>",
     "detach <vm> <device-id>",
     "config <vm>",
