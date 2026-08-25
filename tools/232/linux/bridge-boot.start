@@ -1,0 +1,32 @@
+#!/bin/sh
+# #232: the minimal thing cdroms[0] needs to carry so a genuinely SEPARATE
+# hype-additions.iso (cdroms[1]) can drive the install. Unlike #228's
+# combined-ISO remaster (which injected the whole offline repo + full seed
+# onto the boot medium itself), this apkovl carries nothing but a two-step
+# handoff: find the additions medium, exec its own install-linux.sh. All the
+# substantive content (repo, seed, mkinitfs config) lives on the SEPARATE
+# medium, resolving plan.md decision 70's "open item" pragmatically -- this
+# is the small custom boot medium option that decision named as alternative
+# (b), chosen over Alpine's own alpine_repo=/apkovl= boot parameters because
+# it needs no hype.cfg/grub.cfg cmdline plumbing at all: the apkovl mechanism
+# that finds THIS script is the same one Alpine's live boot already runs by
+# default, and it does not care how small the payload is.
+exec >/dev/console 2>&1
+set -x
+say() { echo "### HYPE232-BRIDGE: $*"; }
+
+say "bridge starting -- looking for a separate hype-additions medium"
+BRIDGE=""
+for m in /media/sr0 /media/sr1 /media/cdrom /media/cdrom1 /media/vdb /media/usb; do
+    [ -x "$m/linux/install-linux.sh" ] && { BRIDGE="$m"; break; }
+done
+if [ -z "$BRIDGE" ]; then
+    for d in /media/*/linux; do [ -x "$d/install-linux.sh" ] && { BRIDGE=$(dirname "$d"); break; }; done
+fi
+if [ -z "$BRIDGE" ]; then
+    say "FATAL no hype-additions linux/install-linux.sh found on any attached medium"
+    say "attached media: $(ls /media 2>/dev/null | tr '\n' ' ')"
+    exit 1
+fi
+say "found additions medium at $BRIDGE -- handing off"
+exec "$BRIDGE/linux/install-linux.sh"

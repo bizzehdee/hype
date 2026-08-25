@@ -3565,6 +3565,31 @@ isn't lost.
     kernel-parameter bridging required. This is real remaining design work for the Linux leg,
     tracked as follow-up rather than settled here.
 
+    **Resolved (2026-08-25), same day:** option (b) above -- `tools/232/linux/bridge-boot.start` is
+    a two-line apkovl (find the separate additions medium, `exec` its `install-linux.sh`) injected
+    into a stock `alpine-standard` ISO via the same xorriso remaster technique #228 already proved
+    (`tools/232/linux/make-bridge-iso.sh`), carrying NONE of the repo/seed content #228's own
+    remaster did. This keeps the "separate ISO" property where it matters -- the repo, the seed and
+    the mkinitfs/bootloader fixups all live on `hype-additions.iso` alone, versioned and rebuilt
+    independently of the boot medium -- while sidestepping Alpine's lack of a "scan every medium"
+    behavior with the smallest possible per-boot-medium footprint, rather than the kernel-parameter
+    route (a), which would need cmdline plumbing this decision did not want to add scope for. Chosen
+    over (a) because it needed no `hype.cfg`/`grub.cfg` changes beyond what #228 already had a
+    working recipe for.
+
+    **Scope correction (2026-08-25):** the content manifest above undersold the real target matrix
+    by naming only Alpine for Linux and only FreeBSD for BSD. The actual bar this ticket is scoped
+    against is: **Linux** across package-manager families (apt/Debian, dnf/Fedora, pacman/Arch, apk/
+    Alpine -- each needs its own offline-repo + unattended-answer mechanism, none of which share
+    tooling with another), **Windows 7 through 11** (and Server equivalents -- `autounattend.xml`'s
+    own schema/components shift across that range, particularly 7/8.x's non-UEFI-default install
+    vs. 10/11's GPT/UEFI default), and **BSD** beyond FreeBSD (OpenBSD's `install.conf`, NetBSD's
+    `sysinst` response file, DragonFlyBSD's own installer -- each a distinct mechanism from
+    FreeBSD's `bsdinstall`/`installerconfig`). Only the Alpine leg is built and QEMU-validated as of
+    this correction; every other family is unbuilt and tracked as follow-up (#725 and likely
+    per-family sub-issues once the Alpine pattern is proven enough to generalize from), not
+    silently assumed covered by "linux/" or "bsd/" as directory names might imply.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what

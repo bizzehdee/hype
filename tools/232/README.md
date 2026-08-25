@@ -9,11 +9,32 @@ to BSD/Windows, which #228 could not do by construction.
 
 ```
 tools/232/
-  linux/    -- Alpine (and, per #146, other distros later) offline install
-  bsd/      -- FreeBSD unattended install via bsdinstall's installerconfig
-  windows/  -- Windows unattended install via autounattend.xml
-  build-additions-iso.sh  -- assembles all three trees into hype-additions.iso
+  linux/    -- Alpine (built) -- other distro families are follow-up, see below
+  bsd/      -- FreeBSD (first draft) -- other BSDs are follow-up, see below
+  windows/  -- Windows (first draft, targets one version range) -- see below
+  build-additions-iso.sh    -- assembles all trees into hype-additions.iso
+  linux/make-bridge-iso.sh  -- the tiny two-line bootstrap for cdroms[0]
 ```
+
+**Real target matrix (corrected 2026-08-25, plan.md decision 70's own scope
+correction) -- directory names above are NOT the full scope:**
+
+- **Linux**, every major package-manager family, not just Alpine: apt
+  (Debian/Ubuntu), dnf (Fedora/RHEL), pacman (Arch), apk (Alpine). Each needs
+  its OWN offline-repo + unattended-answer tooling -- `linux/build-repo.sh`
+  and `linux/install-linux.sh` are the **apk/Alpine leg only**, not a
+  template the others can share code with beyond the overall design pattern.
+- **Windows 7 through 11** (and Server equivalents) -- `windows/autounattend.xml`
+  as it stands targets one version range (UEFI/GPT-default, 10/11-era OOBE
+  component names); 7/8.x need their own variant.
+- **BSD** beyond FreeBSD: OpenBSD (`install.conf`), NetBSD (`sysinst`'s
+  response file), DragonFlyBSD (its own installer). `bsd/installerconfig` is
+  the **FreeBSD leg only**.
+
+**Built and QEMU-validated today: Alpine only.** Everything else above is
+unbuilt -- tracked in #725 and likely to become per-family sub-issues once
+the Alpine pattern is proven enough to generalize from, not silently assumed
+covered by a directory being named `linux/` or `bsd/`.
 
 ## Content manifest, and why each platform needs what it needs
 
@@ -30,23 +51,23 @@ Setup is silent on the serial line hype's whole diagnostic pipeline
 default their console to whatever the kernel command line says, so this is
 Windows-specific.
 
-## Open item, NOT resolved by this design (see plan.md decision 70)
+## Boot-bridge (resolved 2026-08-25)
 
-**How does the primary boot medium learn to look at the second CD at all?**
 FreeBSD's `installerconfig` and Windows' `autounattend.xml` both scan every
 attached medium for their answer file by design -- `cdroms[0]` stays a
-bone-stock, unmodified ISO for both of those. Alpine does not have an
-equivalent "scan everything" behavior for a live/install boot; #228 worked
-around this by remastering the boot ISO itself. A genuinely separate-ISO Linux
-flow needs Alpine's own live-boot kernel parameters (`alpine_repo=`,
-`apkovl=`) pointed at the second CD-ROM device -- standard, documented Alpine
-functionality, not yet wired into a hype install workflow. Tracked as
-follow-up, not implemented here.
+bone-stock, unmodified ISO for both. Alpine's live boot has no equivalent
+"scan everything" behavior, so `cdroms[0]` for the Linux leg is a stock
+`alpine-standard` ISO remastered with ONLY `linux/bridge-boot.start` -- a
+two-line apkovl that finds the separate additions medium and `exec`s its
+`install-linux.sh`. Built via `linux/make-bridge-iso.sh`, using the same
+xorriso technique #228 proved, but injecting nothing else -- no repo, no
+seed. All the substantive content stays on `hype-additions.iso` alone.
 
 ## Status
 
-Content builders and installer scripts below are written and internally
-reviewed against each platform's own documented unattended-install mechanism,
-**but not yet run in QEMU or on real hardware** -- unlike #228's Alpine recipe,
-which was validated end to end before this ticket started. Treat the BSD and
-Windows legs especially as a first draft to validate, not a proven recipe.
+**Alpine leg: built and QEMU-validated under hype** (`tools/232/run-232-linux.sh`).
+Every other family in the target matrix above (Debian/Fedora/Arch, Windows
+7-11, OpenBSD/NetBSD/DragonFlyBSD) is a first draft or entirely unbuilt --
+`bsd/installerconfig` and `windows/autounattend.xml` are written and
+internally reviewed against each mechanism's own documentation but **not yet
+run in QEMU or on real hardware**.
