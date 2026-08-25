@@ -42,6 +42,42 @@ static int win_ends_with(const hype_input_runner_t *r, const uint8_t *pat, uint3
     return 1;
 }
 
+/* #728: the three states of a screen gate. UNKNOWN means "not yet compared against a
+ * screen": the first scan after arming decides, and until one happens the pattern can
+ * only be matched off the wire, which needs no gate. */
+#define GATE_UNKNOWN 0u
+#define GATE_CLOSED 1u /* pattern was on screen when armed -- screen matches suppressed */
+#define GATE_OPEN 2u   /* pattern has since been absent -- a new appearance counts */
+
+#define GATE_NO_PC 0xFFFFFFFFu
+
+/*
+ * #728: does `pat` occur ANYWHERE in `text`? The gate asks about presence on the whole
+ * screen, which is a different question from win_ends_with's "did this just arrive".
+ *
+ * Plain O(n*m) scan. The screen is a couple of thousand cells and patterns are at most
+ * HYPE_INPUT_SCRIPT_MAX_ARG, evaluated at the scan cadence (~10 Hz) and only when the
+ * current directive changes -- there is nothing here worth a smarter algorithm.
+ */
+static int text_contains(const uint8_t *text, uint32_t len, const uint8_t *pat, uint32_t patlen) {
+    uint32_t i;
+    if (patlen == 0u || patlen > len) {
+        return 0;
+    }
+    for (i = 0; i + patlen <= len; i++) {
+        uint32_t j;
+        for (j = 0; j < patlen; j++) {
+            if (text[i + j] != pat[j]) {
+                break;
+            }
+        }
+        if (j == patlen) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /*
  * Consume the directives that need neither a clock nor guest output: `timeout` and
  * `fail-if`. Called from init() and from feed(), not only from poll().
@@ -63,6 +99,8 @@ static void arm_static_directives(hype_input_runner_t *r) {
         if (d->op == HYPE_INPUT_OP_FAIL_IF) {
             if (r->failif_count < HYPE_INPUT_SCRIPT_MAX_DIRECTIVES) {
                 r->failif[r->failif_count] = r->pc;
+                /* #728: undecided until a screen scan compares it. */
+                r->failif_gate[r->failif_count] = GATE_UNKNOWN;
                 r->failif_count++;
             }
             r->pc++;
@@ -91,6 +129,11 @@ void hype_input_runner_init(hype_input_runner_t *r, const hype_input_script_t *s
     r->phase_start_ms = now_ms;
     r->win_len = 0;
     r->failif_count = 0;
+    r->scan_gate_pc = GATE_NO_PC;
+    r->scan_gated = 0;
+    r->scan_suppress = 0;
+    r->gate_pre_pc = GATE_NO_PC;
+    r->gate_pre_present = 0;
     r->verdict = HYPE_INPUT_VERDICT_PENDING;
     r->reason = HYPE_INPUT_REASON_NONE;
     r->detail = 0;
@@ -119,6 +162,12 @@ void hype_input_runner_feed(hype_input_runner_t *r, uint8_t byte) {
      */
     for (i = 0; i < r->failif_count; i++) {
         const hype_input_directive_t *fd = &r->script->d[r->failif[i]];
+        /* #728: while this scan is presenting the screen, a fail-if whose pattern was
+         * already visible when it was armed must not fire. Same defect as the expect
+         * false-pass, wearing the opposite verdict. */
+        if (r->scan_suppress && r->failif_gate[i] == GATE_CLOSED) {
+            continue;
+        }
         if (win_ends_with(r, fd->text, fd->len)) {
             finish(r, HYPE_INPUT_VERDICT_FAIL, HYPE_INPUT_REASON_FAIL_IF_MATCHED, fd->text, fd->len,
                    fd->line);
@@ -128,6 +177,12 @@ void hype_input_runner_feed(hype_input_runner_t *r, uint8_t byte) {
 
     if (r->pc < r->script->count) {
         const hype_input_directive_t *d = &r->script->d[r->pc];
+        /* #728: likewise for the current expect -- a gated pattern is one that was
+         * already on screen when this directive was armed, so matching it here would
+         * pass on history rather than on anything the guest just did. */
+        if (r->scan_suppress && r->scan_gated && r->scan_gate_pc == r->pc) {
+            return;
+        }
         if (d->op == HYPE_INPUT_OP_EXPECT && win_ends_with(r, d->text, d->len)) {
             /* Consume the matched input: a following `expect` for the same pattern
              * (e.g. two `expect ~#` around a command) must NOT be satisfied
@@ -161,9 +216,102 @@ void hype_input_runner_scan(hype_input_runner_t *r, const uint8_t *text, uint32_
      * characters into a match that never appeared anywhere. */
     r->win_len = 0;
 
+    /*
+     * #728: settle every fail-if's gate against THIS screen before feeding it. A pattern
+     * visible at arm time is history; once a scan shows it gone, any later appearance is
+     * genuinely new and the gate opens for good.
+     */
+    for (i = 0; i < r->failif_count; i++) {
+        const hype_input_directive_t *fd = &r->script->d[r->failif[i]];
+        int present = text_contains(text, len, fd->text, fd->len);
+        if (r->failif_gate[i] == GATE_UNKNOWN) {
+            r->failif_gate[i] = present ? (uint8_t)GATE_CLOSED : (uint8_t)GATE_OPEN;
+        } else if (r->failif_gate[i] == GATE_CLOSED && !present) {
+            r->failif_gate[i] = GATE_OPEN;
+        }
+    }
+
+    /*
+     * #728: settle the CURRENT expect's gate. The reference point that matters is the
+     * screen as it was BEFORE this directive became current -- not as it is now.
+     *
+     * Measuring "is it present right now, on the first scan after arming" conflates two
+     * opposite cases: a stale banner left over from before (must gate) and text the
+     * script's own `send`/`sendkey` just put there (must NOT gate, or
+     * `sendkey Hello World` followed by `expect Hello World` in tools/302 would time out
+     * forever). They are indistinguishable at that moment.
+     *
+     * So each scan also pre-measures the NEXT expect in the script -- the one the pc has
+     * not reached yet -- and that recorded answer becomes its gate when it does. By
+     * construction that measurement predates the directive, which is exactly the question
+     * being asked. `gate_pre_pc` says which directive the recorded `gate_pre_present`
+     * belongs to; anything else falls back to measuring against this screen.
+     */
+    if (r->pc == r->scan_gate_pc) {
+        /* Same directive as the previous scan. Once the pattern leaves the screen, any
+         * later appearance is genuinely new, so the gate opens for good. */
+        if (r->scan_gated && r->pc < r->script->count) {
+            const hype_input_directive_t *d = &r->script->d[r->pc];
+            if (!text_contains(text, len, d->text, d->len)) {
+                r->scan_gated = 0;
+            }
+        }
+    } else {
+        r->scan_gate_pc = r->pc;
+        r->scan_gated = 0;
+        if (r->pc < r->script->count) {
+            const hype_input_directive_t *d = &r->script->d[r->pc];
+            if (d->op == HYPE_INPUT_OP_EXPECT) {
+                /* No pre-measurement for this directive means no scan ever saw the screen
+                 * while it was pending, so there is no "before" to call the text stale
+                 * against -- ungated. Gating on the current screen instead would break
+                 * the first scan of a run, which is exactly when a TUI menu is already
+                 * painted (`expect GNU GRUB`). */
+                r->scan_gated = (r->gate_pre_pc == r->pc) ? r->gate_pre_present : 0u;
+            }
+        }
+    }
+
+    /* Pre-measure the next expect the pc has not reached, for the branch above. */
+    {
+        uint32_t k;
+        r->gate_pre_pc = GATE_NO_PC;
+        r->gate_pre_present = 0;
+        for (k = r->pc + 1u; k < r->script->count; k++) {
+            if (r->script->d[k].op == HYPE_INPUT_OP_EXPECT) {
+                r->gate_pre_pc = k;
+                r->gate_pre_present =
+                    (uint8_t)text_contains(text, len, r->script->d[k].text, r->script->d[k].len);
+                break;
+            }
+        }
+    }
+
+    r->scan_suppress = 1;
     for (i = 0; i < len; i++) {
+        /*
+         * The pc can move mid-scan, when an earlier expect matches off this same screen.
+         * The directive that just became current would otherwise be ungated by default
+         * and could be satisfied by text further along in the very same snapshot.
+         */
+        if (r->pc != r->scan_gate_pc) {
+            r->scan_gate_pc = r->pc;
+            r->scan_gated = 0;
+            if (r->pc < r->script->count) {
+                const hype_input_directive_t *d = &r->script->d[r->pc];
+                if (d->op == HYPE_INPUT_OP_EXPECT) {
+                    /* No pre-measurement for this directive means no scan ever saw the screen
+                     * while it was pending, so there is no "before" to call the text stale
+                     * against -- ungated. Gating on the current screen instead would break
+                     * the first scan of a run, which is exactly when a TUI menu is already
+                     * painted (`expect GNU GRUB`). */
+                    r->scan_gated = (r->gate_pre_pc == r->pc) ? r->gate_pre_present : 0u;
+                }
+            }
+        }
         hype_input_runner_feed(r, text[i]);
     }
+    r->scan_suppress = 0;
 
     for (i = 0; i < saved_len; i++) {
         r->win[i] = saved[i];

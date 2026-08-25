@@ -80,6 +80,41 @@ typedef struct {
     uint32_t failif[HYPE_INPUT_SCRIPT_MAX_DIRECTIVES];
     uint32_t failif_count;
 
+    /*
+     * #728: the SCREEN gate. A screen scan re-presents the whole display on every
+     * call, so matching it with an ends-with window is a substring search over
+     * everything currently visible -- including text painted long before the current
+     * directive was reached. That let `expect localhost login:` after a `reboot` be
+     * satisfied instantly by the PREVIOUS boot's banner still on screen, passing a
+     * run whose guest never restarted.
+     *
+     * The rule these fields implement: a screen scan may only satisfy a pattern that
+     * was ABSENT from the screen when its directive was armed. Present-at-arm means
+     * gated, and the gate lifts as soon as a scan shows the pattern gone -- so a
+     * later, genuinely new appearance still matches.
+     *
+     * The wire matcher is untouched. It is a true stream: a byte arriving on it has
+     * by definition just appeared, so it needs no gate.
+     *
+     * `gate_state` holds one of GATE_UNKNOWN / GATE_CLOSED / GATE_OPEN per armed
+     * `fail-if`, indexed alongside `failif[]`; a false FAIL from stale screen text is
+     * the same defect wearing the opposite verdict.
+     */
+    uint32_t scan_gate_pc; /* pc `scan_gated` was computed for; UINT32_MAX = none */
+    uint8_t scan_gated;    /* current expect's pattern was already on screen when armed */
+    uint8_t scan_suppress; /* set only inside hype_input_runner_scan, while gated */
+    uint8_t failif_gate[HYPE_INPUT_SCRIPT_MAX_DIRECTIVES];
+    /*
+     * The reference point has to be the screen BEFORE a directive became current, not
+     * after. Measuring on the first scan following it cannot tell a stale banner apart
+     * from text the script's own send/sendkey just produced -- gating the latter would
+     * hang `sendkey Hello World` / `expect Hello World` (tools/302) forever. So each scan
+     * pre-measures the NEXT expect the pc has not reached yet, and that answer becomes
+     * its gate when it does.
+     */
+    uint32_t gate_pre_pc;     /* directive `gate_pre_present` was measured for */
+    uint8_t gate_pre_present; /* was its pattern on screen before it became current? */
+
     hype_input_verdict_t verdict;
     hype_input_reason_t reason;
     /* The directive that ended the run: its label (pass/fail) or the pattern that
@@ -110,11 +145,19 @@ void hype_input_runner_feed(hype_input_runner_t *r, uint8_t byte);
  * Pass a snapshot of the terminal grid as text, rows concatenated. Call it on a cadence; each call
  * is an independent look at what is CURRENTLY ON SCREEN.
  *
- * That is a deliberately different meaning from the streaming matcher: `expect` against the screen
- * is satisfied by text that is visible NOW, including text that was already there when the expect
- * became current. For a TUI that is the useful question ("is the menu up"), but it is not the same
- * as "this appeared in the output", so the two are separate entry points rather than one merged
- * matcher.
+ * This is still a different question from the streaming matcher's -- it asks what is ON SCREEN, not
+ * what came down the wire -- but since #728 it is no longer "visible NOW" without qualification.
+ *
+ * #728 amended that: a screen scan may only satisfy a pattern that was ABSENT when its directive
+ * was armed. Matching text that was already there turned every repeated `expect` into an instant
+ * pass -- `expect localhost login:` after a `reboot` matched the PREVIOUS boot's banner still on
+ * screen, and a run whose guest never restarted was reported PASS. A false pass is the worst
+ * failure a validation harness has, so the safe reading is the default one.
+ *
+ * The original wording justified the old behaviour with "is the menu up". Every shipped script's
+ * screen-matched expect turns out to WAIT FOR SOMETHING TO APPEAR instead -- `expect GNU GRUB` then
+ * `sendkey c` then `expect grub>`, `expect Press any key to boot from CD or DVD.` -- so none of
+ * them relied on the reading that was removed, and all of them still work.
  *
  * The raw rolling window is saved and restored across the scan, so a pattern arriving one byte at a
  * time on the wire cannot be broken by a screen scan landing in the middle of it.

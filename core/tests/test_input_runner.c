@@ -506,6 +506,141 @@ static void test_scan_edge_inputs(void) {
               (int)hype_input_runner_verdict(&r));
 }
 
+/*
+ * #728: the false-pass regression. A screen scan re-presents the whole display every
+ * time, so an `expect` for a pattern ALREADY on screen used to be satisfied instantly
+ * by history. On hw-val Boot 2b that reported PASS 124ms after `reboot` was sent, on a
+ * guest that never restarted.
+ */
+static void test_scan_does_not_match_text_that_was_already_on_screen(void) {
+    hype_input_runner_t r;
+    static const char *screen = "localhost login: root\nlocalhost:~# reboot\n";
+    load("timeout 5000\nexpect reboot\nexpect localhost login:\npass ok\n");
+    hype_input_runner_init(&r, &g_sc, 0);
+    pump(&r, 0);
+
+    /* The caller scans on a ~10Hz cadence throughout, so by the time the reboot is
+     * issued the screen has already been offered while the FIRST expect was current.
+     * That scan is what gives the gate a genuine "before" to measure against. */
+    hype_input_runner_scan(&r, (const uint8_t *)screen, (uint32_t)strlen(screen));
+
+    /* First expect matches off the wire; the pc moves to `expect localhost login:`
+     * while that pattern is ALREADY on the screen from the previous boot. */
+    feed_str(&r, "reboot");
+    pump(&r, 1);
+
+    hype_input_runner_scan(&r, (const uint8_t *)screen, (uint32_t)strlen(screen));
+    pump(&r, 2);
+    CHECK_INT("stale screen text does not satisfy the expect", (int)HYPE_INPUT_VERDICT_PENDING,
+              (int)hype_input_runner_verdict(&r));
+
+    /* Repeating the same screen must stay pending however many times it is offered. */
+    hype_input_runner_scan(&r, (const uint8_t *)screen, (uint32_t)strlen(screen));
+    hype_input_runner_scan(&r, (const uint8_t *)screen, (uint32_t)strlen(screen));
+    pump(&r, 3);
+    CHECK_INT("and still does not on a later scan", (int)HYPE_INPUT_VERDICT_PENDING,
+              (int)hype_input_runner_verdict(&r));
+}
+
+/* ...and the gate must LIFT: once the pattern leaves the screen, its next appearance is
+ * a genuine event. This is the other half -- a gate that never opened would turn the
+ * false pass into a permanent hang. */
+static void test_scan_gate_lifts_once_the_pattern_leaves_the_screen(void) {
+    hype_input_runner_t r;
+    static const char *before = "localhost login: root\nlocalhost:~# reboot\n";
+    static const char *during = "Restarting system.\n";
+    static const char *after = "Welcome to Alpine Linux\nlocalhost login:";
+    load("timeout 5000\nexpect reboot\nexpect localhost login:\npass ok\n");
+    hype_input_runner_init(&r, &g_sc, 0);
+    pump(&r, 0);
+    hype_input_runner_scan(&r, (const uint8_t *)before, (uint32_t)strlen(before)); /* the "before" */
+    feed_str(&r, "reboot");
+    pump(&r, 1);
+
+    hype_input_runner_scan(&r, (const uint8_t *)before, (uint32_t)strlen(before));
+    pump(&r, 2);
+    CHECK_INT("gated while the stale prompt is up", (int)HYPE_INPUT_VERDICT_PENDING,
+              (int)hype_input_runner_verdict(&r));
+
+    hype_input_runner_scan(&r, (const uint8_t *)during, (uint32_t)strlen(during)); /* screen cleared */
+    hype_input_runner_scan(&r, (const uint8_t *)after, (uint32_t)strlen(after));   /* it comes back */
+    pump(&r, 3);
+    CHECK_INT("the real second prompt does satisfy it", (int)HYPE_INPUT_VERDICT_PASS,
+              (int)hype_input_runner_verdict(&r));
+}
+
+/*
+ * The gate must not swallow text the script itself just caused. `sendkey Hello World`
+ * followed by `expect Hello World` (tools/302's shape) can have the echo on screen
+ * before the first scan after the expect is armed -- indistinguishable from a stale
+ * banner at that instant, which is why the gate is measured from the screen BEFORE the
+ * directive became current rather than after.
+ */
+static void test_scan_gate_does_not_block_output_the_script_just_caused(void) {
+    hype_input_runner_t r;
+    load("timeout 5000\nexpect grub>\nsendkey Hello World\nexpect Hello World\npass ok\n");
+    hype_input_runner_init(&r, &g_sc, 0);
+    pump(&r, 0);
+
+    /* A screen with the prompt but NOT yet the typed text: this is the pre-measurement
+     * that decides the next expect's gate. */
+    hype_input_runner_scan(&r, (const uint8_t *)"grub> ", 6u);
+    pump(&r, 1); /* matches grub>, then hands over the sendkey */
+
+    /* By the next scan the keystrokes have echoed. That is new output, not history. */
+    hype_input_runner_scan(&r, (const uint8_t *)"grub> Hello World", 17u);
+    pump(&r, 2);
+    CHECK_INT("echoed keystrokes still satisfy the expect", (int)HYPE_INPUT_VERDICT_PASS,
+              (int)hype_input_runner_verdict(&r));
+}
+
+/* A fail-if is the same defect wearing the opposite verdict: stale screen text must not
+ * fire it, but a genuine later appearance must. */
+static void test_fail_if_ignores_stale_screen_text(void) {
+    hype_input_runner_t r;
+    load("timeout 5000\nfail-if soft lockup\nexpect DONE\npass ok\n");
+    hype_input_runner_init(&r, &g_sc, 0);
+    pump(&r, 0);
+
+    hype_input_runner_scan(&r, (const uint8_t *)"old log: soft lockup on cpu 3", 29u);
+    pump(&r, 1);
+    CHECK_INT("pre-existing screen text does not trip fail-if",
+              (int)HYPE_INPUT_VERDICT_PENDING, (int)hype_input_runner_verdict(&r));
+
+    hype_input_runner_scan(&r, (const uint8_t *)"a clean screen", 14u);
+    hype_input_runner_scan(&r, (const uint8_t *)"BUG: soft lockup - CPU#0 stuck", 30u);
+    pump(&r, 2);
+    CHECK_INT("but a fresh occurrence does", (int)HYPE_INPUT_VERDICT_FAIL,
+              (int)hype_input_runner_verdict(&r));
+}
+
+/* The wire is a true stream -- a byte arriving on it has by definition just appeared --
+ * so the gate must never apply there, even for a pattern sitting on the screen. */
+static void test_wire_match_is_never_gated_by_the_screen(void) {
+    hype_input_runner_t r;
+    static const char *screen = "READY is already on screen";
+    load("timeout 5000\nexpect GO\nexpect READY\npass ok\n");
+    hype_input_runner_init(&r, &g_sc, 0);
+    pump(&r, 0);
+
+    /* Establishes the "before": READY is on screen while the FIRST expect is current. */
+    hype_input_runner_scan(&r, (const uint8_t *)screen, (uint32_t)strlen(screen));
+    feed_str(&r, "GO");
+    pump(&r, 1);
+
+    hype_input_runner_scan(&r, (const uint8_t *)screen, (uint32_t)strlen(screen));
+    pump(&r, 2);
+    CHECK_INT("the stale screen is gated", (int)HYPE_INPUT_VERDICT_PENDING,
+              (int)hype_input_runner_verdict(&r));
+
+    /* The wire is a true stream: a byte arriving on it has by definition just
+     * appeared, so the gate must never apply there. */
+    feed_str(&r, "READY");
+    pump(&r, 3);
+    CHECK_INT("the wire still matches while the screen is gated",
+              (int)HYPE_INPUT_VERDICT_PASS, (int)hype_input_runner_verdict(&r));
+}
+
 int main(void) {
     test_happy_path();
     test_match_split_across_feeds();
@@ -531,6 +666,11 @@ int main(void) {
     test_scan_does_not_disturb_a_wire_match_in_progress();
     test_scan_does_not_splice_onto_wire_bytes();
     test_scan_edge_inputs();
+    test_scan_does_not_match_text_that_was_already_on_screen();
+    test_scan_gate_lifts_once_the_pattern_leaves_the_screen();
+    test_scan_gate_does_not_block_output_the_script_just_caused();
+    test_fail_if_ignores_stale_screen_text();
+    test_wire_match_is_never_gated_by_the_screen();
     if (failures == 0) {
         printf("all tests passed\n");
         return 0;
