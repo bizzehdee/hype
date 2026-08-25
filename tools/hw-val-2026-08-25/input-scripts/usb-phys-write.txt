@@ -1,0 +1,39 @@
+# hype3d.cfg (#388): prove a USB stick works as a `physical:` write target --
+# the third bus in decision-8's chain, alongside AHCI and NVMe.
+#
+# DEVICE NAME: /dev/vda. [disk.usbtarget] sets no `bus` and os_hint = linux, so
+# hype_cfg_resolve_bus gives virtio-blk, and it is the VM's only attached disk
+# (slot 0). #388 is about the HOST side -- blk_usb behind phys_guard -- not
+# about which front-end the guest sees, so virtio-blk is fine and the guest
+# device name is just what we have to write to. The install ISO is an ATAPI
+# device (sr0) served from the OTHER stick, so it cannot be confused with this.
+#
+# THIS DESTROYS THE TARGET STICK'S CONTENTS. That is the point: it is a
+# sanctioned scratch stick, and the write must land on it and nowhere else.
+#
+# A signature write plus read-back is the whole bar: if phys_guard rejected the
+# device, the writes fail and READBACK never matches. Verifying "nowhere else"
+# is a HOST-side check after the run -- confirm the boot stick and the media
+# stick are untouched.
+timeout 900000
+fail-if soft lockup
+fail-if READBACK-DIFF
+
+expect localhost login:
+send root\n
+expect ~#
+send echo BLK-$(ls /dev/vd* /dev/sd* /dev/sr* 2>/dev/null | tr '\n' ' ')\n
+expect BLK-
+send dd if=/dev/urandom of=/tmp/sig.bin bs=4096 count=1 2>&1; echo SIG-$?\n
+expect SIG-
+send dd if=/tmp/sig.bin of=/dev/vda bs=4096 count=1 seek=64 oflag=direct 2>&1; echo WRITE-$?\n
+expect WRITE-
+send sync; dd if=/dev/vda bs=4096 count=1 skip=64 iflag=direct of=/tmp/back.bin 2>&1; echo READ-$?\n
+expect READ-
+send cmp /tmp/sig.bin /tmp/back.bin && echo READBACK-MATC''H || echo READBACK-DIF''F\n
+expect READBACK-MATCH
+send dd if=/dev/urandom of=/dev/vda bs=1M count=16 seek=1 oflag=direct 2>&1; echo BULK-$?\n
+expect BULK-
+send sync; echo USB-PHYS-WRITE-DON''E\n
+expect USB-PHYS-WRITE-DONE
+pass usb-phys-write

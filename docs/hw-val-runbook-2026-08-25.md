@@ -352,6 +352,19 @@ guard and a manual #125 dashboard confirm at boot that no input-script can do.
 Install media comes from the boot stick, so source and target are different
 devices by construction.
 
+### Boot 3e: naming hype's own boot medium as a physical target — min 2 min [build: default]
+**#388**'s negative test, expected to **REFUSE**. Rule 3 of the ticket: *"hype's
+own boot/log medium is never a target, whatever its serial: refuse by the
+inventory's `HYPE_USB_OWNER_HYPE` claim (identity, not position)."* A successful
+write in Boot 3d says nothing about whether naming the *wrong* device would have
+been caught, so this is its own Validation bullet.
+
+`hype3e.cfg` names the 512 GB boot stick as a physical write target. **PASS =
+refused and the VM does not start with that disk attached. FAIL = it starts** —
+which would mean hype will let a guest write over its own boot medium and log.
+Config-only, needs no extra hardware, seconds long. Run it straight after 3d
+while the same sticks are still plugged in.
+
 ### Boot 3b: one USB-SATA drive, ALL the partitions at once — min 25 min [build: default]
 **#688** + **#689** name the same drive class (a USB-SATA stick) with two
 different data-partition filesystems. Nothing requires them on separate
