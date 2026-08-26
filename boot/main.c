@@ -14615,7 +14615,21 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
      * must never read as "stop everything": the first boot on a fresh stick has no record, and a
      * host that came up with nothing running because of that looks exactly like one that failed.
      */
-    if (hype_run_state_lookup(&g_run_state, vm->name) == HYPE_RUN_STATE_STOPPED) {
+    /*
+     * #732 (plan.md section 10 decision 72): `[hype] autostart` gets its say FIRST, and it is a
+     * ceiling -- a VM it excludes never starts, whatever the run-state record remembers. The key
+     * parsed, validated and serialized for a long time with no consumer at all, so
+     * `autostart = none` started everything: the exact opposite of the request, silently.
+     *
+     * ANDed with M9-4 below rather than replacing it. The config says what SHOULD be up; the
+     * record says what WAS up. Neither is a substitute for the other.
+     */
+    if (!hype_cfg_autostart_permits(&g_hype_cfg.hype, vm->name)) {
+        vm->lifecycle = HYPE_VM_OFF;
+        HYPE_LOGF(HYPE_LOG_INFO, "fw-1 #732: vm%u '%s' is not in [hype] autostart -- left off, not "
+                         "started. 'start %s' at the terminal boots it\n",
+                         (unsigned)(vm - g_vms), vm->name, vm->name);
+    } else if (hype_run_state_lookup(&g_run_state, vm->name) == HYPE_RUN_STATE_STOPPED) {
         vm->lifecycle = HYPE_VM_OFF;
         HYPE_LOGF(HYPE_LOG_INFO, "fw-1 M9-4: vm%u '%s' was STOPPED when the host last went down -- "
                          "left off, not started. 'start %s' at the terminal boots it [#177]\n",
@@ -21436,6 +21450,34 @@ static void load_hype_cfg(void) {
     HYPE_LOGF(HYPE_LOG_INFO, "cfg: loaded \\hype.cfg (%llu bytes) -- %u VM(s)\n",
                      (unsigned long long)sz, g_hype_cfg.vm_count);
 
+    /*
+     * #732: say what autostart is going to do, before anything acts on it, and name every listed
+     * VM that does not exist. A typo in the list is a warning and not a refusal (plan.md section
+     * 10 decision 72) -- but an unnamed typo is how "autostart = run1a" silently starts nothing.
+     */
+    {
+        unsigned int missing = hype_cfg_autostart_unmatched(&g_hype_cfg);
+        unsigned int i;
+
+        HYPE_LOGF(HYPE_LOG_INFO, "cfg: autostart = %s%s -- a VM it excludes is left OFF at boot "
+                         "and started with 'start <name>' [#732]\n",
+                         (g_hype_cfg.hype.autostart == HYPE_CFG_AUTOSTART_ALL) ? "all" :
+                         (g_hype_cfg.hype.autostart == HYPE_CFG_AUTOSTART_NONE) ? "none" : "list",
+                         (g_hype_cfg.hype.autostart == HYPE_CFG_AUTOSTART_LIST) ? " (see below)"
+                                                                               : "");
+        for (i = 0; i < g_hype_cfg.hype.autostart_count && i < HYPE_CFG_MAX_VMS; i++) {
+            if (g_hype_cfg.hype.autostart != HYPE_CFG_AUTOSTART_LIST) break;
+            HYPE_LOGF(HYPE_LOG_INFO, "cfg:   autostart[%u] = '%s'\n", i,
+                             g_hype_cfg.hype.autostart_vms[i]);
+        }
+        for (i = 0; i < missing; i++) {
+            const char *bad = hype_cfg_autostart_unmatched_name(&g_hype_cfg, i);
+
+            HYPE_LOGF(HYPE_LOG_WARN, "cfg: autostart names '%s', which is not a VM in this config "
+                             "-- ignored, the boot continues [#732]\n", bad ? bad : "?");
+        }
+    }
+
     /* #83/#405: the NIC was bound before this point; its ADDRESS could only come from the config
      * that has just been read. */
     fw_1_uplink_adopt_config();
@@ -26732,7 +26774,15 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                             /* The walk always runs to completion now, so its return value
                              * only says whether a visitor cut it short; what matters is
                              * whether a medium was captured. */
-                            (void)hype_xhci_hub_walk(&xc, slot, &path, 1u, fw_1_hub_visit, &vctx);
+                            if (hype_xhci_hub_walk(&xc, slot, &path, 1u, fw_1_hub_visit,
+                                                   &vctx) == HYPE_XHCI_HUB_NOT_WALKED) {
+                                /* #739: say so. The "still in the inventory" line below is
+                                 * true of a hub that was walked and had no storage; for one
+                                 * that was never walked, NOTHING behind it was recorded. */
+                                hype_debug_print("host-xhci: hub on port %u was NOT walked -- "
+                                                 "no device behind it is in the inventory "
+                                                 "[#739]\n", rp);
+                            }
                             if (msc_slot != 0u) {
                                 hype_debug_print("host-xhci: MSC found behind hub on port %u -- "
                                                  "slot %u route 0x%05x speed %u\n", rp, msc_slot,

@@ -1746,6 +1746,56 @@ static void test_hype_section_all_keys(void) {
     CHECK_INT("section 0 is [hype]", (int)HYPE_CFG_SECTION_HYPE, (int)out.sections[0].kind);
 }
 
+/*
+ * #732 (plan.md section 10 decision 72): autostart had no consumer, so `autostart = none`
+ * started everything. These test the decision function the boot path now asks.
+ */
+static void test_autostart_permits(void) {
+    char cfg[3072];
+    hype_cfg_t out;
+
+    /* Absent: the default is ALL, which is what hype did before the key was consumed. */
+    snprintf(cfg, sizeof(cfg), "%s", VM_A);
+    (void)parse_copy(cfg, &out);
+    CHECK_INT("absent autostart permits the VM", 1,
+              hype_cfg_autostart_permits(&out.hype, "a"));
+
+    snprintf(cfg, sizeof(cfg), "%s%s", "[hype]\nautostart = all\n", VM_A);
+    (void)parse_copy(cfg, &out);
+    CHECK_INT("all permits the VM", 1, hype_cfg_autostart_permits(&out.hype, "a"));
+    CHECK_INT("all permits a VM not in the config either", 1,
+              hype_cfg_autostart_permits(&out.hype, "somethingelse"));
+
+    /* This is the reported bug: none must mean none. */
+    snprintf(cfg, sizeof(cfg), "%s%s", "[hype]\nautostart = none\n", VM_A);
+    (void)parse_copy(cfg, &out);
+    CHECK_INT("none permits nothing", 0, hype_cfg_autostart_permits(&out.hype, "a"));
+
+    /* A list permits exactly its members, and nothing else. */
+    snprintf(cfg, sizeof(cfg), "%s%s%s", "[hype]\nautostart = a, c\n", VM_A,
+             "[vm.b]\nvcpus = 1\nmem_mb = 512\nboot = disk\ntarget_disk = file:b.img\n"
+             "firmware = uefi\nos_hint = linux\n");
+    (void)parse_copy(cfg, &out);
+    CHECK_INT("list permits a listed VM", 1, hype_cfg_autostart_permits(&out.hype, "a"));
+    CHECK_INT("list refuses an unlisted VM", 0, hype_cfg_autostart_permits(&out.hype, "b"));
+    /* Names are exact -- a prefix must not match, or "run1" would start "run1a". */
+    CHECK_INT("list does not prefix-match", 0, hype_cfg_autostart_permits(&out.hype, "a2"));
+
+    /* 'c' is listed but is not a VM: a warning, not a refusal (decision 72). */
+    CHECK_INT("one listed name matches no VM", 1, hype_cfg_autostart_unmatched(&out));
+    CHECK_STR("and it is named", "c", hype_cfg_autostart_unmatched_name(&out, 0));
+    CHECK_INT("no second unmatched name", 1,
+              hype_cfg_autostart_unmatched_name(&out, 1) == (const char *)0);
+
+    /* A host that cannot read its config must not come up with nothing running. */
+    CHECK_INT("NULL cfg permits", 1, hype_cfg_autostart_permits((const hype_cfg_hype_t *)0, "a"));
+    CHECK_INT("NULL name permits", 1, hype_cfg_autostart_permits(&out.hype, (const char *)0));
+    CHECK_INT("unmatched count on a NULL cfg is 0", 0,
+              (int)hype_cfg_autostart_unmatched((const hype_cfg_t *)0));
+    CHECK_INT("unmatched name on ALL is NULL", 1,
+              hype_cfg_autostart_unmatched_name((const hype_cfg_t *)0, 0) == (const char *)0);
+}
+
 static void test_hype_section_absent_gives_todays_behaviour(void) {
     hype_cfg_t out;
     hype_cfg_result_t res = parse_copy(VM_A, &out);
@@ -3296,6 +3346,7 @@ int main(void) {
     test_serialize_hype_section_lists();
     test_cfg_init_gives_safe_defaults_not_zeroes();
     test_log_level_key();
+    test_autostart_permits();
     test_count_vms_counts_declarations();
     test_parse_into_accepts_more_vms_than_the_default();
     test_parse_into_refuses_past_bound_storage();

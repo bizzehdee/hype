@@ -1838,10 +1838,10 @@ unsigned int hype_xhci_detect_device(hype_xhci_ctrl_t *c, unsigned int *out_spee
 #define HUB_FEAT_C_PORT_CONNECTION 16u
 #define HUB_FEAT_C_PORT_RESET      20u
 
-static int hub_get_descriptor(hype_xhci_ctrl_t *c, unsigned int slot, uint8_t *buf,
-                              unsigned int len) {
-    /* GET_DESCRIPTOR(HUB): class/IN/device (0xA0), wValue=0x2900, IN. */
-    return control_transfer(c, slot, 0xA0, 6, (uint16_t)(HYPE_USB_DESC_HUB << 8), 0, buf, len, 1);
+static int hub_get_descriptor(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int desc_type,
+                              uint8_t *buf, unsigned int len) {
+    /* GET_DESCRIPTOR(HUB): class/IN/device (0xA0), wValue=type<<8, IN. */
+    return control_transfer(c, slot, 0xA0, 6, (uint16_t)(desc_type << 8), 0, buf, len, 1);
 }
 static int hub_set_port_feature(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int feat,
                                 unsigned int port) {
@@ -1869,20 +1869,42 @@ int hype_xhci_hub_walk(hype_xhci_ctrl_t *c, unsigned int hub_slot,
                        const hype_xhci_devpath_t *hub_path, unsigned int tier,
                        hype_xhci_hub_visit_fn visit, void *ctx) {
     uint8_t hubdesc[16];
-    unsigned int nports, port;
+    unsigned int nports, port, want, ttt;
+    int ss_hub;
 
-    if (!c->inited || hub_slot == 0u || visit == (hype_xhci_hub_visit_fn)0) return -1;
-    if (tier == 0u || tier > 5u) return -1; /* xHCI route strings are 5 hub tiers deep */
-
-    if (hub_get_descriptor(c, hub_slot, hubdesc, sizeof hubdesc) != 0) {
-        hype_debug_print("host-xhci:   hub slot %u GET hub-descriptor FAILED\n", hub_slot);
-        return -1;
+    if (!c->inited || hub_slot == 0u || visit == (hype_xhci_hub_visit_fn)0) {
+        return HYPE_XHCI_HUB_NOT_WALKED;
     }
-    if (hubdesc[1] != HYPE_USB_DESC_HUB) {
+    if (tier == 0u || tier > 5u) {
+        return HYPE_XHCI_HUB_NOT_WALKED; /* xHCI route strings are 5 hub tiers deep */
+    }
+
+    /*
+     * #739: a SuperSpeed hub has no USB 2.0 hub descriptor -- it has the SuperSpeed one,
+     * type 0x2A (USB 3.2 10.15.2.1). Asking every hub for 0x29 made hype skip both
+     * SuperSpeed hubs on the operator's 5950X: one answered with a 0x2A descriptor and
+     * was rejected on type, the other refused the request outright. Everything behind
+     * either was invisible, inventory included.
+     */
+    want = (hub_path->speed >= HYPE_USB_SPEED_SUPER) ? HYPE_USB_DESC_HUB_SS
+                                                     : HYPE_USB_DESC_HUB;
+    if (hub_get_descriptor(c, hub_slot, want, hubdesc, sizeof hubdesc) != 0) {
+        /* A hub that answers the other type is worth one retry: a 2.0 hub reached
+         * through a SuperSpeed port, or an SS hub that only serves 0x29. */
+        unsigned int alt = (want == HYPE_USB_DESC_HUB) ? HYPE_USB_DESC_HUB_SS
+                                                       : HYPE_USB_DESC_HUB;
+        if (hub_get_descriptor(c, hub_slot, alt, hubdesc, sizeof hubdesc) != 0) {
+            hype_debug_print("host-xhci:   hub slot %u GET hub-descriptor FAILED (tried type "
+                             "0x%02x then 0x%02x) [#739]\n", hub_slot, want, alt);
+            return HYPE_XHCI_HUB_NOT_WALKED;
+        }
+    }
+    if (hubdesc[1] != HYPE_USB_DESC_HUB && hubdesc[1] != HYPE_USB_DESC_HUB_SS) {
         hype_debug_print("host-xhci:   hub slot %u bad hub-descriptor type 0x%02x\n",
                          hub_slot, (unsigned)hubdesc[1]);
-        return -1;
+        return HYPE_XHCI_HUB_NOT_WALKED;
     }
+    ss_hub = (hubdesc[1] == HYPE_USB_DESC_HUB_SS);
     nports = hype_xhci_hub_nbr_ports(hubdesc);
     hype_debug_print("host-xhci:   hub slot %u (tier %u) has %u downstream port(s)\n",
                      hub_slot, tier, nports);
@@ -1894,11 +1916,14 @@ int hype_xhci_hub_walk(hype_xhci_ctrl_t *c, unsigned int hub_slot,
      * whose ports are all high-speed never needs the TT -- so a failure is reported and
      * the descent continues.
      */
-    if (hype_xhci_configure_hub_slot(c, hub_slot, hub_path, nports,
-                                     hype_xhci_hub_ttt(hubdesc)) != 0) {
+    /* TT Think Time is meaningless for a SuperSpeed hub -- it has no Transaction
+     * Translator -- and wHubCharacteristics bits 6:5 are reserved there, so read it
+     * only from a 2.0 descriptor. */
+    ttt = ss_hub ? 0u : hype_xhci_hub_ttt(hubdesc);
+    if (hype_xhci_configure_hub_slot(c, hub_slot, hub_path, nports, ttt) != 0) {
         hype_debug_print("host-xhci:   hub slot %u Configure Endpoint (Hub=1 ports=%u ttt=%u) "
                          "FAILED -- LS/FS devices below it may not report [#737]\n",
-                         hub_slot, nports, hype_xhci_hub_ttt(hubdesc));
+                         hub_slot, nports, ttt);
     }
 
     for (port = 1u; port <= nports; port++) {
@@ -1930,7 +1955,14 @@ int hype_xhci_hub_walk(hype_xhci_ctrl_t *c, unsigned int hub_slot,
         if (!(st[0] & 0x02u)) continue; /* PORT_ENABLE clear -> reset didn't take */
         delay_ms(15); /* USB reset recovery before Address Device (see reset_port) */
 
-        child_speed = hub_port_speed(st);
+        /*
+         * #739: the USB 2.0 wPortStatus speed bits do not exist on a SuperSpeed hub --
+         * its bits 10:12 carry the negotiated link speed instead, and a 2.0 device
+         * plugged into a USB-3 receptacle appears on the hub's SEPARATE 2.0 half, which
+         * is its own xHCI device. So everything on an SS hub's downstream ports is
+         * SuperSpeed, and reading bits 9/10 here would have called it full speed.
+         */
+        child_speed = ss_hub ? HYPE_USB_SPEED_SUPER : hub_port_speed(st);
         hype_debug_print("host-xhci:   hub slot %u port %u: device attached (speed id %u)\n",
                          hub_slot, port, child_speed);
 

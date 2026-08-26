@@ -3656,6 +3656,36 @@ isn't lost.
     index caused a real bug three times in this code -- says compute the slot explicitly and let an
     out-of-range value fail loudly rather than clamp.
 
+72. **`autostart` and the run-state record BOTH have to permit a VM to start; the config is the
+    ceiling, the record is a veto within it -- decided (2026-08-27).**
+    #732 found `[hype] autostart` parsed, validated and serialized, with no consumer: `autostart =
+    none` started everything. Honouring the key is a bugfix, but it lands on a site that already
+    has an answer to "does this VM start" -- M9-4's run-state record (#177, `\hype-state.txt`) --
+    and the two can disagree, so the precedence is a decision and not just code.
+
+    **They are ANDed. A VM starts only if `autostart` permits it AND the record does not say
+    STOPPED.** The two answer different questions and neither is a better source for the other's:
+    the config is operator-authored and durable ("what should be up"), the record is hype's own
+    memory of the last shutdown ("what was up"). Letting the record override the config would mean
+    a VM the operator excluded comes up anyway because it happened to be running before -- which is
+    #732's complaint restated. Letting the config override the record would mean a VM the operator
+    stopped at the terminal restarts on the next boot, undoing #177.
+
+    **The default keeps today's behaviour exactly.** `autostart` defaults to `all`, and an absent
+    or unreadable config leaves it there, so a host with no `autostart` key behaves as it does now
+    and only the record holds anything back. This matters for the same reason #177 gives for
+    UNKNOWN: a fresh stick with no record and no config that came up with nothing running looks
+    identical to one that failed.
+
+    **A name in `autostart` that matches no VM is a warning, not a refusal.** It is a typo in an
+    operator's list, and the cost of refusing the whole boot over it is far higher than the cost of
+    saying so and starting the VMs that did match. Consistent with S4.3's warn-and-retain stance
+    for unknown keys.
+
+    **Logged either way, at the same site and in the same shape as M9-4's line**, because the
+    failure this ticket describes is silence: an operator who asks for one VM and gets four must be
+    able to read why from the log.
+
 
 ## 11. Pre-M0 readiness checklist
 

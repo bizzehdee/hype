@@ -276,11 +276,15 @@ static inline uint32_t hype_xhci_portsc_write_preserve(uint32_t current, uint32_
 /* USB hub class (device descriptor bDeviceClass == 0x09). */
 #define HYPE_USB_CLASS_HUB       0x09u
 #define HYPE_USB_DESC_HUB        0x29u /* wValue high byte for GET hub descriptor */
+/* #739: a SuperSpeed hub answers 0x2A, not 0x29 (USB 3.2 10.15.2.1). bNbrPorts is
+ * byte 2 in both, so the port count and the walk are shared; TT Think Time is not. */
+#define HYPE_USB_DESC_HUB_SS     0x2Au
 
 /* PORTSC/hub speed ids (shared with hype_xhci_default_mps). */
 #define HYPE_USB_SPEED_FULL  1u
 #define HYPE_USB_SPEED_LOW   2u
 #define HYPE_USB_SPEED_HIGH  3u
+#define HYPE_USB_SPEED_SUPER 4u
 
 /* A standard USB device descriptor is 18 bytes; bDeviceClass is byte 4. Returns
  * 1 if this device is a hub (its interface may instead carry the class, but the
@@ -536,6 +540,14 @@ typedef int (*hype_xhci_hub_visit_fn)(void *ctx, hype_xhci_ctrl_t *c, unsigned i
 int hype_xhci_hub_walk(hype_xhci_ctrl_t *c, unsigned int hub_slot,
                        const hype_xhci_devpath_t *hub_path, unsigned int tier,
                        hype_xhci_hub_visit_fn visit, void *ctx);
+
+/*
+ * #739: hub_walk's -1 used to mean two different things -- "walked it all, no visitor
+ * said STOP" and "could not walk it at all". A caller that cannot tell them apart
+ * reported "its devices are still in the inventory" for a hub whose devices had never
+ * been looked at. This return says the descent never happened.
+ */
+#define HYPE_XHCI_HUB_NOT_WALKED (-2)
 
 /*
  * USB-3 (#215) block I/O over Bulk-Only Transport (SCSI). Require the device to

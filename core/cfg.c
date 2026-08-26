@@ -2648,3 +2648,56 @@ hype_cfg_serialize_result_t hype_cfg_serialize(const hype_cfg_t *cfg, char *out,
     res.truncated = w.truncated;
     return res;
 }
+
+/* --- #732: autostart consumers (plan.md section 10 decision 72) --- */
+
+int hype_cfg_autostart_permits(const hype_cfg_hype_t *h, const char *vm_name) {
+    unsigned int i;
+
+    if (h == (const hype_cfg_hype_t *)0 || vm_name == (const char *)0) return 1;
+    switch (h->autostart) {
+        case HYPE_CFG_AUTOSTART_NONE:
+            return 0;
+        case HYPE_CFG_AUTOSTART_LIST:
+            for (i = 0; i < h->autostart_count && i < HYPE_CFG_MAX_VMS; i++) {
+                if (hype_streq(h->autostart_vms[i], vm_name)) return 1;
+            }
+            return 0;
+        case HYPE_CFG_AUTOSTART_ALL:
+        default:
+            return 1;
+    }
+}
+
+static int autostart_name_matches_a_vm(const hype_cfg_t *cfg, const char *name) {
+    unsigned int v;
+
+    for (v = 0; v < cfg->vm_count && v < HYPE_CFG_MAX_VMS; v++) {
+        if (hype_streq(cfg->vms[v].name, name)) return 1;
+    }
+    return 0;
+}
+
+unsigned int hype_cfg_autostart_unmatched(const hype_cfg_t *cfg) {
+    unsigned int i, n = 0;
+
+    if (cfg == (const hype_cfg_t *)0 || cfg->hype.autostart != HYPE_CFG_AUTOSTART_LIST) return 0;
+    for (i = 0; i < cfg->hype.autostart_count && i < HYPE_CFG_MAX_VMS; i++) {
+        if (!autostart_name_matches_a_vm(cfg, cfg->hype.autostart_vms[i])) n++;
+    }
+    return n;
+}
+
+const char *hype_cfg_autostart_unmatched_name(const hype_cfg_t *cfg, unsigned int i) {
+    unsigned int k, seen = 0;
+
+    if (cfg == (const hype_cfg_t *)0 || cfg->hype.autostart != HYPE_CFG_AUTOSTART_LIST) {
+        return (const char *)0;
+    }
+    for (k = 0; k < cfg->hype.autostart_count && k < HYPE_CFG_MAX_VMS; k++) {
+        if (autostart_name_matches_a_vm(cfg, cfg->hype.autostart_vms[k])) continue;
+        if (seen == i) return cfg->hype.autostart_vms[k];
+        seen++;
+    }
+    return (const char *)0;
+}

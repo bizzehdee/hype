@@ -120,10 +120,18 @@ kinds are ignored (§4.1).
 | `uplink_mask` | dotted quad | (none) | netmask for `uplink_ip` |
 | `uplink_gateway` | dotted quad | (none) | next hop for anything off-link |
 | `dashboard_default_view` | `dashboard` \| `vm:<name>` | `dashboard` | which view the GOP shows at boot (TERM) |
-| `autostart` | `all` \| `none` \| list | `all` | which VMs to Start at boot (plan.md §6h/§9) |
+| `autostart` | `all` \| `none` \| list | `all` | which VMs to Start at boot (plan.md §6h/§9, §10 decision 72). A VM it excludes is created and fully set up, then left **off**; `start <name>` at the terminal boots it. Names must match a `[vm.<name>]` exactly — a name matching no VM is a **warning** and the boot continues (#732). ANDed with the run-state record: see the note below |
 | `shared_overcommit_ratio` | float, `>= 1.0` | `4.0` | max vCPU:thread over-commit ratio for the shared scheduling tier's pool (plan.md §10 decision 39). Admission (§6i) refuses startup if any `cpu_mode = shared` VM is configured while this is `< 1.0` — that would forbid the pool from over-committing at all, which is the tier's whole point |
 | `log_level` | `error` \| `warn` \| `info` \| `debug` | `debug` | post-`ExitBootServices` log verbosity (#533). **Defaults to `debug` (everything), and every failure to read or understand the config leaves it there** — a host that cannot read its config is the host whose log matters most, so a broken value must never quiet it. Named, not numbered: a number in a config file is unreadable six months later. Phase 0 always logs in full; it runs before the config exists (plan.md §10 decision 37) and it is short. A panic is never filtered at any level. The level in force is printed before any line it could filter, so a reader can tell a quiet host from a quiet logger |
 | `shared_timeslice_us` | int, microseconds | `4000` | LAPIC one-shot preemption-timer slice length for the shared tier (plan.md §10 decision 39, SMP-20). Global only — no per-VM override; a shorter slice for one latency-sensitive shared VM is a plausible future knob, but nothing today asks for it, and it would multiply SMP-20's timing proof surface |
+
+**`autostart` and `\hype-state.txt` both have to permit a VM to start** (#732,
+plan.md §10 decision 72). The config is the ceiling and the run-state record is a
+veto within it, so a VM starts only when `autostart` includes it **and** the
+record does not say it was stopped at the last shutdown. They answer different
+questions — the config is what *should* be up, the record is what *was* up — and
+neither substitutes for the other. The default is `all`, so a config with no
+`autostart` key behaves exactly as before: only the record holds anything back.
 
 **The three `uplink_*` keys are all-or-nothing** (#405). A partial set — an
 address with no gateway, say — parses, but leaves hype with **no** uplink rather

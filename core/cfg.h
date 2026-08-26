@@ -1016,4 +1016,26 @@ const char *hype_cfg_vm_display_name(const hype_cfg_vm_t *vm);
  */
 int hype_cfg_vm_has_target_disk(const hype_cfg_vm_t *vm);
 
+/*
+ * #732 (plan.md section 10 decision 72): does `[hype] autostart` permit this VM to start?
+ *
+ * ALL (the default) permits everything, NONE permits nothing, LIST permits exactly the named
+ * VMs. The caller ANDs this with the run-state record (#177): the config is the ceiling, the
+ * record is a veto within it.
+ *
+ * A NULL cfg or name permits the VM. This decides whether a guest runs, and a host that cannot
+ * read its own config must not silently come up with nothing -- the same reason an absent
+ * run-state record starts everything.
+ */
+int hype_cfg_autostart_permits(const hype_cfg_hype_t *h, const char *vm_name);
+
+/*
+ * #732: how many names in `autostart` match no VM in this config? Zero when autostart is not a
+ * LIST. A typo in an operator's list is a warning, not a refusal (decision 72), so the caller
+ * needs to be able to say so; `hype_cfg_autostart_unmatched_name()` returns the i-th such name
+ * for the message, or NULL.
+ */
+unsigned int hype_cfg_autostart_unmatched(const hype_cfg_t *cfg);
+const char *hype_cfg_autostart_unmatched_name(const hype_cfg_t *cfg, unsigned int i);
+
 #endif /* HYPE_CFG_H */
