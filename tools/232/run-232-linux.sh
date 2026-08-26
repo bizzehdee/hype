@@ -10,8 +10,6 @@ export LC_ALL=C
 cd "$(git rev-parse --show-toplevel)"
 HERE=tools/232
 B=${HYPE_232_BUILD:-disk-images/hype-232-build}
-S="${SCRATCH:-$(mktemp -d disk-images/rig232.XXXXXX)}"
-echo "scratch: $S"
 # Refuse to run twice at once, via an flock on this script itself.
 #
 # This matters because the line below kills every qemu at startup, so a second
@@ -31,6 +29,8 @@ if ! flock -n 9; then
     echo "kill it first, or wait for it to finish" >&2
     exit 1
 fi
+S="${SCRATCH:-$(mktemp -d disk-images/rig232.XXXXXX)}"
+echo "scratch: $S"
 killall -9 qemu-system-x86_64 2>/dev/null || true
 sleep 1
 
@@ -62,15 +62,32 @@ SFDISK
     true
 }
 
+# Which host disk front-end the ESP is attached through.
+#
+# Default stays AHCI, because that is what hype's own host AHCI driver is
+# exercised by here and switching it silently would quietly stop testing that.
+#
+# HOST_DISK=nvme is the escape hatch for #730: qemu-10.2.2 segfaults in its OWN
+# ahci_commit_buf during a DMA read, which kills a whole 20-minute boot and
+# looks like a firmware hang from the outside (73-byte log, qemu at 99% CPU).
+# It is intermittent, so a retry is legitimate -- but when it keeps landing,
+# NVMe sidesteps the crashing code entirely and hype enumerates it fine (#519).
+case "${HOST_DISK:-ahci}" in
+    nvme)
+        HOST_DISK_ARGS='-drive format=raw,file=PLACEHOLDER,if=none,id=d0 -device nvme,drive=d0,serial=HYPEESPDISK,bootindex=0'
+        ;;
+    *)
+        HOST_DISK_ARGS='-device ich9-ahci,id=ahci -drive format=raw,file=PLACEHOLDER,if=none,id=d0 -device ide-hd,drive=d0,bus=ahci.0,serial=HYPEESPDISK,bootindex=0'
+        ;;
+esac
+
 run_qemu() { # $1 = esp, $2 = log, $3 = seconds
     cp /usr/share/edk2/ovmf/OVMF_VARS.fd "$S"/VARS.fd
     timeout "$3" qemu-system-x86_64 -machine q35 -m 4096 -nodefaults \
       -accel kvm -cpu host -smp 2 \
       -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/ovmf/OVMF_CODE.fd \
       -drive if=pflash,format=raw,file="$S"/VARS.fd \
-      -device ich9-ahci,id=ahci \
-      -drive format=raw,file="$1",if=none,id=d0 \
-      -device ide-hd,drive=d0,bus=ahci.0,serial=HYPEESPDISK,bootindex=0 \
+      ${HOST_DISK_ARGS//PLACEHOLDER/$1} \
       -serial "file:$2" -display none -vga none || true
 }
 

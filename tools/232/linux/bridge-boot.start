@@ -44,7 +44,15 @@ if [ -z "$BRIDGE" ]; then
     i=0
     for dev in /dev/sr0 /dev/sr1 /dev/sr2 /dev/sr3; do
         [ -b "$dev" ] || continue
-        mp="/mnt/hype-addons-$i"; i=$((i + 1))
+        # NOT under /mnt: Alpine's setup-disk mounts the TARGET root there
+        # (SYSROOT=${SYSROOT:-/mnt}), which shadows anything already mounted
+        # beneath it. With the additions ISO at /mnt/hype-addons-1 the repo
+        # simply vanished the moment the install began, and apk reported
+        # "package mentioned in index not found" for packages that were
+        # demonstrably present on the disc -- the index was cached, the files
+        # were not reachable. It failed at 97%, on openssh subpackages.
+        # /media is where removable media belongs and setup-disk never touches it.
+        mp="/media/hype-addons-$i"; i=$((i + 1))
         mkdir -p "$mp"
         if mount -t iso9660 -o ro "$dev" "$mp" 2>&1; then
             say "mounted $dev at $mp: $(ls "$mp" 2>/dev/null | tr '\n' ' ')"

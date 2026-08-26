@@ -83,7 +83,7 @@ say "modloop watchdog started (pid $WATCHDOG, kver=$KVER)"
 # It was wrong: the bridge mounts a disc the auto-mounter missed at
 # /mnt/hype-addons-N, then execs this script from there, while this search only
 # ever looked under /media -- so the installer failed to find the very medium it
-# was running from ("found additions medium at /mnt/hype-addons-1 -- handing
+# was running from ("found additions medium at /media/hype-addons-1 -- handing
 # off" immediately followed by "FATAL no hype-additions linux/ tree found").
 # Only reachable once #727 made a second disc exist at all.
 ADDITIONS=""
@@ -93,12 +93,13 @@ _self_dir=$(cd "$(dirname "$0")" 2>/dev/null && pwd || true)
 # us by some other path.
 if [ -z "$ADDITIONS" ]; then
     for m in /media/sr0 /media/sr1 /media/cdrom /media/cdrom1 /media/vdb /media/usb \
-             /mnt/hype-addons-0 /mnt/hype-addons-1 /mnt/hype-addons-2 /mnt/hype-addons-3; do
+             /media/hype-addons-0 /media/hype-addons-1 /media/hype-addons-2 \
+             /media/hype-addons-3; do
         [ -d "$m/linux/apks-hype/x86_64" ] && { ADDITIONS="$m/linux"; break; }
     done
 fi
 if [ -z "$ADDITIONS" ]; then
-    for d in /media/*/linux /mnt/hype-addons-*/linux; do
+    for d in /media/*/linux /media/hype-addons-*/linux; do
         [ -d "$d/apks-hype/x86_64" ] && { ADDITIONS="$d"; break; }
     done
 fi
@@ -181,7 +182,7 @@ FORCE=no
 # Same lesson as the ADDITIONS search above: a disc the bridge mounted itself
 # lives under /mnt/hype-addons-*, not /media, so an override file placed on the
 # additions disc was unreadable here.
-for _m in /media/sr0 /media/sr1 /media/* /mnt/hype-addons-* "$ADDITIONS/.."; do
+for _m in /media/sr0 /media/sr1 /media/* "$ADDITIONS/.."; do
     [ -f "$_m/HYPE232_FORCE" ] && FORCE=yes
 done
 if target_already_installed && [ "$FORCE" != yes ]; then
