@@ -181,18 +181,26 @@ had not been captured: the failed first 2a attempt and the #387 regression
 rerun) before the drive's logs were cleared. Stale `vars-*.bin` and
 `HYPE.BOOTCOUNT` were cleared too, so 1a starts from a clean log rotation.
 
-## Boots 1a + 1b are combined into one host boot (2026-08-26)
+## Currently staged: Boot 1a alone (2026-08-26)
 
-`\hype.cfg` is `hype1ab.cfg`: all four VMs (Alpine + the three #603 microtests),
-6 physical cores of 16, 2560 MB. `\hype-state.txt` (from
-`hype-state-1ab.txt`) holds the micro VMs OFF so 1a's 30-minute idle window
-stays quiet; `start vmexit` / `start vmexitstorm` / `start hello` at the hype
-terminal runs 1b afterwards. Full reasoning in the runbook's Run 1 note.
+`\hype.cfg` is `hype1a.cfg` — the single Alpine VM — and `\input\vm0.txt` is
+the reboot-pin script. No `\hype-state.txt`: absent means every VM starts, and
+there is only one.
 
-Verified before staging, against the real parsers rather than by eye: the
-record parses to `run1a`=RUNNING and all three micro VMs=STOPPED, and the
-config parses to 4 VMs with `run1a` at index 0 (so `\input\vm0.txt` still
-reaches the Alpine guest) passing every admission check at 16 cores.
+**Target host: a dedicated 4-core AMD box, not the 5950X.** 1a asks for two
+whole physical cores and core selection excludes the BSP's core entirely (both
+threads), so a 4-core host offers 3 usable and 2 fits. A dedicated machine also
+gives #641's 30-minute idle window the quiet it actually needs.
+
+**1b still needs the 5950X** — 2+1+1 = 4 physical cores, and a 4-core host has
+only 3 after the BSP core goes. Re-stage `hype1b.cfg` as `\hype.cfg` for that
+boot; it needs no input script.
+
+`hype1ab.cfg` + `hype-state-1ab.txt` (both VMs on one host, micro VMs held off
+by the #177 run-state record and started by hand) are kept here as a worked
+alternative but are **not staged**. Verified against the real parsers when
+written: the record resolves to `run1a`=RUNNING and three STOPPED, and the
+config to 4 VMs with `run1a` at index 0, passing admission at 16 cores.
 
 **The drive is `sdc` today, not `sdd`.** It was `sdd` on 2026-08-25 and the
 letter moved when the machine's USB enumeration changed. Identify it by

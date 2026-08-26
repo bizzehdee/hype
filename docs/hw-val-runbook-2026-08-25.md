@@ -46,33 +46,32 @@ Moved off the AMD laptop (3 usable physical cores after BSP reservation) onto
 this 5950X box, which removes Boot 1b's core-count blocker entirely (16 cores
 is well past the 4 `suite-603.cfg` needs).
 
-> **1a and 1b are now ONE host boot (2026-08-26).** 16 cores / 32 threads makes
-> the combined budget trivial — 2 + 2 + 1 + 1 = 6 physical cores, 2560 MB — so
-> `hype1ab.cfg` carries all four VMs and the host is booted once for both.
+> **1a and 1b run on DIFFERENT machines (2026-08-26).**
 >
-> **They are separated in time, not by boot, and that separation is the whole
-> point.** 1a needs a quiet 30-minute idle window (#641's thresholds were
-> measured over 26 minutes) and 1b's `vmexitstorm` exists to flood exits.
-> Running both live at once poisons exactly the numbers 1a produces. Only
-> `run1a` starts; the three micro VMs are held OFF by `\hype-state.txt`
-> (#177's run-state record), and are started by hand at the hype terminal once
-> 1a is finished:
+> **1a does not need the 5950X.** It asks for `vcpus = 2` — two whole physical
+> cores — and core selection excludes the BSP's core entirely, both threads of
+> it (`hype_cpu_topology_select_cores`). A 4-core AMD host therefore offers 3
+> usable cores, and 2 fits with one to spare. Give it a dedicated 4-core box:
+> the 30-minute idle window #641 needs is genuinely quiet there, which is
+> better than sharing a busy host.
 >
-> ```
-> start vmexit
-> start vmexitstorm
-> start hello
-> ```
+> **1b does need the 5950X**, and this is the blocker this runbook already
+> recorded: `vmexit`=2 + `vmexitstorm`=1 + `hello`=1 is 4 physical cores, and a
+> 4-core host has only 3 after the BSP's core is excluded. That is exactly why
+> Run 1 moved off the AMD laptop in the first place.
 >
-> `poweroff run1a` first if you want 1b to reproduce its original shape
-> exactly. Leaving the Alpine guest up instead is a *stronger* reading of
-> #603's Sec 6g isolation bar (a watchdog force-off and a triple fault must not
-> disturb an unrelated live guest) — but it is a different test from the one
-> #603 specifies, so record which you did.
+> Two boots, two hosts, one drive: stage `hype1a.cfg` as `\hype.cfg` for the
+> 4-core box, then re-stage `hype1b.cfg` for the 5950X. `\input\` is only read
+> by 1a (`vm0.txt`, reboot-pin); 1b's microtests self-verify and need none.
 >
-> `autostart = none` would be the obvious way to express this and **does not
-> work** — the key parses and validates but nothing consumes it (**#732**).
-> The run-state record is the mechanism that is actually implemented.
+> **`hype1ab.cfg` and `hype-state-1ab.txt` remain in the staging directory** as
+> a worked alternative if both ever have to share one host. They are NOT staged
+> now. Their constraint, if ever used: 1a's idle window and 1b's `vmexitstorm`
+> must not be live at the same time — the storm exists to flood exits and would
+> poison the very HLT/TMRLATE numbers 1a produces — so the record holds the
+> micro VMs OFF and they are started by hand afterwards. `autostart = none`
+> would be the obvious way to express that and **does not work**: parsed,
+> validated, never consumed (**#732**).
 >
 > 1c still needs its own boot: it writes to a physical disk and its serial is
 > still a placeholder.
