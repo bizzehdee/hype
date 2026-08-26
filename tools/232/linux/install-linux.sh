@@ -154,8 +154,22 @@ TIMEZONEOPTS="-z UTC"
 PROXYOPTS="none"
 APKREPOSOPTS="$REPO"
 USEROPTS="-a -u -g audio,video,netdev hypeuser"
-SSHDOPTS="-c openssh"
-NTPOPTS="-c chrony"
+# Both "none", and for the same reason as KEYMAPOPTS above: the step fails, and
+# the thing it installs is useless on this guest anyway.
+#
+# setup-sshd and setup-ntp run \`apk add --root /mnt\`, and apk resolves a LOCAL
+# repository path RELATIVE TO THAT ROOT -- so APKREPOSOPTS="$REPO" (an absolute
+# path on the live system) becomes /mnt/$REPO inside the target, which does not
+# exist. The packages are on the additions disc and in the index, so apk reports
+# "package mentioned in index not found" and setup-alpine exits 1 after the base
+# install has already succeeded. Observed at 97%, on openssh-server-common,
+# openssh-server-common-openrc and chrony-openrc.
+#
+# This ticket exists because hype guests have NO EMULATED NIC. An SSH daemon
+# with nothing to listen to and an NTP client with nothing to sync against are
+# not worth a bind-mount to make reachable -- they are worth not installing.
+SSHDOPTS="none"
+NTPOPTS="none"
 DISKOPTS="-m sys /dev/vda"
 LBUOPTS="none"
 APKCACHEOPTS="none"
