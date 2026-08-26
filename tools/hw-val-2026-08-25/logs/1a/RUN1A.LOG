@@ -1,0 +1,33 @@
+[0000073187] ttyS0| BdsDxe: loading Boot0002 "UEFI HYPE VIRTUAL CD-ROM HYPE0000000000000001" from PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)
+[0000073328] ttyS1| BdsDxe: loading Boot0002 "UEFI HYPE VIRTUAL CD-ROM HYPE0000000000000001" from PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)
+[0000073469] ttyS0| BdsDxe: starting Boot0002 "UEFI HYPE VIRTUAL CD-ROM HYPE0000000000000001" from PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)
+[0000073611] ttyS1| BdsDxe: starting Boot0002 "UEFI HYPE VIRTUAL CD-ROM HYPE0000000000000001" from PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)
+[0000073753] ttyS0| GNU GRUB  version 2.12
+[0000073792] ttyS1| GNU GRUB  version 2.12
+[0000073831] ttyS0| 
+[0000073848] ttyS1| 
+[0000073865] ttyS0|      Use the  and  keys to select which entry is highlighted.                              
+[0000073973] ttyS1|      Use the  and  keys to select which entry is highlighted.                              
+[0000074081] ttyS0|       Press enter to boot the selected OS, `e' to edit the commands before booting or `c' for 
+[0000074192] ttyS1|       Press enter to boot the selected OS, `e' to edit the commands before booting or `c' for 
+[0000074303] ttyS0|       a command-line.                                                                          *Linux lts                                                                                                                                                      
+[0000074575] ttyS1|       a command-line.                                                                          *Linux lts                                                                                                                                                      
+[0000074847] ttyS0|                                                                                                                                                                                                                                                                
+[0000075119] ttyS1|                                                                                                                                                                                                                                                                
+[0000075730] ttyS0|                                                                                                                                                                                                                                                                
+[0000076002] ttyS1|                                                                                                                                                                                                                                                                
+[0000076274] ttyS0|                                                                                                                                                                                                                                                                
+[0000076546] ttyS1|                                                                                                                                                                                                                                                                
+[0000076818] ttyS0|                                                                                                                                                                                                                                                                
+[0000077090] ttyS1|                                                                                                                                                                                                                                                                
+[0000077362] ttyS0|                                                                                                                                                                                                                                                                
+[0000077634] ttyS1|                                                                                                                                                                                                                                                                
+[0000077906] ttyS0|                                                                                                                                                                                                                                                                
+[0000078178] ttyS1|                                                                                                                                                                                                                                                                
+[0000078853] ttyS0|                                                                                                                                           The highlighted entry will be executed automatically in 1s.                                        The highlighted en
+[0000079125] ttyS1|                                                                                                                                           The highlighted entry will be executed automatically in 1s.                                        The highlighted en
+[0000079397] ttyS0| try will be executed automatically in 0s.                                       Booting `Linux lts'
+[0000079513] ttyS1| try will be executed automatically in 0s.                                       Booting `Linux lts'
+[0000079629] ttyS0| 
+[0000079646] ttyS1| 
+[0000117133] screen|   Booting `Linux lts'
