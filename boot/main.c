@@ -15079,7 +15079,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * flooding a working boot; the worst a race costs is a couple of extra lines
              * (one-per-host intended, #563).
              */
-            static unsigned avic_exit_logged;
+            static unsigned avic_exit_logged; /* one-per-host, #563 -- see above */
             int avic_ok;
             if (info.reason == HYPE_SVM_EXITCODE_AVIC_INCOMPLETE_IPI) {
                 avic_ok = hype_svm_vcpu_handle_avic_incomplete_ipi(ctx, &g_fw_1_lapic) == 0;

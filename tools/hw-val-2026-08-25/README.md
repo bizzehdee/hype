@@ -160,6 +160,27 @@ in everywhere else. **Standing exclusions from `docs/hw-val-211.md` apply to
 every placeholder above**: never the BitLocker NVMe, never a known-dying
 drive, by serial only, never by index.
 
+## Re-staged for Run 1 on 2026-08-26 — the default binary MOVED
+
+Run 2 (boots 2a-2e) ran on `976e71a-dirty`. Run 1 is staged on a fresh
+**`4b62c48-dirty`** build, because **#728 landed in between** and #728 is
+exactly the defect that makes Boot 1a's own script untrustworthy on the older
+binary: the whole-screen matcher could satisfy `expect localhost login:`
+against the *previous* boot's banner and PASS a guest that never restarted
+(that is how Boot 2b false-passed). Running 1a's reboot-pin on a pre-#728
+binary risks a false PASS of precisely the class just fixed. #727 rode the
+same rebuild.
+
+The old binary is kept on the drive as `\EFI\hype\hype-976e71a.efi` so Run 2's
+results stay reproducible. `hype-apicv.efi` is untouched and is STILL the old
+tree — rebuild it before Boot 2c if 2c is re-run, or its A/B against the
+default build compares two different trees as well as two different flags.
+
+All Run 2 logs were archived to `logs/` (verified by hash, including two that
+had not been captured: the failed first 2a attempt and the #387 regression
+rerun) before the drive's logs were cleared. Stale `vars-*.bin` and
+`HYPE.BOOTCOUNT` were cleared too, so 1a starts from a clean log rotation.
+
 ## Two binaries — only one boot needs the second one
 
 Every boot except **2c** uses `hype-default.efi`. Before Boot 2c, and only

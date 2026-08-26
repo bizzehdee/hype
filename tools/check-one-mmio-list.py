@@ -18,6 +18,7 @@ from inside fw_1_shared_mmio_npf() and nowhere else. The guest LAPIC is delibera
 it is per-vCPU state, needs no device lock, and belongs to whichever vCPU faulted, so each loop
 handles its own.
 """
+import re
 import sys
 
 PATH = "boot/main.c"
@@ -38,6 +39,42 @@ HANDLERS = (
 )
 
 
+def function_extents(lines):
+    """Every `static` function definition in the file, as name -> (first line, last line).
+
+    Crude on purpose: a definition starts at a line beginning `static ` whose header reaches a
+    `{`, and ends at the next line that is exactly `}`. That is the same shape the other guards
+    in this directory rely on, and boot/main.c is formatted that way throughout.
+    """
+    out = {}
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("static ") and "(" in line:
+            header, j = line, i
+            while j < len(lines) and j < i + 6 and not header.rstrip().endswith("{"):
+                j += 1
+                header += " " + lines[j] if j < len(lines) else ""
+            if header.rstrip().endswith("{"):
+                name = re.search(r"(\w+)\s*\(", line)
+                end = next((k for k in range(j + 1, len(lines)) if lines[k] == "}"), None)
+                if name and end is not None:
+                    out[name.group(1)] = (i, end)
+                    i = end
+        i += 1
+    return out
+
+
+def sole_caller_is_dispatch(lines, name, extent, start, end):
+    """True if every call of `name` outside its own body is inside fw_1_shared_mmio_npf()."""
+    calls = [
+        i for i, l in enumerate(lines)
+        if name + "(" in l and not (extent[0] <= i <= extent[1])
+        and not l.strip().startswith(("*", "//", "static "))
+    ]
+    return bool(calls) and all(start <= i <= end for i in calls)
+
+
 def main() -> int:
     lines = open(PATH, encoding="utf-8", errors="surrogateescape").read().split("\n")
 
@@ -51,9 +88,21 @@ def main() -> int:
         print("check-one-mmio-list: could not find the end of fw_1_shared_mmio_npf()")
         return 2
 
+    # A helper the shared dispatch is the SOLE caller of is still one dispatch -- there is no
+    # second list to drift, because reaching the handler still means going through
+    # fw_1_shared_mmio_npf(). #727's per-slot optical loop needs one (it iterates extra drives).
+    # Anything called from anywhere else is exactly the second list this guard exists to catch.
+    extents = function_extents(lines)
+    allowed = [
+        ext for name, ext in extents.items()
+        if not (ext[0] <= start <= ext[1]) and sole_caller_is_dispatch(lines, name, ext, start, end)
+    ]
+
     bad = []
     for i, line in enumerate(lines):
         if start <= i <= end:
+            continue
+        if any(lo <= i <= hi for lo, hi in allowed):
             continue
         stripped = line.strip()
         if stripped.startswith("*") or stripped.startswith("//"):
