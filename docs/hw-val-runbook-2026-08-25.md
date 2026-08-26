@@ -46,6 +46,37 @@ Moved off the AMD laptop (3 usable physical cores after BSP reservation) onto
 this 5950X box, which removes Boot 1b's core-count blocker entirely (16 cores
 is well past the 4 `suite-603.cfg` needs).
 
+> **1a and 1b are now ONE host boot (2026-08-26).** 16 cores / 32 threads makes
+> the combined budget trivial — 2 + 2 + 1 + 1 = 6 physical cores, 2560 MB — so
+> `hype1ab.cfg` carries all four VMs and the host is booted once for both.
+>
+> **They are separated in time, not by boot, and that separation is the whole
+> point.** 1a needs a quiet 30-minute idle window (#641's thresholds were
+> measured over 26 minutes) and 1b's `vmexitstorm` exists to flood exits.
+> Running both live at once poisons exactly the numbers 1a produces. Only
+> `run1a` starts; the three micro VMs are held OFF by `\hype-state.txt`
+> (#177's run-state record), and are started by hand at the hype terminal once
+> 1a is finished:
+>
+> ```
+> start vmexit
+> start vmexitstorm
+> start hello
+> ```
+>
+> `poweroff run1a` first if you want 1b to reproduce its original shape
+> exactly. Leaving the Alpine guest up instead is a *stronger* reading of
+> #603's Sec 6g isolation bar (a watchdog force-off and a triple fault must not
+> disturb an unrelated live guest) — but it is a different test from the one
+> #603 specifies, so record which you did.
+>
+> `autostart = none` would be the obvious way to express this and **does not
+> work** — the key parses and validates but nothing consumes it (**#732**).
+> The run-state record is the mechanism that is actually implemented.
+>
+> 1c still needs its own boot: it writes to a physical disk and its serial is
+> still a placeholder.
+
 **Log-rotation workflow note:** run all three boots below back-to-back first,
 then ingest all three logs together in one pass at the end — not
 incrementally after each boot. Reviewing mid-sequence competes with log

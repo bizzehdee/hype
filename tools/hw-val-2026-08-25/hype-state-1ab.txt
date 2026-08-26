@@ -1,0 +1,18 @@
+# hype run-state record (#176/#177) -- hand-written for the combined 1a+1b boot.
+# Staged to the boot volume root as \hype-state.txt.
+#
+# Read once at startup: any VM listed `stopped` is left OFF, and `start <name>`
+# at the hype terminal brings it up. UNKNOWN (absent from this file) means "no
+# opinion" and the VM takes its default, which is to START -- so every VM in
+# hype1ab.cfg must be named here, or it will come up with the Alpine guest and
+# poison 1a's idle measurement.
+#
+# hype REWRITES this file at host shutdown with the real state at that moment.
+# It is a one-boot instrument, not a permanent setting: after a `host reboot`
+# following 1b, expect it to reflect whatever was actually running then.
+version = 1
+reason = off
+vm run1a = running
+vm vmexit = stopped
+vm vmexitstorm = stopped
+vm hello = stopped

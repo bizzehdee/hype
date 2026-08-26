@@ -181,6 +181,31 @@ had not been captured: the failed first 2a attempt and the #387 regression
 rerun) before the drive's logs were cleared. Stale `vars-*.bin` and
 `HYPE.BOOTCOUNT` were cleared too, so 1a starts from a clean log rotation.
 
+## Boots 1a + 1b are combined into one host boot (2026-08-26)
+
+`\hype.cfg` is `hype1ab.cfg`: all four VMs (Alpine + the three #603 microtests),
+6 physical cores of 16, 2560 MB. `\hype-state.txt` (from
+`hype-state-1ab.txt`) holds the micro VMs OFF so 1a's 30-minute idle window
+stays quiet; `start vmexit` / `start vmexitstorm` / `start hello` at the hype
+terminal runs 1b afterwards. Full reasoning in the runbook's Run 1 note.
+
+Verified before staging, against the real parsers rather than by eye: the
+record parses to `run1a`=RUNNING and all three micro VMs=STOPPED, and the
+config parses to 4 VMs with `run1a` at index 0 (so `\input\vm0.txt` still
+reaches the Alpine guest) passing every admission check at 16 cores.
+
+**The drive is `sdc` today, not `sdd`.** It was `sdd` on 2026-08-25 and the
+letter moved when the machine's USB enumeration changed. Identify it by
+`HYPEBOOT` + `EADE-CA36` and serial `115E0735191800123920` (Linux) /
+`DB9876543214E` (what hype's INQUIRY sees) — never by letter. This is the same
+rule the cfgs already follow for write targets, and the reason for it.
+
+## The drive layout below says `sdd` — it is whatever letter it enumerated as
+
+Every `sdd1`/`sdd2` in this file means "the HYPEBOOT partition" and "the
+EADE-CA36 partition" of the drive with serial `DB9876543214E`. Kept as written
+because that is what the Aug 25 session saw; do not read it as a stable name.
+
 ## Two binaries — only one boot needs the second one
 
 Every boot except **2c** uses `hype-default.efi`. Before Boot 2c, and only
