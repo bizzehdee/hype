@@ -682,6 +682,17 @@ static unsigned long long *g_script_fed;
  * (HYPE_CFG_MAX_VM_DISKS) is checked against this at attach time with a named error.
  */
 #define HYPE_FW_1_MAX_DISKS 3u
+/*
+ * Total optical drives per VM, implicit install_media slot included. Matches
+ * HYPE_CFG_MAX_VM_DISKS -- the config layer's own per-VM device cap -- so any config the
+ * parser accepts can be served rather than admitted and then silently truncated.
+ *
+ * Costs nothing unused: the ISO bounce pool is sized from the ACTUAL configured drive count
+ * (see the hype_iso_stream_pool_alloc call), not from this bound, so a one-CD config
+ * allocates exactly what it allocates today.
+ */
+#define HYPE_FW_1_MAX_OPTICAL HYPE_CFG_MAX_VM_DISKS
+#define HYPE_FW_1_MAX_EXTRA_OPTICAL (HYPE_FW_1_MAX_OPTICAL - 1u)
 
 /*
  * #329: one guest disk -- the front-end device models plus the backend stack that used to be
@@ -1400,6 +1411,25 @@ typedef struct hype_fw_vm {
      * learned to honour install_media (#322). */
     hype_iso_stream_t iso_stream;
     int iso_stream_ready;
+    /*
+     * #727: the EXTRA optical drives from `cdroms =`, beyond the implicit install_media one
+     * above. Each is a self-contained HBA + ATAPI device + stream, the same shape as disk[]
+     * below, because one hype_ahci_t models exactly one port.
+     *
+     * opt_count is how many actually RESOLVED. A cdroms entry whose ISO does not resolve is
+     * not presented at all rather than appearing as an empty tray -- #285's rule for disks,
+     * and for the same reason: a silently-empty device is worse than an absent one.
+     */
+    hype_ahci_t opt_ahci[HYPE_FW_1_MAX_EXTRA_OPTICAL];
+    hype_atapi_t opt_atapi[HYPE_FW_1_MAX_EXTRA_OPTICAL];
+    hype_iso_stream_t opt_stream[HYPE_FW_1_MAX_EXTRA_OPTICAL];
+    int opt_stream_ready[HYPE_FW_1_MAX_EXTRA_OPTICAL];
+    unsigned opt_count;
+    volatile uint64_t shared_opt_bar[HYPE_FW_1_MAX_EXTRA_OPTICAL];
+    volatile unsigned shared_opt_mapped[HYPE_FW_1_MAX_EXTRA_OPTICAL];
+    /* #512's rule per extra drive: the MSI edge is the MODEL's own event counter, never this
+     * loop's sampled level, or a completion landing between two passes is swallowed. */
+    unsigned long long opt_msi_seen[HYPE_FW_1_MAX_EXTRA_OPTICAL];
     /*
      * #329: this VM's guest disks, each a self-contained slot. Slot 0 is what used to be the
      * flat set of vblk/nvme/ata members; grouping them is what lets a VM carry more than one.
@@ -3638,6 +3668,30 @@ static void fw_1_longvmrun_record(unsigned vm_idx, const hype_longvmrun_t *e) {
 #define HYPE_FW_1_PCI_DEV_BOCHS_VBE 8u
 /* #591: the guest-facing xHCI controller. Device 9 (was free), present only for a bus = usb-msc VM. */
 #define HYPE_FW_1_PCI_DEV_XHCI 9u
+
+/*
+ * #727 / decision 71: extra guest optical drives, one AHCI HBA (one PCI function) each.
+ *
+ * `cdroms =` was parsed, admission-checked and displayed but never attached, because
+ * hype_ahci_t carries ONE port's registers as scalars -- HYPE_AHCI_PORT_COUNT is only the
+ * readable aperture, so a second disc cannot be a second port on the dev-2 HBA. One HBA per
+ * drive follows the precedent #262 set for the ATA disk and #329 for extra disk slots, and
+ * reuses the multi-HBA NPF dispatch those already proved.
+ *
+ * Devices 10.. are free: 2/3/4/5/6/7/8/9 and 31 are the only ones spoken for. The matching
+ * _PRT entries in devices/dsdt.asl cover 10-16 unconditionally -- an entry for an absent
+ * device is inert, the same reasoning the extra-disk and virtio-net entries already record --
+ * so raising the cap below needs no ACPI change.
+ *
+ * ALL of them share HYPE_FW_1_AHCI_GSI with the dev-2 CD controller. The 24-pin IO-APIC is
+ * fully allocated (that exhaustion is what caps disks at 3), so a per-drive pin does not
+ * exist; sharing a level-triggered PCI line is ordinary, and what it demands is that the LINE
+ * be the OR of its devices. #440 is the standing warning: it moved the SATA function OFF this
+ * pin precisely because a per-device deassert drops another HBA's still-pending interrupt.
+ * fw_1_optical_line_pending() is that OR, and it is what makes sharing safe here.
+ */
+#define HYPE_FW_1_PCI_DEV_OPTICAL_BASE 10u
+
 /*
  * NET-2 (#81): the guest virtio-net adapter, present only when `net_mode = nat`. Device 4 -- the
  * lowest free slot, and clear of the device-6 aliasing between the VBE adapter and disk slot 1
@@ -10502,6 +10556,24 @@ static void fw_1_program_kernel_bars(hype_fw_vm_t *vm) {
                                      hype_pci_bus_master_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_AHCI));
         }
     }
+    /* #727: the same mapping for every extra optical HBA, each on its own PCI device. */
+    {
+        unsigned oi;
+        for (oi = 0; oi < vm->opt_count && oi < HYPE_FW_1_MAX_EXTRA_OPTICAL; oi++) {
+            unsigned dev = HYPE_FW_1_PCI_DEV_OPTICAL_BASE + oi;
+            uint64_t obar;
+            if (!hype_pci_memory_space_enabled(&g_fw_1_pci, (uint8_t)dev)) {
+                continue;
+            }
+            obar = hype_pci_get_bar_value(&g_fw_1_pci, (uint8_t)dev, 5);
+            if (obar != 0) {
+                vm->shared_opt_bar[oi] = obar;
+                vm->shared_opt_mapped[oi] = 1u;
+                hype_ahci_set_bus_master(&vm->opt_ahci[oi],
+                                         hype_pci_bus_master_enabled(&g_fw_1_pci, (uint8_t)dev));
+            }
+        }
+    }
     if (hype_pci_function_memory_space_enabled(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA,
                                                HYPE_FW_1_PCI_FUNC_ATA)) {
         uint64_t abar = hype_pci_get_function_bar_value(&g_fw_1_pci, HYPE_FW_1_PCI_DEV_ATA,
@@ -10768,6 +10840,37 @@ static void fw_1_attach_storage(hype_fw_vm_t *vm) {
      * drive (media_size 0), which is what a real machine with an empty optical drive presents --
      * not a missing device. */
     hype_atapi_reset_stream(&g_fw_1_atapi, vm->iso_stream_ready ? &vm->iso_stream : 0);
+    /*
+     * #727: the EXTRA optical drives. One AHCI HBA per drive on its own PCI function, because
+     * hype_ahci_t models exactly one port -- see HYPE_FW_1_PCI_DEV_OPTICAL_BASE.
+     *
+     * Only drives whose ISO actually resolved are here (fw_1_resolve_all_optical sets
+     * opt_count), so unlike the implicit drive above there is no empty-tray case: a cdroms
+     * entry that did not resolve is absent from the guest's PCI space entirely, which is
+     * #285's rule.
+     */
+    {
+        unsigned oi;
+        for (oi = 0; oi < vm->opt_count && oi < HYPE_FW_1_MAX_EXTRA_OPTICAL; oi++) {
+            unsigned dev = HYPE_FW_1_PCI_DEV_OPTICAL_BASE + oi;
+            if (hype_pci_add_device(&g_fw_1_pci, (uint8_t)dev, HYPE_PCI_VENDOR_ID_HYPE, 0x0005u,
+                                    0x01, 0x06, 0x01) != 0) {
+                hype_serial_print("fw-1[vm %d]: optical drive %u could not take PCI dev %u -- "
+                                  "NOT presented (#727)\n", (int)(vm - &g_vms[0]), oi + 1u, dev);
+                continue;
+            }
+            hype_pci_set_bar_size(&g_fw_1_pci, (uint8_t)dev, 5, 0x1000u);
+            hype_pci_set_interrupt(&g_fw_1_pci, (uint8_t)dev, 1, 11);
+            hype_pci_set_msi_capability(&g_fw_1_pci, (uint8_t)dev);
+            hype_ahci_reset(&vm->opt_ahci[oi]);
+            /* hype_ahci_reset defaults to the ATAPI signature, which is what an optical drive
+             * must report -- the opposite of #262's plain-ATA disk HBAs, which override it. */
+            hype_atapi_reset_stream(&vm->opt_atapi[oi], &vm->opt_stream[oi]);
+            hype_debug_print("fw-1[vm %d]: optical drive %u at PCI dev %u -- %llu bytes (#727)\n",
+                             (int)(vm - &g_vms[0]), oi + 1u, dev,
+                             (unsigned long long)vm->opt_stream[oi].iso_size);
+        }
+    }
 #if defined(HYPE_318_ATAPI_TRACE) && HYPE_318_ATAPI_TRACE
     /* #318: per-command ATAPI trace, enabled HERE -- the one storage bring-up both entry points
      * share (#342) -- because the first attempt enabled it in one of the two then-duplicated
@@ -11169,6 +11272,64 @@ static uint64_t fw_1_tpm_entropy(void *ctx) {
     return z ^ (z >> 31);
 }
 
+/*
+ * #727: route an NPF to whichever EXTRA optical HBA owns the address, if any.
+ *
+ * Returns 1 when the access belonged to one of them (handled or absorbed), 0 to let the caller
+ * carry on testing its other windows. Each drive is a separate hype_ahci_t + hype_atapi_t pair
+ * on its own PCI function, so this is the same shape as the extra-disk-slot loop #329 added --
+ * the multi-HBA dispatch pattern this reuses is already proven there.
+ */
+/*
+ * #727: is ANY extra optical HBA asserting? This is the OR that makes sharing
+ * HYPE_FW_1_AHCI_GSI with the dev-2 CD controller safe.
+ *
+ * #440 is the standing warning and the reason this exists: it moved the SATA function OFF this
+ * pin because hype's per-device deassert drops a still-pending interrupt from another HBA
+ * sharing it. Deasserting a shared level line while a sibling still has PxIS set loses that
+ * sibling's completion for good -- seen from the guest as an ATAPI command timeout. So the line
+ * only goes low when EVERY drive on it is quiet.
+ */
+static int fw_1_extra_optical_irq_pending(const hype_fw_vm_t *vm) {
+    unsigned oi;
+    for (oi = 0; oi < vm->opt_count && oi < HYPE_FW_1_MAX_EXTRA_OPTICAL; oi++) {
+        if (vm->shared_opt_mapped[oi] &&
+            hype_ahci_irq_pending((hype_ahci_t *)&vm->opt_ahci[oi])) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int fw_1_optical_npf(hype_fw_vm_t *vm, hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
+                            const hype_vmm_npf_t *npf, const uint8_t *insn, int is_bsp,
+                            unsigned vidx) {
+    unsigned oi;
+    for (oi = 0; oi < vm->opt_count && oi < HYPE_FW_1_MAX_EXTRA_OPTICAL; oi++) {
+        uint64_t base = (uint64_t)vm->shared_opt_bar[oi];
+        if (!vm->shared_opt_mapped[oi] || npf->guest_phys_addr < base ||
+            npf->guest_phys_addr >= base + HYPE_AHCI_MMIO_SIZE) {
+            continue;
+        }
+        if (is_bsp) g_436_loop_section[vidx] = 776;
+        /*
+         * Claim ONLY what the model actually serviced, exactly as the primary drive's branch
+         * does. Claiming unconditionally is an infinite NPF loop: a register this model does not
+         * implement never gets its RIP advanced, so the guest re-faults the same instruction for
+         * ever. Measured -- the first cut of this ignored the return value and wedged OVMF while
+         * it enumerated the new device, with the config-access ring and every ATAPI counter
+         * frozen. Declining here lets the address reach the absorb catch-all, which advances the
+         * RIP, which is what the guest needs to make progress.
+         */
+        if (vmm_handle_ahci_npf_map(kind, ctx, &vm->opt_ahci[oi], &vm->opt_atapi[oi], base,
+                                    &g_fw_1_dma_map, insn) == 0) {
+            return 1;
+        }
+        return 0;
+    }
+    return 0;
+}
+
 static hype_fw_dev_t fw_1_shared_mmio_npf(hype_fw_vm_t *vm, hype_vmm_kind_t kind,
                                           hype_vcpu_ctx_t *ctx, const uint8_t *insn, int is_bsp,
                                           hype_fw_mmio_refusal_t *refusal) {
@@ -11251,6 +11412,13 @@ static hype_fw_dev_t fw_1_shared_mmio_npf(hype_fw_vm_t *vm, hype_vmm_kind_t kind
                                          insn) == 0) {
             return HYPE_FW_DEV_ATA;
         }
+    } else if (fw_1_optical_npf(vm, kind, ctx, &npf, insn, is_bsp, vidx)) {
+        /*
+         * #727: an EXTRA optical drive's MMIO window. Tested before the primary one below only
+         * because the windows are disjoint and this keeps the primary block -- with all its
+         * #364/#365 instrumentation -- exactly as it was; nothing here changes drive 0's path.
+         */
+        return HYPE_FW_DEV_AHCI;
     } else if (vm->shared_ahci_mapped && npf.guest_phys_addr >= vm->shared_ahci_abar &&
                npf.guest_phys_addr < vm->shared_ahci_abar + HYPE_AHCI_MMIO_SIZE) {
         /*
@@ -17044,12 +17212,45 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     ahci_irqs++;
                 }
             }
-        } else if (vm->shared_ahci_mapped) {
+        } else if (vm->shared_ahci_mapped && !fw_1_extra_optical_irq_pending(vm)) {
             /* AHCI IRQ line deasserted (guest serviced it -> PxIS cleared):
              * drop the IO-APIC Remote-IRR so the next completion re-injects.
              * Models a level line going low; the guest's LAPIC EOI need not be
-             * decoded (hype's minimal LAPIC doesn't track the ISR vector). */
+             * decoded (hype's minimal LAPIC doesn't track the ISR vector).
+             *
+             * #727: guarded by the OR over the extra optical drives sharing this GSI. Without
+             * it, drive 0 going quiet would drop the line while another drive still had a
+             * completion pending -- #440's exact failure, which is why it moved the SATA
+             * function off this pin rather than share it. */
             hype_ioapic_deassert(&g_fw_1_ioapic, HYPE_FW_1_AHCI_GSI);
+        }
+        /*
+         * #727: the extra optical drives. MSI is per-function so each carries its own edge
+         * counter; the legacy path raises the SAME shared GSI, which the deassert above is now
+         * gated on.
+         */
+        {
+            unsigned oi;
+            for (oi = 0; oi < vm->opt_count && oi < HYPE_FW_1_MAX_EXTRA_OPTICAL; oi++) {
+                unsigned dev = HYPE_FW_1_PCI_DEV_OPTICAL_BASE + oi;
+                if (!vm->shared_opt_mapped[oi] || !hype_ahci_irq_pending(&vm->opt_ahci[oi])) {
+                    continue;
+                }
+                if (hype_pci_msi_enabled(&g_fw_1_pci, (uint8_t)dev)) {
+                    if (vm->opt_msi_seen[oi] != vm->opt_ahci[oi].irq_events) {
+                        vm->opt_msi_seen[oi] = vm->opt_ahci[oi].irq_events;
+                        fw_1_deliver_msi_vector(vm, (uint8_t)dev, 0,
+                                                hype_pci_msi_vector(&g_fw_1_pci, (uint8_t)dev));
+                        ahci_irqs++;
+                    }
+                } else {
+                    uint8_t iov;
+                    if (hype_ioapic_raise(&g_fw_1_ioapic, HYPE_FW_1_AHCI_GSI, &iov)) {
+                        fw_1_deliver_device_vector(vm, kind, HYPE_FW_1_AHCI_GSI, iov);
+                        ahci_irqs++;
+                    }
+                }
+            }
         }
         /*
          * #594: the guest xHCI's completion interrupt. The controller sets an interrupt-pending
@@ -20155,8 +20356,56 @@ static void fw_1_343_verify_stream(unsigned vi) {
 }
 #endif
 
-static int fw_1_resolve_media_stream_unlocked(unsigned vi) {
+/*
+ * #727: which optical drive of VM `vi` this resolve is for. `oi` 0 is the implicit
+ * install_media drive; 1..opt_count are the `cdroms =` entries in config order.
+ *
+ * Returning pointers rather than copying keeps ONE resolve implementation for both, which is
+ * the whole point: #322's lesson was that two acquisition paths meant only one of them ever
+ * learned to honour install_media.
+ */
+static hype_iso_stream_t *fw_1_optical_stream(unsigned vi, unsigned oi) {
+    return (oi == 0u) ? &g_vms[vi].iso_stream : &g_vms[vi].opt_stream[oi - 1u];
+}
+
+static int *fw_1_optical_ready(unsigned vi, unsigned oi) {
+    return (oi == 0u) ? &g_vms[vi].iso_stream_ready : &g_vms[vi].opt_stream_ready[oi - 1u];
+}
+
+/*
+ * #727: the bounce slot for one optical stream. Distinct per (VM, drive) because two streams
+ * sharing a buffer serve each other's sectors -- #428's bug one level down, and its own fix
+ * refuses an out-of-range slot rather than clamping, so a mis-sized pool surfaces as a guest
+ * MEDIUM ERROR instead of silent corruption.
+ */
+static unsigned fw_1_optical_bounce_slot(unsigned vi, unsigned oi) {
+    return vi * HYPE_FW_1_MAX_OPTICAL + oi;
+}
+
+/*
+ * #727: the [disk.*] entry behind VM `vi`'s cdroms[oi-1], or 0 when the id names nothing or
+ * the entry is not a cdrom. Mirrors fw_1_slot_cfg's shape for disks.
+ */
+static const hype_cfg_disk_t *fw_1_optical_cfg(unsigned vi, unsigned oi) {
     const hype_cfg_vm_t *cv = (vi < g_hype_cfg.vm_count) ? &g_hype_cfg.vms[vi] : 0;
+    unsigned di;
+    if (cv == 0 || oi == 0u || oi > cv->cdroms_count) {
+        return 0;
+    }
+    for (di = 0; di < g_hype_cfg.disk_count; di++) {
+        if (term_streq(g_hype_cfg.disks[di].id, cv->cdroms[oi - 1u]) &&
+            g_hype_cfg.disks[di].type == HYPE_CFG_DISK_TYPE_CDROM) {
+            return &g_hype_cfg.disks[di];
+        }
+    }
+    return 0;
+}
+
+static int fw_1_resolve_media_stream_unlocked(unsigned vi, unsigned oi) {
+    const hype_cfg_vm_t *cv = (vi < g_hype_cfg.vm_count) ? &g_hype_cfg.vms[vi] : 0;
+    hype_iso_stream_t *st = fw_1_optical_stream(vi, oi);
+    int *st_ready = fw_1_optical_ready(vi, oi);
+    const hype_cfg_disk_t *ocd = fw_1_optical_cfg(vi, oi);
 
     /*
      * `boot = disk` means no optical media at all -- what you need to boot a guest hype has just
@@ -20164,8 +20413,18 @@ static int fw_1_resolve_media_stream_unlocked(unsigned vi) {
      * live here, or a disk-boot VM would still be handed the installer CD it was configured away
      * from.
      */
-    if (cv != 0 && cv->boot == HYPE_CFG_BOOT_DISK) {
+    if (oi == 0u && cv != 0 && cv->boot == HYPE_CFG_BOOT_DISK) {
         hype_debug_print("host-stream: vm%u boot=disk -- no installer media attached\n", vi);
+        return 0;
+    }
+    /*
+     * #727: an extra drive exists only because `cdroms =` named a [disk.*] cdrom entry for it.
+     * Unlike the implicit drive it has no generated default path to fall back on -- a name that
+     * resolves to nothing is not presented at all, rather than becoming an empty tray.
+     */
+    if (oi != 0u && (ocd == 0 || !ocd->has_path)) {
+        hype_serial_print("host-stream: vm%u cdrom %u names no usable [disk.*] cdrom entry -- "
+                          "NOT presented (#727)\n", vi, oi);
         return 0;
     }
     /* GLADDER-11: prefer streaming the ISO from a FILE on the FAT32/
@@ -20209,7 +20468,7 @@ static int fw_1_resolve_media_stream_unlocked(unsigned vi) {
      * run the streamer off the end of any disc that is not exactly full.
      */
     for (unsigned cdev = 0u; iso_sel != HYPE_ADM_MEDIA_ABSENT && cdev < g_media_dev_count &&
-                             !g_vms[vi].iso_stream_ready;
+                             !(*st_ready);
          cdev++) {
         static uint8_t pvd[HYPE_AHCI_HOST_CD_SECTOR_SIZE];
         const uint64_t pvd_lba512 =
@@ -20237,18 +20496,18 @@ static int fw_1_resolve_media_stream_unlocked(unsigned vi) {
         } else {
             blocks = (uint64_t)pvd[80] | ((uint64_t)pvd[81] << 8) | ((uint64_t)pvd[82] << 16) |
                      ((uint64_t)pvd[83] << 24);
-            iso_stream_bind_dev(&g_vms[vi].iso_stream, cdev);
-            g_vms[vi].iso_stream.bounce_slot = vi; /* #352 */
-            g_vms[vi].iso_stream.part_start_lba = 0u;
-            g_vms[vi].iso_stream.extent_count = 0u;
-            g_vms[vi].iso_stream.iso_size = blocks * HYPE_AHCI_HOST_CD_SECTOR_SIZE;
-            if (hype_iso_stream_read(&g_vms[vi].iso_stream, 32769u, cd, 5u) == 0 && cd[0] == 'C' &&
+            iso_stream_bind_dev(st, cdev);
+            st->bounce_slot = fw_1_optical_bounce_slot(vi, oi); /* #352, #727 */
+            st->part_start_lba = 0u;
+            st->extent_count = 0u;
+            st->iso_size = blocks * HYPE_AHCI_HOST_CD_SECTOR_SIZE;
+            if (hype_iso_stream_read(st, 32769u, cd, 5u) == 0 && cd[0] == 'C' &&
                 cd[1] == 'D' && cd[2] == '0' && cd[3] == '0' && cd[4] == '1') {
-                g_vms[vi].iso_stream_ready = 1;
+                (*st_ready) = 1;
                 hype_serial_print("host-stream: vm%u CD001 verified streaming the whole disc "
                                   "(%llu blocks, %llu bytes) -- backing guest CD from the optical "
                                   "drive (#325)\n", vi, (unsigned long long)blocks,
-                                  (unsigned long long)g_vms[vi].iso_stream.iso_size);
+                                  (unsigned long long)st->iso_size);
             } else {
                 hype_debug_print("host-stream: disc PVD found but streaming it back failed "
                                  "(got %02x %02x %02x %02x %02x)\n", (unsigned)cd[0],
@@ -20270,7 +20529,9 @@ static int fw_1_resolve_media_stream_unlocked(unsigned vi) {
          * below sits OUTSIDE the loop, so by then didx has run past the match -- binding the stream
          * to it left the stream pointing at no device at all. Record the match where it happens. */
         unsigned file_dev = 0u;
-        const char *media_path = fw_1_media_path(vi); /* #322 */
+        /* #727: an extra drive's path comes from its own [disk.*] entry; drive 0 keeps
+         * fw_1_media_path()'s install_media-or-generated-default resolution (#322). */
+        const char *media_path = (oi == 0u) ? fw_1_media_path(vi) : ocd->path;
         /* Scan up to the first 4 GPT partitions for \iso\test.iso,
          * trying FAT32 then exFAT on each. This covers both the ISO
          * sitting on the FAT ESP itself and on a separate FAT/exFAT
@@ -20284,7 +20545,7 @@ static int fw_1_resolve_media_stream_unlocked(unsigned vi) {
          * first, and without this gate the file path re-resolved over the top of it, so an
          * inserted disc was still quietly replaced by a file on the boot medium. */
         for (didx = 0u; iso_sel != HYPE_ADM_MEDIA_ABSENT && didx < g_media_dev_count &&
-                        !have_file && !g_vms[vi].iso_stream_ready;
+                        !have_file && !(*st_ready);
              didx++) {
         /* #323: restrict to the configured drive when one was named. */
         if (iso_sel >= 0 && didx != (unsigned)iso_sel) {
@@ -20344,27 +20605,27 @@ static int fw_1_resolve_media_stream_unlocked(unsigned vi) {
                              (unsigned long long)file.extents[0].start_lba,
                              (unsigned long long)abs_lba,
                              (unsigned long long)file.size_bytes, file.count);
-            iso_stream_bind_dev(&g_vms[vi].iso_stream, file_dev); /* #325 */
+            iso_stream_bind_dev(st, file_dev); /* #325 */
             /* #352: each VM streams on its own AP core, so each needs its own bounce buffer. */
-            g_vms[vi].iso_stream.bounce_slot = vi;
-            g_vms[vi].iso_stream.part_start_lba = abs_lba;
-            g_vms[vi].iso_stream.iso_size = file.size_bytes;
+            st->bounce_slot = fw_1_optical_bounce_slot(vi, oi);
+            st->part_start_lba = abs_lba;
+            st->iso_size = file.size_bytes;
             /*
              * Extents are VOLUME-relative (core/fat.h); the stream wants
              * DISK-absolute, so add the partition base once here rather than at every
              * read. A single-extent file leaves extent_count 0 so it keeps taking the
              * contiguous fast path exactly as before.
              */
-            g_vms[vi].iso_stream.extent_count = (file.count > 1u) ? file.count : 0u;
+            st->extent_count = (file.count > 1u) ? file.count : 0u;
             for (ei = 0; ei < file.count && ei < HYPE_ISO_STREAM_MAX_EXTENTS; ei++) {
-                g_vms[vi].iso_stream.extents[ei].start_lba =
+                st->extents[ei].start_lba =
                     g_media.part_base_lba + file.extents[ei].start_lba;
-                g_vms[vi].iso_stream.extents[ei].sector_count =
+                st->extents[ei].sector_count =
                     file.extents[ei].sector_count;
             }
-            if (hype_iso_stream_read(&g_vms[vi].iso_stream, 32769u, cd, 5u) == 0 && cd[0] == 'C' &&
+            if (hype_iso_stream_read(st, 32769u, cd, 5u) == 0 && cd[0] == 'C' &&
                 cd[1] == 'D' && cd[2] == '0' && cd[3] == '0' && cd[4] == '1') {
-                g_vms[vi].iso_stream_ready = 1;
+                (*st_ready) = 1;
 #if HYPE_343_VERIFY_STREAM
                 fw_1_343_verify_stream(vi); /* #343 diagnostic */
 #endif
@@ -20411,7 +20672,7 @@ static int fw_1_resolve_media_stream_unlocked(unsigned vi) {
     /* #324: and try the raw-partition fallback on every device too, not just the
      * one that happened to be active when the FAT scan gave up. */
     for (unsigned rdev = 0u; iso_sel != HYPE_ADM_MEDIA_ABSENT && rdev < g_media_dev_count &&
-                             !g_vms[vi].iso_stream_ready;
+                             !(*st_ready);
          rdev++) {
         if (iso_sel >= 0 && rdev != (unsigned)iso_sel) {
             continue; /* #323 */
@@ -20420,7 +20681,7 @@ static int fw_1_resolve_media_stream_unlocked(unsigned vi) {
         /* #346: fresh budget for the raw-partition probe -- a stale armed deadline from an
          * earlier scan phase falsely clipped this probe after 3 reads in QEMU validation. */
         scan_budget_arm(5u);
-    if (!g_vms[vi].iso_stream_ready) {
+    if (!(*st_ready)) {
         hype_gpt_partition_t iso_part;
         if (hype_gpt_find_partition(hostdisk_read, 0, 2u, &iso_part) != 0) {
             hype_serial_print("host-gpt: no partition 2 (raw ISO) on the %s device\n",
@@ -20431,11 +20692,11 @@ static int fw_1_resolve_media_stream_unlocked(unsigned vi) {
                              (unsigned long long)iso_part.first_lba,
                              (unsigned long long)iso_part.last_lba,
                              (unsigned long long)iso_part.size_bytes);
-            iso_stream_bind_dev(&g_vms[vi].iso_stream, rdev); /* #325 */
-            g_vms[vi].iso_stream.bounce_slot = vi; /* #352 */
-            g_vms[vi].iso_stream.part_start_lba = iso_part.first_lba;
-            g_vms[vi].iso_stream.iso_size = iso_part.size_bytes;
-            if (hype_iso_stream_read(&g_vms[vi].iso_stream, 32769u, cd, 5u) == 0 && cd[0] == 'C' &&
+            iso_stream_bind_dev(st, rdev); /* #325 */
+            st->bounce_slot = fw_1_optical_bounce_slot(vi, oi); /* #352, #727 */
+            st->part_start_lba = iso_part.first_lba;
+            st->iso_size = iso_part.size_bytes;
+            if (hype_iso_stream_read(st, 32769u, cd, 5u) == 0 && cd[0] == 'C' &&
                 cd[1] == 'D' && cd[2] == '0' && cd[3] == '0' && cd[4] == '1') {
                 /* #92: report the DISC's size, not the partition's. The partition is
                  * MiB-rounded, so READ CAPACITY otherwise claims up to ~500 phantom
@@ -20447,20 +20708,20 @@ static int fw_1_resolve_media_stream_unlocked(unsigned vi) {
                  * Space Size (byte 80 of sector 16, little-endian half of the
                  * both-endian field) is the disc's true block count. */
                 uint8_t vss[4];
-                if (hype_iso_stream_read(&g_vms[vi].iso_stream, 32768u + 80u, vss, 4u) == 0) {
+                if (hype_iso_stream_read(st, 32768u + 80u, vss, 4u) == 0) {
                     uint64_t disc_bytes = ((uint64_t)vss[0] | ((uint64_t)vss[1] << 8) |
                                            ((uint64_t)vss[2] << 16) | ((uint64_t)vss[3] << 24)) *
                                           2048ull;
-                    if (disc_bytes != 0 && disc_bytes <= g_vms[vi].iso_stream.iso_size) {
+                    if (disc_bytes != 0 && disc_bytes <= st->iso_size) {
                         hype_debug_print("host-stream: vm%u disc size %llu bytes from the PVD "
                                          "(partition carries %llu) [#92]\n", vi,
                                          (unsigned long long)disc_bytes,
-                                         (unsigned long long)g_vms[vi].iso_stream.iso_size);
-                        g_vms[vi].iso_stream.iso_size = disc_bytes;
+                                         (unsigned long long)st->iso_size);
+                        st->iso_size = disc_bytes;
                     }
                 }
                 /* Streaming read path verified -- back the guest CD with it. */
-                g_vms[vi].iso_stream_ready = 1;
+                (*st_ready) = 1;
                 hype_serial_print("host-stream: vm%u CD001 verified via streaming from "
                                   "partition 2 -- backing guest CD via streaming\n", vi);
             } else {
@@ -20473,15 +20734,45 @@ static int fw_1_resolve_media_stream_unlocked(unsigned vi) {
     }
     scan_budget_disarm(); /* #346: never leave a deadline armed past the scan phase */
     } /* #324: end raw-partition device loop */
-    return g_vms[vi].iso_stream_ready;
+    return (*st_ready);
 }
-static int fw_1_resolve_media_stream(unsigned vi) {
+static int fw_1_resolve_media_stream(unsigned vi, unsigned oi) {
     int rc;
     media_scan_lock();
-    rc = fw_1_resolve_media_stream_unlocked(vi);
+    rc = fw_1_resolve_media_stream_unlocked(vi, oi);
     media_scan_unlock();
     return rc;
 }
+
+/*
+ * #727: resolve the implicit install_media drive plus every `cdroms =` entry, in config order.
+ *
+ * opt_count is set to how many EXTRA drives actually resolved, and that is what the attach and
+ * dispatch paths iterate -- a named ISO that does not resolve is never presented, so the guest
+ * cannot see an optical device that would answer every read with an error.
+ */
+static void fw_1_resolve_all_optical(unsigned vi) {
+    const hype_cfg_vm_t *cv = (vi < g_hype_cfg.vm_count) ? &g_hype_cfg.vms[vi] : 0;
+    unsigned want = (cv != 0) ? cv->cdroms_count : 0u;
+    unsigned oi;
+
+    (void)fw_1_resolve_media_stream(vi, 0u);
+
+    if (want > HYPE_FW_1_MAX_EXTRA_OPTICAL) {
+        hype_serial_print("host-stream: vm%u asked for %u cdroms, presenting the first %u -- "
+                          "HYPE_FW_1_MAX_OPTICAL (#727)\n", vi, want,
+                          (unsigned)HYPE_FW_1_MAX_EXTRA_OPTICAL);
+        want = HYPE_FW_1_MAX_EXTRA_OPTICAL;
+    }
+    g_vms[vi].opt_count = 0u;
+    for (oi = 1u; oi <= want; oi++) {
+        (void)fw_1_resolve_media_stream(vi, oi);
+        if (g_vms[vi].opt_stream_ready[oi - 1u]) {
+            g_vms[vi].opt_count = oi; /* contiguous: drives are presented in config order */
+        }
+    }
+}
+
 
 /*
  * #326: read the FIRST `buflen` bytes of an ISO off the boot ESP, for the ISO-2 microtest only.
@@ -22607,7 +22898,7 @@ static int fw_1_start_new_vm(unsigned vi) {
     g_vm_count = vi + 1u;
 
     load_input_script(vmn, vi);
-    (void)fw_1_resolve_media_stream(vi);
+    fw_1_resolve_all_optical(vi);
 
     nv = fw_1_guest_visible_vcpus(vmn);
     if (nv > HYPE_MAX_VCPUS_PER_VM) nv = HYPE_MAX_VCPUS_PER_VM;
@@ -25099,7 +25390,38 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * silently aliased vm2+ onto vm0's buffer, which served one VM's CD
      * sectors to another under concurrent streaming (the 4-VM #392 run's
      * Fedora/Ubuntu boot corruption). */
-    hype_iso_stream_pool_alloc(g_max_vms, fw_alloc_zeroed_pages);
+    /*
+     * #727: slots are per (VM, optical drive) now, not per VM -- two streams sharing one buffer
+     * serve each other's sectors, which is #428's bug one level down.
+     *
+     * Sized from the ACTUAL configured drive count rather than from HYPE_FW_1_MAX_OPTICAL: a
+     * slot is 256 KiB, so the worst case would be tens of megabytes for drives nobody asked
+     * for. load_hype_cfg() has already run (see the vCPU-pool comment above), so the real
+     * counts are known here. Floored at g_max_vms so the no-config and built-in-default paths
+     * keep exactly today's allocation.
+     *
+     * The INDEX still comes from fw_1_optical_bounce_slot()'s vi * MAX_OPTICAL + oi, so the
+     * pool must cover the highest index any configured drive can produce, not merely the
+     * drive count -- summing the counts alone would under-allocate the moment vm1 has any
+     * extra drive at all. #428's own fix refuses an out-of-range slot rather than clamping, so
+     * getting this wrong is a visible guest MEDIUM ERROR, not silent aliasing.
+     */
+    {
+        unsigned slots = g_max_vms;
+        unsigned ci;
+        for (ci = 0; ci < g_hype_cfg.vm_count && ci < g_max_vms; ci++) {
+            unsigned n = g_hype_cfg.vms[ci].cdroms_count;
+            unsigned high;
+            if (n > HYPE_FW_1_MAX_EXTRA_OPTICAL) n = HYPE_FW_1_MAX_EXTRA_OPTICAL;
+            high = ci * HYPE_FW_1_MAX_OPTICAL + n + 1u; /* highest index in use, + 1 */
+            if (high > slots) slots = high;
+        }
+        hype_iso_stream_pool_alloc(slots, fw_alloc_zeroed_pages);
+        if (slots != g_max_vms) {
+            hype_debug_print("iso-pool: %u bounce slot(s) for %u VM(s) -- extra optical drives "
+                             "configured (#727)\n", slots, g_max_vms);
+        }
+    }
     /*
      * #413: one AP stack per host core that runs a guest.
      *
@@ -27028,9 +27350,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * only because the RAM-preload path caught those machines; with #326 it would have left an
      * NVMe-only or USB-only host with no media at all.
      */
-    (void)fw_1_resolve_media_stream(0u);
+    fw_1_resolve_all_optical(0u);
     for (unsigned vi = 1u; vi < g_vm_count; vi++) { /* #414 */
-        (void)fw_1_resolve_media_stream(vi);
+        fw_1_resolve_all_optical(vi);
     }
 
 #if HYPE_RUN_TWO_VMS
@@ -27051,7 +27373,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         g_vms[vi].iso_stream.ctx = g_vms[0].iso_stream.ctx;
         /* #352: the SAME media, read concurrently on a different core -- so each gets its own
          * bounce slot, deliberately not copied from vm0 along with everything else. */
-        g_vms[vi].iso_stream.bounce_slot = vi;
+        g_vms[vi].iso_stream.bounce_slot = fw_1_optical_bounce_slot(vi, 0u);
         g_vms[vi].iso_stream.part_start_lba = g_vms[0].iso_stream.part_start_lba;
         g_vms[vi].iso_stream.iso_size = g_vms[0].iso_stream.iso_size;
         g_vms[vi].iso_stream.extent_count = g_vms[0].iso_stream.extent_count;

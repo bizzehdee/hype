@@ -125,6 +125,33 @@ DefinitionBlock ("", "DSDT", 2, "HYPE  ", "HYPEDSDT", 0x00000001)
                  * an absent device is inert, and a conditional table would need a per-config DSDT. */
                 Package () { 0x0006FFFF, 0x00, 0x00, 0x16 },  /* dev 6 INTA -> GSI 22 (disk slot 1) */
                 Package () { 0x0007FFFF, 0x00, 0x00, 0x17 },  /* dev 7 INTA -> GSI 23 (disk slot 2) */
+                /*
+                 * #727: extra optical drives. `cdroms =` attaches any number of CD-ROMs, and
+                 * hype_ahci_t models exactly ONE port, so each drive is its own AHCI HBA on its
+                 * own PCI device -- devices 10 upward (2/3/4/5/6/7/8/9/31 are spoken for).
+                 *
+                 * They all share GSI 16 with the dev-2 CD controller, because there is no free
+                 * pin: the 24-entry IO-APIC is fully allocated (see the disk-slot note above,
+                 * which is why disks cap at 3). Sharing a level-triggered PCI line is ordinary;
+                 * what it requires is that hype treat the line as the OR of its devices, which
+                 * fw_1_extra_optical_irq_pending() in boot/main.c does. #440 is the warning that
+                 * makes that mandatory rather than tidy: a per-device deassert on a shared pin
+                 * drops a sibling HBA's still-pending interrupt, which is exactly why #440 moved
+                 * the SATA function to its own GSI instead.
+                 *
+                 * Listed unconditionally and beyond what HYPE_FW_1_MAX_OPTICAL currently
+                 * presents, on the same reasoning the disk-slot and virtio-net entries record: a
+                 * _PRT entry for an absent device is inert, and a conditional table would need a
+                 * per-config DSDT. Raising the cap in boot/main.c therefore needs no ACPI change
+                 * and no regenerated AML.
+                 */
+                Package () { 0x000AFFFF, 0x00, 0x00, 0x10 },  /* dev 10 INTA -> GSI 16 (optical 1) */
+                Package () { 0x000BFFFF, 0x00, 0x00, 0x10 },  /* dev 11 INTA -> GSI 16 (optical 2) */
+                Package () { 0x000CFFFF, 0x00, 0x00, 0x10 },  /* dev 12 INTA -> GSI 16 (optical 3) */
+                Package () { 0x000DFFFF, 0x00, 0x00, 0x10 },  /* dev 13 INTA -> GSI 16 (optical 4) */
+                Package () { 0x000EFFFF, 0x00, 0x00, 0x10 },  /* dev 14 INTA -> GSI 16 (optical 5) */
+                Package () { 0x000FFFFF, 0x00, 0x00, 0x10 },  /* dev 15 INTA -> GSI 16 (optical 6) */
+                Package () { 0x0010FFFF, 0x00, 0x00, 0x10 },  /* dev 16 INTA -> GSI 16 (optical 7) */
             })
 
             /* Claim bus 0 so the kernel associates this bridge (and thus its _PRT) with
