@@ -11,6 +11,13 @@
 # for the first disc while the second was never attached at all.
 set -eu
 cd "$(cd "$(dirname "$0")/../.." && pwd)"
+
+# Kill any earlier instance first. `timeout` keeps a run alive for its full
+# budget, so starting a second one while the first is still going leaves both
+# writing the SAME boot.log and sharing the SAME esp.img -- the logs interleave
+# and the results are worthless. That cost two misread runs before the guard
+# was added; tools/232's rig has the same line for the same reason.
+for p in $(ps -o pid= -C qemu-system-x86_64 2>/dev/null); do kill -9 "$p" 2>/dev/null || true; done
 S="${SCRATCH:-/tmp/hype-727}"
 ALPINE="disk-images/alpine-standard-3.21.7-x86_64.iso"
 

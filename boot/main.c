@@ -18384,6 +18384,39 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                               (unsigned long long)bar5);
                         }
                     }
+                    /*
+                     * #727: the same latch for every extra optical HBA.
+                     *
+                     * This is the FIRMWARE-boot publish path. The kernel-boot one
+                     * (fw_1_program_kernel_bars) returns early unless vm->kernel_boot, so a
+                     * latch added only there never fires for a VM whose own firmware programs
+                     * the BARs -- which is every installer VM, i.e. exactly the configuration
+                     * `cdroms =` exists for.
+                     */
+                    {
+                        unsigned oi;
+                        for (oi = 0; oi < vm->opt_count && oi < HYPE_FW_1_MAX_EXTRA_OPTICAL; oi++) {
+                            unsigned odev = HYPE_FW_1_PCI_DEV_OPTICAL_BASE + oi;
+                            uint64_t obar;
+                            hype_ahci_set_bus_master(&vm->opt_ahci[oi],
+                                                     hype_pci_bus_master_enabled(&g_fw_1_pci,
+                                                                                 (uint8_t)odev));
+                            if (vm->shared_opt_mapped[oi] ||
+                                !hype_pci_memory_space_enabled(&g_fw_1_pci, (uint8_t)odev)) {
+                                continue;
+                            }
+                            obar = hype_pci_get_bar_value(&g_fw_1_pci, (uint8_t)odev, 5);
+                            if (obar != 0) {
+                                /* #576's ordering: base before the flag, so a reader that sees
+                                 * mapped always sees a valid base. */
+                                vm->shared_opt_bar[oi] = obar;
+                                vm->shared_opt_mapped[oi] = 1u;
+                                hype_debug_print("fw-1: optical drive %u BAR5 (ABAR) enabled at "
+                                                 "guest-physical 0x%llx -- routing its MMIO now "
+                                                 "(#727)\n", oi + 1u, (unsigned long long)obar);
+                            }
+                        }
+                    }
                     /* #262 slice 2: same latch for the SATA-disk HBA's BAR5. */
                     if (!vm->shared_ata_mapped && hype_pci_function_memory_space_enabled(&g_fw_1_pci,
                                                                                 HYPE_FW_1_PCI_DEV_ATA,
