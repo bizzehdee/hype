@@ -172,6 +172,30 @@ void hype_xhci_slot_ctx(uint32_t sc[8], unsigned int route, unsigned int speed,
                         unsigned int ctx_entries, unsigned int root_port,
                         unsigned int tt_hub_slot, unsigned int tt_port);
 
+/*
+ * #737/#736: mark an already-built Slot Context as a HUB. xHCI 6.2.2 gives a hub slot
+ * three fields a function slot does not use: Hub (dword0 bit 26), Number of Ports
+ * (dword1 bits 31:24) and TT Think Time (dword2 bits 17:16). They are evaluated by a
+ * Configure Endpoint command with A0 set (xHCI 4.6.6).
+ *
+ * hype used to leave all three at zero, so every hub it addressed looked like a plain
+ * function. That is not cosmetic: a child's Slot Context names the hub as its
+ * Transaction Translator by slot id, and a TT Hub Slot ID pointing at a slot with
+ * Hub=0 leaves the controller unable to build a split-transaction schedule for it.
+ * Measured: Address Device rejected with Parameter Error (code 17) for a full-speed
+ * device behind a high-speed hub on one controller, and 68818 polls with reports=0 for
+ * a keyboard on another.
+ *
+ * mtt is 0 for every hub hype drives today -- single-TT is the safe encoding and a
+ * multi-TT hub still works as one TT.
+ */
+void hype_xhci_slot_ctx_set_hub(uint32_t sc[8], unsigned int nbr_ports, unsigned int ttt,
+                                unsigned int mtt);
+
+/* TT Think Time for a hub's Slot Context: wHubCharacteristics (hub descriptor bytes
+ * 3..4) bits 6:5, already in the field's own encoding. */
+unsigned int hype_xhci_hub_ttt(const uint8_t *hubdesc);
+
 /* A device's topology path, needed to Address Device + Configure Endpoints for
  * a device that may sit behind one or more hubs. root_port is the ROOT port the
  * chain hangs off; route is the xHCI Route String (nibble per hub tier). */
@@ -434,6 +458,16 @@ int hype_xhci_address_device(hype_xhci_ctrl_t *c, unsigned int slot,
  * buf18 (>= 18 bytes). Returns 0 on success, -1 on error/timeout.
  */
 int hype_xhci_get_device_descriptor(hype_xhci_ctrl_t *c, unsigned int slot, uint8_t *buf18);
+
+/*
+ * #737: Configure Endpoint (A0 only) that marks an addressed slot as a hub --
+ * Hub=1, Number of Ports, TT Think Time. Must run after Address Device on the hub and
+ * BEFORE any device below it is addressed, because a child's Slot Context names this
+ * slot as its Transaction Translator. Returns 0 on success, -1 on error/timeout.
+ */
+int hype_xhci_configure_hub_slot(hype_xhci_ctrl_t *c, unsigned int slot,
+                                 const hype_xhci_devpath_t *path, unsigned int nbr_ports,
+                                 unsigned int ttt);
 
 /*
  * Reads the full configuration descriptor (config + interface + endpoint
@@ -808,7 +842,8 @@ int hype_xhci_int_in_poll(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int e
  */
 unsigned int hype_xhci_interval_encode(unsigned int speed_id, unsigned int b_interval);
 
-/* Endpoint context with an explicit Interval -- for interrupt (and isoch) endpoints. */
+/* Endpoint context with an explicit Interval and Max ESIT Payload -- for interrupt
+ * (and isoch) endpoints. */
 void hype_xhci_ep_ctx_interval(uint32_t ep[8], unsigned int ep_type, unsigned int max_packet,
                                uint64_t tr_dequeue_phys, int dcs, unsigned int interval);
 #endif /* HYPE_CORE_XHCI_H */

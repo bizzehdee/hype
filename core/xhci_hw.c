@@ -803,6 +803,41 @@ int hype_xhci_configure_int_in_endpoint(hype_xhci_ctrl_t *c, unsigned int slot,
 }
 
 /*
+ * #737: tell the controller that an addressed slot is a HUB.
+ *
+ * Address Device builds a plain function's Slot Context. A hub needs three more
+ * fields -- Hub, Number of Ports, TT Think Time -- and they are only evaluated by a
+ * Configure Endpoint command with A0 set (xHCI 4.6.6). Until this runs, every child
+ * addressed through the hub names it as its Transaction Translator by slot id while
+ * that slot still says Hub=0, which is what the controller rejects.
+ *
+ * A0 only: no endpoint contexts are added or dropped, and Context Entries stays at 1
+ * (EP0) because hype never configures a hub's own status-change endpoint.
+ */
+int hype_xhci_configure_hub_slot(hype_xhci_ctrl_t *c, unsigned int slot,
+                                 const hype_xhci_devpath_t *path, unsigned int nbr_ports,
+                                 unsigned int ttt) {
+    xhci_hw_t *hw = HW(c);
+    unsigned int cs = c->ctx_size;
+    uint32_t ctx[8], cmd[4], evt[4];
+
+    if (!c->inited || slot == 0u || path == (const hype_xhci_devpath_t *)0) return -1;
+
+    zero(hw->input_ctx, XPAGE);
+    hype_xhci_input_ctrl_ctx(ctx, HYPE_XHCI_ADD_SLOT, 0);
+    write_ctx(hw->input_ctx, 0, ctx);
+    hype_xhci_slot_ctx(ctx, path->route, path->speed, 1, path->root_port,
+                       path->tt_hub_slot, path->tt_port);
+    hype_xhci_slot_ctx_set_hub(ctx, nbr_ports, ttt, 0u);
+    write_ctx(hw->input_ctx, cs, ctx);
+
+    hype_xhci_trb_configure_endpoint(cmd, phys(hw->input_ctx), slot, (int)hw->cmd_cyc);
+    if (cmd_submit_wait(c, cmd, evt) != 0) return -1;
+    if (hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS) return -1;
+    return 0;
+}
+
+/*
  * Poll for one HID report. Returns 1 when a report was copied out, 0 when none has
  * arrived yet, -1 on a transfer error.
  *
@@ -1851,6 +1886,20 @@ int hype_xhci_hub_walk(hype_xhci_ctrl_t *c, unsigned int hub_slot,
     nports = hype_xhci_hub_nbr_ports(hubdesc);
     hype_debug_print("host-xhci:   hub slot %u (tier %u) has %u downstream port(s)\n",
                      hub_slot, tier, nports);
+
+    /*
+     * #737: mark this slot as a hub BEFORE addressing anything below it. A child's TT
+     * Hub Slot ID points here, and a controller will not build a split-transaction
+     * schedule against a slot that still says Hub=0. Not fatal on its own -- a hub
+     * whose ports are all high-speed never needs the TT -- so a failure is reported and
+     * the descent continues.
+     */
+    if (hype_xhci_configure_hub_slot(c, hub_slot, hub_path, nports,
+                                     hype_xhci_hub_ttt(hubdesc)) != 0) {
+        hype_debug_print("host-xhci:   hub slot %u Configure Endpoint (Hub=1 ports=%u ttt=%u) "
+                         "FAILED -- LS/FS devices below it may not report [#737]\n",
+                         hub_slot, nports, hype_xhci_hub_ttt(hubdesc));
+    }
 
     for (port = 1u; port <= nports; port++) {
         uint8_t st[4];

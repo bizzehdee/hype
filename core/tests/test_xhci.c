@@ -693,6 +693,80 @@ static void test_ep_ctx_interval_field(void) {
     CHECK_HEX("dequeue ptr preserved", 0x1001u, ep[2]);
 }
 
+/*
+ * #736: a periodic endpoint with Max ESIT Payload 0 gets no periodic bandwidth, so it
+ * configures cleanly and never reports. The keyboard that measured 68818 polls with
+ * reports=0 has mps 8; the mouse on the same hub has 64.
+ */
+static void test_ep_ctx_interval_sets_max_esit_payload(void) {
+    uint32_t ep[8];
+
+    hype_xhci_ep_ctx_interval(ep, HYPE_XHCI_EP_TYPE_INT_IN, 8u, 0x1000u, 1, 3u);
+    CHECK_HEX("max ESIT payload = mps 8", 8u, (ep[4] >> 16) & 0xFFFFu);
+    CHECK_HEX("average TRB length still 8", 8u, ep[4] & 0xFFFFu);
+
+    hype_xhci_ep_ctx_interval(ep, HYPE_XHCI_EP_TYPE_INT_IN, 64u, 0x1000u, 1, 3u);
+    CHECK_HEX("max ESIT payload = mps 64", 64u, (ep[4] >> 16) & 0xFFFFu);
+
+    /* The bulk/control builder must NOT gain the field -- it is a periodic-only fact. */
+    hype_xhci_ep_ctx(ep, HYPE_XHCI_EP_TYPE_BULK_IN, 512u, 0x1000u, 1);
+    CHECK_HEX("bulk max ESIT payload stays 0", 0u, (ep[4] >> 16) & 0xFFFFu);
+}
+
+/*
+ * #737: a hub's Slot Context needs Hub=1, Number of Ports and TT Think Time. Without
+ * them a child that names the hub as its Transaction Translator is rejected with
+ * Parameter Error (code 17) -- measured on a 32-byte-context controller.
+ */
+static void test_slot_ctx_hub_fields(void) {
+    uint32_t c[8];
+    /* A high-speed 4-port hub on root port 6, no TT of its own. */
+    hype_xhci_slot_ctx(c, 0, HYPE_USB_SPEED_HIGH, 1, 6, 0, 0);
+    CHECK_HEX("function slot has Hub=0", 0u, (c[0] >> 26) & 0x1u);
+    CHECK_HEX("function slot has no port count", 0u, (c[1] >> 24) & 0xFFu);
+
+    hype_xhci_slot_ctx_set_hub(c, 4u, 2u, 0u);
+    CHECK_HEX("Hub bit set", 1u, (c[0] >> 26) & 0x1u);
+    CHECK_HEX("MTT stays 0 for a single-TT hub", 0u, (c[0] >> 25) & 0x1u);
+    CHECK_HEX("number of ports = 4", 4u, (c[1] >> 24) & 0xFFu);
+    CHECK_HEX("TTT = 2", 2u, (c[2] >> 16) & 0x3u);
+    /* Everything Address Device already put there must survive. */
+    CHECK_HEX("speed preserved", HYPE_USB_SPEED_HIGH, (c[0] >> 20) & 0xFu);
+    CHECK_HEX("ctx entries preserved", 1u, (c[0] >> 27) & 0x1Fu);
+    CHECK_HEX("root port preserved", 6u, (c[1] >> 16) & 0xFFu);
+
+    /* A hub behind a hub keeps its own TT fields when the hub bits are added. */
+    hype_xhci_slot_ctx(c, 0x21, HYPE_USB_SPEED_FULL, 1, 7, 4, 3);
+    hype_xhci_slot_ctx_set_hub(c, 7u, 3u, 1u);
+    CHECK_HEX("TT hub slot preserved", 4u, c[2] & 0xFFu);
+    CHECK_HEX("TT port preserved", 3u, (c[2] >> 8) & 0xFFu);
+    CHECK_HEX("TTT = 3 alongside the TT fields", 3u, (c[2] >> 16) & 0x3u);
+    CHECK_HEX("MTT set when asked", 1u, (c[0] >> 25) & 0x1u);
+    CHECK_HEX("route string preserved", 0x21u, c[0] & 0xFFFFFu);
+
+    /* An over-wide port count must not spill into TTT/Interrupter Target. */
+    hype_xhci_slot_ctx(c, 0, HYPE_USB_SPEED_HIGH, 1, 1, 0, 0);
+    hype_xhci_slot_ctx_set_hub(c, 0x1FFu, 0x7u, 0u);
+    CHECK_HEX("port count masked to 8 bits", 0xFFu, (c[1] >> 24) & 0xFFu);
+    CHECK_HEX("TTT masked to 2 bits", 0x3u, (c[2] >> 16) & 0x3u);
+    CHECK_HEX("nothing above TTT touched", 0u, c[2] >> 18);
+}
+
+/* TT Think Time is wHubCharacteristics bits 6:5 -- hub-descriptor byte 3. */
+static void test_hub_ttt_from_descriptor(void) {
+    /* bNbrPorts 4, wHubCharacteristics 0x0009 -> TTT 0 (8 FS bit times). */
+    static const uint8_t ttt0[] = { 9, 0x29, 4, 0x09, 0x00, 0x32, 0x64, 0x00, 0xFF };
+    /* wHubCharacteristics 0x0069: bits 6:5 = 0b11 -> TTT 3 (32 FS bit times). */
+    static const uint8_t ttt3[] = { 9, 0x29, 4, 0x69, 0x00, 0x32, 0x64, 0x00, 0xFF };
+    /* bits 6:5 = 0b01 -> TTT 1. */
+    static const uint8_t ttt1[] = { 9, 0x29, 7, 0x29, 0x00, 0x32, 0x64, 0x00, 0xFF };
+
+    CHECK_HEX("TTT 0", 0u, hype_xhci_hub_ttt(ttt0));
+    CHECK_HEX("TTT 3", 3u, hype_xhci_hub_ttt(ttt3));
+    CHECK_HEX("TTT 1", 1u, hype_xhci_hub_ttt(ttt1));
+    CHECK_HEX("port count still read from byte 2", 7u, hype_xhci_hub_nbr_ports(ttt1));
+}
+
 /* --- USB-7 (#241): endpoint-set collection --- */
 
 static void test_collect_endpoints_walks_all_interfaces(void) {
@@ -838,6 +912,9 @@ int main(void) {
     test_collect_endpoints_rejects_bad_input();
     test_interval_encode();
     test_ep_ctx_interval_field();
+    test_ep_ctx_interval_sets_max_esit_payload();
+    test_slot_ctx_hub_fields();
+    test_hub_ttt_from_descriptor();
     test_first_iface_class();
     test_inventory_add_and_find();
     test_inventory_dedupes_by_position_not_identity();

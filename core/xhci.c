@@ -140,6 +140,19 @@ void hype_xhci_slot_ctx(uint32_t sc[8], unsigned int route, unsigned int speed,
     }
 }
 
+void hype_xhci_slot_ctx_set_hub(uint32_t sc[8], unsigned int nbr_ports, unsigned int ttt,
+                                unsigned int mtt) {
+    /* dword0: MTT[25], Hub[26]. dword1: Number of Ports[31:24]. dword2: TTT[17:16]. */
+    sc[0] |= (1u << 26) | ((mtt ? 1u : 0u) << 25);
+    sc[1] = (sc[1] & 0x00FFFFFFu) | ((nbr_ports & 0xFFu) << 24);
+    sc[2] = (sc[2] & ~0x00030000u) | ((ttt & 0x3u) << 16);
+}
+
+unsigned int hype_xhci_hub_ttt(const uint8_t *hubdesc) {
+    /* wHubCharacteristics is bytes 3..4; TT Think Time is its bits 6:5. */
+    return (unsigned int)((hubdesc[3] >> 5) & 0x3u);
+}
+
 unsigned int hype_xhci_route_append(unsigned int parent_route, unsigned int tier, unsigned int port) {
     if (tier == 0u || tier > 5u) return parent_route; /* xHCI supports 5 hub tiers */
     return parent_route | ((port & 0xFu) << ((tier - 1u) * 4u));
@@ -565,6 +578,16 @@ void hype_xhci_ep_ctx_interval(uint32_t ep[8], unsigned int ep_type, unsigned in
     hype_xhci_ep_ctx(ep, ep_type, max_packet, tr_dequeue_phys, dcs);
     /* dword0: Interval[23:16]. */
     ep[0] = (ep[0] & ~0x00FF0000u) | ((interval & 0xFFu) << 16);
+    /*
+     * #736: dword4 Max ESIT Payload[31:16] is how much the controller reserves per
+     * service interval. Left at 0 a periodic endpoint gets no periodic bandwidth, so it
+     * configures cleanly and then never reports -- measured as 68818 interrupt-IN polls
+     * with reports=0 on a full-speed keyboard behind a high-speed hub.
+     *
+     * xHCI 6.2.3.8: Max ESIT Payload = Max Packet Size * (Mult + 1) * (Max Burst + 1).
+     * hype leaves Mult and Max Burst at 0, so it is the packet size.
+     */
+    ep[4] = (ep[4] & 0x0000FFFFu) | ((max_packet & 0xFFFFu) << 16);
 }
 
 unsigned int hype_usb_collect_endpoints(const uint8_t *cfg, unsigned int len, hype_usb_ep_t *out,
