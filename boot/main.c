@@ -21412,7 +21412,8 @@ static void load_hype_cfg(void) {
             /* #329: the FW-1 machine model can route at most HYPE_FW_1_MAX_DISKS per VM (the
              * IO-APIC GSI budget); the parser's own cap is larger, so an over-long disks= list
              * parses cleanly and would otherwise have its tail silently never attached. */
-            dr = hype_adm_check_disk_count(&g_hype_cfg, HYPE_FW_1_MAX_DISKS);
+            dr = hype_adm_check_disk_count(&g_hype_cfg, HYPE_FW_1_MAX_DISKS,
+                                           HYPE_FW_1_MAX_OPTICAL);
         }
         if (dr.status != HYPE_ADM_OK) {
             /*

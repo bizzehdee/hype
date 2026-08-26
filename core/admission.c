@@ -493,18 +493,28 @@ hype_adm_result_t hype_adm_check_disk_bus(const hype_cfg_t *cfg) {
     return adm_ok();
 }
 
-hype_adm_result_t hype_adm_check_disk_count(const hype_cfg_t *cfg, unsigned int max_disks_per_vm) {
+hype_adm_result_t hype_adm_check_disk_count(const hype_cfg_t *cfg, unsigned int max_disks_per_vm,
+                                            unsigned int max_cdroms_per_vm) {
     unsigned int vi;
 
     for (vi = 0; vi < cfg->vm_count; vi++) {
         /*
-         * ADM-6 (#224): cdroms count too. The bound is the FW-1 machine model's per-VM STORAGE
-         * DEVICE budget -- an interrupt line and a PCI slot each -- and a cdrom spends both exactly
-         * as a disk does. Counting only `disks` let a config with 2 disks and 3 cdroms pass a
-         * 4-device budget and then have its tail silently never attached, which is the failure this
-         * check exists to prevent, one list over.
+         * ADM-6 (#224) counted cdroms against the DISK budget, because back then a cdrom spent an
+         * interrupt line and a PCI slot out of the same pool a disk did.
+         *
+         * #727 separated them: each optical drive now has its own PCI device (10+) and they all
+         * share one GSI, so a cdrom no longer consumes a disk slot. Keeping the combined test
+         * would refuse configurations the machine can serve -- 2 disks + 2 cdroms trips a 3-disk
+         * bound while every device has somewhere to go -- and would have silently capped the
+         * multi-cdrom work at three drives total.
+         *
+         * The failure #224 was guarding against is unchanged and still guarded: a list longer
+         * than its own front-end can present must fail loudly here, not be truncated at attach.
          */
-        if (cfg->vms[vi].disks_count + cfg->vms[vi].cdroms_count > max_disks_per_vm) {
+        if (cfg->vms[vi].disks_count > max_disks_per_vm) {
+            return adm_err(HYPE_ADM_ERR_DISK_COUNT_EXCEEDED, vi, HYPE_ADM_NO_VM);
+        }
+        if (cfg->vms[vi].cdroms_count > max_cdroms_per_vm) {
             return adm_err(HYPE_ADM_ERR_DISK_COUNT_EXCEEDED, vi, HYPE_ADM_NO_VM);
         }
     }

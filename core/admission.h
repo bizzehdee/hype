@@ -202,13 +202,23 @@ hype_adm_result_t hype_adm_check_disk_phys_overlap(const hype_cfg_t *cfg);
 hype_adm_result_t hype_adm_check_disk_bus(const hype_cfg_t *cfg);
 
 /*
- * #329: refuse a VM whose disks= list is longer than the front-end can present. max_disks_per_vm
- * is a parameter, not a constant read from the FW layer: the bound is owned by the caller (it is
- * an interrupt-budget fact of the FW-1 machine model, HYPE_FW_1_MAX_DISKS), and admission stays a
- * pure library. The parser's own cap (HYPE_CFG_MAX_VM_DISKS) is larger, so without this a 4-disk
- * config would parse cleanly and then have its tail silently never attached.
+ * #329: refuse a VM whose disks= list is longer than the front-end can present. The bounds are
+ * parameters, not constants read from the FW layer: they are interrupt- and PCI-budget facts of
+ * the FW-1 machine model (HYPE_FW_1_MAX_DISKS, HYPE_FW_1_MAX_OPTICAL) owned by the caller, and
+ * admission stays a pure library. The parser's own cap (HYPE_CFG_MAX_VM_DISKS) is larger than
+ * either, so without this a 4-disk config would parse cleanly and then have its tail silently
+ * never attached.
+ *
+ * #727: the two lists are counted SEPARATELY. This used to test
+ * `disks_count + cdroms_count` against the disk bound alone, on the reasoning (#224) that a
+ * cdrom spends an interrupt line and a PCI slot exactly as a disk does. That stopped being true
+ * when optical drives got their own PCI devices and their own shared GSI: they no longer come
+ * out of the disk budget, and the combined test refused configurations the machine can now
+ * serve -- 2 disks plus 2 cdroms is 4, over a 3-disk bound, yet every one of those devices has
+ * somewhere to go. Counting them together would have quietly capped #727 at three total drives.
  */
-hype_adm_result_t hype_adm_check_disk_count(const hype_cfg_t *cfg, unsigned int max_disks_per_vm);
+hype_adm_result_t hype_adm_check_disk_count(const hype_cfg_t *cfg, unsigned int max_disks_per_vm,
+                                            unsigned int max_cdroms_per_vm);
 
 /*
  * ADM-6 (#224): `[hype] host_cpu_budget` -- the cores the operator has given hype at all.

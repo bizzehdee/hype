@@ -718,15 +718,15 @@ static void test_disk_count_over_frontend_budget_is_refused(void) {
     attach(&cfg.vms[0], "d2", 0);
 
     CHECK_INT("exactly at the budget passes", (int)HYPE_ADM_OK,
-              (int)hype_adm_check_disk_count(&cfg, 3u).status);
+              (int)hype_adm_check_disk_count(&cfg, 3u, 8u).status);
 
     attach(&cfg.vms[0], "d3", 0);
-    r = hype_adm_check_disk_count(&cfg, 3u);
+    r = hype_adm_check_disk_count(&cfg, 3u, 8u);
     CHECK_INT("one past the budget is refused", (int)HYPE_ADM_ERR_DISK_COUNT_EXCEEDED, (int)r.status);
     CHECK_INT("the refusal names the offending VM", 0, (int)r.vm_index_a);
 
     CHECK_INT("no config at all passes trivially", (int)HYPE_ADM_OK,
-              (int)hype_adm_check_disk_count(&(hype_cfg_t){0}, 3u).status);
+              (int)hype_adm_check_disk_count(&(hype_cfg_t){0}, 3u, 8u).status);
 }
 
 
@@ -1274,28 +1274,47 @@ static void test_two_inline_physical_targets_overlap_by_scope(void) {
 /* ---- ADM-6 (#224): cdroms count against the device budget ---- */
 
 /*
- * A cdrom spends an interrupt line and a PCI slot exactly as a disk does. Counting only `disks`
- * let a 2-disk + 3-cdrom VM pass a 4-device budget and then have its tail silently never attached,
- * which is the failure this check exists to prevent, one list over.
+ * #727: disks and cdroms are counted against SEPARATE budgets.
+ *
+ * #224 originally counted them together, because a cdrom then spent an interrupt line and a PCI
+ * slot out of the same pool a disk did. Optical drives now have their own PCI devices and share
+ * one GSI, so they no longer come out of the disk budget -- and a combined test would refuse
+ * configurations the machine can serve.
  */
-static void test_cdroms_count_against_the_device_budget(void) {
+static void test_disks_and_cdroms_have_separate_budgets(void) {
     hype_cfg_t cfg;
     hype_adm_result_t r;
 
     hype_cfg_init(&cfg);
     cfg.vm_count = 1;
     make_vm(&cfg.vms[0], "many", 1, 512, "");
-    cfg.vms[0].disks_count = 2;
-    cfg.vms[0].cdroms_count = 3;
 
-    r = hype_adm_check_disk_count(&cfg, 4u);
-    CHECK_INT("2 disks + 3 cdroms exceeds a 4-device budget",
-              (int)HYPE_ADM_ERR_DISK_COUNT_EXCEEDED, (int)r.status);
+    /* The case the old combined rule wrongly refused: over a 3-disk bound when summed, but
+     * every device has somewhere to go. Counting together would have capped #727 at 3 drives. */
+    cfg.vms[0].disks_count = 2;
+    cfg.vms[0].cdroms_count = 2;
+    CHECK_INT("2 disks + 2 cdroms is fine on separate budgets", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_disk_count(&cfg, 3u, 8u).status);
+
+    /* Each list is still refused against its OWN bound -- #224's actual concern, which is that a
+     * list longer than its front-end can present must fail loudly rather than be truncated. */
+    cfg.vms[0].disks_count = 4;
+    cfg.vms[0].cdroms_count = 0;
+    r = hype_adm_check_disk_count(&cfg, 3u, 8u);
+    CHECK_INT("4 disks exceeds the disk bound", (int)HYPE_ADM_ERR_DISK_COUNT_EXCEEDED,
+              (int)r.status);
     CHECK_INT("and it names the VM", 0u, r.vm_index_a);
 
-    cfg.vms[0].cdroms_count = 2;
-    CHECK_INT("2 disks + 2 cdroms fits exactly", (int)HYPE_ADM_OK,
-              (int)hype_adm_check_disk_count(&cfg, 4u).status);
+    cfg.vms[0].disks_count = 1;
+    cfg.vms[0].cdroms_count = 9;
+    r = hype_adm_check_disk_count(&cfg, 3u, 8u);
+    CHECK_INT("9 cdroms exceeds the optical bound", (int)HYPE_ADM_ERR_DISK_COUNT_EXCEEDED,
+              (int)r.status);
+    CHECK_INT("and names that VM too", 0u, r.vm_index_a);
+
+    cfg.vms[0].cdroms_count = 8;
+    CHECK_INT("8 cdroms fits exactly", (int)HYPE_ADM_OK,
+              (int)hype_adm_check_disk_count(&cfg, 3u, 8u).status);
 }
 
 /*
@@ -1652,7 +1671,7 @@ int main(void) {
     test_inline_physical_target_overlaps_a_named_disk();
     test_one_vm_may_hold_overlapping_claims_on_its_own_drive();
     test_two_inline_physical_targets_overlap_by_scope();
-    test_cdroms_count_against_the_device_budget();
+    test_disks_and_cdroms_have_separate_budgets();
     test_physical_cdrom_claim_is_attributed_too();
     test_physical_device_without_an_identity_is_skipped();
     test_cpu_sets_alone_can_over_claim_the_budget();

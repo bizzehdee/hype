@@ -201,7 +201,15 @@ is one device; a VM references them by id in `disks =` / `cdroms =`.
 ### 5.4 Boot media / optical (CD/DVD)
 
 Optical drives are first-class `[disk.<id>] type=cdrom` devices; a VM attaches
-**any number** via `cdroms =` (`bus=ahci-atapi`, read-only, `backing=file` ISO).
+**up to `HYPE_CFG_MAX_VM_DISKS` (8)** of them via `cdroms =` (`bus=ahci-atapi`,
+read-only, `backing=file` ISO), the implicit `install_media` drive included.
+
+> This said "**any number**" until 2026-08-26, and #727 is what that cost: the
+> key was parsed, admission-checked and displayed while nothing ever attached it
+> to a guest device, so a VM with `install_media` plus `cdroms =` booted with one
+> optical drive and the promise went unnoticed for as long as nobody counted the
+> discs. Each drive is its own AHCI HBA on its own PCI function, so the number is
+> finite and worth stating.
 `install_media` stays as **sugar** for the common single-installer case: it
 creates one implicit boot cdrom and places it first in `boot_order`
 (maps to the per-VM ISO backing, #140). Use explicit `cdroms =` when a VM needs
@@ -405,9 +413,9 @@ correct for when they exist.)
 
 | resource | range | enforced |
 |---|---|---|
-| hard disks / VM (`disks`) | 0 .. `HYPE_CFG_MAX_DISKS_PER_VM` (~24) | parser cap; guest bus limits (AHCI ≤ 32 ports, PCI slots) at admission |
-| optical / VM (`cdroms`) | 0 .. `HYPE_CFG_MAX_CDROMS_PER_VM` (~4) | parser cap |
-| NICs / VM (`nics`) | 0 .. `HYPE_CFG_MAX_NICS_PER_VM` (~8) | parser cap |
+| hard disks / VM (`disks`) | 0 .. `HYPE_CFG_MAX_VM_DISKS` (8) parsed; **3 attached** (`HYPE_FW_1_MAX_DISKS`) | parser cap, then the runtime cap — the 24-pin IO-APIC is fully allocated, so disk slots 1 and 2 hold its last two free pins |
+| optical / VM (`cdroms`) | 0 .. `HYPE_CFG_MAX_VM_DISKS` (8), `install_media`'s implicit drive included | parser cap; `HYPE_FW_1_MAX_OPTICAL` matches it, so anything the parser accepts is attached (#727) |
+| NICs / VM (`nics`) | 0 .. `HYPE_CFG_MAX_VM_NICS` (4) | parser cap |
 | `vcpus` | 1 .. host **physical core** count | parser ≥1; **admission** caps at the cores in `host_cpu_budget` with the BSP's reserved. A vCPU is a physical core; SMT multiplies what the guest SEES, not what it costs (plan.md §10 decision 47) |
 | `mem_mb` | 1 .. host usable RAM (MB) | parser ≥1; **admission** caps at real free RAM |
 
