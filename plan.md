@@ -3633,6 +3633,22 @@ isn't lost.
     installer ISO plus a Windows storage-driver ISO visible *simultaneously* during setup), and
     building the cheap thing first would leave the documented behaviour still unimplemented.
 
+    **Implemented and QEMU-validated 2026-08-26** (`tools/727`): the guest sees `/dev/sr0` and
+    `/dev/sr1`, mounts the second and reads back a marker file present only on that disc. Two
+    traps found doing it, recorded because neither is visible from the design:
+
+    - **There are TWO BAR-publish paths and the obvious one is the wrong one.**
+      `fw_1_program_kernel_bars()` returns early unless `vm->kernel_boot`, so a latch added there
+      never fires for a VM whose own firmware programs the BARs -- which is every installer VM,
+      i.e. exactly the configuration `cdroms =` exists for. The live one is the firmware-boot path
+      beside #262's SATA latch. The symptom read nothing like the cause: hype wedged in HOST code
+      with the guest's exit count FROZEN while its in-host time climbed, on an ECAM access to the
+      new device.
+    - **Claiming an NPF the model declined is an infinite fault loop.** Ignoring
+      `vmm_handle_ahci_npf_map`'s return value and claiming the access regardless means a register
+      the model does not implement never gets its RIP advanced. Claim only what was serviced, as
+      the primary drive's branch already did.
+
     **Known coupling to fix in the same change:** the ISO bounce pool is one slot per VM
     (`bounce_slot = vi`, four sites in `boot/main.c`, pool sized to the VM count by #428). Two
     streams on one VM would share a buffer and corrupt each other's reads, so the pool resizes to
