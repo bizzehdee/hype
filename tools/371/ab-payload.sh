@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 # #371 A/B: does a minimal EFI app fail to boot at the same rate hype does?
 #
 # Same base ESP image (one copy, then BOOTX64.EFI overwritten), same QEMU command line, same
@@ -16,7 +17,7 @@ run_one() {
   local arm="$1" esp="$2" banner="$3" i="$4"
   local log="disk-images/ab371-$arm-$i.log"
   cp -f /usr/share/edk2/ovmf/OVMF_VARS.fd "$log.vars.fd"; rm -f "$log"
-  qemu-system-x86_64 -machine q35 -m 8192 -nodefaults -accel kvm -cpu host -smp 4 \
+  "$QEMU" -machine q35 -m 8192 -nodefaults -accel kvm -cpu host -smp 4 \
     -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/ovmf/OVMF_CODE.fd \
     -drive if=pflash,format=raw,file="$log.vars.fd" \
     -drive format=raw,file="$esp" \
@@ -26,7 +27,7 @@ run_one() {
   for t in $(seq "$SECS"); do kill -0 $qpid 2>/dev/null || break; sleep 1; done
   kill -9 $qpid 2>/dev/null; wait $qpid 2>/dev/null
   # Never leave one behind -- see the pgrep/comm truncation trap; killall is the only reliable form.
-  killall -9 qemu-system-x86_64 2>/dev/null; sleep 1
+  killall -9 "$(basename "$QEMU")" 2>/dev/null; sleep 1
 
   local bytes hit
   bytes=$(wc -c < "$log")

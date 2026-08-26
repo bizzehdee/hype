@@ -14,6 +14,7 @@
 # A run that stalls (nonzero stalled, dropped=0) still passes: the guest waited,
 # nothing was lost. That is the whole point of the fix.
 set -e
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 export LC_ALL=C
 cd "$(git rev-parse --show-toplevel)"
 S="${SCRATCH:-disk-images/639}"
@@ -23,7 +24,7 @@ ISO="${ISO:-disk-images/alpine-virt-console.iso}"
 CODE=${OVMF_CODE:-/usr/share/OVMF/OVMF_CODE.fd}
 VARS=${OVMF_VARS:-/usr/share/OVMF/OVMF_VARS.fd}
 mkdir -p "$S"
-killall -9 qemu-system-x86_64 2>/dev/null || true; sleep 1
+killall -9 "$(basename "$QEMU")" 2>/dev/null || true; sleep 1
 
 cat > $S/hype.cfg <<'CFG'
 [hype]
@@ -77,7 +78,7 @@ mcopy -i "$E" $S/vm0.txt ::/input/vm0.txt
 
 for ATTEMPT in 1 2 3; do
   cp "$VARS" $S/VARS.fd
-  timeout "$SECS" qemu-system-x86_64 \
+  timeout "$SECS" "$QEMU" \
     -machine q35 -m 4096 -nodefaults \
     -accel kvm -accel tcg -cpu host -smp 4 \
     -drive if=pflash,format=raw,readonly=on,file="$CODE" \

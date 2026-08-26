@@ -15,6 +15,7 @@
 # timer stops advancing, that loop never exits, the AHCI poll never runs again, and the ATA timeout
 # never counts down -- which matches every observation including the permanence.
 set -u
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 cd "$(dirname "$0")/../.."
 N="${1:-8}"; SECS="${2:-40}"; DBG="${DEBUGCON:-1}"
 ESP=disk-images/esp-371-hello.img
@@ -29,7 +30,7 @@ for i in $(seq 1 "$N"); do
   log="$OUT/run$i.log"; dbg="$OUT/run$i.debugcon"; mon="$PWD/$OUT/run$i.mon"
   rm -f "$log" "$dbg" "$mon"; cp -f /usr/share/edk2/ovmf/OVMF_VARS.fd "$OUT/run$i.vars.fd"
   dbgargs=(); [ "$DBG" = 1 ] && dbgargs=(-debugcon "file:$dbg" -global isa-debugcon.iobase=0x402)
-  qemu-system-x86_64 -machine q35 -m 8192 -nodefaults -accel kvm -cpu host -smp 4 \
+  "$QEMU" -machine q35 -m 8192 -nodefaults -accel kvm -cpu host -smp 4 \
     -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/ovmf/OVMF_CODE.fd \
     -drive if=pflash,format=raw,file="$OUT/run$i.vars.fd" \
     -drive format=raw,file="$ESP" "${dbgargs[@]}" \
@@ -70,7 +71,7 @@ for i in $(seq 1 "$N"); do
     echo "    load-map entries: $(wc -l < "$OUT/run$i.loadmap.txt")"
   fi
   kill -9 $qpid 2>/dev/null; wait $qpid 2>/dev/null
-  killall -9 qemu-system-x86_64 2>/dev/null; sleep 1
+  killall -9 "$(basename "$QEMU")" 2>/dev/null; sleep 1
   rm -f "$OUT/run$i.vars.fd"
 done
 echo; echo "RESULT: $ok booted, $no noboot of $N"

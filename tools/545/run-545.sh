@@ -1,8 +1,9 @@
 #!/bin/bash
 # #545 leg: real bzImage + initramfs direct boot. PASS = the in-guest computed marker.
 set -e
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 cd "$(git rev-parse --show-toplevel)"
-killall -9 qemu-system-x86_64 2>/dev/null || true
+killall -9 "$(basename "$QEMU")" 2>/dev/null || true
 sleep 1
 HYPE_CFG=tools/545/hype.cfg \
 HYPE_KERNELS="disk-images/545/vmlinuz-virt disk-images/545/initramfs-virt" \

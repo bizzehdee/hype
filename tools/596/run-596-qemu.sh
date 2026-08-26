@@ -9,6 +9,7 @@
 # #596 reproduced. Then fsck.vfat judges the USB image: a "File size ... cluster chain length"
 # (dirent > chain) line is the bug.
 set -e
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 export LC_ALL=C
 cd "$(git rev-parse --show-toplevel)"
 S="${SCRATCH:-disk-images/596-qemu}"
@@ -18,7 +19,7 @@ CODE=${OVMF_CODE:-/usr/share/OVMF/OVMF_CODE.fd}
 VARS=${OVMF_VARS:-/usr/share/OVMF/OVMF_VARS.fd}
 ITERS=${ITERS:-3}
 
-killall -9 qemu-system-x86_64 2>/dev/null || true; sleep 1
+killall -9 "$(basename "$QEMU")" 2>/dev/null || true; sleep 1
 
 # --- the LOG volume (where g_hype_log mounts): large, 32 KiB clusters, both markers armed ---
 rm -f "$S/usb.img"
@@ -39,7 +40,7 @@ mcopy -i "$S/esp.img" tools/hwstick/hype-fat32.cfg ::/hype.cfg
 
 for ATTEMPT in 1 2 3; do
     cp "$VARS" "$S/VARS.fd"
-    timeout "${1:-400}" qemu-system-x86_64 \
+    timeout "${1:-400}" "$QEMU" \
         -machine q35 -m 4096 -nodefaults \
         -accel kvm -accel tcg -cpu host -smp 4 \
         -drive if=pflash,format=raw,readonly=on,file="$CODE" \

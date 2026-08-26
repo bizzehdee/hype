@@ -2,6 +2,7 @@
 # #338 validation: boot hype with an emulated USB stick, then read back the
 # split log files the run leaves on it.
 set -e
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 export LC_ALL=C
 cd "$(git rev-parse --show-toplevel)"
 S="${SCRATCH:-$(mktemp -d)}"
@@ -22,7 +23,7 @@ mcopy -i $S/esp.img tools/qemu-cd-hype.cfg ::/hype.cfg 2>/dev/null || true
 
 for ATTEMPT in 1 2 3; do
 cp /usr/share/OVMF/OVMF_VARS.fd $S/VARS.fd
-timeout "${1:-150}" qemu-system-x86_64 \
+timeout "${1:-150}" "$QEMU" \
   -machine q35 -m 2048 -nodefaults \
   -accel kvm -accel tcg -cpu host -smp 2 \
   -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE.fd \

@@ -12,6 +12,7 @@
 # seconds of silence, which reads as hype hanging on entry and is not. With the device named, the
 # same image boots and reaches the FreeBSD installer.
 set -e
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 cd "$(dirname "$0")/../../disk-images"
 LOG="${1:-bsd-run}.log"
 SECS="${2:-180}"
@@ -33,7 +34,7 @@ cp -f "$OVMF_VARS" host-vars.fd
 echo "hype.efi refreshed in ESP; booting for ${SECS}s -> $LOG"
 
 rm -f "$LOG"
-qemu-system-x86_64 \
+"$QEMU" \
   -machine q35 -m 8192 -nodefaults \
   -accel kvm -cpu host -smp 4 \
   -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \

@@ -34,6 +34,7 @@
 #    vendored GUEST varstore (fw/OVMF_VARS.fd, for the 4MB build) against a 2MB host CODE
 #    produces a 0-byte serial log, indistinguishable from hype faulting on entry.
 set -e
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 cd "$(dirname "$0")/.."
 ISO="$1"; NAME="${2:-guest}"; SECS="${3:-180}"
 # #581: seconds to let QEMU shut down in order after SIGTERM before resorting to SIGKILL. Five is
@@ -252,7 +253,7 @@ boot_once() {
         rm -f "$OUT.qmp"
         qmp_args=(-qmp "unix:$OUT.qmp,server=on,wait=off")
     fi
-    qemu-system-x86_64 \
+    "$QEMU" \
       -machine q35 -m "${QEMU_MEM:-8192}" -nodefaults \
       -accel kvm -cpu host -smp "${SMP:-4}" ${EXTRA_QEMU_ARGS:-} \
       -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \

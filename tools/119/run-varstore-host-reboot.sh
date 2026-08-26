@@ -33,6 +33,7 @@
 #                            the saved image cannot equal the pristine one.
 #
 set -u
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 export LC_ALL=C
 cd "$(git rev-parse --show-toplevel)"
 
@@ -96,7 +97,7 @@ while :; do
     cp "$OVMF_VARS" "$S/VARS.fd"
     # -vga std, not none: with `none` hype's display path never runs at all, which is how #370's
     # rdmsr #GP hid behind what looked like a render stall.
-    timeout "$SECS" qemu-system-x86_64 \
+    timeout "$SECS" "$QEMU" \
       -machine q35 -m 4096 -nodefaults \
       -accel kvm -cpu host -smp 4 \
       -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \

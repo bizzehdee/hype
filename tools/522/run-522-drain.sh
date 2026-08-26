@@ -4,6 +4,7 @@
 # never falls behind, which is why the drain's burst behaviour was only ever
 # visible on hardware.
 set -e
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 export LC_ALL=C
 cd "$(git rev-parse --show-toplevel)"
 S="${SCRATCH:?set SCRATCH to a DISK-backed dir, never /tmp (tmpfs)}"
@@ -61,7 +62,7 @@ if [ -z "${NOCFG:-}" ]; then mcopy -i $S/esp.img $S/hype.cfg ::/hype.cfg; fi
 
 for ATTEMPT in 1 2 3; do
   cp /usr/share/OVMF/OVMF_VARS.fd $S/VARS.fd
-  timeout "$SECS" qemu-system-x86_64 \
+  timeout "$SECS" "$QEMU" \
     -machine q35 -m 6144 -nodefaults \
     -accel kvm -accel tcg -cpu host -smp 4 \
     -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE.fd \

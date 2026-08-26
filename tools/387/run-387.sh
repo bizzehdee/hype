@@ -3,11 +3,12 @@
 # claim) on ONE qemu-xhci controller. PASS = B claimed as MEDIA with its own bulk rings, both
 # registered, the VM's ISO resolved+streamed from B BY SERIAL, and the log still landing on A.
 set -e
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 export LC_ALL=C
 cd "$(git rev-parse --show-toplevel)"
 S="${SCRATCH:-$(mktemp -d /mnt/data/dev/hype/disk-images/rig387.XXXXXX)}"
 echo "scratch: $S"
-killall -9 qemu-system-x86_64 2>/dev/null || true
+killall -9 "$(basename "$QEMU")" 2>/dev/null || true
 sleep 1
 
 # stick A: hype's log medium (plain FAT superfloppy, as the log path expects)
@@ -37,7 +38,7 @@ mcopy -i "$S"/esp.img@@1M fw/OVMF_CODE.fd fw/OVMF_VARS.fd ::/EFI/hype/
 mcopy -i "$S"/esp.img@@1M tools/387/hype.cfg ::/hype.cfg
 
 cp /usr/share/edk2/ovmf/OVMF_VARS.fd "$S"/VARS.fd
-timeout "${1:-300}" qemu-system-x86_64 -machine q35 -m 4096 -nodefaults \
+timeout "${1:-300}" "$QEMU" -machine q35 -m 4096 -nodefaults \
   -accel kvm -cpu host -smp 4 \
   -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/ovmf/OVMF_CODE.fd \
   -drive if=pflash,format=raw,file="$S"/VARS.fd \

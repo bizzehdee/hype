@@ -4,6 +4,7 @@
 # (boot 1's log, rotated out of the way instead of truncated), each carrying a
 # distinct #643 boot-counter line, correctly ordered.
 set -e
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 export LC_ALL=C
 cd "$(git rev-parse --show-toplevel)"
 S="${SCRATCH:-disk-images/643}"
@@ -12,7 +13,7 @@ SECS="${1:-60}"
 CODE=${OVMF_CODE:-/usr/share/OVMF/OVMF_CODE.fd}
 VARS=${OVMF_VARS:-/usr/share/OVMF/OVMF_VARS.fd}
 mkdir -p "$S"
-killall -9 qemu-system-x86_64 2>/dev/null || true; sleep 1
+killall -9 "$(basename "$QEMU")" 2>/dev/null || true; sleep 1
 
 cat > $S/hype.cfg <<'CFG'
 [hype]
@@ -47,7 +48,7 @@ cp "$VARS" $S/VARS.fd
 run_once() {
   local attempt_log="$1"
   for ATTEMPT in 1 2 3; do
-    timeout "$SECS" qemu-system-x86_64 \
+    timeout "$SECS" "$QEMU" \
       -machine q35 -m 1024 -nodefaults \
       -accel kvm -accel tcg -cpu host -smp 2 \
       -drive if=pflash,format=raw,readonly=on,file="$CODE" \

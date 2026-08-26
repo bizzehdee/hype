@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 # #371 round 2: is the bannerless boot caused by host resource exhaustion?
 #
 # The A/B established the failure is firmware-side, not hype's. What it did NOT establish is WHY,
@@ -40,7 +41,7 @@ for i in $(seq 1 "$N"); do
   pm=$(psi memory some); pc=$(psi cpu some); pio=$(psi io some)
 
   t0=$(date +%s)
-  qemu-system-x86_64 -machine q35 -m 8192 -nodefaults -accel kvm -cpu host -smp 4 \
+  "$QEMU" -machine q35 -m 8192 -nodefaults -accel kvm -cpu host -smp 4 \
     -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/ovmf/OVMF_CODE.fd \
     -drive if=pflash,format=raw,file="$OUT/r$i.vars.fd" \
     -drive format=raw,file="$ESP" \
@@ -50,7 +51,7 @@ for i in $(seq 1 "$N"); do
   for t in $(seq "$SECS"); do kill -0 $qpid 2>/dev/null || break; sleep 1; done
   t1=$(date +%s)
   kill -9 $qpid 2>/dev/null; wait $qpid 2>/dev/null
-  killall -9 qemu-system-x86_64 2>/dev/null; sleep 1
+  killall -9 "$(basename "$QEMU")" 2>/dev/null; sleep 1
 
   hit=$(LC_ALL=C grep -ac "hello: build" "$LOG" 2>/dev/null || echo 0)
   eb=$(wc -c < "$ERR"); db=$(wc -c < "$DBG" 2>/dev/null || echo 0)

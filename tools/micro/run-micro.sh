@@ -25,6 +25,7 @@
 # it is the one that actually happened: #535's first run reported a correct PASS from a guest
 # entered at the wrong address entirely. A harness that greps only for FAIL passes a dead test.
 set -u
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 cd "$(dirname "$0")/../.."
 
 SECS="${SECS:-90}"
@@ -206,7 +207,7 @@ run_one() {   # $1 = test name
     [ -f "build/micro/$name.bin" ] || { echo "MISSING $name -- build/micro/$name.bin, run 'make micro'"; return 1; }
     gen_cfg "$name" "$cfg"
 
-    killall -9 qemu-system-x86_64 2>/dev/null
+    killall -9 "$(basename "$QEMU")" 2>/dev/null
     sleep 1
 
     # A storage test gets a freshly zeroed image, so a pattern found afterwards can only have been
@@ -327,7 +328,7 @@ if [ "${1:-}" = "--suite" ]; then
         done
     fi
 
-    killall -9 qemu-system-x86_64 2>/dev/null
+    killall -9 "$(basename "$QEMU")" 2>/dev/null
     sleep 1
     run_guest_quiet env HYPE_CFG="$cfg" HYPE_KERNELS="$kernels" HYPE_INPUTS="$inputs" \
         EXTRA_QEMU_ARGS="$suite_qargs" \

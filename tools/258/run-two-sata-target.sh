@@ -2,6 +2,7 @@
 # #258: two SATA disks on ONE ich9-ahci. hype boots from the ESP on port 0; the config names the
 # scratch on port 1 as its physical target -- the exact layout the ticket was filed about.
 set -e
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 export LC_ALL=C
 cd "$(git rev-parse --show-toplevel)"
 S="${SCRATCH:-$(mktemp -d)}"
@@ -20,7 +21,7 @@ dd if=/dev/zero of=$S/scratch.img bs=1M count=64 status=none
 
 for ATTEMPT in 1 2 3 4; do
 cp /usr/share/OVMF/OVMF_VARS.fd $S/VARS.fd
-timeout "${1:-150}" qemu-system-x86_64 \
+timeout "${1:-150}" "$QEMU" \
   -machine q35 -m 2048 -nodefaults \
   -accel kvm -accel tcg -cpu host -smp 2 \
   -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE.fd \

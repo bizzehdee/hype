@@ -3,6 +3,7 @@
 # Rebuild hype and re-stage its binary into the ESP image before each run --
 # forgetting that step silently re-tests the previous build.
 set -eu
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 OUT=${OUT:-/mnt/data/hype-bisect/rig262}
@@ -13,11 +14,11 @@ cd "$OUT"
 mcopy -o -i esp-hype.fat "$REPO/build/hype.efi" ::/EFI/BOOT/BOOTX64.EFI
 dd if=esp-hype.fat of=esp-hype.img bs=512 seek=2048 conv=notrunc status=none
 
-killall -9 qemu-system-x86_64 2>/dev/null || true
+killall -9 "$(basename "$QEMU")" 2>/dev/null || true
 sleep 1
 rm -f hype.log
 cp "$OVMF_VARS" hype-vars.fd
-timeout "${RUNSECS:-200}" qemu-system-x86_64 -machine q35 -m 8192 -nodefaults \
+timeout "${RUNSECS:-200}" "$QEMU" -machine q35 -m 8192 -nodefaults \
   -accel kvm -cpu host -smp 4 \
   -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
   -drive if=pflash,format=raw,file=hype-vars.fd \

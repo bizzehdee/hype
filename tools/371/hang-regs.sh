@@ -15,6 +15,7 @@
 # Healthy idle baseline on this host, measured on a booted guest:
 #   PxIS=0x00000001 (DHRS sticky from the last command), PxTFD=0x00000050 (DRDY, !BSY), PxCI=0
 set -u
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 cd "$(dirname "$0")/../.."
 N="${1:-40}"; SECS="${2:-25}"
 ESP=disk-images/esp-371-hello.img
@@ -32,7 +33,7 @@ for i in $(seq 1 "$N"); do
   log="$OUT/run$i.log"; dbg="$OUT/run$i.debugcon"; mon="$OUT/run$i.mon"
   rm -f "$log" "$dbg" "$mon"; cp -f /usr/share/edk2/ovmf/OVMF_VARS.fd "$OUT/run$i.vars.fd"
   dbgargs=(); [ "$DBG" = 1 ] && dbgargs=(-debugcon "file:$dbg" -global isa-debugcon.iobase=0x402)
-  qemu-system-x86_64 -machine q35 -m 8192 -nodefaults -accel kvm -cpu host -smp 4 \
+  "$QEMU" -machine q35 -m 8192 -nodefaults -accel kvm -cpu host -smp 4 \
     -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/ovmf/OVMF_CODE.fd \
     -drive if=pflash,format=raw,file="$OUT/run$i.vars.fd" \
     -drive format=raw,file="$ESP" "${dbgargs[@]}" \
@@ -79,7 +80,7 @@ for i in $(seq 1 "$N"); do
     fi
   fi
   kill -9 $qpid 2>/dev/null; wait $qpid 2>/dev/null
-  killall -9 qemu-system-x86_64 2>/dev/null; sleep 1
+  killall -9 "$(basename "$QEMU")" 2>/dev/null; sleep 1
   rm -f "$OUT/run$i.vars.fd"
   [ "$hit" = 1 ] && rm -f "$dbg" "$log" "$OUT/run$i.stderr"
 done

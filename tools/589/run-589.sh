@@ -3,10 +3,11 @@
 # registry (now one device per inventoried port) resolves the file there and the guest reads it.
 # Before #589 only the boot disk (ahci.0) was a media device, so the file was NOT FOUND.
 set -e
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 cd "$(git rev-parse --show-toplevel)"
 S="${SCRATCH:-$(mktemp -d /mnt/data/dev/hype/disk-images/rig589.XXXXXX)}"
 echo "scratch: $S"
-killall -9 qemu-system-x86_64 2>/dev/null || true
+killall -9 "$(basename "$QEMU")" 2>/dev/null || true
 sleep 1
 
 # The SECOND disk: GPT + one FAT32 volume holding \disks\vda.img (the guest's disk).
@@ -35,7 +36,7 @@ mcopy -i "$ESP@@1M" tools/589/shell-vm0.txt ::/input/vm0.txt
 
 cp /usr/share/edk2/ovmf/OVMF_VARS.fd "$S"/VARS.fd
 LOG="$S"/serial.txt
-timeout "${TIMEOUT:-300}" qemu-system-x86_64 -machine q35 -m 4096 -nodefaults \
+timeout "${TIMEOUT:-300}" "$QEMU" -machine q35 -m 4096 -nodefaults \
   -accel kvm -cpu host -smp 4 \
   -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/ovmf/OVMF_CODE.fd \
   -drive if=pflash,format=raw,file="$S"/VARS.fd \

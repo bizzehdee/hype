@@ -8,11 +8,12 @@
 # Also proves #716 (the date-based build version string): both boots' serial logs are checked
 # for the "hype: version YYYY.M.D[-tag] (#commit)" startup-banner line in the right shape.
 set -e
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 export LC_ALL=C
 cd "$(git rev-parse --show-toplevel)"
 S="${SCRATCH:-$(mktemp -d /mnt/data/dev/hype/disk-images/rig120.XXXXXX)}"
 echo "scratch: $S"
-killall -9 qemu-system-x86_64 2>/dev/null || true
+killall -9 "$(basename "$QEMU")" 2>/dev/null || true
 sleep 1
 
 # The guest's own disk, fully preallocated (real zero bytes -- #90's own established recipe;
@@ -46,7 +47,7 @@ run_qemu() { # $1 = esp, $2 = log, $3 = seconds, $4 = 1 to attach hype's host-fa
     local net=()
     [ "${4:-}" = "1" ] && net=(-netdev user,id=n0 -device e1000,netdev=n0)
     cp /usr/share/edk2/ovmf/OVMF_VARS.fd "$S"/VARS.fd
-    timeout "$3" qemu-system-x86_64 -machine q35 -m 4096 -nodefaults \
+    timeout "$3" "$QEMU" -machine q35 -m 4096 -nodefaults \
       -accel kvm -cpu host -smp 4 \
       -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/ovmf/OVMF_CODE.fd \
       -drive if=pflash,format=raw,file="$S"/VARS.fd \
@@ -78,7 +79,7 @@ for i in $(seq 1 230); do
     grep -aq "SCRIPT vm0: PASS\|SCRIPT vm0: FAIL" "$S"/boot1.log 2>/dev/null && break
 done
 sleep 5  # let qemu's own buffered serial-log writes flush before the SIGTERM below
-killall qemu-system-x86_64 2>/dev/null || true
+killall "$(basename "$QEMU")" 2>/dev/null || true
 wait $QPID 2>/dev/null || true
 grep -a "SCRIPT vm0: PASS\|SCRIPT vm0: FAIL" "$S"/boot1.log | head -4
 grep -aq "SCRIPT vm0: PASS" "$S"/boot1.log || { echo "FAIL: unattended install did not complete"; exit 1; }
@@ -89,7 +90,7 @@ grep -aq "FALLBACK-COPY-0" "$S"/boot1.log || { echo "FAIL: the UEFI fallback boo
 echo "PASS: install completed, fallback bootloader path confirmed in place"
 
 echo "=== host reboot: a COMPLETELY FRESH qemu process, no state carried except the disk ==="
-killall -9 qemu-system-x86_64 2>/dev/null || true
+killall -9 "$(basename "$QEMU")" 2>/dev/null || true
 sleep 2
 
 echo "=== boot 2 (host boot #2): boot = disk, no installer media at all ==="
@@ -101,7 +102,7 @@ for i in $(seq 1 115); do
     grep -aq "SCRIPT vm0: PASS\|SCRIPT vm0: FAIL" "$S"/boot2.log 2>/dev/null && break
 done
 sleep 5  # let qemu's own buffered serial-log writes flush before the SIGTERM below
-killall qemu-system-x86_64 2>/dev/null || true
+killall "$(basename "$QEMU")" 2>/dev/null || true
 wait $QPID 2>/dev/null || true
 grep -a "SCRIPT vm0: PASS\|SCRIPT vm0: FAIL" "$S"/boot2.log | head -4
 grep -aq "SCRIPT vm0: PASS" "$S"/boot2.log || { echo "FAIL: boot 2 (disk boot) did not reach the installed system"; exit 1; }

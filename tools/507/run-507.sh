@@ -8,10 +8,11 @@
 # leg #505 already proved end-to-end for the non-sparse case.
 set -e
 set -o pipefail
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 cd "$(git rev-parse --show-toplevel)"
 S="${SCRATCH:-$(mktemp -d /mnt/data/dev/hype/disk-images/rig507.XXXXXX)}"
 echo "scratch: $S"
-killall -9 qemu-system-x86_64 2>/dev/null || true
+killall -9 "$(basename "$QEMU")" 2>/dev/null || true
 sleep 1
 
 # The target disk: GPT + one EXT4 volume (the only host filesystem that can represent a hole,
@@ -50,7 +51,7 @@ run_qemu() { # $1 = esp, $2 = log, $3 = seconds [, $4 = qmp-socket]
     local qmp=()
     [ -n "${4:-}" ] && { rm -f "$4"; qmp=(-qmp "unix:$4,server=on,wait=off"); }
     cp /usr/share/edk2/ovmf/OVMF_VARS.fd "$S"/VARS.fd
-    timeout "$3" qemu-system-x86_64 -machine q35 -m 4096 -nodefaults \
+    timeout "$3" "$QEMU" -machine q35 -m 4096 -nodefaults \
       -accel kvm -cpu host -smp 4 \
       -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/ovmf/OVMF_CODE.fd \
       -drive if=pflash,format=raw,file="$S"/VARS.fd \
@@ -73,7 +74,7 @@ for i in $(seq 1 230); do
     LC_ALL=C grep -aq "MKDISK: DONE\|MKDISK: FAILED\|mkdisk: FAILED\|raw-sparse refused" \
         "$S"/boot1.log 2>/dev/null && break
 done
-killall qemu-system-x86_64 2>/dev/null || true
+killall "$(basename "$QEMU")" 2>/dev/null || true
 wait $QPID 2>/dev/null || true
 LC_ALL=C grep -a "TERMCMD.*mkdisk\|MKDISK" "$S"/boot1.log | head -6
 LC_ALL=C grep -aq "MKDISK: DONE" "$S"/boot1.log || { echo "FAIL: mkdisk did not finish"; exit 1; }

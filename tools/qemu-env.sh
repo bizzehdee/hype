@@ -16,6 +16,9 @@
 #
 # Print which one was chosen, always. A rig that silently picks a different
 # hypervisor binary than the operator assumes is how #730 stayed invisible.
+# Build it with tools/install-qemu.sh. Override the prefix here if it lives
+# somewhere else on this machine -- every box that runs the rigs needs its own
+# build, including the Intel/VMX one.
 : "${HYPE_QEMU_PREFIX:=/mnt/data/dev/qemu-build/install}"
 if [ -z "${QEMU:-}" ]; then
     if [ -x "$HYPE_QEMU_PREFIX/bin/qemu-system-x86_64" ]; then
@@ -26,3 +29,9 @@ if [ -z "${QEMU:-}" ]; then
 fi
 export QEMU
 echo "qemu: $QEMU ($("$QEMU" --version 2>/dev/null | head -1))" >&2
+if [ "$QEMU" = qemu-system-x86_64 ]; then
+    echo "qemu: WARNING -- falling back to the distro QEMU on PATH. The rigs are" >&2
+    echo "qemu:   validated against a source build (tools/install-qemu.sh); some" >&2
+    echo "qemu:   distro builds segfault in ahci_commit_buf mid-run (#730), which" >&2
+    echo "qemu:   looks like a firmware hang and silently wastes the boot." >&2
+fi

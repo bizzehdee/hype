@@ -3,6 +3,7 @@
 # 2 VMs, STARTABLE=2 build), \iso\test.iso + \iso\vm1.iso, USB log stick,
 # 8 whole host cores so both VMs get their dedicated cores like the laptop.
 set -e
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 cd "$(dirname "$0")/.."
 S=rig/i513
 mkdir -p $S
@@ -24,7 +25,7 @@ mcopy -i $S/esp.img disk-images/alpine-virt-console.iso ::/iso/vm1.iso
 # NO hype.cfg -- that is the point.
 
 cp /usr/share/edk2/ovmf/OVMF_VARS.fd $S/VARS.fd
-timeout "$SECS" qemu-system-x86_64 \
+timeout "$SECS" "$QEMU" \
   -machine q35 -m 8192 -nodefaults \
   -accel kvm -cpu host -smp 8,sockets=1,cores=4,threads=2 \
   -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/ovmf/OVMF_CODE.fd \

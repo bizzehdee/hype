@@ -2,8 +2,9 @@
 # #588 leg: a boot = kernel VM WITH a virtio-blk disk. PASS = the guest reaches its shell
 # (did not wedge at the virtio probe) and the disk function's BAR reads back programmed.
 set -e
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 cd "$(git rev-parse --show-toplevel)"
-killall -9 qemu-system-x86_64 2>/dev/null || true
+killall -9 "$(basename "$QEMU")" 2>/dev/null || true
 sleep 1
 HYPE_CFG=tools/588/hype.cfg \
 HYPE_KERNELS="disk-images/545/vmlinuz-virt disk-images/545/initramfs-virt" \

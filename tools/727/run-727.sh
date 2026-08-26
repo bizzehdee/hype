@@ -17,8 +17,8 @@ cd "$(cd "$(dirname "$0")/../.." && pwd)"
 # writing the SAME boot.log and sharing the SAME esp.img -- the logs interleave
 # and the results are worthless. That cost two misread runs before the guard
 # was added; tools/232's rig has the same line for the same reason.
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 for p in $(ps -o pid= -C "$(basename "$QEMU")" 2>/dev/null); do kill -9 "$p" 2>/dev/null || true; done
-. ./tools/qemu-env.sh
 S="${SCRATCH:-/tmp/hype-727}"
 ALPINE="disk-images/alpine-standard-3.21.7-x86_64.iso"
 

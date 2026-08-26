@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 # #343 CONTROL: FreeBSD under plain QEMU, NO hype in the picture at all.
 #
 # The same discipline tools/262/make-rig.sh already codifies -- "THE CONTROL RUNS FIRST" -- applied
@@ -14,15 +15,15 @@ export LC_ALL=C
 cd /mnt/data/dev/hype/disk-images
 ok=0; bad=0
 for i in $(seq 1 8); do
-  killall -9 qemu-system-x86_64 2>/dev/null; sleep 2
+  killall -9 "$(basename "$QEMU")" 2>/dev/null; sleep 2
   cp -f /usr/share/edk2/ovmf/OVMF_VARS.fd cv.fd
-  timeout 90 qemu-system-x86_64 -machine q35 -m 4096 -nodefaults -accel kvm -cpu host -smp 4 \
+  timeout 90 "$QEMU" -machine q35 -m 4096 -nodefaults -accel kvm -cpu host -smp 4 \
     -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/ovmf/OVMF_CODE.fd \
     -drive if=pflash,format=raw,file=cv.fd \
     -drive id=cd,if=none,format=raw,readonly=on,file=/home/darren/Downloads/FreeBSD-15.1-RELEASE-amd64-disc1.iso \
     -device ide-cd,drive=cd,bus=ide.0,bootindex=0 \
     -serial file:k$i.log -display none -vga none 2>/dev/null || true
-  killall -9 qemu-system-x86_64 2>/dev/null
+  killall -9 "$(basename "$QEMU")" 2>/dev/null
   p=$(grep -acE 'panic:|Fatal trap' k$i.log); r=$(grep -ac 'pci0:' k$i.log)
   [ "$r" -gt 0 ] && ok=$((ok+1)) || bad=$((bad+1))
   echo "k$i: panic=$p reached_pci=$r bytes=$(wc -c < k$i.log)"

@@ -2,8 +2,9 @@
 # #594 leg: a kernel VM with bus = usb-msc. PASS = a real Linux binds usb-storage over hype's
 # emulated xHCI, /dev/sda is removable, and its LBA0 reads hype's on-disk magic byte-exact.
 set -e
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 cd "$(git rev-parse --show-toplevel)"
-killall -9 qemu-system-x86_64 2>/dev/null || true
+killall -9 "$(basename "$QEMU")" 2>/dev/null || true
 sleep 1
 HYPE_CFG=tools/594/hype.cfg \
 HYPE_KERNELS="disk-images/545/vmlinuz-virt disk-images/545/initramfs-virt" \

@@ -23,6 +23,7 @@
 #
 # Needs no root: sfdisk + mtools only.
 set -eu
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
@@ -63,7 +64,7 @@ dd if=esp.fat of=boot-test.img bs=512 seek=2048 conv=notrunc status=none
 # ------------------------------------------------------------------ THE CONTROL
 echo "== control: bare QEMU must boot boot-test.img over SATA =="
 cp "$OVMF_VARS" ctrl-vars.fd
-timeout 90 qemu-system-x86_64 -machine q35 -m 2048 -nodefaults -accel kvm -cpu host \
+timeout 90 "$QEMU" -machine q35 -m 2048 -nodefaults -accel kvm -cpu host \
   -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
   -drive if=pflash,format=raw,file=ctrl-vars.fd \
   -drive format=raw,file=boot-test.img,if=none,id=d0 -device ide-hd,drive=d0,bus=ide.0 \

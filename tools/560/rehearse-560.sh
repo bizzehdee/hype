@@ -15,6 +15,7 @@
 # and that both Alpine input scripts arm. It does NOT check the guests' own tickets -- that is
 # what the bare-metal run is for.
 set -e
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 export LC_ALL=C
 cd "$(git rev-parse --show-toplevel)"
 SECS="${1:-150}"
@@ -92,14 +93,14 @@ mdir -i "$S/esp.img@@1M" ::/iso 2>/dev/null | grep -qi "test" || \
 mdir -i "$S/esp.img@@1M" ::/hype/disks 2>/dev/null | grep -qi "alpine" || \
     { echo "ESP verify FAILED: vm1's boot disk not readable at partition 1"; exit 1; }
 
-killall -9 qemu-system-x86_64 2>/dev/null || true
+killall -9 "$(basename "$QEMU")" 2>/dev/null || true
 sleep 1
 
 for ATTEMPT in 1 2 3; do
   # The OUTER firmware's varstore must be the HOST's, never fw/OVMF_VARS.fd -- that pair is the
   # GUEST firmware hype hands its VMs, and using it here boots to silent zero output.
   cp /usr/share/edk2/ovmf/OVMF_VARS.fd $S/VARS.fd
-  timeout $((SECS + 60)) qemu-system-x86_64 \
+  timeout $((SECS + 60)) "$QEMU" \
     -machine q35 -m 12288 -nodefaults \
     -accel kvm -accel tcg -cpu host,topoext=on -smp "$SMP" \
     -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/ovmf/OVMF_CODE.fd \
@@ -115,7 +116,7 @@ for ATTEMPT in 1 2 3; do
   fi
   echo "attempt $ATTEMPT: hype never ran (#371 noboot, $(wc -c <$S/serial-$ATTEMPT.txt) bytes) -- retrying"
 done
-killall -9 qemu-system-x86_64 2>/dev/null || true
+killall -9 "$(basename "$QEMU")" 2>/dev/null || true
 
 echo "=== VMs dropped (must be none):"
 grep -a "WILL NOT RUN\|only the first" $S/serial.txt || echo "  none"

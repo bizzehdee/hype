@@ -3,8 +3,9 @@
 # dashboard. Boot 2: the SAME ESP again, unstaged -- the config write must survive, so hype
 # comes up with ONE VM and no [vm.beta] anywhere.
 set -e
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 cd "$(git rev-parse --show-toplevel)"
-killall -9 qemu-system-x86_64 2>/dev/null || true
+killall -9 "$(basename "$QEMU")" 2>/dev/null || true
 sleep 1
 KEYS=$(cat tools/491/sendkeys.txt)
 HYPE_CFG=tools/491/hype.cfg SENDKEYS="$KEYS" \
@@ -23,11 +24,11 @@ grep -q "\[vm.alpha\]" /tmp/claude-1000/hype-491-after.cfg || { echo "FAIL: alph
 echo "hype.cfg on disk holds alpha only"
 
 echo "=== boot 2: same ESP, no restage ==="
-killall -9 qemu-system-x86_64 2>/dev/null || true
+killall -9 "$(basename "$QEMU")" 2>/dev/null || true
 # HOST vars to pair with the HOST code blob -- fw/OVMF_VARS.fd is the GUEST-side varstore and
 # the mixed pair boots to a silent 0-byte log (the known mixup).
 cp /usr/share/edk2/ovmf/OVMF_VARS.fd /tmp/claude-1000/hype-491-vars.fd
-timeout 150 qemu-system-x86_64 -machine q35 -m 8192 -nodefaults \
+timeout 150 "$QEMU" -machine q35 -m 8192 -nodefaults \
   -accel kvm -cpu host -smp 4 \
   -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/ovmf/OVMF_CODE.fd \
   -drive if=pflash,format=raw,file=/tmp/claude-1000/hype-491-vars.fd \

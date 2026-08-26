@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 # #371 round 4: does the failure survive when AHCI is removed from the path?
 #
 # The payload is eliminated (a 2.5 KB hello-world fails too) and the firmware BUILD is eliminated
@@ -36,7 +37,7 @@ run_one() {
   else
     set -- -drive id=d0,if=none,format=raw,file="$ESP" -device virtio-blk-pci,drive=d0
   fi
-  qemu-system-x86_64 -machine q35 -m 8192 -nodefaults -accel kvm -cpu host -smp 4 \
+  "$QEMU" -machine q35 -m 8192 -nodefaults -accel kvm -cpu host -smp 4 \
     -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/ovmf/OVMF_CODE.fd \
     -drive if=pflash,format=raw,file="$OUT/$arm-$i.vars.fd" \
     "$@" \
@@ -45,7 +46,7 @@ run_one() {
   for t in $(seq "$SECS"); do kill -0 $qpid 2>/dev/null || break; sleep 1; done
   kill -9 $qpid 2>/dev/null; wait $qpid 2>/dev/null
   # killall, never pkill/pgrep: those match the truncated comm (qemu-system-x86) and silently no-op.
-  killall -9 qemu-system-x86_64 2>/dev/null; sleep 1
+  killall -9 "$(basename "$QEMU")" 2>/dev/null; sleep 1
   local bytes hit
   bytes=$(wc -c < "$log")
   hit=$(LC_ALL=C grep -ac "hello: build" "$log" 2>/dev/null || echo 0)

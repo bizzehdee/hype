@@ -29,6 +29,7 @@
 # booting from disk once, and would pass for the wrong reason.
 #
 set -u
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 export LC_ALL=C
 cd "$(git rev-parse --show-toplevel)"
 REPO=$PWD
@@ -83,7 +84,7 @@ dd if=esp.fat of=installed.img bs=512 seek=2048 conv=notrunc status=none
 echo "=== control: bare QEMU must boot installed.img over SATA ==="
 cp "$OVMF_VARS" ctrl-vars.fd
 rm -f ctrl.log
-timeout 90 qemu-system-x86_64 -machine q35 -m 2048 -nodefaults -accel kvm -cpu host \
+timeout 90 "$QEMU" -machine q35 -m 2048 -nodefaults -accel kvm -cpu host \
   -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
   -drive if=pflash,format=raw,file=ctrl-vars.fd \
   -drive format=raw,file=installed.img,if=none,id=d0 -device ide-hd,drive=d0,bus=ide.0 \
@@ -143,7 +144,7 @@ while :; do
     rm -f "$LOG"
     # -vga std, not none: with `none` hype's display path never runs at all, which is how #370's
     # rdmsr #GP hid behind what looked like a render stall.
-    timeout "$SECS" qemu-system-x86_64 \
+    timeout "$SECS" "$QEMU" \
       -machine q35 -m 4096 -nodefaults \
       -accel kvm -cpu host -smp 4 \
       -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \

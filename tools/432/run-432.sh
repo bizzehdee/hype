@@ -4,11 +4,12 @@
 #   B: the Microsoft-SIGNED shim loads and executes
 #   C: the persisted varstore reports SecureBoot ON with PK/KEK/db enrolled
 set -e
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 export LC_ALL=C
 cd "$(git rev-parse --show-toplevel)"
 S="${SCRATCH:-$(mktemp -d /mnt/data/dev/hype/disk-images/rig432.XXXXXX)}"
 echo "scratch: $S"
-killall -9 qemu-system-x86_64 2>/dev/null || true
+killall -9 "$(basename "$QEMU")" 2>/dev/null || true
 sleep 1
 [ -f fw/OVMF_CODE.secboot.fd ] && [ -f fw/OVMF_VARS.secboot.fd ] || {
     echo "run FW_SECBOOT=1 tools/build-fw.sh + tools/enroll-secboot.sh first"; exit 1; }
@@ -37,7 +38,7 @@ SFDISK
 
 run_qemu() { # $1 = log, $2 = secs
     cp /usr/share/edk2/ovmf/OVMF_VARS.fd "$S"/VARS.fd
-    timeout "$2" qemu-system-x86_64 -machine q35 -m 4096 -nodefaults \
+    timeout "$2" "$QEMU" -machine q35 -m 4096 -nodefaults \
       -accel kvm -cpu host -smp 4 \
       -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/ovmf/OVMF_CODE.fd \
       -drive if=pflash,format=raw,file="$S"/VARS.fd \

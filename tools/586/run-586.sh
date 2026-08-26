@@ -8,12 +8,13 @@
 # Builds with HYPE_M10_6_AUTOCONFIRM=1 (QEMU-scratch only, never a stick build) and
 # `make clean`s on BOTH sides, because make ignores EXTRA_CFLAGS changes.
 set -e
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 export LC_ALL=C
 cd "$(git rev-parse --show-toplevel)"
 S="${SCRATCH:-$(mktemp -d /mnt/data/dev/hype/disk-images/rig586.XXXXXX)}"
 echo "scratch: $S"
 
-killall -9 qemu-system-x86_64 2>/dev/null || true
+killall -9 "$(basename "$QEMU")" 2>/dev/null || true
 sleep 1
 
 make clean >/dev/null
@@ -46,7 +47,7 @@ python3 -c "import sys; sys.stdout.buffer.write(b'\xee'*(64*1024*1024))" > "$S"/
 
 for ATTEMPT in 1 2 3 4; do
   cp fw/OVMF_VARS.fd "$S"/VARS.fd
-  timeout "${1:-420}" qemu-system-x86_64 \
+  timeout "${1:-420}" "$QEMU" \
     -machine q35 -m 3072 -nodefaults \
     -accel kvm -cpu host -smp 2 \
     -drive if=pflash,format=raw,readonly=on,file=fw/OVMF_CODE.fd \

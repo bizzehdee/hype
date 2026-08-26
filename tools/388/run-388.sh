@@ -3,11 +3,12 @@
 # on stickB.img byte-exact and stick A (the boot/log medium) stays untouched at that LBA.
 # Leg 2: naming the BOOT medium's serial must refuse to arm (rule 3, by identity).
 set -e
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 export LC_ALL=C
 cd "$(git rev-parse --show-toplevel)"
 S="${SCRATCH:-$(mktemp -d /mnt/data/dev/hype/disk-images/rig388.XXXXXX)}"
 echo "scratch: $S"
-killall -9 qemu-system-x86_64 2>/dev/null || true
+killall -9 "$(basename "$QEMU")" 2>/dev/null || true
 sleep 1
 
 make clean >/dev/null && make all EXTRA_CFLAGS=-DHYPE_M10_6_AUTOCONFIRM=1 >/dev/null
@@ -36,7 +37,7 @@ SFDISK
 
 run_qemu() { # $1 = log, $2 = seconds, $3 = stickB serial
     cp /usr/share/edk2/ovmf/OVMF_VARS.fd "$S"/VARS.fd
-    timeout "$2" qemu-system-x86_64 -machine q35 -m 4096 -nodefaults \
+    timeout "$2" "$QEMU" -machine q35 -m 4096 -nodefaults \
       -accel kvm -cpu host -smp 4 \
       -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/ovmf/OVMF_CODE.fd \
       -drive if=pflash,format=raw,file="$S"/VARS.fd \

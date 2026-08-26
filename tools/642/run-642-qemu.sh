@@ -6,6 +6,7 @@
 # (RT-2c); running past two dump intervals with the guest already idle means a
 # fixed screen must be dumped exactly ONCE, not once per interval.
 set -e
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 export LC_ALL=C
 cd "$(git rev-parse --show-toplevel)"
 S="${SCRATCH:-disk-images/642}"
@@ -14,7 +15,7 @@ SECS="${1:-95}"
 CODE=${OVMF_CODE:-/usr/share/OVMF/OVMF_CODE.fd}
 VARS=${OVMF_VARS:-/usr/share/OVMF/OVMF_VARS.fd}
 mkdir -p "$S"
-killall -9 qemu-system-x86_64 2>/dev/null || true; sleep 1
+killall -9 "$(basename "$QEMU")" 2>/dev/null || true; sleep 1
 
 cat > $S/hype.cfg <<'CFG'
 [hype]
@@ -47,7 +48,7 @@ mcopy -i "$E" $S/hype.cfg ::/hype.cfg
 
 for ATTEMPT in 1 2 3; do
   cp "$VARS" $S/VARS.fd
-  timeout "$SECS" qemu-system-x86_64 \
+  timeout "$SECS" "$QEMU" \
     -machine q35 -m 1024 -nodefaults \
     -accel kvm -accel tcg -cpu host -smp 2 \
     -drive if=pflash,format=raw,readonly=on,file="$CODE" \

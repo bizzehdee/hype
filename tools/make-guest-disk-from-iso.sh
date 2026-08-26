@@ -25,6 +25,7 @@
 # identical -- and on a cold-boot-only laptop that mistake costs a whole run.
 #
 set -u
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 export LC_ALL=C
 cd "$(git rev-parse --show-toplevel)"
 
@@ -78,7 +79,7 @@ cp "$OVMF_VARS" "$CTRL_DIR/.ctrl-vars.fd"
 rm -f "$CTRL_DIR/.ctrl.log"
 # if=none + ide-hd, and NO -cdrom: if it boots, it booted the disk. `console=ttyS0` is not needed --
 # Alpine's ISO grub config already carries a serial console entry, and the login prompt lands on it.
-timeout 120 qemu-system-x86_64 \
+timeout 120 "$QEMU" \
   -machine q35 -m 2048 -nodefaults -accel kvm -cpu host \
   -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE" \
   -drive if=pflash,format=raw,file="$CTRL_DIR/.ctrl-vars.fd" \

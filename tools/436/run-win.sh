@@ -12,6 +12,7 @@
 #    runs at all, so a display bug cannot be observed and a working display
 #    cannot be distinguished from an absent one.
 set -eu
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
@@ -34,7 +35,7 @@ mcopy -i "$RIG/media.img@@1M" -o "$HERE/hype.cfg" ::/hype.cfg
 cp -f "$REPO/fw/OVMF_VARS.fd" "$RIG/host-vars.fd"
 
 # Match the process NAME truncated to the 15 characters the kernel keeps in
-# comm. `pgrep -x qemu-system-x86_64` matches nothing at all (the name is too
+# comm. `pgrep -x "$(basename "$QEMU")"` matches nothing at all (the name is too
 # long), and `pgrep -f` matches any shell whose command line merely mentions
 # QEMU -- including the one running this script, which makes the guard fire on
 # itself every time.
@@ -46,7 +47,7 @@ rm -f "$LOG" "$SHOT" "$RIG/qmp.sock"
 echo "running for up to ${SECS}s -> $LOG"
 # #93: give the outer hardware a real USB HID pointer. Hype enumerates this
 # xHCI controller and forwards its reports through the inner PS/2 mouse path.
-timeout "$SECS" qemu-system-x86_64 \
+timeout "$SECS" "$QEMU" \
     -enable-kvm -cpu host -machine q35,accel=kvm -smp 4 -m 8192 \
     -drive if=pflash,format=raw,readonly=on,file="$REPO/fw/OVMF_CODE.fd" \
     -drive if=pflash,format=raw,file="$RIG/host-vars.fd" \

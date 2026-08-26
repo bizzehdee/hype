@@ -1,4 +1,5 @@
 #!/bin/bash
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 # #371 round 3: is the bannerless boot the FIRMWARE BUILD's fault, or QEMU's?
 #
 # Same minimal payload, same ESP, same QEMU command line. The only variable is which OVMF builds
@@ -29,7 +30,7 @@ run_one() {
   local arm="$1" code="$2" vars="$3" i="$4"
   local log="$OUT/$arm-$i.log"
   cp -f "$vars" "$OUT/$arm-$i.vars.fd"; rm -f "$log"
-  qemu-system-x86_64 -machine q35 -m 8192 -nodefaults -accel kvm -cpu host -smp 4 \
+  "$QEMU" -machine q35 -m 8192 -nodefaults -accel kvm -cpu host -smp 4 \
     -drive if=pflash,format=raw,readonly=on,file="$code" \
     -drive if=pflash,format=raw,file="$OUT/$arm-$i.vars.fd" \
     -drive format=raw,file="$ESP" \
@@ -37,7 +38,7 @@ run_one() {
   local qpid=$! t
   for t in $(seq "$SECS"); do kill -0 $qpid 2>/dev/null || break; sleep 1; done
   kill -9 $qpid 2>/dev/null; wait $qpid 2>/dev/null
-  killall -9 qemu-system-x86_64 2>/dev/null; sleep 1
+  killall -9 "$(basename "$QEMU")" 2>/dev/null; sleep 1
   local bytes hit
   bytes=$(wc -c < "$log")
   hit=$(LC_ALL=C grep -ac "hello: build" "$log" 2>/dev/null || echo 0)

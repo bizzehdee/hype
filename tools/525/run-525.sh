@@ -6,6 +6,7 @@
 # "vm0 vCPU 1 guest reset via ACPI reset register (0xCF9)" -- exactly once --
 # plus the input script's pass marker (login reached again after the restart).
 set -e
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 export LC_ALL=C
 cd "$(git rev-parse --show-toplevel)"
 S="${SCRATCH:-disk-images/525}"
@@ -15,7 +16,7 @@ ISO="${ISO:-disk-images/alpine-virt-console.iso}"
 CODE=${OVMF_CODE:-/usr/share/OVMF/OVMF_CODE.fd}
 VARS=${OVMF_VARS:-/usr/share/OVMF/OVMF_VARS.fd}
 mkdir -p "$S"
-killall -9 qemu-system-x86_64 2>/dev/null || true; sleep 1
+killall -9 "$(basename "$QEMU")" 2>/dev/null || true; sleep 1
 
 rm -f $S/usb.img $S/esp.img
 dd if=/dev/zero of=$S/usb.img bs=1M count=64 status=none
@@ -55,7 +56,7 @@ mcopy -i "$E" tools/input-scripts/smp525-reboot-vm0.txt ::/input/vm0.txt
 
 for ATTEMPT in 1 2 3; do
   cp "$VARS" $S/VARS.fd
-  timeout "$SECS" qemu-system-x86_64 \
+  timeout "$SECS" "$QEMU" \
     -machine q35 -m 4096 -nodefaults \
     -accel kvm -accel tcg -cpu host -smp 4 \
     -drive if=pflash,format=raw,readonly=on,file="$CODE" \

@@ -5,12 +5,13 @@
 # --apparent-size vs du and filefrag -v on the extracted file confirm no hole. Boot 2: a guest
 # attached to it reports a 1 GiB disk and a write persists.
 set -e
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 cd "$(git rev-parse --show-toplevel)"
 # DISK, never tmpfs: this rig moves >2.5 GiB of images, and /tmp is RAM-backed (the standing
 # never-tmpfs rule -- quota deaths and stolen VM RAM).
 S="${SCRATCH:-$(mktemp -d /mnt/data/dev/hype/disk-images/rig505.XXXXXX)}"
 echo "scratch: $S"
-killall -9 qemu-system-x86_64 2>/dev/null || true
+killall -9 "$(basename "$QEMU")" 2>/dev/null || true
 sleep 1
 
 # The target disk: GPT + one FAT32 volume, 1.5 GiB (room for the 1 GiB image + metadata).
@@ -41,7 +42,7 @@ run_qemu() { # $1 = esp, $2 = log, $3 = seconds [, $4 = qmp-socket]
     local qmp=()
     [ -n "${4:-}" ] && { rm -f "$4"; qmp=(-qmp "unix:$4,server=on,wait=off"); }
     cp /usr/share/edk2/ovmf/OVMF_VARS.fd "$S"/VARS.fd
-    timeout "$3" qemu-system-x86_64 -machine q35 -m 4096 -nodefaults \
+    timeout "$3" "$QEMU" -machine q35 -m 4096 -nodefaults \
       -accel kvm -cpu host -smp 4 \
       -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/ovmf/OVMF_CODE.fd \
       -drive if=pflash,format=raw,file="$S"/VARS.fd \
@@ -64,7 +65,7 @@ for i in $(seq 1 230); do
     LC_ALL=C grep -aq "MKDISK: DONE\|MKDISK: FAILED\|mkdisk: WRITE FAILED\|tail readback FAILED" \
         "$S"/boot1.log 2>/dev/null && break
 done
-killall qemu-system-x86_64 2>/dev/null || true
+killall "$(basename "$QEMU")" 2>/dev/null || true
 wait $QPID 2>/dev/null || true
 LC_ALL=C grep -a "TERMCMD.*mkdisk\|MKDISK" "$S"/boot1.log | head -6
 LC_ALL=C grep -aq "MKDISK: DONE" "$S"/boot1.log || { echo "FAIL: mkdisk did not finish"; exit 1; }

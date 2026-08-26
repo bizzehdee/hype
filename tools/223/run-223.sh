@@ -3,9 +3,10 @@
 # with no host network attached to QEMU at all. PASS = both scripts' pass markers + vm0's
 # neighbour entry showing vm1's REAL MAC (bridge, not router).
 set -e
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 cd "$(git rev-parse --show-toplevel)"
 NAME="${1:-223-switch}"
-killall -9 qemu-system-x86_64 2>/dev/null || true
+killall -9 "$(basename "$QEMU")" 2>/dev/null || true
 sleep 1
 # Both VMs stream the SAME ISO file (per-VM backing #140 allows different ones; sameness is fine).
 HYPE_CFG=tools/223/hype.cfg \

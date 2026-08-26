@@ -12,6 +12,7 @@
 # the blank stick is provably never opened; a run whose boot device genuinely
 # has nothing writable still reports that loudly (unchanged fallback).
 set -e
+. "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 export LC_ALL=C
 cd "$(git rev-parse --show-toplevel)"
 S="${SCRATCH:-disk-images/638}"
@@ -21,7 +22,7 @@ ISO="${ISO:-disk-images/alpine-virt-console.iso}"
 CODE=${OVMF_CODE:-/usr/share/OVMF/OVMF_CODE.fd}
 VARS=${OVMF_VARS:-/usr/share/OVMF/OVMF_VARS.fd}
 mkdir -p "$S"
-killall -9 qemu-system-x86_64 2>/dev/null || true; sleep 1
+killall -9 "$(basename "$QEMU")" 2>/dev/null || true; sleep 1
 
 # The blank stick: zeroed, no partition table, no filesystem at all -- exactly
 # what a bystander stick looks like to the media scan.
@@ -61,7 +62,7 @@ mcopy -i "$E" $S/hype.cfg ::/hype.cfg
 
 for ATTEMPT in 1 2 3; do
   cp "$VARS" $S/VARS.fd
-  timeout "$SECS" qemu-system-x86_64 \
+  timeout "$SECS" "$QEMU" \
     -machine q35 -m 2048 -nodefaults \
     -accel kvm -accel tcg -cpu host -smp 2 \
     -drive if=pflash,format=raw,readonly=on,file="$CODE" \
