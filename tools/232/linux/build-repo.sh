@@ -1,13 +1,26 @@
 #!/bin/bash
 # #232: offline apk repo for the hype-additions ISO's linux/ tree.
 #
-# Same recipe #228 proved end to end (see tools/228/build-offline-repo.sh) --
-# this is that recipe with two changes: it writes to the additions-ISO layout
-# (tools/232/build-additions-iso.sh's linux/apks-hype/, not a combined
-# installer-ISO staging tree) and it drops the noarch/ subdir #228 also wrote,
-# per the #232 ticket's own correction: apk resolves a repo as
-# <repo>/<arch>/APKINDEX.tar.gz and reads ONLY that index, so a noarch/ copy is
-# harmless clutter, not a second thing apk actually consults.
+# Same recipe #228 proved end to end (see tools/228/build-offline-repo.sh),
+# rewritten for the additions-ISO layout (linux/apks-hype/, not a combined
+# installer-ISO staging tree).
+#
+# IT WRITES BOTH x86_64/ AND noarch/, and #228 was right to write both.
+#
+# This script used to drop noarch/, on the #232 ticket's own "correction" that
+# apk resolves a repo as <repo>/<arch>/APKINDEX.tar.gz and reads ONLY that
+# index, so a noarch/ copy is harmless clutter. Half true, and the conclusion
+# does not follow: apk reads one INDEX, but it FETCHES each package from the
+# arch in that package's own A: field. An A:noarch entry sends apk to
+# <repo>/noarch/<pkg>.apk no matter which index named it.
+#
+# With no noarch/ dir every noarch package failed as "package mentioned in
+# index not found" -- present in x86_64/, indexed correctly, simply not where
+# apk looked. 18 of ~112 packages here, and it cost several 20-minute runs
+# before the A: field explained it: kbd-bkeymaps took setup-keymap into an
+# interactive prompt, openssh-server-common and chrony-openrc broke
+# setup-sshd/setup-ntp, and lddtree + ncurses-terminfo-base failed the base
+# install at 97%.
 set -euo pipefail
 HYPE_DISK_IMAGES=${HYPE_DISK_IMAGES:-$(cd "$(dirname "$0")/../../.." && pwd)/disk-images}
 OUT=${HYPE_232_LINUX_REPO:-$HYPE_DISK_IMAGES/hype-232-build/linux/apks-hype}
@@ -35,5 +48,15 @@ podman run --rm -v "$OUT":/out:z alpine:3.21 sh -euc "
   cp /fetch/*.apk /out/x86_64/
   ( cd /out/x86_64 && apk index -o APKINDEX.tar.gz *.apk )
   echo \"x86_64: \$(ls /out/x86_64/*.apk | wc -l) packages indexed\"
+  # Every noarch package ALSO under noarch/, because that is where apk fetches
+  # it from -- see the header. Copied, not moved: the duplication costs a few
+  # MB and keeps x86_64/ complete for anything that resolves by directory.
+  mkdir -p /out/noarch
+  for f in /out/x86_64/*.apk; do
+      a=\$(tar -xzOf \"\$f\" .PKGINFO 2>/dev/null | sed -n 's/^arch = //p' | head -1)
+      if [ \"\$a\" = noarch ]; then cp \"\$f\" /out/noarch/; fi
+  done
+  ( cd /out/noarch && apk index -o APKINDEX.tar.gz *.apk )
+  echo \"noarch: \$(ls /out/noarch/*.apk | wc -l) packages indexed\"
 "
 du -sh "$OUT"

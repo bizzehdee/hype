@@ -210,6 +210,26 @@ say "target check: no existing #232 install found (force=$FORCE) -- proceeding"
 
 export ERASE_DISKS=/dev/vda
 export BOOTLOADER=grub
+# Seed the two install_if packages into the LIVE world before setup-alpine.
+#
+# apk pulls install_if deps in a LATER pass than the base install, and that pass
+# resolves the TARGET's own /etc/apk/repositories -- which APKREPOSOPTS has set
+# to an absolute path on the live system. apk treats a local repository path as
+# relative to --root, so inside the target it becomes /mnt/$REPO and does not
+# exist. The base packages install fine because that pass reaches the repo; the
+# install_if extras do not:
+#
+#   ERROR: lddtree-1.27-r0: package mentioned in index not found
+#   ERROR: ncurses-terminfo-base-6.5_p20241006-r3: package mentioned in index not found
+#
+# Both are on the additions disc with correct names (verified with xorriso) --
+# they are simply unreachable from where apk looks. #232's own ticket text
+# already warned these two are what `apk fetch --recursive` misses.
+#
+# Adding them to the live root's world makes setup-disk install them EXPLICITLY,
+# in the pass that does reach the repo, instead of leaving them to install_if.
+apk add --quiet lddtree ncurses-terminfo-base 2>&1 | tail -2 || true
+say "seeded install_if deps into world: $(apk info -e lddtree ncurses-terminfo-base 2>/dev/null | tr '\n' ' ')"
 say "running setup-alpine"
 timeout 900 setup-alpine -e -f /tmp/answers
 rc=$?
