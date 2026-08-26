@@ -641,6 +641,41 @@ static void test_wire_match_is_never_gated_by_the_screen(void) {
               (int)HYPE_INPUT_VERDICT_PASS, (int)hype_input_runner_verdict(&r));
 }
 
+/*
+ * #728 / #731: the shell-prompt case, which is the most COMMON repeated expect in
+ * this repo (`expect ~#` appears around nearly every command in every script).
+ *
+ * The prompt is essentially always on screen, so the gate stays closed for its whole
+ * life -- and that is fine, because the prompt is also re-emitted on the WIRE after
+ * every command, and the wire is never gated. This test pins that down: the pattern
+ * being permanently visible must not stop the script progressing, and each command's
+ * prompt must be matched from its own output rather than from the previous one still
+ * being displayed.
+ */
+static void test_shell_prompt_progresses_from_the_wire_while_permanently_on_screen(void) {
+    hype_input_runner_t r;
+    static const char *screen = "localhost:~# first\nlocalhost:~# ";
+    load("timeout 5000\nexpect ~#\nsend one\\n\nexpect ~#\nsend two\\n\nexpect ~#\npass ok\n");
+    hype_input_runner_init(&r, &g_sc, 0);
+
+    /* The prompt is on screen from the very start and never leaves. */
+    hype_input_runner_scan(&r, (const uint8_t *)screen, (uint32_t)strlen(screen));
+    pump(&r, 0);
+
+    /* Each command's own prompt arrives on the wire; the screen never changes. */
+    feed_str(&r, "localhost:~# ");
+    hype_input_runner_scan(&r, (const uint8_t *)screen, (uint32_t)strlen(screen));
+    pump(&r, 1);
+    feed_str(&r, "one\nlocalhost:~# ");
+    hype_input_runner_scan(&r, (const uint8_t *)screen, (uint32_t)strlen(screen));
+    pump(&r, 2);
+    feed_str(&r, "two\nlocalhost:~# ");
+    pump(&r, 3);
+
+    CHECK_INT("a permanently-visible prompt still lets the script finish",
+              (int)HYPE_INPUT_VERDICT_PASS, (int)hype_input_runner_verdict(&r));
+}
+
 int main(void) {
     test_happy_path();
     test_match_split_across_feeds();
@@ -671,6 +706,7 @@ int main(void) {
     test_scan_gate_does_not_block_output_the_script_just_caused();
     test_fail_if_ignores_stale_screen_text();
     test_wire_match_is_never_gated_by_the_screen();
+    test_shell_prompt_progresses_from_the_wire_while_permanently_on_screen();
     if (failures == 0) {
         printf("all tests passed\n");
         return 0;
