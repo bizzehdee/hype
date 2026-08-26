@@ -67,11 +67,16 @@ SFDISK
 # Default stays AHCI, because that is what hype's own host AHCI driver is
 # exercised by here and switching it silently would quietly stop testing that.
 #
-# HOST_DISK=nvme is the escape hatch for #730: qemu-10.2.2 segfaults in its OWN
-# ahci_commit_buf during a DMA read, which kills a whole 20-minute boot and
-# looks like a firmware hang from the outside (73-byte log, qemu at 99% CPU).
-# It is intermittent, so a retry is legitimate -- but when it keeps landing,
-# NVMe sidesteps the crashing code entirely and hype enumerates it fine (#519).
+# HOST_DISK=nvme helps with #730, but only partly, so do not over-trust it:
+# qemu-10.2.2 segfaults in its OWN ahci_commit_buf during a DMA read, and NVMe
+# avoids that crashing code (hype enumerates NVMe fine, #519). It does NOT avoid
+# the other half -- an intermittent hang in the outer OVMF before hype.efi is
+# even loaded, which happens on NVMe too and leaves no core.
+#
+# Both wear the same face: boot log stuck at 73 bytes (the outer OVMF's screen
+# clear) with qemu at 99% CPU. Treat that as "this run is dead" whichever
+# front-end is in use, rather than waiting out the 20-minute timeout;
+# `coredumpctl list` tells you which of the two it was.
 case "${HOST_DISK:-ahci}" in
     nvme)
         HOST_DISK_ARGS='-drive format=raw,file=PLACEHOLDER,if=none,id=d0 -device nvme,drive=d0,serial=HYPEESPDISK,bootindex=0'
