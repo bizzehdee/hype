@@ -1464,6 +1464,17 @@ typedef struct hype_fw_vm {
     uint64_t stall_prev_tsc;
     uint64_t vmrun_max_tsc;        /* longest single uninterrupted VMRUN */
     unsigned long long vmrun_over100ms;
+    /*
+     * #640 acceptance criterion 4: AVIC exit accounting. The bounded 8-line log next to the
+     * handler cannot answer "did any IPI get dropped over a 26-minute run" -- a log budget
+     * that has been spent reads exactly like an event that stopped happening. These count
+     * every AVIC exit and, separately, every one the handler could NOT decode, which is the
+     * only way an IPI can be lost on this path. Per VM, not file-static: two guests take these
+     * exits concurrently and a shared counter cannot say which one lost an IPI.
+     */
+    volatile unsigned long long avic_incomplete_ipi;
+    volatile unsigned long long avic_noaccel;
+    volatile unsigned long long avic_undecodable;
 } hype_fw_vm_t;
 
 /*
@@ -15096,14 +15107,19 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             static unsigned avic_exit_logged; /* one-per-host, #563 -- see above */
             int avic_ok;
             if (info.reason == HYPE_SVM_EXITCODE_AVIC_INCOMPLETE_IPI) {
+                vm->avic_incomplete_ipi++;
                 avic_ok = hype_svm_vcpu_handle_avic_incomplete_ipi(ctx, &g_fw_1_lapic) == 0;
             } else {
+                vm->avic_noaccel++;
                 uint8_t insn_n = 0;
                 const uint8_t *insn = vmm_guest_insn_bytes(kind, ctx, &insn_n);
                 if (insn_n == 0) {
                     insn = fw_1_insn_bytes_via_ptwalk(vm, ctx, info.guest_rip);
                 }
                 avic_ok = hype_svm_vcpu_handle_avic_noaccel(ctx, insn) == 0;
+            }
+            if (!avic_ok) {
+                vm->avic_undecodable++; /* the only way this path can lose an IPI (#640) */
             }
             if (avic_exit_logged < 8u) {
                 avic_exit_logged++;
@@ -16537,6 +16553,21 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                      (unsigned long long)idg.eventinj,
                                      (int)((idg.rflags >> 9) & 1u),
                                      (unsigned long long)idg.interrupt_shadow);
+                    /*
+                     * #640 criterion 4: AVIC exit totals for THIS VM. Printed unconditionally in
+                     * an AVIC build (all-zero in a default build, where the exits cannot occur),
+                     * because "no AVIC line in the log" is what boot D saw and it could not tell
+                     * an inactive AVIC from a working one. undecodable is the number that matters:
+                     * it is the only way this path can lose an IPI, and it must read 0.
+                     */
+                    if (vm->avic_incomplete_ipi != 0ull || vm->avic_noaccel != 0ull ||
+                        vm->avic_undecodable != 0ull) {
+                        hype_debug_print("fw-1 AVICSTAT vm%u: incomplete_ipi=%llu noaccel=%llu "
+                                         "undecodable=%llu (non-zero undecodable = a lost IPI) "
+                                         "[#640]\n",
+                                         (unsigned)(vm - g_vms), vm->avic_incomplete_ipi,
+                                         vm->avic_noaccel, vm->avic_undecodable);
+                    }
                     { /* #315: IDT-delivery recovery totals. A non-zero `refused` is the signal that a
                        * guest may have lost an event hype declined to re-stage -- the whole point of
                        * reporting rather than guessing is that this number is visible. */
