@@ -2,10 +2,20 @@
 
 Design decided in `plan.md` section 10, decision 70 (2026-08-25): the additions
 payload is a **separate** disc from the OS installer, attached as a second
-`cdroms` entry (`docs/hype-cfg-spec.md` §5.7 already allows several per VM --
-no hype-side change needed, only content). This generalizes #228's proven
-Alpine-only recipe (a remastered installer ISO) to #146's mixed-distro case and
-to BSD/Windows, which #228 could not do by construction.
+`cdroms` entry. This generalizes #228's proven Alpine-only recipe (a remastered
+installer ISO) to #146's mixed-distro case and to BSD/Windows, which #228 could
+not do by construction.
+
+> **Correction (2026-08-26).** This said the spec "already allows several per VM
+> -- no hype-side change needed, only content". That was reading the spec, not
+> the code. `cdroms =` was parsed, admission-checked and displayed while nothing
+> ever attached it to a guest device, so a VM with `install_media` plus
+> `cdroms =` booted with ONE optical drive and this whole design could not work.
+> Filed and fixed as **#727** (decision 71): each drive is now its own AHCI HBA
+> on its own PCI function, up to 8 per VM, QEMU-validated to three drives.
+> Admission also counted cdroms against the *disk* budget until then, so a
+> 2-disk + 2-cdrom config was refused outright -- the two lists have separate
+> budgets now.
 
 ```
 tools/232/
@@ -31,7 +41,9 @@ correction) -- directory names above are NOT the full scope:**
   response file), DragonFlyBSD (its own installer). `bsd/installerconfig` is
   the **FreeBSD leg only**.
 
-**Built and QEMU-validated today: Alpine only.** Everything else above is
+**Built and QEMU-validated: Alpine only** (and see the #727 note above -- the
+first validation attempt is what uncovered that the second disc was never
+attached at all). Everything else above is
 unbuilt -- tracked in #725 and likely to become per-family sub-issues once
 the Alpine pattern is proven enough to generalize from, not silently assumed
 covered by a directory being named `linux/` or `bsd/`.
