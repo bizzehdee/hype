@@ -12,6 +12,7 @@
 #include "../../../core/fatal.h"
 #include "../cpu/isr.h"
 #include "../../../core/guest_mem.h"
+#include "../../../core/guest_mtrr.h" /* #729: the guest MTRR model, shared with SVM */
 #include "../../../devices/ahci.h"
 #include "../../../devices/atapi.h"
 #include "../../../devices/bochs_vbe.h"
@@ -375,6 +376,14 @@ struct hype_vcpu_ctx {
      * what it set. Mirrors the SVM ctx's fields of the same name. */
     uint64_t pvclock_system_msr;
     uint64_t pvclock_wall_msr;
+    /*
+     * #729: the guest's MTRRs. VMX carried the pre-#436 stub -- writes dropped, reads 0 --
+     * while CPUID/MTRRcap still advertised 8 variable MTRRs, which is the inconsistent pair
+     * that made OVMF's MtrrLib loop forever for Windows on AMD before #436. Linux and BSD
+     * never call MtrrLib, which is why every VMX guest booted so far missed it and only the
+     * micro/vmexit MSR round-trip probe caught it.
+     */
+    hype_guest_mtrr_t mtrr;
     /* M7-1 (#91): this guest's Hyper-V OS identity and hypercall-page MSR values.
      * Per-vCPU for the same reason pvclock_map is -- each guest writes its own. */
     uint64_t hv_guest_os_id;
@@ -489,6 +498,9 @@ static void vmx_ctx_reset_pending(struct hype_vcpu_ctx *ctx) {
      * pvclock pages -- same reasoning as the SVM path's reset. */
     ctx->pvclock_system_msr = 0;
     ctx->pvclock_wall_msr = 0;
+    /* #729/#481: WB default with MTRRs enabled and FE clear -- NOT all-zero, which reads as
+     * "all memory uncached" and makes FreeBSD panic. Same call the SVM path makes. */
+    hype_guest_mtrr_reset(&ctx->mtrr);
     ctx->hv_guest_os_id = 0;
     ctx->hv_hypercall = 0;
     ctx->hv_enabled = 0;
@@ -1922,9 +1934,11 @@ void hype_vmx_vcpu_handle_cpuid(hype_vcpu_ctx_t *ctx) {
  * (gprs[2]:gprs[0]). Guest EFER lives in the VMCS GUEST_IA32_EFER field (not a
  * GPR), so it is VMREAD/VMWRITE'd. Returns 0 if handled, -1 to reject.
  *
- * The pvclock / MTRR / PAT special-casing the SVM handler carries is omitted:
- * the M2-M4-5 microtests (the VMX validation set) touch only APIC_BASE + EFER;
- * a full guest OS on VMX would need those ported too (future work).
+ * The pvclock (#667), PAT (#251) and MTRR (#729) special-casing the SVM handler carries is
+ * ported here too, each ahead of the action switch, because none of them is in msr_emulate's
+ * table and the absorb path would drop the writes and return 0. MTRR was the last of the
+ * three and the only one a guest OS had not already forced: Linux and BSD never call OVMF's
+ * MtrrLib, so it took the micro/vmexit MSR probe to find it.
  */
 /* Host TSC frequency, stashed at guest start (hype_vmx_vcpu_set_pvclock). Declared
  * here rather than beside the other pvclock file-scope state below because the
@@ -2094,6 +2108,24 @@ int hype_vmx_vcpu_handle_msr(hype_vcpu_ctx_t *ctx, int is_write, hype_guest_lapi
         } else {
             real->gprs[0] = (uint64_t)(uint32_t)real->pvclock_wall_msr;
             real->gprs[2] = (uint64_t)(uint32_t)(real->pvclock_wall_msr >> 32);
+        }
+        vmx_advance_rip();
+        return 0;
+    }
+
+    /*
+     * #729: the MTRR round-trip, the same model SVM uses (core/guest_mtrr.c). Handled ahead
+     * of the action switch for the same reason pvclock and PAT are: these are not in
+     * msr_emulate's table, so without this they fell through to the absorb path -- writes
+     * dropped, reads 0 -- while MTRRcap advertised 8 variable MTRRs that did not exist.
+     */
+    if (hype_guest_mtrr_is_msr(msr_number)) {
+        if (is_write) {
+            hype_guest_mtrr_write(&real->mtrr, msr_number,
+                                  ((uint64_t)(uint32_t)real->gprs[2] << 32) |
+                                      (uint64_t)(uint32_t)real->gprs[0]);
+        } else {
+            vmx_msr_return(real, hype_guest_mtrr_read(&real->mtrr, msr_number));
         }
         vmx_advance_rip();
         return 0;

@@ -4,6 +4,7 @@
 #include "../cpu/hyperv.h"
 #include "../cpu/lapic.h" /* #640 cause 2: HYPE_LAPIC_DEFAULT_BASE, for this core's own APIC ID */
 
+#include "../../../core/guest_mtrr.h" /* #729: the guest MTRR model, shared with VMX */
 #include "../../../core/guest_mem.h"
 #include "../../../core/avic.h" /* #640 cause 2: hype_avic_bitmap_highest() for the NOACCEL EOI path */
 
@@ -91,9 +92,10 @@ struct hype_vcpu_ctx {
      * MtrrLibSetMemoryAttributesWorker forever. Storing writes and returning them makes the
      * verify converge. These MTRRs are cosmetic to hype's own NPT memory typing (WB via PAT);
      * they exist so the guest reads back what it wrote. Zeroed at reset. */
-    uint64_t mtrr_deftype;   /* IA32_MTRR_DEF_TYPE (0x2FF) */
-    uint64_t mtrr_var[16];   /* 8 PHYSBASE/PHYSMASK pairs (0x200..0x20F) */
-    uint64_t mtrr_fix[11];   /* 0x250, 0x258, 0x259, 0x268..0x26F */
+    /* #729: the storage and the round-trip rules moved to core/guest_mtrr.c so the VMX
+     * backend uses the same one instead of re-deriving it -- a divergence between the two
+     * would only be found by another Windows boot, the way #436 was. */
+    hype_guest_mtrr_t mtrr;
     /* Deferred-interrupt slot, per-vCPU. M8-0b STEP 2: two guests run
      * concurrently, so a single shared pending-IRQ slot let one guest's
      * deferred vector be overwritten by, or injected into, the OTHER guest ->
@@ -366,32 +368,11 @@ static void reset_gprs(struct hype_vcpu_ctx *ctx) {
     ctx->spec_ctrl_valid = 0;
     ctx->pvclock_system_msr = 0;
     ctx->pvclock_wall_msr = 0;
-    {
-        /*
-         * #436: default MTRR state = "all memory Write-Back, MTRRs enabled". hype forces WB for
-         * all guest RAM via the NPT/PAT, so the guest's MTRR view must AGREE: MTRRdefType with
-         * E (bit 11) set and default type WB (6) -> 0x806. Starting from 0 instead
-         * (MTRRs disabled, default type UC) told a guest that reads MTRRs -- FreeBSD does, Linux/
-         * BSD via the MADT do not -- that ALL memory is uncached, and FreeBSD panicked/reset.
-         * Fixed MTRRs default to WB (0x06 per byte) for the same reason. Variable MTRRs stay 0
-         * (disabled, mask.V=0): with the default already WB, none are needed.
-         */
-        unsigned mi;
-        /*
-         * #481: E=1, type=WB, and FE (bit 10) CLEAR. FE used to be set, which a DEBUG OVMF
-         * rejects outright -- "ASSERT MemDetect.c: (MtrrSettings.MtrrDefType & 0x400) == 0" --
-         * halting the guest firmware in PEI before MP init ever runs. RELEASE builds compile
-         * the assert out, so it stayed invisible until a DEBUG firmware was booted.
-         *
-         * Clearing FE does not change the effective memory type: with the fixed ranges not
-         * consulted, the low 1MB falls through to the WB default, which is what the all-WB
-         * mtrr_fix[] below already produced. The WB default itself is load-bearing and stays
-         * -- see the comment above on FreeBSD panicking when all memory read as uncached.
-         */
-        ctx->mtrr_deftype = 0x0806u;
-        for (mi = 0; mi < 16u; mi++) ctx->mtrr_var[mi] = 0;
-        for (mi = 0; mi < 11u; mi++) ctx->mtrr_fix[mi] = 0x0606060606060606ull; /* all WB */
-    }
+    /* #436/#481: "all memory Write-Back, MTRRs enabled", because hype forces WB for all guest
+     * RAM via NPT/PAT and the guest's MTRR view has to agree. The exact values and the reason
+     * for each now live with the model in core/guest_mtrr.h, so the VMX backend cannot reset
+     * to a different state (#729). */
+    hype_guest_mtrr_reset(&ctx->mtrr);
     ctx->hv_guest_os_id = 0;
     ctx->hv_hypercall = 0;
     ctx->hv_ref_tsc = 0;
@@ -1857,14 +1838,6 @@ void hype_svm_vcpu_get_mtrr_diag(unsigned long long *reads, unsigned long long *
     *last_var_wr = g_mtrr_last_var_wr;
 }
 
-/* True for the MTRR MSR set: MTRRcap 0xFE, MTRRdefType 0x2FF, 8 variable
- * base/mask pairs 0x200-0x20F, and the fixed MTRRs (0x250, 0x258/0x259,
- * 0x268-0x26F). IA32_PAT (0x277) is handled separately, not counted here. */
-static int msr_is_mtrr(uint32_t n) {
-    return n == 0xFEu || n == 0x2FFu || (n >= 0x200u && n <= 0x20Fu) || n == 0x250u ||
-           n == 0x258u || n == 0x259u || (n >= 0x268u && n <= 0x26Fu);
-}
-
 void hype_svm_vcpu_set_rip(hype_vcpu_ctx_t *ctx, uint64_t rip) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     real->vmcb->save.rip = rip;
@@ -2140,49 +2113,32 @@ int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lapic) {
 
     /* PERF-1 memory-type probe: count guest MTRR MSR traffic (does not change
      * handling -- these still fall through to the stub path below). */
-    if (msr_is_mtrr(msr_number) || msr_number == 0xFEu) {
+    if (hype_guest_mtrr_is_msr(msr_number)) {
         /*
          * #436: round-trip the MTRR MSRs (store writes, return them on reads) so OVMF MtrrLib's
-         * write-then-verify converges instead of looping. MTRRcap (0xFE) is read-only and returns
-         * a fixed, self-consistent capability: 8 variable MTRRs + fixed-MTRR + WC supported.
+         * write-then-verify converges instead of looping. The model is shared with VMX (#729);
+         * only the PERF-1 counters below are vendor-side.
          */
-        uint64_t rval = 0;
-        int fixi = -1;
-        if (msr_number == 0x250u) fixi = 0;
-        else if (msr_number == 0x258u) fixi = 1;
-        else if (msr_number == 0x259u) fixi = 2;
-        else if (msr_number >= 0x268u && msr_number <= 0x26Fu) fixi = 3 + (int)(msr_number - 0x268u);
         if (is_write) {
             uint64_t wval =
                 ((uint64_t)(uint32_t)real->gprs[2] << 32) | (uint64_t)(uint32_t)real->vmcb->save.rax;
             g_mtrr_writes++;
-            if (msr_number == 0xFEu) {
-                /* MTRRcap is read-only; a write is #GP on real hardware. Ignore it. */
-            } else if (msr_number == 0x2FFu) {
-                real->mtrr_deftype = wval;
+            if (msr_number == 0x2FFu) {
                 g_mtrr_last_deftype_wr = wval;
             } else if (msr_number >= 0x200u && msr_number <= 0x20Fu) {
-                real->mtrr_var[msr_number - 0x200u] = wval;
                 g_mtrr_last_var_wr = wval;
-            } else if (fixi >= 0) {
-                real->mtrr_fix[fixi] = wval;
             }
+            hype_guest_mtrr_write(&real->mtrr, msr_number, wval);
             real->vmcb->save.rip += 2;
             return 0;
         }
-        g_mtrr_reads++;
-        if (msr_number == 0xFEu) {
-            /* VCNT=8 [7:0], FIX=1 [8], WC=1 [10]. Matches the 8 mtrr_var[] pairs above. */
-            rval = 0x0508u;
-        } else if (msr_number == 0x2FFu) {
-            rval = real->mtrr_deftype;
-        } else if (msr_number >= 0x200u && msr_number <= 0x20Fu) {
-            rval = real->mtrr_var[msr_number - 0x200u];
-        } else if (fixi >= 0) {
-            rval = real->mtrr_fix[fixi];
+        {
+            uint64_t rval = hype_guest_mtrr_read(&real->mtrr, msr_number);
+
+            g_mtrr_reads++;
+            real->vmcb->save.rax = (uint64_t)(uint32_t)rval;
+            real->gprs[2] = (uint64_t)(uint32_t)(rval >> 32);
         }
-        real->vmcb->save.rax = (uint64_t)(uint32_t)rval;
-        real->gprs[2] = (uint64_t)(uint32_t)(rval >> 32);
         real->vmcb->save.rip += 2;
         return 0;
     }
