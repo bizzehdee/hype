@@ -12,6 +12,25 @@ HERE=tools/232
 B=${HYPE_232_BUILD:-disk-images/hype-232-build}
 S="${SCRATCH:-$(mktemp -d disk-images/rig232.XXXXXX)}"
 echo "scratch: $S"
+# Refuse to run twice at once, via an flock on this script itself.
+#
+# This matters because the line below kills every qemu at startup, so a second
+# copy murders the first one's VM, which then does the same back on ITS next
+# phase -- the two starve each other and neither ever boots. The symptom reads
+# exactly like a firmware hang: a boot log stuck at 73 bytes (the outer OVMF's
+# screen clear), qemu at 99% CPU, and an elapsed time that keeps resetting. It
+# cost several misdiagnosed runs before six concurrent copies of this script
+# turned up in `ps`.
+#
+# flock rather than a pgrep scan: `pgrep -f run-232-linux.sh` also matches the
+# `nohup ./tools/232/run-232-linux.sh` wrapper, whose pid is not this shell's,
+# so a pid-based guard refuses to start when nothing is actually running.
+exec 9<"$0"
+if ! flock -n 9; then
+    echo "refusing to start: another run-232-linux.sh holds the lock" >&2
+    echo "kill it first, or wait for it to finish" >&2
+    exit 1
+fi
 killall -9 qemu-system-x86_64 2>/dev/null || true
 sleep 1
 

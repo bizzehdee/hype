@@ -122,8 +122,27 @@ apk update && say "apk update ok" || say "apk update rc=$?"
 # Full answerfile. Every key must be set -- an unset option prompts, and a
 # prompt is an unattended hang with no operator (#228).
 HOSTNAME=${HYPE232_HOSTNAME:-hype-guest}
+#
+# KEYMAPOPTS is deliberately EMPTY, which is the one key that must NOT be set.
+#
+# setup-alpine gates the step on `is_virtual_console || [ -n "$KEYMAPOPTS" ]`,
+# so ANY value runs it -- "none" included, which is why setting that did not
+# help. is_virtual_console tests whether stdin is a /dev/ttyN, and we run from
+# an OpenRC local.d script whose stdin is not, so empty skips it outright.
+#
+# Skipping matters because setup-keymap does `apk add kbd-bkeymaps` and that
+# fails against the offline repo ("package mentioned in index not found", even
+# though all 112 apks including that one are on the additions ISO with correct
+# Rock Ridge names). It then falls through to an interactive
+# `Select variant (or 'abort'):` prompt, which in an unattended run is a
+# 900-second hang ending in a timeout.
+#
+# A guest reached over a serial console has no local keyboard whose layout
+# could matter, so there is nothing to configure and skipping is correct rather
+# than merely expedient. The "every key must be set" rule above still holds for
+# every OTHER key: this is the documented exception, not a counter-example.
 cat > /tmp/answers <<EOF
-KEYMAPOPTS="us us"
+KEYMAPOPTS=""
 HOSTNAMEOPTS="-n $HOSTNAME"
 DEVDOPTS="mdev"
 INTERFACESOPTS="auto lo
