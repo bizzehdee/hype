@@ -693,6 +693,19 @@ static unsigned long long *g_script_fed;
  */
 #define HYPE_FW_1_MAX_OPTICAL HYPE_CFG_MAX_VM_DISKS
 #define HYPE_FW_1_MAX_EXTRA_OPTICAL (HYPE_FW_1_MAX_OPTICAL - 1u)
+/*
+ * #727: ISO bounce slots reserved for EXTRA optical drives, machine-wide, on top of the one
+ * slot per VM the implicit install_media drives use.
+ *
+ * Machine-wide rather than per-VM because the pool is allocated before the config is read, so
+ * the only affordable bound is a fixed one: a slot is 256 KiB, and reserving
+ * HYPE_FW_1_MAX_OPTICAL per VM would cost tens of megabytes for drives nobody configured. 16
+ * costs a flat 4 MiB and lets one VM take the full per-VM cap while several take two or three.
+ *
+ * Exhausting it is reported and the drive is not presented -- never silently shared, because
+ * two streams on one buffer is exactly #428's corruption one level down.
+ */
+#define HYPE_FW_1_EXTRA_OPTICAL_SLOTS 16u
 
 /*
  * #329: one guest disk -- the front-end device models plus the backend stack that used to be
@@ -1430,6 +1443,8 @@ typedef struct hype_fw_vm {
     /* #512's rule per extra drive: the MSI edge is the MODEL's own event counter, never this
      * loop's sampled level, or a completion landing between two passes is swallowed. */
     unsigned long long opt_msi_seen[HYPE_FW_1_MAX_EXTRA_OPTICAL];
+    /* #727: assigned bounce slot + 1, so a zeroed arena reads as "not yet assigned". */
+    unsigned opt_bounce[HYPE_FW_1_MAX_EXTRA_OPTICAL];
     /*
      * #329: this VM's guest disks, each a self-contained slot. Slot 0 is what used to be the
      * flat set of vblk/nvme/ata members; grouping them is what lets a VM carry more than one.
@@ -20408,11 +20423,35 @@ static int *fw_1_optical_ready(unsigned vi, unsigned oi) {
 /*
  * #727: the bounce slot for one optical stream. Distinct per (VM, drive) because two streams
  * sharing a buffer serve each other's sectors -- #428's bug one level down, and its own fix
- * refuses an out-of-range slot rather than clamping, so a mis-sized pool surfaces as a guest
- * MEDIUM ERROR instead of silent corruption.
+ * refuses an out-of-range slot rather than clamping.
+ *
+ * Drive 0 keeps slot `vi`, unchanged. Extra drives take the next free slot from the fixed
+ * machine-wide budget above, assigned once and remembered, so the pool needs to cover the drive
+ * COUNT rather than a strided index -- see the pool-allocation comment for why a strided index
+ * is unaffordable here.
+ *
+ * Returns HYPE_FW_1_NO_BOUNCE_SLOT when the budget is spent. The caller must not present the
+ * drive in that case: sharing a slot is silent corruption, and a refused read would surface as
+ * an unexplained CD001 verify failure.
  */
+#define HYPE_FW_1_NO_BOUNCE_SLOT 0xFFFFFFFFu
+static unsigned g_optical_slot_next; /* dense cursor into the extra-drive budget */
+
 static unsigned fw_1_optical_bounce_slot(unsigned vi, unsigned oi) {
-    return vi * HYPE_FW_1_MAX_OPTICAL + oi;
+    unsigned *held;
+    if (oi == 0u) {
+        return vi;
+    }
+    held = &g_vms[vi].opt_bounce[oi - 1u];
+    if (*held != 0u) {
+        return *held - 1u; /* stored +1 so a zeroed VM arena reads as "unassigned" */
+    }
+    if (g_optical_slot_next >= HYPE_FW_1_EXTRA_OPTICAL_SLOTS) {
+        return HYPE_FW_1_NO_BOUNCE_SLOT;
+    }
+    *held = g_max_vms + g_optical_slot_next + 1u;
+    g_optical_slot_next++;
+    return *held - 1u;
 }
 
 /*
@@ -20458,6 +20497,17 @@ static int fw_1_resolve_media_stream_unlocked(unsigned vi, unsigned oi) {
     if (oi != 0u && (ocd == 0 || !ocd->has_path)) {
         hype_serial_print("host-stream: vm%u cdrom %u names no usable [disk.*] cdrom entry -- "
                           "NOT presented (#727)\n", vi, oi);
+        return 0;
+    }
+    /*
+     * #727: no bounce slot, no drive. Sharing one would be #428's corruption, and presenting a
+     * drive whose reads are refused surfaces as an unexplained CD001 verify failure -- which is
+     * exactly how the strided-index version failed, and it cost a run to read.
+     */
+    if (oi != 0u && fw_1_optical_bounce_slot(vi, oi) == HYPE_FW_1_NO_BOUNCE_SLOT) {
+        hype_serial_print("host-stream: vm%u cdrom %u -- the %u-slot machine-wide ISO bounce "
+                          "budget is spent, NOT presented (#727)\n", vi, oi,
+                          (unsigned)HYPE_FW_1_EXTRA_OPTICAL_SLOTS);
         return 0;
     }
     /* GLADDER-11: prefer streaming the ISO from a FILE on the FAT32/
@@ -20656,7 +20706,10 @@ static int fw_1_resolve_media_stream_unlocked(unsigned vi, unsigned oi) {
                 st->extents[ei].sector_count =
                     file.extents[ei].sector_count;
             }
-            if (hype_iso_stream_read(st, 32769u, cd, 5u) == 0 && cd[0] == 'C' &&
+            int rc727;
+            cd[0] = cd[1] = cd[2] = cd[3] = cd[4] = 0u; /* #727: never report a stale CD001 */
+            rc727 = hype_iso_stream_read(st, 32769u, cd, 5u);
+            if (rc727 == 0 && cd[0] == 'C' &&
                 cd[1] == 'D' && cd[2] == '0' && cd[3] == '0' && cd[4] == '1') {
                 (*st_ready) = 1;
 #if HYPE_343_VERIFY_STREAM
@@ -20668,10 +20721,20 @@ static int fw_1_resolve_media_stream_unlocked(unsigned vi, unsigned oi) {
                                   "a host volume -- backing guest CD via streaming\n", vi);
                 usb_log_flush(); /* #346: the stream verdict must reach the log pre-dispatch */
             } else {
-                hype_debug_print("host-stream: CD001 NOT found streaming the ESP file "
-                                 "(got %02x %02x %02x %02x %02x)\n", (unsigned)cd[0],
-                                 (unsigned)cd[1], (unsigned)cd[2], (unsigned)cd[3],
-                                 (unsigned)cd[4]);
+                /*
+                 * #727: report the READ's own verdict, not just the bytes. `cd` is static and
+                 * shared across every drive's resolve, so on a failed read it still holds the
+                 * PREVIOUS drive's bytes -- this line printed a perfectly valid CD001 while
+                 * declaring failure, which sent a whole debugging pass down the wrong path.
+                 * The slot and size are here because a refused bounce slot (#428) and a
+                 * short/zero iso_size are the two ways the read fails without the bytes being
+                 * wrong.
+                 */
+                hype_debug_print("host-stream: CD001 NOT found streaming the ESP file -- read rc=%d "
+                                 "slot=%u iso_size=%llu (got %02x %02x %02x %02x %02x)\n", rc727,
+                                 st->bounce_slot, (unsigned long long)st->iso_size,
+                                 (unsigned)cd[0], (unsigned)cd[1], (unsigned)cd[2],
+                                 (unsigned)cd[3], (unsigned)cd[4]);
                 usb_log_flush(); /* #346: THE failure line two hardware runs never captured */
             }
         } else if (frag_seen) {
@@ -25425,37 +25488,25 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * sectors to another under concurrent streaming (the 4-VM #392 run's
      * Fedora/Ubuntu boot corruption). */
     /*
-     * #727: slots are per (VM, optical drive) now, not per VM -- two streams sharing one buffer
+     * #727: slots are per (VM, optical DRIVE) now, not per VM -- two streams sharing one buffer
      * serve each other's sectors, which is #428's bug one level down.
      *
-     * Sized from the ACTUAL configured drive count rather than from HYPE_FW_1_MAX_OPTICAL: a
-     * slot is 256 KiB, so the worst case would be tens of megabytes for drives nobody asked
-     * for. load_hype_cfg() has already run (see the vCPU-pool comment above), so the real
-     * counts are known here. Floored at g_max_vms so the no-config and built-in-default paths
-     * keep exactly today's allocation.
+     * This allocation CANNOT consult the config: it is read by fw_1_phase1_config(), which runs
+     * later, and re-allocating there is not an option either -- phase 1 is post-EBS, so Boot
+     * Services allocation is gone and the only pool left is the guest's own RAM.
      *
-     * The INDEX still comes from fw_1_optical_bounce_slot()'s vi * MAX_OPTICAL + oi, so the
-     * pool must cover the highest index any configured drive can produce, not merely the
-     * drive count -- summing the counts alone would under-allocate the moment vm1 has any
-     * extra drive at all. #428's own fix refuses an out-of-range slot rather than clamping, so
-     * getting this wrong is a visible guest MEDIUM ERROR, not silent aliasing.
+     * Layout: one slot per VM for the implicit install_media drives (exactly today's size), plus
+     * ONE FIXED machine-wide budget for extra drives, handed out densely as they resolve.
+     *
+     * A strided vi * MAX_OPTICAL + oi index was the first cut, and it is what forced that config
+     * dependency: the pool must then cover the highest INDEX rather than the drive COUNT, which
+     * worst-case is g_max_vms * HYPE_FW_1_MAX_OPTICAL slots at 256 KiB each -- tens of megabytes
+     * for drives nobody configured. It also failed silently in a way that took a run to read: a
+     * third drive resolved its file and then failed its CD001 verify, because #428 REFUSES an
+     * out-of-range slot, and the verify's `cd` buffer is static so it printed the PREVIOUS
+     * drive's valid CD001 while reporting failure.
      */
-    {
-        unsigned slots = g_max_vms;
-        unsigned ci;
-        for (ci = 0; ci < g_hype_cfg.vm_count && ci < g_max_vms; ci++) {
-            unsigned n = g_hype_cfg.vms[ci].cdroms_count;
-            unsigned high;
-            if (n > HYPE_FW_1_MAX_EXTRA_OPTICAL) n = HYPE_FW_1_MAX_EXTRA_OPTICAL;
-            high = ci * HYPE_FW_1_MAX_OPTICAL + n + 1u; /* highest index in use, + 1 */
-            if (high > slots) slots = high;
-        }
-        hype_iso_stream_pool_alloc(slots, fw_alloc_zeroed_pages);
-        if (slots != g_max_vms) {
-            hype_debug_print("iso-pool: %u bounce slot(s) for %u VM(s) -- extra optical drives "
-                             "configured (#727)\n", slots, g_max_vms);
-        }
-    }
+    hype_iso_stream_pool_alloc(g_max_vms + HYPE_FW_1_EXTRA_OPTICAL_SLOTS, fw_alloc_zeroed_pages);
     /*
      * #413: one AP stack per host core that runs a guest.
      *

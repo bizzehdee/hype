@@ -29,6 +29,13 @@ rm -rf "$S"; mkdir -p "$S/addons"
 # guest reached THIS medium, not a second node backed by the first one's stream.
 echo "HYPE-727-SECOND-DISC-OK" > "$S/addons/HYPE727.TXT"
 genisoimage -quiet -J -r -V HYPE727 -o "$S/addons.iso" "$S/addons"
+# THREE=1 adds a third drive, so "any number" is proven past the two-drive case
+# the spec's own example (installer + storage-driver ISO) needs.
+if [ "${THREE:-0}" = "1" ]; then
+    mkdir -p "$S/addons2"
+    echo "HYPE-727-THIRD-DISC-OK" > "$S/addons2/HYPE727B.TXT"
+    genisoimage -quiet -J -r -V HYPE727B -o "$S/addons2.iso" "$S/addons2"
+fi
 
 dd if=/dev/zero of="$S/scratch.img" bs=1M count=64 conv=fsync status=none
 ESP="$S/esp.img"
@@ -43,8 +50,14 @@ mcopy -i "$ESP@@1M" fw/OVMF_CODE.fd fw/OVMF_VARS.fd ::/EFI/hype/
 mcopy -i "$ESP@@1M" "$ALPINE" ::/iso/test.iso
 mcopy -i "$ESP@@1M" "$S/addons.iso" ::/iso/addons.iso
 mcopy -i "$ESP@@1M" "$S/scratch.img" ::/hype/disks/scratch.img
-mcopy -i "$ESP@@1M" tools/727/hype-2cd.cfg ::/hype.cfg
-mcopy -i "$ESP@@1M" tools/727/input-vm0.txt ::/input/vm0.txt
+if [ "${THREE:-0}" = "1" ]; then
+    mcopy -i "$ESP@@1M" "$S/addons2.iso" ::/iso/addons2.iso
+    mcopy -i "$ESP@@1M" tools/727/hype-3cd.cfg ::/hype.cfg
+    mcopy -i "$ESP@@1M" tools/727/input-3cd.txt ::/input/vm0.txt
+else
+    mcopy -i "$ESP@@1M" tools/727/hype-2cd.cfg ::/hype.cfg
+    mcopy -i "$ESP@@1M" tools/727/input-vm0.txt ::/input/vm0.txt
+fi
 
 cp /usr/share/edk2/ovmf/OVMF_VARS.fd "$S/VARS.fd"
 timeout "${SECS:-600}" qemu-system-x86_64 -machine q35 -m 4096 -nodefaults \
@@ -57,4 +70,4 @@ timeout "${SECS:-600}" qemu-system-x86_64 -machine q35 -m 4096 -nodefaults \
   -serial "file:$S/boot.log" -display none -vga none || true
 
 echo "=== log: $S/boot.log"
-grep -aE 'optical drive|cdrom|SCRIPT vm0|SR-|MOUNT1-|HYPE-727|TWOCD-DONE' "$S/boot.log" | tail -25
+grep -aE 'optical drive|cdrom|SCRIPT vm0|SR-|MOUNT1-|MOUNT2-|HYPE-727|TWOCD-DONE' "$S/boot.log" | tail -25
