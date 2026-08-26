@@ -17,7 +17,8 @@ cd "$(cd "$(dirname "$0")/../.." && pwd)"
 # writing the SAME boot.log and sharing the SAME esp.img -- the logs interleave
 # and the results are worthless. That cost two misread runs before the guard
 # was added; tools/232's rig has the same line for the same reason.
-for p in $(ps -o pid= -C qemu-system-x86_64 2>/dev/null); do kill -9 "$p" 2>/dev/null || true; done
+for p in $(ps -o pid= -C "$(basename "$QEMU")" 2>/dev/null); do kill -9 "$p" 2>/dev/null || true; done
+. ./tools/qemu-env.sh
 S="${SCRATCH:-/tmp/hype-727}"
 ALPINE="disk-images/alpine-standard-3.21.7-x86_64.iso"
 
@@ -60,7 +61,7 @@ else
 fi
 
 cp /usr/share/edk2/ovmf/OVMF_VARS.fd "$S/VARS.fd"
-timeout "${SECS:-600}" qemu-system-x86_64 -machine q35 -m 4096 -nodefaults \
+timeout "${SECS:-600}" "$QEMU" -machine q35 -m 4096 -nodefaults \
   -accel kvm -cpu host -smp 2 \
   -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/ovmf/OVMF_CODE.fd \
   -drive if=pflash,format=raw,file="$S/VARS.fd" \

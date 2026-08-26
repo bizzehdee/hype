@@ -8,6 +8,7 @@
 set -e
 export LC_ALL=C
 cd "$(git rev-parse --show-toplevel)"
+. ./tools/qemu-env.sh
 HERE=tools/232
 B=${HYPE_232_BUILD:-disk-images/hype-232-build}
 # Refuse to run twice at once, via an flock on this script itself.
@@ -31,7 +32,7 @@ if ! flock -n 9; then
 fi
 S="${SCRATCH:-$(mktemp -d disk-images/rig232.XXXXXX)}"
 echo "scratch: $S"
-killall -9 qemu-system-x86_64 2>/dev/null || true
+killall -9 "$(basename "$QEMU")" 2>/dev/null || true
 sleep 1
 
 BRIDGE_ISO="$B/alpine-hype-232-bridge.iso"
@@ -88,7 +89,7 @@ esac
 
 run_qemu() { # $1 = esp, $2 = log, $3 = seconds
     cp /usr/share/edk2/ovmf/OVMF_VARS.fd "$S"/VARS.fd
-    timeout "$3" qemu-system-x86_64 -machine q35 -m 4096 -nodefaults \
+    timeout "$3" "$QEMU" -machine q35 -m 4096 -nodefaults \
       -accel kvm -cpu host -smp 2 \
       -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/ovmf/OVMF_CODE.fd \
       -drive if=pflash,format=raw,file="$S"/VARS.fd \
@@ -105,14 +106,14 @@ for i in $(seq 1 235); do
     grep -aq "HYPE232: INSTALL SUCCEEDED\|HYPE232: INSTALL FAILED" "$S"/boot1.log 2>/dev/null && break
 done
 sleep 5
-killall qemu-system-x86_64 2>/dev/null || true
+killall "$(basename "$QEMU")" 2>/dev/null || true
 wait $QPID 2>/dev/null || true
 grep -a "HYPE232-BRIDGE:\|HYPE232:.*INSTALL" "$S"/boot1.log | tail -10
 grep -aq "HYPE232: INSTALL SUCCEEDED" "$S"/boot1.log || { echo "FAIL: unattended install did not succeed"; exit 1; }
 echo "PASS: boot 1 -- unattended install via the separate additions ISO succeeded"
 
 echo "=== host reboot: fresh qemu process, boot = disk, no CDs attached ==="
-killall -9 qemu-system-x86_64 2>/dev/null || true
+killall -9 "$(basename "$QEMU")" 2>/dev/null || true
 sleep 2
 
 echo "=== boot 2: boot = disk, no installer media at all ==="
@@ -124,7 +125,7 @@ for i in $(seq 1 55); do
     grep -aq "hype-guest login:" "$S"/boot2.log 2>/dev/null && break
 done
 sleep 5
-killall qemu-system-x86_64 2>/dev/null || true
+killall "$(basename "$QEMU")" 2>/dev/null || true
 wait $QPID 2>/dev/null || true
 grep -aq "hype-guest login:" "$S"/boot2.log || { echo "FAIL: installed disk did not boot to login with no CDs attached"; exit 1; }
 echo "PASS: boot 2 -- installed disk boots to login with no CDs attached at all"
