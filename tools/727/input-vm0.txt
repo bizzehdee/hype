@@ -1,0 +1,18 @@
+# #727: prove the guest sees BOTH optical drives and can READ the second one.
+# The marker file lives only on addons.iso, so reading it back is what
+# distinguishes "a second device node exists" from "the second disc works".
+timeout 900000
+fail-if soft lockup
+
+expect localhost login:
+send root\n
+expect ~#
+send echo SR-$(ls /dev/sr* 2>/dev/null | tr '\n' ' ')\n
+expect SR-
+send mkdir -p /mnt/a && mount -t iso9660 /dev/sr1 /mnt/a 2>&1; echo MOUNT1-$?\n
+expect MOUNT1-
+send cat /mnt/a/HYPE727.TXT; echo READ1-$?\n
+expect HYPE-727-SECOND-DISC-OK
+send umount /mnt/a; echo TWOCD-DON''E\n
+expect TWOCD-DONE
+pass two-optical-drives
