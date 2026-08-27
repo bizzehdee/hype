@@ -300,8 +300,17 @@ int hype_log_sink_flush_budget(hype_log_sink_t *s, unsigned int max_source_bytes
 int hype_log_sink_flush(hype_log_sink_t *s) {
     unsigned int before;
     do {
+        int rc;
         before = s->flushed;
-        if (hype_log_sink_flush_budget(s, ~0u) != 0) return -1;
+        rc = hype_log_sink_flush_budget(s, ~0u);
+        /*
+         * #747: PROPAGATE the code, do not flatten it to -1. "the append failed" and "the
+         * device is gone" want different responses -- the first may be worth retrying, the
+         * second never is, and a caller that cannot tell them apart either retries forever
+         * or gives up on a transient. Flattening here would have thrown that away one
+         * level above the place that bothered to distinguish it.
+         */
+        if (rc != 0) return rc;
         /* A filtered sink stops at a trailing partial record. */
     } while (s->flushed != before && s->flushed < hype_logbuf_len());
     return 0;

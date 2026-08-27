@@ -612,7 +612,81 @@ static void test_every_record_is_keyed(void) {
     CHECK_HEX("every record keyed", lines, keyed);
 }
 
+/* ---- #747: a departed volume stops the sink writing, and says so ---- */
+
+static void test_747_gone_sink_refuses_every_flush(void) {
+    hype_log_sink_t sink;
+    unsigned int size_at_departure;
+
+    build_vol();
+    hype_logbuf_reset();
+    hype_logbuf_append("host-usb: medium present\n");
+    CHECK_HEX("open ok", 0, hype_log_sink_open(&sink, vol_read, vol_write, NULL, "GONE.LOG", 0));
+    CHECK_HEX("present to begin with", 0, hype_log_sink_device_gone(&sink));
+    size_at_departure = (unsigned)sink.file.size;
+
+    hype_log_sink_mark_device_gone(&sink);
+    CHECK_HEX("now gone", 1, hype_log_sink_device_gone(&sink));
+
+    /* The distinct code matters: -1 already means "the append failed", which a caller may
+     * retry. GONE never succeeds, and a caller that retries it spins. */
+    hype_logbuf_append("this must never reach the medium\n");
+    CHECK_HEX("flush refuses with GONE", HYPE_LOG_SINK_ERR_GONE, hype_log_sink_flush(&sink));
+    CHECK_HEX("and again", HYPE_LOG_SINK_ERR_GONE, hype_log_sink_flush(&sink));
+    CHECK_HEX("budgeted flush too", HYPE_LOG_SINK_ERR_GONE,
+              hype_log_sink_flush_budget(&sink, 4096u));
+
+    /*
+     * THE POINT. Not "the flush returned an error" but "nothing was written". The in-memory
+     * FAT state describes a medium that is not there, so any further append -- including a
+     * tidy close -- is the torn write this exists to prevent. #596 is what that looks like
+     * when it is not prevented.
+     */
+    CHECK_HEX("the file did not grow", size_at_departure, (unsigned)sink.file.size);
+}
+
+static void test_747_gone_beats_inactive(void) {
+    hype_log_sink_t sink;
+    /* A gone sink is not an inactive one: it mounted, it has a file, and its FAT state is
+     * live. Reporting -1 ("never opened") would send the next reader to the wrong layer,
+     * which is the exact argument the ERR_MOUNT/CREATE/WRITE split was made on. */
+    build_vol();
+    hype_logbuf_reset();
+    CHECK_HEX("open ok", 0, hype_log_sink_open(&sink, vol_read, vol_write, NULL, "GONE2.LOG", 0));
+    hype_log_sink_mark_device_gone(&sink);
+    hype_logbuf_append("x\n");
+    CHECK_HEX("GONE, not -1", HYPE_LOG_SINK_ERR_GONE, hype_log_sink_flush(&sink));
+}
+
+static void test_747_reopen_clears_it_but_nothing_else_does(void) {
+    hype_log_sink_t sink;
+
+    build_vol();
+    hype_logbuf_reset();
+    CHECK_HEX("open ok", 0, hype_log_sink_open(&sink, vol_read, vol_write, NULL, "GONE3.LOG", 0));
+    hype_log_sink_mark_device_gone(&sink);
+    hype_log_sink_mark_device_gone(&sink); /* idempotent */
+    CHECK_HEX("still gone", 1, hype_log_sink_device_gone(&sink));
+
+    /* Only an explicit re-open brings it back -- a re-plug does not. A half-written chain
+     * is not made good by the device returning. */
+    build_vol();
+    CHECK_HEX("reopen ok", 0, hype_log_sink_open(&sink, vol_read, vol_write, NULL, "GONE3.LOG", 0));
+    CHECK_HEX("reopen clears it", 0, hype_log_sink_device_gone(&sink));
+    hype_logbuf_append("writable again\n");
+    CHECK_HEX("and writes again", 0, hype_log_sink_flush(&sink));
+}
+
+static void test_747_null_sink_is_not_gone(void) {
+    CHECK_HEX("NULL is not a gone sink", 0, hype_log_sink_device_gone(0));
+    hype_log_sink_mark_device_gone(0); /* must not fault */
+}
+
 int main(void) {
+    test_747_gone_sink_refuses_every_flush();
+    test_747_gone_beats_inactive();
+    test_747_reopen_clears_it_but_nothing_else_does();
+    test_747_null_sink_is_not_gone();
     test_split_sink_reuses_primary_fat_mount();
     test_durable_ordered_sink_installs_sync();
     test_budgeted_combined_flush_makes_bounded_progress();
