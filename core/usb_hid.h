@@ -33,7 +33,11 @@
  * break code is two bytes for the extended set -- sized generously since overflowing
  * would silently drop keystrokes, which is the one failure an input path must not
  * have. */
-#define HYPE_USB_HID_MAX_SCANCODES 32u
+/* #734: 48, not 32. Extended keys now cost TWO bytes (E0 + code), so the worst-case
+ * transition -- eight modifier changes plus six releases and six presses, arrows and
+ * right-hand modifiers among them -- no longer fits in 32 and would silently drop its
+ * tail. */
+#define HYPE_USB_HID_MAX_SCANCODES 48u
 
 /* The interrupt-IN endpoint a boot keyboard delivers its reports on. */
 typedef struct {

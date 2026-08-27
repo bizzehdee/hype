@@ -3,6 +3,7 @@
 
 #include "../usb_hid.h"
 #include "../xhci.h"
+#include "../../arch/x86_64/cpu/leader_chord.h"
 
 static int failures = 0;
 
@@ -132,13 +133,145 @@ static void test_modifier_release(void) {
     CHECK_HEX("ctrl release", 1, n);
     CHECK_HEX("ctrl break 0x9D", 0x9D, out[0]);
 
-    /* Right-hand Ctrl folds onto the left code: hype's decoder has no side-specific
-     * behaviour, so "was Ctrl held" stays a single question. */
+    /*
+     * #734: the RIGHT-hand Ctrl is `E0 1D`, NOT a bare 0x1D. It used to be folded onto
+     * the left-hand code, and this test asserted the folding -- which is how a broken
+     * leader chord passed the suite for as long as it did. hype_chord_feed_scancode()
+     * distinguishes the sides and every chord needs the right-hand pair.
+     */
     mk_report(r1, 0x00u, 0, 0, 0);
     mk_report(r2, 0x10u, 0, 0, 0); /* Right Ctrl */
     n = hype_usb_hid_report_to_scancodes(r1, r2, out, sizeof(out));
-    CHECK_HEX("right ctrl make", 1, n);
-    CHECK_HEX("folds to 0x1D", 0x1D, out[0]);
+    CHECK_HEX("right ctrl make is two bytes", 2, n);
+    CHECK_HEX("E0 prefix", 0xE0, out[0]);
+    CHECK_HEX("then 0x1D", 0x1D, out[1]);
+
+    mk_report(r1, 0x10u, 0, 0, 0);
+    mk_report(r2, 0x00u, 0, 0, 0);
+    n = hype_usb_hid_report_to_scancodes(r1, r2, out, sizeof(out));
+    CHECK_HEX("right ctrl break is two bytes", 2, n);
+    CHECK_HEX("E0 prefix on break too", 0xE0, out[0]);
+    CHECK_HEX("then 0x9D", 0x9D, out[1]);
+
+    /* The LEFT-hand pair stays single-byte -- that part was always right. */
+    mk_report(r1, 0x00u, 0, 0, 0);
+    mk_report(r2, 0x01u, 0, 0, 0); /* Left Ctrl */
+    n = hype_usb_hid_report_to_scancodes(r1, r2, out, sizeof(out));
+    CHECK_HEX("left ctrl stays one byte", 1, n);
+    CHECK_HEX("bare 0x1D", 0x1D, out[0]);
+
+    /* Right SHIFT is genuinely single-byte on Set-1; it must NOT gain a prefix. */
+    mk_report(r1, 0x00u, 0, 0, 0);
+    mk_report(r2, 0x20u, 0, 0, 0);
+    n = hype_usb_hid_report_to_scancodes(r1, r2, out, sizeof(out));
+    CHECK_HEX("right shift is one byte", 1, n);
+    CHECK_HEX("0x36", 0x36, out[0]);
+}
+
+static void test_arrows_are_extended(void) {
+    uint8_t r0[8], r1[8];
+    uint8_t out[HYPE_USB_HID_MAX_SCANCODES];
+    unsigned n;
+
+    /*
+     * #734: arrows are `E0 4B` and friends. The un-prefixed forms are keypad codes, and
+     * core/kbd_decode.c only maps the arrows behind SC_EXT_PREFIX -- so the old
+     * single-byte output meant an arrow key did nothing in hype's own line editor and
+     * could not complete Right-Ctrl+Right-Alt+Left either.
+     */
+    mk_report(r0, 0, 0, 0, 0);
+    mk_report(r1, 0, 0x50, 0, 0); /* Left arrow */
+    n = hype_usb_hid_report_to_scancodes(r0, r1, out, sizeof(out));
+    CHECK_HEX("left arrow is two bytes", 2, n);
+    CHECK_HEX("E0", 0xE0, out[0]);
+    CHECK_HEX("0x4B", 0x4B, out[1]);
+
+    n = hype_usb_hid_report_to_scancodes(r1, r0, out, sizeof(out));
+    CHECK_HEX("release is two bytes", 2, n);
+    CHECK_HEX("E0", 0xE0, out[0]);
+    CHECK_HEX("0xCB", 0xCB, out[1]);
+}
+
+static void test_a_lone_e0_is_never_emitted_at_the_cap(void) {
+    uint8_t r0[8], r1[8];
+    uint8_t out[1];
+    unsigned n;
+
+    /*
+     * A one-byte buffer cannot hold `E0 4B`. Emitting just the 0xE0 would re-prefix
+     * whatever byte the NEXT call produced, turning an unrelated key into an extended
+     * one -- so the pair is dropped whole.
+     */
+    mk_report(r0, 0, 0, 0, 0);
+    mk_report(r1, 0, 0x50, 0, 0);
+    n = hype_usb_hid_report_to_scancodes(r0, r1, out, sizeof(out));
+    CHECK_HEX("no room for the pair, so nothing", 0, n);
+}
+
+static void test_usb_keyboard_can_actually_fire_a_leader_chord(void) {
+    uint8_t r0[8], r1[8], r2[8];
+    uint8_t out[HYPE_USB_HID_MAX_SCANCODES];
+    hype_chord_state_t st;
+    hype_chord_result_t res;
+    unsigned n, i;
+
+    /*
+     * #734, and the reason any of the above matters: drive the REAL path end to end --
+     * boot report -> scancodes -> hype_chord_feed_scancode -> action. On the 5950X this
+     * read `scancodes=147 chords=0`, and the operator could get into a guest with the
+     * `focus` command and had no way back out, because Right-Ctrl+Right-Alt+Esc could
+     * not be assembled from what the USB path emitted.
+     */
+    hype_chord_state_reset(&st);
+    res.action = HYPE_CHORD_ACTION_NONE;
+
+    mk_report(r0, 0, 0, 0, 0);
+    mk_report(r1, 0x50u, 0, 0, 0);    /* Right Ctrl + Right Alt held */
+    mk_report(r2, 0x50u, 0x29, 0, 0); /* ... and Escape */
+
+    n = hype_usb_hid_report_to_scancodes(r0, r1, out, sizeof(out));
+    for (i = 0; i < n; i++) {
+        res = hype_chord_feed_scancode(&st, out[i]);
+    }
+    CHECK_HEX("modifiers alone are not an action", HYPE_CHORD_ACTION_NONE, res.action);
+
+    n = hype_usb_hid_report_to_scancodes(r1, r2, out, sizeof(out));
+    for (i = 0; i < n; i++) {
+        res = hype_chord_feed_scancode(&st, out[i]);
+    }
+    CHECK_HEX("Right-Ctrl+Right-Alt+Esc returns to the dashboard",
+              HYPE_CHORD_ACTION_RETURN_TO_DASHBOARD, res.action);
+}
+
+static void test_usb_keyboard_chord_jump_and_cycle(void) {
+    uint8_t r0[8], r1[8], r2[8];
+    uint8_t out[HYPE_USB_HID_MAX_SCANCODES];
+    hype_chord_state_t st;
+    hype_chord_result_t res;
+    unsigned n, i;
+
+    hype_chord_state_reset(&st);
+    res.action = HYPE_CHORD_ACTION_NONE;
+    mk_report(r0, 0, 0, 0, 0);
+    mk_report(r1, 0x50u, 0, 0, 0);
+    mk_report(r2, 0x50u, 0x1E, 0, 0); /* '1' */
+
+    n = hype_usb_hid_report_to_scancodes(r0, r1, out, sizeof(out));
+    for (i = 0; i < n; i++) (void)hype_chord_feed_scancode(&st, out[i]);
+    n = hype_usb_hid_report_to_scancodes(r1, r2, out, sizeof(out));
+    for (i = 0; i < n; i++) res = hype_chord_feed_scancode(&st, out[i]);
+    CHECK_HEX("jump to VM", HYPE_CHORD_ACTION_JUMP_TO_VM, res.action);
+    CHECK_HEX("vm 1", 1, res.vm_index);
+
+    /* And the cycle chord, which needs BOTH halves extended -- the modifiers and the
+     * arrow. It is the one that fails if only one of the two fixes is applied. */
+    hype_chord_state_reset(&st);
+    mk_report(r2, 0x50u, 0x50, 0, 0); /* Right Ctrl + Right Alt + Left arrow */
+    n = hype_usb_hid_report_to_scancodes(r0, r1, out, sizeof(out));
+    for (i = 0; i < n; i++) (void)hype_chord_feed_scancode(&st, out[i]);
+    n = hype_usb_hid_report_to_scancodes(r1, r2, out, sizeof(out));
+    for (i = 0; i < n; i++) res = hype_chord_feed_scancode(&st, out[i]);
+    CHECK_HEX("cycle to the previous VM", HYPE_CHORD_ACTION_CYCLE_PREV, res.action);
 }
 
 static void test_unmapped_keys_are_skipped_not_zero_emitted(void) {
@@ -398,6 +531,10 @@ int main(void) {
     test_shift_precedes_the_key_it_modifies();
     test_release_before_press();
     test_modifier_release();
+    test_arrows_are_extended();
+    test_a_lone_e0_is_never_emitted_at_the_cap();
+    test_usb_keyboard_can_actually_fire_a_leader_chord();
+    test_usb_keyboard_chord_jump_and_cycle();
     test_unmapped_keys_are_skipped_not_zero_emitted();
     test_output_capacity_is_respected();
     test_null_safe();

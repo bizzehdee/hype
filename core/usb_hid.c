@@ -2,6 +2,11 @@
 
 #include "xhci.h" /* USB descriptor type/class constants */
 
+/* Set-1's extended-key prefix. Defined here rather than pulled from the arch-side
+ * leader_chord.h -- core/ must not include arch/ -- exactly as core/kbd_decode.c
+ * defines its own SC_EXT_PREFIX for the same byte. */
+#define SC_EXT_PREFIX 0xE0u
+
 /*
  * HID keyboard usage id -> PS/2 Set-1 make code.
  *
@@ -51,29 +56,74 @@ static const uint8_t g_usage_to_set1[256] = {
     [0x3A] = 0x3B, [0x3B] = 0x3C, [0x3C] = 0x3D, [0x3D] = 0x3E, [0x3E] = 0x3F,
     [0x3F] = 0x40, [0x40] = 0x41, [0x41] = 0x42, [0x42] = 0x43, [0x43] = 0x44,
     [0x44] = 0x57, [0x45] = 0x58,
-    /* Arrows. Real Set-1 sends these with an 0xE0 prefix; the single-byte forms are
-     * used here because hype's own decoder (core/kbd_decode.c) treats them as plain
-     * codes, and matching the decoder hype actually has matters more than matching a
-     * PS/2 controller nothing here is emulating. */
+    /*
+     * Arrows -- EXTENDED, emitted as `E0 <code>`. See g_usage_is_ext below.
+     *
+     * This table used to emit the single-byte forms, on the reasoning that hype's own
+     * decoder treats them as plain codes. That reasoning was simply wrong:
+     * core/kbd_decode.c has handled the 0xE0 prefix since it was written (SC_E0_UP and
+     * friends) and does NOT map the un-prefixed forms to arrows at all -- un-prefixed
+     * 0x48 is the keypad, not Up.
+     */
     [0x4F] = 0x4D, /* Right */
     [0x50] = 0x4B, /* Left */
     [0x51] = 0x50, /* Down */
     [0x52] = 0x48, /* Up */
 };
 
-/* Modifier bit (report byte 0) -> Set-1 make code. Left/right Ctrl and Alt both map
- * to their left-hand code: hype's decoder has no side-specific behaviour, and folding
- * them keeps "was Ctrl held" a single question. */
+/*
+ * Which usages need the 0xE0 prefix that real Set-1 sends for them.
+ *
+ * Kept as a parallel table rather than a flag bit in the code, because the code byte is
+ * what goes on the wire and packing a marker into it would have to be masked out again at
+ * every use, including in hype_usb_hid_usage_to_scancode()'s callers.
+ */
+static const uint8_t g_usage_is_ext[256] = {
+    [0x4F] = 1, [0x50] = 1, [0x51] = 1, [0x52] = 1, /* Right, Left, Down, Up */
+};
+
+/*
+ * Modifier bit (report byte 0) -> Set-1 make code, and whether it is extended.
+ *
+ * #734: the RIGHT-hand Ctrl and Alt are `E0 1D` and `E0 38` on real Set-1, and they used
+ * to be folded onto the left-hand single-byte codes here "because hype's decoder has no
+ * side-specific behaviour". One consumer very much does: hype_chord_feed_scancode() sets
+ * right_ctrl_held / right_alt_held ONLY from the extended forms, and every leader chord
+ * requires both. Folding them meant no chord could ever fire from a USB keyboard --
+ * measured on the 5950X as `scancodes=147 chords=0`, with the operator unable to get back
+ * out of a guest because Right-Ctrl+Right-Alt+Esc could not be recognised.
+ *
+ * These bytes share a queue with the PS/2 ISR's raw output (hype_host_kbd_inject_scancode),
+ * so real Set-1 is the queue's contract, not an aesthetic preference.
+ */
 static const uint8_t g_mod_to_set1[8] = {
     0x1D, /* bit0: Left Ctrl  */
     0x2A, /* bit1: Left Shift */
     0x38, /* bit2: Left Alt   */
     0x00, /* bit3: Left GUI   -- unmapped; no consumer */
-    0x1D, /* bit4: Right Ctrl */
-    0x36, /* bit5: Right Shift */
-    0x38, /* bit6: Right Alt  */
+    0x1D, /* bit4: Right Ctrl  -- E0 1D */
+    0x36, /* bit5: Right Shift -- genuinely single-byte on Set-1 */
+    0x38, /* bit6: Right Alt   -- E0 38 */
     0x00, /* bit7: Right GUI  */
 };
+static const uint8_t g_mod_is_ext[8] = { 0, 0, 0, 0, 1, 0, 1, 0 };
+
+/* Append one Set-1 event: `E0` first when extended, then make or break. Returns the
+ * new count; writes nothing at all if the pair would not fit, so a truncated buffer
+ * never emits a lone 0xE0 that would re-prefix whatever byte follows it. */
+static unsigned int emit_code(uint8_t *out, unsigned int n, unsigned int out_cap,
+                              uint8_t code, int ext, int release) {
+    unsigned int need = ext ? 2u : 1u;
+
+    if (n + need > out_cap) {
+        return n;
+    }
+    if (ext) {
+        out[n++] = SC_EXT_PREFIX;
+    }
+    out[n++] = release ? (uint8_t)(code | 0x80u) : code;
+    return n;
+}
 
 uint8_t hype_usb_hid_usage_to_scancode(uint8_t usage) {
     return g_usage_to_set1[usage];
@@ -193,9 +243,9 @@ unsigned int hype_usb_hid_report_to_scancodes(const uint8_t *prev, const uint8_t
             continue;
         }
         if ((cmod & bit) != 0u && (pmod & bit) == 0u) {
-            if (n < out_cap) out[n++] = code;               /* pressed */
+            n = emit_code(out, n, out_cap, code, g_mod_is_ext[i], 0); /* pressed */
         } else if ((cmod & bit) == 0u && (pmod & bit) != 0u) {
-            if (n < out_cap) out[n++] = (uint8_t)(code | 0x80u); /* released */
+            n = emit_code(out, n, out_cap, code, g_mod_is_ext[i], 1); /* released */
         }
     }
 
@@ -208,8 +258,8 @@ unsigned int hype_usb_hid_report_to_scancodes(const uint8_t *prev, const uint8_t
             continue;
         }
         code = g_usage_to_set1[usage];
-        if (code != 0u && n < out_cap) {
-            out[n++] = (uint8_t)(code | 0x80u);
+        if (code != 0u) {
+            n = emit_code(out, n, out_cap, code, g_usage_is_ext[usage], 1);
         }
     }
     for (i = 0; i < HYPE_USB_HID_MAX_KEYS; i++) {
@@ -219,8 +269,8 @@ unsigned int hype_usb_hid_report_to_scancodes(const uint8_t *prev, const uint8_t
             continue; /* held, not newly pressed -- see the header on auto-repeat */
         }
         code = g_usage_to_set1[usage];
-        if (code != 0u && n < out_cap) {
-            out[n++] = code;
+        if (code != 0u) {
+            n = emit_code(out, n, out_cap, code, g_usage_is_ext[usage], 0);
         }
     }
     return n;
