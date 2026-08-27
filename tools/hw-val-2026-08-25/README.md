@@ -315,3 +315,29 @@ unmount/mount cycle so neither SHA came out of the page cache. `\hype.cfg`
 into the PE header, so re-linking the same source gives a different SHA -- two
 default builds of `3cb97e2` differed in exactly one byte, at file offset 128.
 Compare against the staged copy, not against a fresh local build.
+
+## Re-staged 2026-08-27, third stage -- after the halt-recovery fix
+
+Full detail in [`RUN-CARD-2026-08-27.md`](RUN-CARD-2026-08-27.md), the byte-identical
+copy of `\RUN-CARD.md` on the drive.
+
+The 09:46 boot is archived at `logs/1a-desktop-5950x-2026-08-27-boot2/`, md5-verified
+against the media before `\HYPE.LOG` and `\RUN1A.LOG` were cleared. It proved #732,
+#737, #738 and #739 (this time fully -- 12 devices across 2 controllers in the
+INVENTORY), failed #734 with the completion codes named at last, and reproduced #735
+cleanly for the second time.
+
+What landed on `/dev/sdb1`:
+
+```
+062ba13d3be521369ec359183e1689cbf4cc928955c83ff11e31d6a10ddecffb  \EFI\BOOT\BOOTX64.EFI = \EFI\hype\hype-default.efi
+83304ab90f5b87d471b655d2493c1f1c2a14ef9cdcb4677e429bf51fbc7d814b  \EFI\hype\hype-avic.efi
+```
+
+Both are commit `1919410` (`-dirty` = the `edk2` submodule only), built one at a time
+with `make clean` between them, and re-read from the media after an unmount/mount cycle
+so neither SHA came out of the page cache. `\RUN-CARD.md` and `\QUEUE-2026-08-27.md`
+were refreshed. `\hype.cfg` (1535 bytes), all 18 configs, `\input\vm0.txt` and the
+2 GiB `\hype\disks\run1a-scratch.img` were already correct and were NOT rewritten.
+`\HYPE.LOG`, `\RUN1A.LOG`, `\HYPE.BOOTCOUNT` and `\vars-run1a.bin` were cleared, so
+boot 3 starts from a clean log rotation.
