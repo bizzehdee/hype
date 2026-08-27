@@ -11472,6 +11472,10 @@ static unsigned long long (*g_ap_vcpu_exits)[HYPE_MAX_VCPUS_PER_VM];
 static uint64_t (*g_ap_vcpu_last_reason)[HYPE_MAX_VCPUS_PER_VM];
 static uint64_t (*g_ap_vcpu_last_rip)[HYPE_MAX_VCPUS_PER_VM];
 static unsigned long long (*g_ap_vcpu_unhandled)[HYPE_MAX_VCPUS_PER_VM];
+/* #749: NPFs no device claimed, completed as unclaimed bus accesses. Separate from
+ * `unhandled` because they are no longer unhandled -- the guest was answered and moved on
+ * -- but a large or growing count still names a device window hype is missing. */
+static unsigned long long (*g_ap_vcpu_unclaimed)[HYPE_MAX_VCPUS_PER_VM];
 static unsigned (*g_ap_vcpu_excp_dumped)[HYPE_MAX_VCPUS_PER_VM];
 static int g_ap_mpdata_sample;
 
@@ -12630,13 +12634,53 @@ wait_for_sipi:
             if (ap_mmio_done) {
                 /* handled */
             } else if (vmm_handle_lapic_npf(kind, ctx, lapic, HYPE_LAPIC_DEFAULT_BASE, insn) != 0) {
-                if (g_ap_vcpu_unhandled[vm_idx][vi] < 8ull) {
-                    hype_debug_print("fw-1 vm%u vCPU %u: NPF at gpa 0x%llx rip 0x%llx needs "
-                                     "shared device state -- refused, see SMP-7 [#190]\n",
-                                     vm_idx, vi, (unsigned long long)info.qualification,
-                                     (unsigned long long)info.guest_rip);
+                /*
+                 * #749/#735: nothing claimed it. ABSORB it -- all-ones read, dropped write,
+                 * RIP ADVANCED -- through vmm_absorb_mmio_npf(), which is the same absorber
+                 * the BSP loop has used since GLADDER-1.
+                 *
+                 * That is the whole fix: the function already existed and the AP loop simply
+                 * never called it. #576's rule is that every MMIO window goes in TWO places,
+                 * the AP loop and the BSP chain; this is that rule broken for the FALLBACK
+                 * rather than for a window.
+                 *
+                 * This used to count the exit and re-enter with RIP unchanged, so the guest
+                 * re-executed the same instruction against the same address forever. Boot 6
+                 * on the 5950X measured 37,009,095 of them on vCPU 1 at one rip, ~350k/s,
+                 * from t=170s to the end of the run -- and the operator's `reboot`, pinned
+                 * to that vCPU, could never run. That is #735.
+                 *
+                 * Only eight were ever printed (the line is capped per vCPU), so the log
+                 * showed a handful at t=168s and nothing after, and it read as a transient
+                 * that had stopped. It had not. The counter is what told the truth, and the
+                 * log line now reports the COUNT so the next reader cannot make the same
+                 * mistake.
+                 */
+                if (vmm_absorb_mmio_npf(kind, ctx, insn) == 0) {
+                    unsigned long long n = ++g_ap_vcpu_unclaimed[vm_idx][vi];
+                    /* Powers of two: loud when it starts, loud again if it becomes a
+                     * storm, silent through the ordinary case of a guest probing an
+                     * address once. A flat cap is what hid this for five boots. */
+                    if ((n & (n - 1ull)) == 0ull) {
+                        hype_debug_print("fw-1 vm%u vCPU %u: NPF at gpa 0x%llx rip 0x%llx "
+                                         "claimed by NO device -- completed as an unclaimed "
+                                         "bus access (all-ones read / dropped write), "
+                                         "occurrence %llu [#749]\n",
+                                         vm_idx, vi, (unsigned long long)info.qualification,
+                                         (unsigned long long)info.guest_rip, n);
+                    }
+                } else {
+                    /* Undecodable: resuming would need a RIP advance nobody can compute, so
+                     * this one really is left alone. */
+                    if (g_ap_vcpu_unhandled[vm_idx][vi] < 8ull) {
+                        hype_debug_print("fw-1 vm%u vCPU %u: NPF at gpa 0x%llx rip 0x%llx "
+                                         "UNDECODABLE -- cannot complete or retire it "
+                                         "[#190 #749]\n",
+                                         vm_idx, vi, (unsigned long long)info.qualification,
+                                         (unsigned long long)info.guest_rip);
+                    }
+                    g_ap_vcpu_unhandled[vm_idx][vi]++;
                 }
-                g_ap_vcpu_unhandled[vm_idx][vi]++;
             }
         } else if (kind == HYPE_VMM_KIND_VMX &&
                    info.reason == HYPE_VMX_EXIT_REASON_APIC_WRITE) {
@@ -15949,11 +15993,13 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     for (_av = 1u; _av < vm->vcpu_count && _av < HYPE_MAX_VCPUS_PER_VM; _av++) {
                         hype_debug_print(
                             "fw-1 APVCPU vm%u/%u: live=%u exits=%llu unhandled=%llu "
+                            "unclaimed=%llu "
                             "last=0x%llx@0x%llx timer_irqs=%llu init=%u cur=%u lvt=0x%x "
                             "ahci=%llu ecam=%llu vblk=%llu lt=%llu span=%llu lockwait=%llu lockmax=%llu lockmaxsec=%u | held_max=%llu held_tot=%llu house_tot=%llu house_max=%llu "
                             "[#190]\n", _vmi, _av,
                             (unsigned)g_ap_vcpu_live[_vmi][_av],
                             g_ap_vcpu_exits[_vmi][_av], g_ap_vcpu_unhandled[_vmi][_av],
+                            g_ap_vcpu_unclaimed[_vmi][_av], /* #749 */
                             (unsigned long long)g_ap_vcpu_last_reason[_vmi][_av],
                             (unsigned long long)g_ap_vcpu_last_rip[_vmi][_av],
                             (unsigned long long)g_ap_timer_injected[_vmi][_av],
@@ -25855,6 +25901,7 @@ static void fw_alloc_vm_aux_arena(EFI_BOOT_SERVICES *bs) {
     g_ap_vcpu_last_reason = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_vcpu_last_reason);
     g_ap_vcpu_last_rip = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_vcpu_last_rip);
     g_ap_vcpu_unhandled = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_vcpu_unhandled);
+    g_ap_vcpu_unclaimed = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_vcpu_unclaimed); /* #749 */
     g_ap_vcpu_excp_dumped = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_vcpu_excp_dumped);
     g_snap_name = fw_aux_alloc(bs, (UINTN)n * sizeof *g_snap_name);
     g_snap_label = fw_aux_alloc(bs, (UINTN)n * sizeof *g_snap_label);

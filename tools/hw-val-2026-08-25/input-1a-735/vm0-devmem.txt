@@ -1,0 +1,69 @@
+# #735 ROOT CAUSE, reproduced deliberately: touch an address no device claims, FROM AN AP,
+# then try to reboot pinned to that same AP.
+#
+# Boot 6 on the 5950X showed vCPU 1 taking 37,009,095 unhandled NPFs at one rip -- ~350k/s
+# from t=170s to the end of the run -- because the AP loop counted an unmatched NPF and
+# re-entered with RIP unchanged. The guest re-executed the same instruction forever. The
+# `reboot` the operator then pinned to vCPU 1 could never run, which is #735.
+#
+# `busybox devmem` does exactly that access on demand, and `taskset -c 1` puts it on the AP.
+# 0x100000004 is the address the 5950X actually wedged on: 4 GiB + 4, above this guest's
+# RAM, above every window hype models, and below nothing.
+#
+# PRE-FIX this script hangs at DEVMEM-DONE and never reaches the reboot -- which is the
+# reproduction. POST-FIX devmem returns 0xFFFFFFFF, the shell comes back, and the pinned
+# reboot completes.
+
+timeout 600000
+fail-if soft lockup
+fail-if STALE-SHELL
+
+expect localhost login:
+send root\n
+expect ~#
+
+send echo CPUS-$(nproc)\n
+expect CPUS-
+
+# The access, on vCPU 1. If the AP wedges here, nothing below ever prints.
+send taskset -c 1 busybox devmem 0x100000004 32; echo DEV1-$?\n
+expect DEV1-0
+
+# And a write, which takes the other decoder path.
+send taskset -c 1 busybox devmem 0x100000004 32 0x5A5A; echo DEV2-$?\n
+expect DEV2-0
+
+# Hammer it, so "completed once" and "completes reliably" are not confused -- the pre-fix
+# failure was an unbounded loop, so a hundred is a meaningful distinction from one.
+# EXPECT THE EXIT CODE, not just some output. The first version of this ran a bare `devmem`,
+# which is a busybox APPLET and is not symlinked on Alpine's live ISO -- it returned 127
+# (command not found), NO unclaimed access ever happened, and the script sailed past because
+# it only checked that something printed. `expect DEV1-0` cannot pass that way.
+#
+# Split across two sends: HYPE_INPUT_SCRIPT_MAX_ARG is 128 bytes and the one-liner form of
+# this was 150, which the parser refuses outright ("argument too long -- refusing to arm").
+# It refuses the WHOLE script, so one over-long line costs the entire run.
+send taskset -c 1 sh -c 'i=0;while [ $i -lt 100 ];do busybox devmem 0x100000004 32;i=$((i+1));done' >/dev/null\n
+send echo DEVMEM-100-DONE\n
+expect DEVMEM-100-DONE
+
+# The AP is demonstrably still alive and scheduling.
+send taskset -c 1 sh -c 'echo AP-STILL-ALIVE-$(cut -d. -f1 /proc/uptime)'\n
+expect AP-STILL-ALIVE-
+
+# Now #735's own sequence, on the AP that just took those faults.
+send touch /tmp/preboot-marker; echo CPUS-BEFORE-$(nproc)-UP-$(cut -d. -f1 /proc/uptime)\n
+expect CPUS-BEFORE-
+send echo 1 > /sys/kernel/reboot/cpu && echo CPU-PINNED-$(cat /sys/kernel/reboot/cpu)\n
+expect CPU-PINNED-1
+send clear\n
+send reboot\n
+
+expect localhost login:
+send root\n
+expect ~#
+send test -e /tmp/preboot-marker && echo STALE-S''HELL || echo FRESH-B''OOT\n
+expect FRESH-BOOT
+send echo CPUS-AFTER-$(nproc)-UP-$(cut -d. -f1 /proc/uptime)\n
+expect CPUS-AFTER-
+pass 735-unclaimed-then-reboot-on-the-same-ap
