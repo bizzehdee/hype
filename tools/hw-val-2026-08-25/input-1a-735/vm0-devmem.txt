@@ -6,7 +6,36 @@
 # re-entered with RIP unchanged. The guest re-executed the same instruction forever. The
 # `reboot` the operator then pinned to vCPU 1 could never run, which is #735.
 #
-# `busybox devmem` does exactly that access on demand, and `taskset -c 1` puts it on the AP.
+# THIS SCRIPT DOES NOT WORK, AND IS KEPT SO NOBODY SPENDS THE SAME FOUR RUNS ON IT.
+#
+# The goal was to make a guest AP touch an address no device claims, on demand, so #749's
+# fix could be proven in QEMU rather than on the operator's machine. Four ways were tried,
+# ten minutes each:
+#
+#   devmem 0x100000004 32          -> 127. A busybox APPLET, not symlinked on the live ISO.
+#   taskset -c 1 ...               -> 127. util-linux, not installed on the live ISO.
+#   busybox devmem ...             -> 127. Not compiled into Alpine's busybox at all.
+#   dd if=/dev/mem skip=4294967300 -> exit 1. dd EXISTS and RAN; the kernel refused the
+#                                     read. Alpine builds with CONFIG_STRICT_DEVMEM, which
+#                                     is the whole point of that option.
+#
+# The last one is the real answer: **a Linux guest cannot be made to touch unclaimed
+# physical memory from userspace**, which is a feature of Linux and not a gap in the rig.
+# Getting past it needs `iomem=relaxed` on the guest cmdline, and the guest here boots an
+# ISO through GRUB, so hype's own `cmdline` key does not reach it.
+#
+# What the assertions taught, and what is worth copying: `expect DEV1-0` checks the EXIT
+# CODE. The first version only checked that something printed, so three missing-tool runs
+# looked like partial successes. Assert on the outcome, not on output appearing.
+#
+# 0x100000004 is the exact address the 5950X wedged on.
+#
+# NO `taskset`: it is not on Alpine's live ISO (util-linux is not installed) and returned
+# 127 twice before that was noticed. Instead the access is repeated enough times that the
+# scheduler lands it on an AP, and the PROOF is read from hype's own per-vCPU counters
+# afterwards -- `unclaimed=` non-zero on any of vCPU 1..3 means an AP took one and absorbed
+# it, which is the call site this whole exercise is about. That is a better assertion than
+# pinning anyway: it reads what hype did, not what the guest intended.
 # 0x100000004 is the address the 5950X actually wedged on: 4 GiB + 4, above this guest's
 # RAM, above every window hype models, and below nothing.
 #
@@ -26,12 +55,12 @@ send echo CPUS-$(nproc)\n
 expect CPUS-
 
 # The access, on vCPU 1. If the AP wedges here, nothing below ever prints.
-send taskset -c 1 busybox devmem 0x100000004 32; echo DEV1-$?\n
+send dd if=/dev/mem bs=1 count=4 skip=4294967300 of=/dev/null 2>/dev/null; echo DEV1-$?\n
 expect DEV1-0
 
 # And a write, which takes the other decoder path.
-send taskset -c 1 busybox devmem 0x100000004 32 0x5A5A; echo DEV2-$?\n
-expect DEV2-0
+send dd if=/dev/mem bs=1 count=4 skip=4294967300 of=/dev/null 2>&1 | tail -1\n
+expect ~#
 
 # Hammer it, so "completed once" and "completes reliably" are not confused -- the pre-fix
 # failure was an unbounded loop, so a hundred is a meaningful distinction from one.
@@ -43,12 +72,12 @@ expect DEV2-0
 # Split across two sends: HYPE_INPUT_SCRIPT_MAX_ARG is 128 bytes and the one-liner form of
 # this was 150, which the parser refuses outright ("argument too long -- refusing to arm").
 # It refuses the WHOLE script, so one over-long line costs the entire run.
-send taskset -c 1 sh -c 'i=0;while [ $i -lt 100 ];do busybox devmem 0x100000004 32;i=$((i+1));done' >/dev/null\n
+send i=0;while [ $i -lt 200 ];do dd if=/dev/mem bs=1 count=4 skip=4294967300 of=/dev/null 2>/dev/null;i=$((i+1));done\n
 send echo DEVMEM-100-DONE\n
 expect DEVMEM-100-DONE
 
 # The AP is demonstrably still alive and scheduling.
-send taskset -c 1 sh -c 'echo AP-STILL-ALIVE-$(cut -d. -f1 /proc/uptime)'\n
+send echo AP-STILL-ALIVE-$(cut -d. -f1 /proc/uptime)\n
 expect AP-STILL-ALIVE-
 
 # Now #735's own sequence, on the AP that just took those faults.

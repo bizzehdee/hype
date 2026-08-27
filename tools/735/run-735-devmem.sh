@@ -1,26 +1,27 @@
 #!/bin/bash
-# #735: a guest `reboot` pinned to a non-BSP vCPU never reaches the reset port.
+# #735/#749: KEPT AS A RECORD OF A DEAD END. This rig does not work and cannot be made to.
 #
-# (The --devmem variant of this rig, tools/735/run-735-devmem.sh, drives #735's ROOT CAUSE
-# directly: an unclaimed MMIO access from the AP, then the pinned reboot on that same AP.)
+# The aim was to make a guest AP touch an address no device claims, on demand, so the AP
+# call site of #749's fix could be proven in QEMU. Four attempts, ten minutes each:
 #
-# tools/525's rig already proves the 0xCF9 path from vCPU 1 and PASSES. This rig
-# differs from it in ONE deliberate way, which is the difference between that rig
-# and the 5950X hardware runs that fail:
+#   devmem 0x100000004 32          -> 127  (busybox applet, not symlinked)
+#   taskset -c 1 ...               -> 127  (util-linux, not on the live ISO)
+#   busybox devmem ...             -> 127  (not compiled into Alpine's busybox)
+#   dd if=/dev/mem skip=4294967300 -> 1    (dd ran; the KERNEL refused it)
 #
-#   525:  -smp 4 (no SMT)      -> hype grants 2 physical cores -> guest sees 2 CPUs
-#   735:  -smp cores=4,threads=2 + topoext -> 2 physical cores -> guest sees 4 CPUs
+# The last is the answer: Alpine builds with CONFIG_STRICT_DEVMEM, so a Linux guest cannot
+# be made to touch unclaimed physical memory from userspace. That is Linux working as
+# designed, not a gap in the rig. Getting past it needs `iomem=relaxed` on the guest
+# cmdline, and this guest boots an ISO through GRUB, where hype's `cmdline` key does not
+# reach.
 #
-# On the hardware the guest reported CPUS-BEFORE-4-UP-nn on every failing boot,
-# because hype hands a vCPU a whole physical core and the core's SMT sibling comes
-# free (#564). The 525 rig never had that bonus, so it never had 4 CPUs, and the
-# reboot it proves is a 2-CPU reboot. Whether the extra pair is what wedges
-# stop_machine is exactly the question.
+# What DOES prove the absorber is tests/micro/unclaimed.c (tools/749) -- but on the BSP,
+# because the microtest harness is single-vCPU. Proving the AP call site needs either an
+# SMP microtest with its own AP trampoline, or the hardware, where the pre-fix counter
+# already read unhandled=37009095 on vCPU 1.
 #
-# Everything else is 525's rig: same ISO, same GPT ESP, same USB log volume.
-# The input script is the hardware runbook's own reboot-pin (#728 markers), so a
-# guest that never restarts prints STALE-SHELL rather than false-passing on the
-# previous boot's login prompt still being on screen.
+# Left runnable, because if a guest with `iomem=relaxed` ever exists in this tree, this is
+# the script to point at it.
 set -e
 . "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 export LC_ALL=C
@@ -102,7 +103,10 @@ echo "=== the unclaimed accesses, from the AP ==="
 grep -aoE 'DEV1-[0-9]+|DEV2-[0-9]+|DEVMEM-100-DONE|AP-STILL-ALIVE-[0-9]+' $S/serial.txt | sort -u || true
 echo "=== hype on those accesses ==="
 grep -a "claimed by NO device" $S/serial.txt | head -3 || true
-grep -a "APVCPU vm0/1" $S/serial.txt | tail -1 | sed -n 's/.*\(exits=[0-9]* unhandled=[0-9]* unclaimed=[0-9]*\).*/  \1/p' || true
+for v in 1 2 3; do
+  grep -a "APVCPU vm0/$v" $S/serial.txt | tail -1 \
+    | sed -n "s/.*\(exits=[0-9]* unhandled=[0-9]* unclaimed=[0-9]*\).*/  vCPU $v \1/p" || true
+done
 echo "=== what the guest saw ==="
 grep -aoE 'CPUS-BEFORE-[0-9]+-UP-[0-9]+|CPU-PINNED-[0-9]+|STALE-SHELL|FRESH-BOOT|CPUS-AFTER-[0-9]+-UP-[0-9]+' $S/serial.txt | sort -u || true
 echo "=== the reset, if it happened ==="
@@ -138,10 +142,24 @@ fi
 grep -aoE 'ioio=[0-9]+' $S/serial.txt | tail -2 || true
 # The counters are the before/after. Hardware boot 6 read unhandled=37009095 unclaimed=0
 # (the field did not exist); a fixed build must show unclaimed climbing and unhandled flat.
-uc=$(grep -a "APVCPU vm0/1" $S/serial.txt | tail -1 | sed -n 's/.*unclaimed=\([0-9]*\).*/\1/p')
-uh=$(grep -a "APVCPU vm0/1" $S/serial.txt | tail -1 | sed -n 's/.*unhandled=\([0-9]*\).*/\1/p')
-echo "AP counters: unclaimed=${uc:-?} unhandled=${uh:-?}  (hardware boot 6: unhandled=37009095)"
-if [ "${uc:-0}" -lt 100 ] 2>/dev/null; then
-  echo "FAIL: fewer than 100 accesses were absorbed -- the guest did not exercise the path"; rc=1
+# THE assertion this rig exists for: an AP absorbed unclaimed accesses instead of spinning.
+# Summed across vCPU 1..3 because nothing pins the access -- which CPU services it is the
+# scheduler's business, and hype's counters are what say an AP did.
+uc=0; uh=0
+for v in 1 2 3; do
+  a=$(grep -a "APVCPU vm0/$v" $S/serial.txt | tail -1 | sed -n 's/.*unclaimed=\([0-9]*\).*/\1/p')
+  b=$(grep -a "APVCPU vm0/$v" $S/serial.txt | tail -1 | sed -n 's/.*unhandled=\([0-9]*\).*/\1/p')
+  uc=$((uc + ${a:-0})); uh=$((uh + ${b:-0}))
+done
+echo "AP totals across vCPU 1-3: unclaimed=$uc unhandled=$uh"
+echo "  (hardware boot 6, pre-fix: vCPU 1 alone read unhandled=37009095 unclaimed=0)"
+if [ "$uc" -lt 1 ]; then
+  echo "FAIL: no AP absorbed a single unclaimed access -- the AP call site is UNPROVEN by"
+  echo "      this run, whatever else passed"; rc=1
+else
+  echo "PROVEN: an AP took $uc unclaimed accesses, absorbed every one, and kept running [#749]"
+fi
+if [ "$uh" -gt 1000 ]; then
+  echo "FAIL: unhandled=$uh on the APs -- something is still NOT being absorbed"; rc=1
 fi
 exit "$rc"
