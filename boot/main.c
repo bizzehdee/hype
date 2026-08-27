@@ -11479,6 +11479,22 @@ static unsigned long long (*g_ap_vcpu_unhandled)[HYPE_MAX_VCPUS_PER_VM];
  * -- but a large or growing count still names a device window hype is missing. */
 static unsigned long long (*g_ap_vcpu_unclaimed)[HYPE_MAX_VCPUS_PER_VM];
 /*
+ * #750: the longest an AP went WITHOUT executing guest code, and when it last did.
+ *
+ * Every other measurement on this path is ambiguous. The deferred-interrupt wait reaches
+ * 208 seconds on a tripped run -- but also 282 on a clean one, because a vector deferred
+ * while the guest still wanted a timer and drained long after it disarmed one measures an
+ * interval during which nothing was wrong.
+ *
+ * This one cannot be read two ways. The guest's watchdog says "swapper/3 stuck for 26s",
+ * and swapper is the IDLE task: a CPU whose idle loop has not run for 26 seconds is a CPU
+ * that has not executed an instruction for 26 seconds. If hype went that long between
+ * VMRUNs on that vCPU, hype froze it; if it did not, the guest froze itself and hype's
+ * delivery is exonerated. Nothing else distinguishes those two.
+ */
+static unsigned long long (*g_ap_entry_gap_max)[HYPE_MAX_VCPUS_PER_VM];
+static unsigned long long (*g_ap_entry_last)[HYPE_MAX_VCPUS_PER_VM];
+/*
  * #752: how many times a vCPU may take an UNDECODABLE NPF at all before its VM is stopped.
  *
  * Generous, because a guest legitimately probing an odd address a few times must not be
@@ -12384,6 +12400,18 @@ wait_for_sipi:
         if (vm->flash_flush_pending[vi]) { /* #457: a flash-window remap happened */
             vm->flash_flush_pending[vi] = 0u;
             vmm_request_nested_tlb_flush(kind, ctx);
+        }
+        /* #750: how long since this vCPU last ran guest code. Sampled at the entry, so the
+         * gap covers everything between two VMRUNs -- host dispatch, lock waits, the lot. */
+        {
+            unsigned long long now_e = hype_rdtsc();
+            if (g_ap_entry_last[vm_idx][vi] != 0ull) {
+                unsigned long long gap = now_e - g_ap_entry_last[vm_idx][vi];
+                if (gap > g_ap_entry_gap_max[vm_idx][vi]) {
+                    g_ap_entry_gap_max[vm_idx][vi] = gap;
+                }
+            }
+            g_ap_entry_last[vm_idx][vi] = now_e;
         }
         if (ops->vcpu_run(ctx, &info) != 0) {
             fw_1_dev_lock(vm);
@@ -17043,10 +17071,20 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                             if (g_fw_1_host_tsc_hz != 0ull) {
                                 wms = (unsigned int)(wmax / (g_fw_1_host_tsc_hz / 1000ull));
                             }
-                            hype_debug_print("fw-1 INTDEFER vm%u/%u: cannot_accept=%llu "
-                                             "vintr_prio=%llu | worst_wait=%ums (vec 0x%02x) "
-                                             "[#750]\n",
-                                             (unsigned)(vm - g_vms), d_, nac, vpr, wms, wvec);
+                            {
+                                /* #750: and the unambiguous one -- the longest this vCPU went
+                                 * without executing guest code at all. */
+                                unsigned int gapms = 0;
+                                if (d_ > 0u && g_fw_1_host_tsc_hz != 0ull) {
+                                    gapms = (unsigned int)(g_ap_entry_gap_max[(unsigned)(vm - g_vms)][d_] /
+                                                           (g_fw_1_host_tsc_hz / 1000ull));
+                                }
+                                hype_debug_print("fw-1 INTDEFER vm%u/%u: cannot_accept=%llu "
+                                                 "vintr_prio=%llu | worst_wait=%ums (vec 0x%02x) "
+                                                 "| max_gap_between_entries=%ums [#750]\n",
+                                                 (unsigned)(vm - g_vms), d_, nac, vpr, wms,
+                                                 wvec, gapms);
+                            }
                         }
                         hype_debug_print("fw-1 INTDIAG vm%u/%u: eventinj=%llu defer=%llu "
                                          "window=%llu coalesced=%llu collisions=%llu | "
@@ -26142,6 +26180,8 @@ static void fw_alloc_vm_aux_arena(EFI_BOOT_SERVICES *bs) {
     g_ap_vcpu_last_rip = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_vcpu_last_rip);
     g_ap_vcpu_unhandled = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_vcpu_unhandled);
     g_ap_vcpu_unclaimed = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_vcpu_unclaimed); /* #749 */
+    g_ap_entry_gap_max = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_entry_gap_max);   /* #750 */
+    g_ap_entry_last = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_entry_last);         /* #750 */
     g_ap_vcpu_excp_dumped = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_vcpu_excp_dumped);
     g_snap_name = fw_aux_alloc(bs, (UINTN)n * sizeof *g_snap_name);
     g_snap_label = fw_aux_alloc(bs, (UINTN)n * sizeof *g_snap_label);
