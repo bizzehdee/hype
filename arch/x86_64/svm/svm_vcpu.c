@@ -162,6 +162,23 @@ struct hype_vcpu_ctx {
     unsigned long long int_defer_cannot_accept; /* IF clear or in an STI shadow */
     unsigned long long int_defer_vintr_prio;    /* VINTR priority refused the vector */
     /*
+     * #750: HOW LONG a deferred vector waited, not just how many were deferred.
+     *
+     * Every counter here is a total, and a total cannot distinguish four thousand
+     * sub-millisecond deferrals from one that lasted twenty-six seconds -- which is exactly
+     * the number the guest's watchdog reports when it trips. Three leads were eliminated on
+     * totals alone; this is the measurement that can find a stall or rule hype's delivery
+     * out for good.
+     *
+     * One timestamp per VECTOR, because the IRR is a bitmap: a second request for a vector
+     * already pending coalesces, and the wait that matters is from the FIRST request (when
+     * the guest first needed it) to the drain. Overwriting on the second would report the
+     * shorter, flattering interval.
+     */
+    uint64_t int_defer_tsc[256];   /* 0 = not currently deferred */
+    uint64_t int_defer_wait_max;   /* worst request->drain wait, TSC ticks */
+    uint8_t int_defer_wait_vec;    /* which vector held the record */
+    /*
      * #456: the vectors staged into EVENTINJ since the caller last drained this,
      * as a 256-bit set. The guest's emulated LAPIC ISR must be marked at the
      * moment a vector is COMMITTED to the guest, not when it is requested --
@@ -410,6 +427,8 @@ static void reset_gprs(struct hype_vcpu_ctx *ctx) {
         for (i = 0; i < 256; i++) {
             ctx->int_req_by_vec[i] = 0;   /* #359: a recycled slot must not inherit */
             ctx->int_inj_by_vec[i] = 0;   /* the previous guest's interrupt history */
+            ctx->int_defer_tsc[i] = 0;    /* #750: nor a stale deferral timestamp, which
+                                           * would report a wait of the whole boot */
         }
     }
 }
@@ -1487,6 +1506,14 @@ void hype_svm_vcpu_get_defer_reasons(hype_vcpu_ctx_t *ctx, unsigned long long *c
     if (vintr_prio) *vintr_prio = (real != 0) ? real->int_defer_vintr_prio : 0ull;
 }
 
+/* #750: the worst request->drain wait seen on this vCPU, and which vector held it. */
+void hype_svm_vcpu_get_defer_wait(hype_vcpu_ctx_t *ctx, unsigned long long *max_tsc,
+                                  unsigned int *vector) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    if (max_tsc) *max_tsc = (real != 0) ? real->int_defer_wait_max : 0ull;
+    if (vector) *vector = (real != 0) ? (unsigned int)real->int_defer_wait_vec : 0u;
+}
+
 void hype_svm_vcpu_get_int_diag(hype_vcpu_ctx_t *ctx, unsigned long long *eventinj,
                                  unsigned long long *defer, unsigned long long *window,
                                  unsigned long long *overwrite) {
@@ -1653,6 +1680,10 @@ trace_done:
     if ((real->pending_irr[vector >> 5] & ((uint32_t)1u << (vector & 31u))) != 0) {
         real->int_overwrite++; /* vector already pending -> coalesced (not lost) */
     }
+    /* #750: stamp the FIRST request only -- a coalesced repeat must not restart the clock. */
+    if (real->int_defer_tsc[vector] == 0ull) {
+        real->int_defer_tsc[vector] = real_rdtsc();
+    }
     hype_svm_irr_set(real->pending_irr, vector);
     hype_svm_sync_vintr(real);
     real->int_defer++;
@@ -1736,6 +1767,15 @@ void hype_svm_vcpu_handle_vintr_window(hype_vcpu_ctx_t *ctx) {
         real->int_inj_by_vec[(uint8_t)v]++;
         svm_note_injected(real, (uint8_t)v); /* #456 */
         real->int_window++;
+        /* #750: and how long it waited. */
+        if (real->int_defer_tsc[(uint8_t)v] != 0ull) {
+            uint64_t waited = real_rdtsc() - real->int_defer_tsc[(uint8_t)v];
+            real->int_defer_tsc[(uint8_t)v] = 0ull;
+            if (waited > real->int_defer_wait_max) {
+                real->int_defer_wait_max = waited;
+                real->int_defer_wait_vec = (uint8_t)v;
+            }
+        }
     }
     hype_svm_sync_vintr(real);
 }

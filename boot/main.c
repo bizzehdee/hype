@@ -17028,13 +17028,25 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         {
                             /* #750: WHY the deferrals -- the guest having interrupts off is
                              * a different problem from hype's own priority gate refusing. */
-                            unsigned long long nac = 0, vpr = 0;
+                            unsigned long long nac = 0, vpr = 0, wmax = 0;
+                            unsigned int wvec = 0, wms = 0;
                             if (kind == HYPE_VMM_KIND_SVM) {
                                 hype_svm_vcpu_get_defer_reasons(vm->vcpu[d_], &nac, &vpr);
+                                hype_svm_vcpu_get_defer_wait(vm->vcpu[d_], &wmax, &wvec);
+                            }
+                            /*
+                             * #750: worst_wait is the number that matters. Everything else
+                             * here is a total, and a total cannot tell four thousand fast
+                             * deferrals from one that lasted 26 seconds -- which is exactly
+                             * the figure the guest's watchdog prints when it trips.
+                             */
+                            if (g_fw_1_host_tsc_hz != 0ull) {
+                                wms = (unsigned int)(wmax / (g_fw_1_host_tsc_hz / 1000ull));
                             }
                             hype_debug_print("fw-1 INTDEFER vm%u/%u: cannot_accept=%llu "
-                                             "vintr_prio=%llu [#750]\n",
-                                             (unsigned)(vm - g_vms), d_, nac, vpr);
+                                             "vintr_prio=%llu | worst_wait=%ums (vec 0x%02x) "
+                                             "[#750]\n",
+                                             (unsigned)(vm - g_vms), d_, nac, vpr, wms, wvec);
                         }
                         hype_debug_print("fw-1 INTDIAG vm%u/%u: eventinj=%llu defer=%llu "
                                          "window=%llu coalesced=%llu collisions=%llu | "
@@ -24921,8 +24933,23 @@ static void fw_1_usb_storage_departed(hype_xhci_ctrl_t *xc, unsigned int ctrl_id
      * to a device that is not there.
      */
     if (g_usb_ubk.slot == slot && g_usb_ubk.ctrl != 0 && g_usb_ubk.ctrl->bar == xc->bar) {
+        unsigned int vi;
+
         hype_blk_phys_mark_departed(&g_usb_uphys);
         hype_log_sink_mark_device_gone(&g_hype_log);
+        /*
+         * EVERY per-VM split sink too, not just the combined one. They share the primary's
+         * FAT mount (hype_log_sink_open_shared_ordered), so the same in-memory metadata now
+         * describes a device that is not there -- and usb_log_flush()'s split loop drains
+         * them DIRECTLY. Marking only the combined sink would leave each of them to
+         * discover the medium is gone by attempting one more append into that metadata,
+         * which is exactly the write this ticket exists to prevent: one per VM.
+         */
+        for (vi = 0; vi < g_vm_count && vi < HYPE_CFG_MAX_VMS; vi++) {
+            hype_log_sink_mark_device_gone(&g_vm_log[vi]);
+            g_vm_log_ready[vi] = 0;
+        }
+        g_hype_log_ready = 0;
         /* Straight to the serial console, NOT through the log sink that just died. */
         hype_serial_print("host-usb: the LOG/BOOT medium (slot%u) DEPARTED -- the log sink is "
                           "abandoned, not closed, and every further block I/O to it fails. "

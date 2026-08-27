@@ -690,6 +690,10 @@ void hype_svm_vcpu_get_intr_state(hype_vcpu_ctx_t *ctx, hype_svm_intr_state_t *o
 void hype_svm_vcpu_get_defer_reasons(hype_vcpu_ctx_t *ctx, unsigned long long *cannot_accept,
                                      unsigned long long *vintr_prio);
 
+/* #750: worst deferred-interrupt wait on this vCPU, in TSC ticks, and its vector. */
+void hype_svm_vcpu_get_defer_wait(hype_vcpu_ctx_t *ctx, unsigned long long *max_tsc,
+                                  unsigned int *vector);
+
 void hype_svm_vcpu_get_int_diag(hype_vcpu_ctx_t *ctx, unsigned long long *eventinj,
                                  unsigned long long *defer,
                                  unsigned long long *window, unsigned long long *overwrite);
