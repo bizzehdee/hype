@@ -336,6 +336,19 @@ static unsigned int usb_hid_drain(void);
 static int usb_mouse_drain(hype_ps2_mouse_t *dst);
 static void fw_1_usb_hotplug_poll(void); /* #744 */
 /*
+ * #745: the controllers the sweep left RUNNING, and their inventory-facing indices.
+ *
+ * The departure poller could iterate the claimed keyboards, because a departure is always
+ * of something claimed. Arrival cannot: a machine that boots with no keyboard and has one
+ * plugged in afterwards has nothing to iterate, which is exactly the case that most needs
+ * to work. Recorded where the sweep decides NOT to quiesce a controller (#299), so this
+ * list is by construction the set whose PORTSC can be read at all.
+ */
+#define HYPE_LIVE_XHCI_MAX 4u
+static hype_xhci_ctrl_t g_live_xc[HYPE_LIVE_XHCI_MAX];
+static unsigned int g_live_xc_idx[HYPE_LIVE_XHCI_MAX];
+static unsigned int g_live_xc_count;
+/*
  * #742: EVERY claimed keyboard, not the first one.
  *
  * hype used to claim one boot keyboard and leave every other one `owner=free`, doing
@@ -24250,17 +24263,97 @@ static unsigned int usb_hid_drain(void) {
  * Runs from the same 125 Hz input tick as the HID drain, so it costs a register read per
  * changed port and nothing at all when no port has changed.
  */
+/*
+ * #745: enumerate and claim a device that has just appeared on a root port.
+ *
+ * The same sequence the boot sweep runs -- reset, Enable Slot, Address Device, descriptors,
+ * record, claim -- so a keyboard plugged in after boot works exactly as one present at boot
+ * does. Deliberately NOT a call into the sweep itself: the sweep also hunts for the boot
+ * medium, quiesces controllers and prints a topology summary, none of which is right in the
+ * middle of a running machine.
+ *
+ * Identity stays (controller, root port, route), per decision 73: two identical keyboards
+ * must not be confused for one another, and the same physical device moved to another port
+ * is a different attachment.
+ *
+ * Returns 1 if it did any work, so the caller can stop after one device this tick.
+ */
+static int fw_1_usb_enumerate_arrival(hype_xhci_ctrl_t *xc, unsigned int ctrl_idx,
+                                      unsigned int port) {
+    static uint8_t cfgbuf[512];
+    uint8_t desc[18];
+    hype_xhci_devpath_t path;
+    unsigned int slot = 0, speed = 0, cfglen = 0;
+
+    if (!hype_xhci_reset_port(xc, port, &speed)) {
+        hype_debug_print("host-usb: port %u reset did not bring a device up -- ignoring the "
+                         "arrival [#745]\n", port);
+        return 1;
+    }
+    if (hype_xhci_enable_slot(xc, &slot) != 0 || slot == 0u) {
+        hype_debug_print("host-usb: port %u Enable Slot FAILED on arrival [#745]\n", port);
+        return 1;
+    }
+    path.root_port = port;
+    path.route = 0u;          /* a root-port device has no hub above it, so no TT either */
+    path.speed = speed;
+    path.tt_hub_slot = 0u;
+    path.tt_port = 0u;
+    if (hype_xhci_address_device(xc, slot, &path) != 0) {
+        hype_debug_print("host-usb: port %u Address Device FAILED on arrival [#745]\n", port);
+        (void)hype_xhci_release_device(xc, slot);
+        return 1;
+    }
+    if (hype_xhci_get_device_descriptor(xc, slot, desc) != 0) {
+        hype_debug_print("host-usb: port %u GET_DESCRIPTOR FAILED on arrival [#745]\n", port);
+        (void)hype_xhci_release_device(xc, slot);
+        return 1;
+    }
+    (void)hype_xhci_get_config_descriptor(xc, slot, cfgbuf, sizeof(cfgbuf), &cfglen);
+    /* Record BEFORE deciding whether hype wants it, exactly as the boot sweep does -- that
+     * is what makes the inventory a topology rather than a list of useful things. */
+    (void)fw_1_usb_record(&g_usb_inv, ctrl_idx, &path, slot, desc, cfgbuf, cfglen);
+    hype_debug_print("host-usb: port %u ARRIVED -- %04x:%04x slot%u speed%u, enumerated and "
+                     "in the inventory [#745]\n", port,
+                     (unsigned)(desc[8] | (desc[9] << 8)),
+                     (unsigned)(desc[10] | (desc[11] << 8)), slot, speed);
+    /*
+     * Then offer it to the claim path, which will take it if it is a boot HID and hype has
+     * room. If it is anything else it stays in the inventory as `owner=free`, which is what
+     * a device hype does not drive should look like.
+     */
+    fw_1_claim_boot_hid(xc, HYPE_USB_PROTO_KEYBOARD, "keyboard", g_hid, &g_hid_count,
+                        HYPE_HOST_KBD_MAX, &g_hid_skipped);
+    if (!g_mouse_ready) {
+        static hype_host_kbd_t mouse_arrival;
+        unsigned int mcount = 0, mskip = 0;
+        fw_1_claim_boot_hid(xc, HYPE_USB_PROTO_MOUSE, "mouse", &mouse_arrival, &mcount, 1u,
+                            &mskip);
+        if (mcount != 0u) {
+            g_mouse_xc = mouse_arrival.xc;
+            g_mouse_slot = mouse_arrival.slot;
+            g_mouse_ep = mouse_arrival.ep;
+            g_mouse_mps = mouse_arrival.mps;
+            g_mouse_root_port = mouse_arrival.root_port;
+            g_mouse_ready = 1;
+        }
+    }
+    return 1;
+}
+
 static void fw_1_usb_hotplug_poll(void) {
     unsigned int k;
-
     /*
-     * Only the controllers hype kept something on are polled. Every other controller was
-     * quiesced after the sweep (#299) and reading its PORTSC would be reading a halted
-     * controller. Walking the claimed devices rather than a controller list also keeps
-     * this honest about scope: hype can only act on a departure of something it owns.
+     * #745: at most ONE device enumerated per tick. Enumeration is a dozen synchronous
+     * xHCI commands and this runs from the guest dispatch loop -- #734 measured 3.6
+     * SECONDS of visible dashboard freeze from far less than a full enumeration. Ports
+     * that changed stay flagged, so a second arrival is picked up 8ms later rather than
+     * doubling this tick's cost.
      */
-    for (k = 0; k < g_hid_count && k < HYPE_HOST_KBD_MAX; k++) {
-        hype_xhci_ctrl_t *xc = &g_hid[k].xc;
+    int enumerated = 0;
+
+    for (k = 0; k < g_live_xc_count && k < HYPE_LIVE_XHCI_MAX; k++) {
+        hype_xhci_ctrl_t *xc = &g_live_xc[k];
         unsigned int port;
 
         while ((port = hype_xhci_take_port_change(xc)) != 0u) {
@@ -24273,7 +24366,10 @@ static void fw_1_usb_hotplug_poll(void) {
             hype_debug_print("host-usb: port %u on this controller changed -- %s [#744]\n",
                              port, connected ? "something is attached" : "now empty");
             if (connected) {
-                continue; /* arrival is #745 */
+                if (!enumerated) {
+                    enumerated = fw_1_usb_enumerate_arrival(xc, g_live_xc_idx[k], port);
+                }
+                continue;
             }
             /*
              * Release every claimed keyboard on that root port. Compared by root port and
@@ -27549,6 +27645,12 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                     hype_xhci_host_quiesce(&xc);
                     hype_debug_print("host-xhci: controller[%u] quiesced -- nothing kept on it; "
                                       "ring block returned to the pool [#299]\n", xhci_count);
+                } else if (g_live_xc_count < HYPE_LIVE_XHCI_MAX) {
+                    /* #745: kept Running, so its ports can still be read -- and therefore a
+                     * device arriving on one can be enumerated. */
+                    g_live_xc[g_live_xc_count] = xc;
+                    g_live_xc_idx[g_live_xc_count] = xhci_count;
+                    g_live_xc_count++;
                 }
             }
         } /* while (each xHCI controller) */
