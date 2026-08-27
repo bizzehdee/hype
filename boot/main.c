@@ -2127,6 +2127,13 @@ typedef struct {
     hype_xhci_devpath_t *msc_path;
     hype_xhci_msc_eps_t *msc_eps;
     int msc_wanted; /* 0 once a medium has been found elsewhere */
+    /*
+     * #734: how many more non-HID, non-hub devices this controller's walk may KEEP
+     * addressed rather than release. Shared across every hub on the controller, so it
+     * points at the caller's counter. See fw_1_hub_visit() for why releasing them is
+     * what makes a later HID inherit a recycled slot id.
+     */
+    unsigned int *keep_budget;
 } fw_1_hub_visit_ctx_t;
 
 static int fw_1_hub_visit(void *ctx, hype_xhci_ctrl_t *c, unsigned int slot,
@@ -2160,13 +2167,38 @@ static int fw_1_hub_visit(void *ctx, hype_xhci_ctrl_t *c, unsigned int slot,
     }
     /*
      * Keep a HID device's slot: claiming a keyboard later needs it still addressed
-     * (#217). Everything else is released, and its inventory entry keeps the slot id it
-     * had -- a passthrough claim will have to re-address it. That is deliberate: the
-     * device-context pool is 8 per controller, so holding every slot would starve
-     * enumeration itself on a machine with a populated hub, which is a worse failure
-     * than an extra Address Device at claim time.
+     * (#217).
+     *
+     * #734: keep a BOUNDED number of the others too, and this is the interesting half.
+     * Releasing a non-HID device mid-walk hands its slot id straight back, and the very
+     * next port's device inherits it. Across the 2026-08-27 10:42 and 11:23 boots that
+     * recycled id is the one thing every failing HID had in common:
+     *
+     *   10:42  eba4:6579 took ctrl2 slot 3, released -> keyboard inherited slot 3  cc=4
+     *          mouse took a fresh slot 4                                           548 reports
+     *   11:23  eba4:6579 took ctrl2 slot 3, released -> mouse    inherited slot 3  cc=4
+     *          keyboard on ctrl1, fresh slot 2                                     reports fine
+     *
+     * Four device-instances, no exceptions, and for the mouse the slot id is the ONLY
+     * variable that moved between the two boots -- same hub, same TT, same port, same
+     * endpoint, working then failing. Not keeping the slot in the first place is the
+     * cheapest way to find out whether that correlation is the cause.
+     *
+     * Bounded because the original reasoning still stands: the device-context pool is 8
+     * per controller, and holding every slot would starve enumeration itself, which is a
+     * worse failure than an extra Address Device at claim time. Budget exhausted = the
+     * old behaviour, and it says so.
      */
-    return (cls == HYPE_USB_CLASS_HID) ? HYPE_XHCI_VISIT_KEEP : HYPE_XHCI_VISIT_RELEASE;
+    if (cls == HYPE_USB_CLASS_HID) {
+        return HYPE_XHCI_VISIT_KEEP;
+    }
+    if (v->keep_budget != 0 && *v->keep_budget != 0u) {
+        (*v->keep_budget)--;
+        return HYPE_XHCI_VISIT_KEEP;
+    }
+    hype_debug_print("host-usb:   slot %u released -- keep budget spent; a later device may "
+                     "inherit this id [#734]\n", slot);
+    return HYPE_XHCI_VISIT_RELEASE;
 }
 
 /* M10-6a (#227): the enumerated NVMe scratch target for a confirmed `physical:`
@@ -26630,6 +26662,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
         uint32_t xhci_cur = 0, xhci_bdf = 0;
         unsigned int xhci_count = 0;
         int msc_found_any = 0;
+        /* #734: non-HID, non-hub slots this controller's hub walks may keep addressed
+         * rather than release. 3 of a pool of 8, leaving room for the hubs themselves
+         * and for anything the root-port scan retains. */
+        unsigned int hub_keep_budget = 3u;
         hype_usb_inventory_reset(&g_usb_inv); /* #241 */
         /*
          * #299: sweep EVERY controller. This used to stop at the first one holding a USB
@@ -26830,6 +26866,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                             vctx.msc_path = &msc_path;
                             vctx.msc_eps = &msc;
                             vctx.msc_wanted = !msc_found_any;
+                            vctx.keep_budget = &hub_keep_budget;
                             /* The walk always runs to completion now, so its return value
                              * only says whether a visitor cut it short; what matters is
                              * whether a medium was captured. */

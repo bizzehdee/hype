@@ -100,6 +100,7 @@ typedef struct {
     unsigned int ep0_cyc[DEVPOOL];
     unsigned int dev_used[DEVPOOL]; /* 1 if this pool slot is in use */
     unsigned int slot_dev[256];     /* slot id -> pool index + 1 (0 = none) */
+    uint8_t slot_seen[256];         /* #734: slot id has been Enable-Slot'd at least once */
 
     /* #387: the MSC bulk rings + BOT state moved to the per-claimed-device pool below --
      * per-CONTROLLER they were the reason a second stick could not be brought up at all. */
@@ -508,6 +509,23 @@ int hype_xhci_enable_slot(hype_xhci_ctrl_t *c, unsigned int *out_slot) {
         return -1;
     }
     if (out_slot) *out_slot = hype_xhci_event_slot_id(evt);
+    /*
+     * #734: say when a slot id is handed out for the SECOND time.
+     *
+     * Across the 2026-08-27 10:42 and 11:23 boots, every claimed HID that failed with
+     * cc=4 sat on a slot id previously enabled for another device and then disabled, and
+     * every one that worked sat on a fresh id -- four device-instances, no exceptions.
+     * That pattern was inferred from duplicate slot numbers in the inventory; this makes
+     * it a fact the log states outright, so the next boot either confirms or kills it.
+     */
+    {
+        unsigned int sid = hype_xhci_event_slot_id(evt) & 0xFFu;
+        if (hw->slot_seen[sid]) {
+            hype_debug_print("host-xhci:     Enable Slot: %u -- RECYCLED, this id was "
+                             "enabled and disabled before [#734]\n", sid);
+        }
+        hw->slot_seen[sid] = 1u;
+    }
     return 0;
 }
 
@@ -960,6 +978,8 @@ static void int_in_report_error(unsigned int slot, unsigned int dci, uint64_t tr
 
 static int ep_recover(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int dci, uint8_t *ring,
                       unsigned int *enq, unsigned int *cyc);
+static int ep_recover_halted(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int dci,
+                             uint8_t *ring, unsigned int *enq, unsigned int *cyc);
 
 /*
  * #734: an error completion on an interrupt endpoint HALTS it (xHCI 4.10.2.1) -- the
@@ -979,12 +999,13 @@ static int ep_recover(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int dci, 
  * off forever, since a device that starts answering later is still the operator's only
  * keyboard. The counters reset on the next good report.
  */
-#define INT_IN_MAX_RECOVERIES 8u
-#define INT_IN_BACKOFF_POLLS  8192u
+#define INT_IN_MAX_RECOVERIES 2u
+#define INT_IN_BACKOFF_POLLS  200000u
 
 static void int_in_recover(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int dci,
                            xhci_int_in_hw_t *iin) {
     static unsigned int backoff_reported = 0;
+    static unsigned int recover_reported = 0;
 
     iin->armed = 0;
     iin->pending_trb = 0;
@@ -999,9 +1020,11 @@ static void int_in_recover(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int 
         return;
     }
     iin->recoveries++;
-    hype_debug_print("host-xhci: interrupt-IN slot=%u ep=%u halted -- recovering (%u/%u) "
-                     "[#734]\n", slot, dci, iin->recoveries, (unsigned)INT_IN_MAX_RECOVERIES);
-    (void)ep_recover(c, slot, dci, iin->ring, &iin->enq, &iin->cyc);
+    if (recover_reported++ < 8u) {
+        hype_debug_print("host-xhci: interrupt-IN slot=%u ep=%u halted -- recovering (%u/%u) "
+                         "[#734]\n", slot, dci, iin->recoveries, (unsigned)INT_IN_MAX_RECOVERIES);
+    }
+    (void)ep_recover_halted(c, slot, dci, iin->ring, &iin->enq, &iin->cyc);
 }
 
 int hype_xhci_int_in_poll(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int ep_addr,
@@ -1346,6 +1369,41 @@ static int ep_recover(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int dci, 
                      "restarted at index 0, producer cycle 1\n", slot, dci,
                      hype_xhci_event_cc(evt));
     return 0;
+}
+
+/*
+ * #734: recovery for an endpoint that is already HALTED, which is the interrupt-IN case.
+ *
+ * Two differences from ep_recover(), and both come from the 2026-08-27 11:23 boot, where
+ * eight recoveries took 3.6 SECONDS of the guest dispatch loop and the dashboard visibly
+ * froze:
+ *
+ *   - No Stop Endpoint. Stop is defined on a RUNNING endpoint (xHCI 4.6.9); against a
+ *     halted one it returns Context State Error, which is exactly what that boot logged
+ *     eight times over -- `#289 Stop Endpoint cc=19`. It is a third of the cost for a
+ *     command that cannot do anything.
+ *   - Quiet by default. ep_recover() prints a line per step because the bulk path runs it
+ *     rarely; an interrupt endpoint failing every millisecond must not narrate.
+ *
+ * Reset Endpoint (Halted -> Stopped) then Set TR Dequeue Pointer to a restarted ring is
+ * the whole of what xHCI 4.6.8/4.6.10 asks for here.
+ */
+static int ep_recover_halted(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int dci,
+                             uint8_t *ring, unsigned int *enq, unsigned int *cyc) {
+    xhci_hw_t *hw = HW(c);
+    uint32_t cmd[4], evt[4];
+    unsigned int i;
+
+    hype_xhci_trb_reset_endpoint(cmd, slot, dci, (int)hw->cmd_cyc);
+    if (cmd_submit_wait(c, cmd, evt) != 0) return -1;
+
+    for (i = 0; i < XPAGE; i++) { ring[i] = 0; }
+    ring_init_link(ring);
+    *enq = 0;
+    *cyc = 1;
+    hype_xhci_trb_set_tr_dequeue(cmd, phys(ring) | 1u /* DCS=1 */, slot, dci, (int)hw->cmd_cyc);
+    if (cmd_submit_wait(c, cmd, evt) != 0) return -1;
+    return (hype_xhci_event_cc(evt) == HYPE_XHCI_CC_SUCCESS) ? 0 : -1;
 }
 
 /*
@@ -2274,6 +2332,7 @@ int hype_xhci_disable_slot(hype_xhci_ctrl_t *c, unsigned int slot) {
     if (!c->inited || slot == 0u) return -1;
     hype_xhci_trb_disable_slot(cmd, slot, (int)hw->cmd_cyc);
     if (cmd_submit_wait(c, cmd, evt) != 0) { dev_free(hw, slot); return -1; }
+    hype_debug_print("host-xhci:     Disable Slot: %u [#734]\n", slot);
     dev_free(hw, slot); /* release the pool entry regardless of the controller's verdict */
     return (hype_xhci_event_cc(evt) == HYPE_XHCI_CC_SUCCESS) ? 0 : -1;
 }
