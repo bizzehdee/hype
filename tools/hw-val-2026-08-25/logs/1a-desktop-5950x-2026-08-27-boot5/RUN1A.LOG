@@ -1,0 +1,66 @@
+[0000095288] ttyS0| BdsDxe: loading Boot0002 "UEFI HYPE VIRTUAL CD-ROM HYPE0000000000000001" from PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)
+[0000095538] ttyS1| BdsDxe: loading Boot0002 "UEFI HYPE VIRTUAL CD-ROM HYPE0000000000000001" from PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)
+[0000095789] ttyS0| BdsDxe: starting Boot0002 "UEFI HYPE VIRTUAL CD-ROM HYPE0000000000000001" from PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)
+[0000095931] ttyS1| BdsDxe: starting Boot0002 "UEFI HYPE VIRTUAL CD-ROM HYPE0000000000000001" from PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)
+[0000096073] ttyS0| GNU GRUB  version 2.12
+[0000096112] ttyS1| GNU GRUB  version 2.12
+[0000096151] ttyS0| 
+[0000096168] ttyS1| 
+[0000096185] ttyS0|      Use the  and  keys to select which entry is highlighted.                              
+[0000096293] ttyS1|      Use the  and  keys to select which entry is highlighted.                              
+[0000096401] ttyS0|       Press enter to boot the selected OS, `e' to edit the commands before booting or `c' for 
+[0000096512] ttyS1|       Press enter to boot the selected OS, `e' to edit the commands before booting or `c' for 
+[0000096623] ttyS0|       a command-line.                                                                          *Linux lts                                                                                                                                                      
+[0000096895] ttyS1|       a command-line.                                                                          *Linux lts                                                                                                                                                      
+[0000097167] ttyS0|                                                                                                                                                                                                                                                                
+[0000097439] ttyS1|                                                                                                                                                                                                                                                                
+[0000097711] ttyS0|                                                                                                                                                                                                                                                                
+[0000097983] ttyS1|                                                                                                                                                                                                                                                                
+[0000098255] ttyS0|                                                                                                                                                                                                                                                                
+[0000098527] ttyS1|                                                                                                                                                                                                                                                                
+[0000098799] ttyS0|                                                                                                                                                                                                                                                                
+[0000099071] ttyS1|                                                                                                                                                                                                                                                                
+[0000099343] ttyS0|                                                                                                                                                                                                                                                                
+[0000099615] ttyS1|                                                                                                                                                                                                                                                                
+[0000099887] ttyS0|                                                                                                                                                                                                                                                                
+[0000100159] ttyS1|                                                                                                                                                                                                                                                                
+[0000101103] ttyS0|                                                                                                                                           The highlighted entry will be executed automatically in 1s.                                        The highlighted en
+[0000101375] ttyS1|                                                                                                                                           The highlighted entry will be executed automatically in 1s.                                        The highlighted en
+[0000101647] ttyS0| try will be executed automatically in 0s.                                       Booting `Linux lts'
+[0000101763] ttyS1| try will be executed automatically in 0s.                                       Booting `Linux lts'
+[0000101879] ttyS0| 
+[0000101896] ttyS1| 
+[0000167738] screen|   Booting `Linux lts'
+[0000186569] ttyS1| 
+[0000186586] ttyS0| 
+[0000186683] ttyS1| Welcome to Alpine Linux 3.21
+[0000186728] ttyS0| Welcome to Alpine Linux 3.21
+[0000186813] ttyS0| Kernel 6.12.81-0-lts on an x86_64 (/dev/ttyS0)
+[0000186876] ttyS0| 
+[0000186893] ttyS1| Kernel 6.12.81-0-lts on an x86_64 (/dev/ttyS1)
+[0000186956] ttyS1| 
+[0000186973] ttyS0| localhost login: 
+[0000187007] ttyS1| localhost login: 
+[0000187441] ttyS0| root
+[0000187502] ttyS0| Welcome to Alpine!
+[0000187537] ttyS0| 
+[0000187554] ttyS0| The Alpine Wiki contains a large amount of how-to guides and general
+[0000187639] ttyS0| information about administrating Alpine systems.
+[0000187704] ttyS0| See <https://wiki.alpinelinux.org/>.
+[0000187757] ttyS0| 
+[0000187774] ttyS0| You can setup the system with the command: setup-alpine
+[0000187846] ttyS0| 
+[0000187863] ttyS0| You may change this message by editing /etc/motd.
+[0000187929] ttyS0| 
+[0000187986] ttyS0| localhost:~# 
+[0000189336] ttyS0| touch /tmp/preboot-marker; echo CPUS-BEFORE-$(nproc)-UP-$(cut -d. -
+[0000189420] ttyS0| f1 /proc/uptime)
+[0000189971] ttyS0| CPUS-BEFORE-4-UP-31
+[0000190344] ttyS0| localhost:~# echo 1 > /sys/kernel/reboot/cpu && echo CPU-PINNED-$(cat /sys/kerne
+[0000190441] ttyS0| l/reboot/cpu)
+[0000190471] ttyS0| CPU-PINNED-1
+[0000190500] ttyS0| localhost:~# clear
+[0000190535] ttyS0| localhost:~# reboot
+[0000190571] ttyS0| localhost:~# 
+[0000209494] screen| localhost:~# reboot
+[0000209531] screen| localhost:~#

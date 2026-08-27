@@ -392,3 +392,27 @@ Both are commit `d74d65f`, built one at a time with `make clean` between them an
 from the media after an unmount/mount cycle. The dashboard freezes the operator saw on
 the 11:23 boot were the halt-recovery path spending 3.6s of the guest dispatch loop on
 synchronous xHCI commands; that is fixed in the same commit.
+
+## Re-staged 2026-08-27, sixth stage -- the leader-chord test
+
+Full detail in [`RUN-CARD-2026-08-27.md`](RUN-CARD-2026-08-27.md). Boot 5 is archived at
+`logs/1a-desktop-5950x-2026-08-27-boot5/`, md5-verified against the media first.
+
+**#734's keyboard passes**: back on the 2.0 hub, on a fresh slot, `reports=151 errors=0`
+and not one interrupt-IN transfer failure in the whole boot. The recycled-slot mechanism
+is still not understood -- the keep-budget is a workaround, tracked as #743.
+
+Boot 5 found the next thing instead: `chords=0`. No leader chord could ever fire from a
+USB keyboard, because the path folded right-hand Ctrl and Alt onto the left-hand
+single-byte codes while `hype_chord_feed_scancode()` only recognises the extended forms.
+Arrows were un-prefixed too, so they did nothing in hype's own line editor either. Fixed
+in `a6ad16c`; the USB path now emits real Set-1.
+
+```
+538603142ff47ec416a336c7f261ab03c650013b8daf2f5374bb2380285e2a84  \EFI\BOOT\BOOTX64.EFI = \EFI\hype\hype-default.efi
+5f68bb2fa9df4614b3f30bd7b56d4cf03bd0ff3776d68eeb94843649a8527b4a  \EFI\hype\hype-avic.efi
+```
+
+Both are commit `a6ad16c`, built one at a time with `make clean` between them and re-read
+from the media after an unmount/mount cycle. Boot 6 needs no re-cabling -- keyboard and
+mouse stay on the hub; it is a chord test.
