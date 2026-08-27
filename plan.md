@@ -417,6 +417,15 @@ distinct from any guest's own console:
   (the unknown-key-retaining write-back contract of
   `docs/hype-cfg-spec.md`, #220/#221, is what makes that lossless), so
   the runtime set and the configured set never drift.
+- **Host input devices are hot-pluggable** (decision 73, 2026-08-27). The
+  operator's keyboard and mouse are physical USB devices on hype's own
+  controllers, and unplugging one and plugging it back in must leave it
+  working — a hypervisor whose only input surface is a keyboard cannot treat
+  the keyboard as a boot-time constant. Detection is event-driven (xHCI Port
+  Status Change Events for root ports, each hub's status-change interrupt
+  endpoint for anything behind a hub) rather than a polled rescan, and the
+  same mechanism covers USB mass storage arriving and departing, which is the
+  harder half because hype boots from and logs to it (decision 28).
 - Explicitly **local-only for v1** — no serial or network exposure. This
   keeps the feature inside the existing console-ownership model instead of
   adding a network stack or serial protocol to the trusted hypervisor core.
@@ -3686,6 +3695,65 @@ isn't lost.
     failure this ticket describes is silence: an operator who asks for one VM and gets four must be
     able to read why from the log.
 
+
+73. **USB hot-plug: event-driven, covering HID and mass storage -- decided (2026-08-27).**
+    Raised by the operator during #734's hardware validation: unplugging the keyboard and
+    plugging it back in leaves hype unable to use it. Stated as a requirement, not a
+    preference.
+
+    hype has no hot-plug machinery at all today -- not incomplete, absent. Enumeration
+    runs exactly once, during the root-port scan and hub walk at boot. There is no Port
+    Status Change Event handling anywhere: the only event TRB type `core/xhci.h` names is
+    `HYPE_XHCI_TRB_TRANSFER_EVENT = 32`, and `cmd_submit_wait()` documents port-change
+    events only as noise to be skipped while waiting for a command completion. A device
+    that leaves is never torn down and a device that arrives is never seen.
+
+    **Detection is EVENT-DRIVEN: xHCI Port Status Change Events for root ports, and each
+    hub's status-change interrupt endpoint for everything behind a hub.** The alternative
+    considered, and rejected, was a polled rescan -- periodically re-reading PORTSC and
+    issuing `GET_PORT_STATUS` to every hub from the existing dispatch loop. Polling is
+    markedly simpler, reuses enumeration code that already works, and needs no new event
+    class; its cost is per-hub bus traffic on every tick forever, and a plug latency
+    bounded by the tick. Event-driven was chosen for the opposite trade: no steady-state
+    traffic, and a topology change is noticed when it happens rather than up to a tick
+    later. It is the larger change and it lands in the layer that produced #734's four
+    distinct faults, so it is to be built behind its own diagnostics from the start.
+
+    **The hub half is not optional and is the harder half.** A 2.0 hub reports downstream
+    port changes on its own status-change interrupt endpoint, which hype deliberately does
+    not configure today -- `hype_xhci_configure_hub_slot()` sets Context Entries to 1
+    (EP0) precisely because nothing needed it. The operator's keyboard is behind a 2.0
+    hub, so the case that prompted this requires that endpoint. It also makes every hub a
+    consumer of the per-endpoint interrupt-IN pool, which is `HYPE_XHCI_INT_IN_MAX = 4`
+    and was sized for two HIDs.
+
+    **Scope is HID and mass storage, and the two are not the same problem.** A keyboard
+    or mouse arriving or leaving is an enumeration question: claim it, or release it and
+    stop polling. Mass storage is a data-integrity question, because hype boots from USB
+    and writes its own log there (decision 28). An unplug mid-write must fail the
+    in-flight I/O cleanly and mark the backing device gone rather than let a FAT32 or
+    exFAT writer continue against a device that is not there; a re-plug must not silently
+    resume a half-written cluster chain. #596 is the precedent for how badly that half
+    goes wrong when it is not thought about. The log sink and `blk_phys` therefore need an
+    explicit "backing device departed" state, and that is the bulk of the work.
+
+    **Device identity on re-plug is by port and route, not by VID:PID or serial.** Two
+    identical keyboards must not be confused for one another, and a device moved to a
+    different port is a different attachment even when it is the same physical object.
+    This matches how `media_disk` already resolves (by INQUIRY serial) only because a
+    storage medium's identity genuinely is its contents; an input device's is its place in
+    the topology.
+
+    **Slot teardown is required, not incidental.** `DEVPOOL` is 8 per controller and a
+    departed device's slot is currently never freed, so without teardown a dozen
+    unplug/replug cycles exhaust enumeration itself.
+
+    **Blocked by #743.** Hot-plug recycles slot ids as its normal mode of operation, and a
+    HID on a recycled slot id currently fails every interrupt-IN transfer with cc=4 --
+    observed four times across the 2026-08-27 boots, mechanism not yet identified, worked
+    around in `fw_1_hub_visit()` with a fixed keep-budget of 3. Building hot-plug on that
+    foundation would produce a feature that works intermittently and appears to be its own
+    fault. #743 must be understood first.
 
 ## 11. Pre-M0 readiness checklist
 
