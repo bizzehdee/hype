@@ -382,7 +382,13 @@ void hype_xhci_set_tsc_hz(uint64_t hz);
  *
  * 4, like HYPE_XHCI_MSC_MAX: 2 covers the machines in hand, and each block is ~4 KiB.
  */
-#define HYPE_XHCI_INT_IN_MAX 4u
+/*
+ * #746: 12, not 4. Every HUB now owns one of these for its status-change endpoint, and the
+ * 5950X alone has five hubs across two controllers on top of a keyboard and a mouse. Sized
+ * for a hub-heavy desk rather than for the two HIDs it originally served; the cost is one
+ * page-aligned ring plus a 64-byte report each.
+ */
+#define HYPE_XHCI_INT_IN_MAX 12u
 
 /*
  * The identity of one pooled interrupt-IN endpoint. Kept separate from the DMA block it
@@ -557,6 +563,63 @@ int hype_xhci_get_device_descriptor(hype_xhci_ctrl_t *c, unsigned int slot, uint
 int hype_xhci_configure_hub_slot(hype_xhci_ctrl_t *c, unsigned int slot,
                                  const hype_xhci_devpath_t *path, unsigned int nbr_ports,
                                  unsigned int ttt);
+
+/*
+ * #746: add a HUB's status-change interrupt-IN endpoint, keeping it a hub while doing it.
+ *
+ * NOT hype_xhci_configure_int_in_endpoint(): that rebuilds the Slot Context through
+ * hype_xhci_slot_ctx(), which does not set Hub, Number of Ports or TT Think Time -- so
+ * using it on a hub would clear Hub=1 as a side effect of adding the endpoint, and every
+ * LS/FS device below it would lose its Transaction Translator. That is #737's own failure,
+ * re-created from the other direction.
+ */
+int hype_xhci_configure_hub_int_in(hype_xhci_ctrl_t *c, unsigned int slot,
+                                   const hype_xhci_devpath_t *path, unsigned int nbr_ports,
+                                   unsigned int ttt, unsigned int ep_addr, unsigned int mps,
+                                   unsigned int interval);
+
+/* #746: how many hubs the walk registered, and one's identity. */
+#define HYPE_XHCI_HUB_MAX 6u
+unsigned int hype_xhci_hub_count(void);
+int hype_xhci_hub_at(unsigned int i, unsigned int *out_ctrl, unsigned int *out_slot,
+                     unsigned int *out_nports, unsigned int *out_ep);
+
+/*
+ * #746: the next downstream port of hub `i` whose status changed, 1-based, or 0.
+ *
+ * Polls the hub's status-change endpoint (non-blocking, the same three-way contract as
+ * hype_xhci_int_in_poll) and drains one port per call, clearing that port's C_PORT_CONNECTION
+ * so the hub will report the next change. *out_connected says what is there NOW.
+ */
+int hype_xhci_hub_take_change(hype_xhci_ctrl_t *c, unsigned int i, unsigned int *out_port,
+                              int *out_connected);
+
+/* #746: hub status-endpoint poll counters -- "hype is not polling" and "the hub is not
+ * reporting" are different faults and look identical without them. */
+void hype_xhci_hub_poll_stats(unsigned long long *polls, unsigned long long *reports,
+                              unsigned long long *errs);
+
+/* #746: forget every hub registered on this controller (it is being torn down). */
+void hype_xhci_hub_forget_ctrl(unsigned int ctrl);
+
+/*
+ * #746: the route string a device on `port` of this hub would have. No bus traffic --
+ * used to identify which claimed device just left, where its slot is already meaningless.
+ */
+int hype_xhci_hub_child_route(hype_xhci_ctrl_t *c, unsigned int hub_slot, unsigned int port,
+                              unsigned int *out_route);
+
+/* #746: the root port this hub hangs off, which the inventory keys on alongside the route. */
+int hype_xhci_hub_root_port(hype_xhci_ctrl_t *c, unsigned int hub_slot, unsigned int *out_port);
+
+/*
+ * #746: reset a hub's downstream port and build the topology a device there needs --
+ * route, speed and, for a LS/FS device under a HS hub, the Transaction Translator (#218).
+ * Does bus traffic. 0 on success.
+ */
+int hype_xhci_hub_child_path(hype_xhci_ctrl_t *c, unsigned int hub_slot, unsigned int port,
+                             hype_xhci_devpath_t *out_hub, hype_xhci_devpath_t *out_child,
+                             unsigned int *out_speed);
 
 /*
  * Reads the full configuration descriptor (config + interface + endpoint

@@ -974,6 +974,328 @@ int hype_xhci_configure_hub_slot(hype_xhci_ctrl_t *c, unsigned int slot,
 }
 
 /*
+ * #746: the hubs this walk registered, so their status-change endpoints can be polled.
+ *
+ * A hub's downstream ports do NOT raise xHCI Port Status Change Events -- those are root
+ * ports only. The hub reports its own port changes on an interrupt-IN endpoint that hype
+ * never configured, because until hot-plug nothing needed it (hype_xhci_configure_hub_slot()
+ * still sets Context Entries to 1 for exactly that reason). Without this, #744 and #745
+ * cover root ports and miss the operator's actual topology, where the keyboard is behind a
+ * 2.0 hub.
+ */
+/* Defined with the rest of the hub descent further down; declared here because the
+ * status-change poller above it is the first user. */
+#define HUB_FEAT_PORT_RESET        4u
+#define HUB_FEAT_PORT_POWER        8u
+#define HUB_FEAT_C_PORT_CONNECTION 16u
+#define HUB_FEAT_C_PORT_RESET      20u
+static int hub_set_port_feature(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int feat,
+                                unsigned int port);
+static int hub_clear_port_feature(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int feat,
+                                  unsigned int port);
+static int hub_get_port_status(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int port,
+                               uint8_t st[4]);
+static unsigned int hub_port_speed(const uint8_t st[4]);
+
+typedef struct {
+    unsigned int used;
+    unsigned int ctrl;      /* c->hw_slot */
+    unsigned int slot;
+    unsigned int nports;
+    unsigned int ep;        /* the status-change endpoint address, 0 if it could not be set up */
+    unsigned int bitmap_len;
+    /* #746: what a child arriving here needs. Kept at walk time because recomputing it
+     * later would mean re-walking the topology to find this hub's own route and TT. */
+    hype_xhci_devpath_t path;
+    unsigned int tier;
+    int ss;                 /* a SuperSpeed hub: its downstream ports are all SS */
+} xhci_hub_reg_t;
+
+static xhci_hub_reg_t g_hubs[HYPE_XHCI_HUB_MAX];
+/* #746: how often the hub status endpoints were polled, and what came back. Without this,
+ * "hype is not polling" and "the hub is not reporting" look identical from the log. */
+static unsigned long long g_hub_polls, g_hub_reports, g_hub_errs;
+
+void hype_xhci_hub_poll_stats(unsigned long long *polls, unsigned long long *reports,
+                              unsigned long long *errs) {
+    if (polls) *polls = g_hub_polls;
+    if (reports) *reports = g_hub_reports;
+    if (errs) *errs = g_hub_errs;
+}
+
+int hype_xhci_configure_hub_int_in(hype_xhci_ctrl_t *c, unsigned int slot,
+                                   const hype_xhci_devpath_t *path, unsigned int nbr_ports,
+                                   unsigned int ttt, unsigned int ep_addr, unsigned int mps,
+                                   unsigned int interval) {
+    xhci_hw_t *hw = HW(c);
+    unsigned int cs = c->ctx_size;
+    unsigned int dci = hype_xhci_ep_dci(ep_addr);
+    xhci_int_in_hw_t *iin;
+    uint32_t ctx[8], cmd[4], evt[4];
+
+    if (!c->inited || slot == 0u || path == (const hype_xhci_devpath_t *)0) return -1;
+    iin = iin_hw_for(c, slot, dci, 1);
+    if (iin == (xhci_int_in_hw_t *)0) {
+        hype_debug_print("host-xhci: no interrupt-IN block free for hub slot=%u ep=0x%02x "
+                         "(pool of %u) -- that hub's ports cannot hot-plug [#746]\n",
+                         slot, ep_addr, (unsigned)HYPE_XHCI_INT_IN_MAX);
+        return -1;
+    }
+    /* A hub's status-change endpoint is one bit per port plus one for the hub, so its
+     * mps is tiny -- but honour whatever the descriptor said, clamped to the block. */
+    if (mps == 0u) mps = 1u;
+    if (mps > sizeof(iin->report)) mps = (unsigned int)sizeof(iin->report);
+
+    zero(iin->ring, XPAGE);
+    ring_init_link(iin->ring);
+    iin->enq = 0; iin->cyc = 1; iin->armed = 0; iin->pending_trb = 0;
+    iin->mps = mps; iin->recoveries = 0; iin->backoff = 0;
+
+    zero(hw->input_ctx, XPAGE);
+    hype_xhci_input_ctrl_ctx(ctx, HYPE_XHCI_ADD_SLOT | (1u << dci), 0);
+    write_ctx(hw->input_ctx, 0, ctx);
+    hype_xhci_slot_ctx(ctx, path->route, path->speed, dci, path->root_port,
+                       path->tt_hub_slot, path->tt_port);
+    /* THE POINT OF THIS FUNCTION: still a hub afterwards. */
+    hype_xhci_slot_ctx_set_hub(ctx, nbr_ports, ttt, 0u);
+    write_ctx(hw->input_ctx, cs, ctx);
+    hype_xhci_ep_ctx_interval(ctx, HYPE_XHCI_EP_TYPE_INT_IN, mps, phys(iin->ring), 1,
+                              hype_xhci_interval_encode(path->speed, interval));
+    write_ctx(hw->input_ctx, (1u + dci) * cs, ctx);
+
+    hype_xhci_trb_configure_endpoint(cmd, phys(hw->input_ctx), slot, (int)hw->cmd_cyc);
+    if (cmd_submit_wait(c, cmd, evt) != 0) return -1;
+    if (hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS) return -1;
+    dump_out_ctx(c, slot, dci, "hub-status");
+    return 0;
+}
+
+static void hub_register(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int nports,
+                         unsigned int ep, unsigned int bitmap_len,
+                         const hype_xhci_devpath_t *path, unsigned int tier, int ss) {
+    unsigned int i;
+
+    for (i = 0; i < HYPE_XHCI_HUB_MAX; i++) {
+        if (g_hubs[i].used && g_hubs[i].ctrl == c->hw_slot && g_hubs[i].slot == slot) {
+            break; /* re-walked: update in place rather than duplicating */
+        }
+    }
+    if (i == HYPE_XHCI_HUB_MAX) {
+        for (i = 0; i < HYPE_XHCI_HUB_MAX; i++) {
+            if (!g_hubs[i].used) break;
+        }
+    }
+    if (i == HYPE_XHCI_HUB_MAX) {
+        hype_debug_print("host-xhci: hub slot %u not registered -- only %u hubs fit; its ports "
+                         "cannot hot-plug [#746]\n", slot, (unsigned)HYPE_XHCI_HUB_MAX);
+        return;
+    }
+    g_hubs[i].used = 1u;
+    g_hubs[i].ctrl = c->hw_slot;
+    g_hubs[i].slot = slot;
+    g_hubs[i].nports = nports;
+    g_hubs[i].ep = ep;
+    g_hubs[i].bitmap_len = bitmap_len;
+    g_hubs[i].path = *path;
+    g_hubs[i].tier = tier;
+    g_hubs[i].ss = ss;
+}
+
+static int hub_reg_find(unsigned int ctrl, unsigned int slot) {
+    unsigned int i;
+    for (i = 0; i < HYPE_XHCI_HUB_MAX; i++) {
+        if (g_hubs[i].used && g_hubs[i].ctrl == ctrl && g_hubs[i].slot == slot) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+int hype_xhci_hub_child_route(hype_xhci_ctrl_t *c, unsigned int hub_slot, unsigned int port,
+                              unsigned int *out_route) {
+    int i;
+    if (c == (hype_xhci_ctrl_t *)0 || out_route == (unsigned int *)0) return -1;
+    i = hub_reg_find(c->hw_slot, hub_slot);
+    if (i < 0) return -1;
+    *out_route = hype_xhci_route_append(g_hubs[i].path.route, g_hubs[i].tier, port);
+    return 0;
+}
+
+int hype_xhci_hub_root_port(hype_xhci_ctrl_t *c, unsigned int hub_slot, unsigned int *out_port) {
+    int i;
+    if (c == (hype_xhci_ctrl_t *)0 || out_port == (unsigned int *)0) return -1;
+    i = hub_reg_find(c->hw_slot, hub_slot);
+    if (i < 0) return -1;
+    *out_port = g_hubs[i].path.root_port;
+    return 0;
+}
+
+int hype_xhci_hub_child_path(hype_xhci_ctrl_t *c, unsigned int hub_slot, unsigned int port,
+                             hype_xhci_devpath_t *out_hub, hype_xhci_devpath_t *out_child,
+                             unsigned int *out_speed) {
+    uint8_t st[4];
+    unsigned int guard, child_speed;
+    int i;
+
+    if (c == (hype_xhci_ctrl_t *)0 || out_child == (hype_xhci_devpath_t *)0) return -1;
+    i = hub_reg_find(c->hw_slot, hub_slot);
+    if (i < 0) return -1;
+
+    /*
+     * Reset the port and wait for the reset-complete change bit, exactly as the walk does.
+     * A device that has just been plugged in is not addressable until its port is reset --
+     * this is not optional tidiness, it is the bus protocol.
+     */
+    hub_set_port_feature(c, hub_slot, HUB_FEAT_PORT_POWER, port);
+    /*
+     * #746: CONNECT DEBOUNCE. USB 2.0 7.1.7.3 requires 100ms between a connect being
+     * detected and the port being reset, for the electrical connection to settle.
+     *
+     * The boot walk never needed it -- by the time it runs, everything plugged in has been
+     * attached for seconds. A device plugged in at runtime is reset within one 8ms input
+     * tick of arriving, and without this the reset lands on a port that has not settled:
+     * PORT_ENABLE comes back clear and hype decides nothing arrived.
+     */
+    delay_ms(100);
+    if (hub_get_port_status(c, hub_slot, port, st) != 0) return -1;
+    if (!(st[0] & 0x01u)) {
+        hype_debug_print("host-xhci: hub slot %u port %u -- gone again before the reset "
+                         "(status 0x%02x%02x) [#746]\n", hub_slot, port,
+                         (unsigned)st[1], (unsigned)st[0]);
+        return -1;
+    }
+    if (hub_set_port_feature(c, hub_slot, HUB_FEAT_PORT_RESET, port) != 0) return -1;
+    for (guard = 0; guard < 20u; guard++) {
+        short_delay();
+        if (hub_get_port_status(c, hub_slot, port, st) != 0) break;
+        if (st[2] & 0x10u) break; /* C_PORT_RESET */
+    }
+    hub_clear_port_feature(c, hub_slot, HUB_FEAT_C_PORT_RESET, port);
+    hub_clear_port_feature(c, hub_slot, HUB_FEAT_C_PORT_CONNECTION, port);
+    if (hub_get_port_status(c, hub_slot, port, st) != 0) return -1;
+    if (!(st[0] & 0x02u)) {
+        hype_debug_print("host-xhci: hub slot %u port %u -- reset did not enable the port "
+                         "(status 0x%02x%02x) [#746]\n", hub_slot, port,
+                         (unsigned)st[1], (unsigned)st[0]);
+        return -1;
+    }
+    delay_ms(15); /* USB reset recovery before Address Device */
+
+    /* #739: everything on a SuperSpeed hub's downstream ports is SuperSpeed; its 2.0 half
+     * is a separate xHCI device, so reading the 2.0 speed bits here would call it full. */
+    child_speed = g_hubs[i].ss ? HYPE_USB_SPEED_SUPER : hub_port_speed(st);
+
+    out_child->root_port = g_hubs[i].path.root_port;
+    out_child->route = hype_xhci_route_append(g_hubs[i].path.route, g_hubs[i].tier, port);
+    out_child->speed = child_speed;
+    /* #218: the same TT selection the walk makes -- a LS/FS child of a HS hub is reached
+     * through THAT hub's translator, and one under an already-translated hub inherits it. */
+    if (hype_xhci_tt_required(g_hubs[i].path.speed, child_speed)) {
+        out_child->tt_hub_slot = hub_slot;
+        out_child->tt_port = port;
+    } else if ((child_speed == HYPE_USB_SPEED_LOW || child_speed == HYPE_USB_SPEED_FULL) &&
+               g_hubs[i].path.tt_hub_slot) {
+        out_child->tt_hub_slot = g_hubs[i].path.tt_hub_slot;
+        out_child->tt_port = g_hubs[i].path.tt_port;
+    } else {
+        out_child->tt_hub_slot = 0u;
+        out_child->tt_port = 0u;
+    }
+    if (out_hub) *out_hub = g_hubs[i].path;
+    if (out_speed) *out_speed = child_speed;
+    return 0;
+}
+
+unsigned int hype_xhci_hub_count(void) {
+    unsigned int i, n = 0;
+    for (i = 0; i < HYPE_XHCI_HUB_MAX; i++) {
+        if (g_hubs[i].used) n++;
+    }
+    return n;
+}
+
+int hype_xhci_hub_at(unsigned int i, unsigned int *out_ctrl, unsigned int *out_slot,
+                     unsigned int *out_nports, unsigned int *out_ep) {
+    if (i >= HYPE_XHCI_HUB_MAX || !g_hubs[i].used) {
+        return -1;
+    }
+    if (out_ctrl) *out_ctrl = g_hubs[i].ctrl;
+    if (out_slot) *out_slot = g_hubs[i].slot;
+    if (out_nports) *out_nports = g_hubs[i].nports;
+    if (out_ep) *out_ep = g_hubs[i].ep;
+    return 0;
+}
+
+void hype_xhci_hub_forget_ctrl(unsigned int ctrl) {
+    unsigned int i;
+    for (i = 0; i < HYPE_XHCI_HUB_MAX; i++) {
+        if (g_hubs[i].used && g_hubs[i].ctrl == ctrl) {
+            g_hubs[i].used = 0u;
+        }
+    }
+}
+
+int hype_xhci_hub_take_change(hype_xhci_ctrl_t *c, unsigned int i, unsigned int *out_port,
+                              int *out_connected) {
+    uint8_t bitmap[8];
+    uint8_t st[4];
+    unsigned int port;
+    unsigned int len;
+    int r;
+
+    if (c == (hype_xhci_ctrl_t *)0 || out_port == (unsigned int *)0 ||
+        out_connected == (int *)0 || i >= HYPE_XHCI_HUB_MAX || !g_hubs[i].used ||
+        g_hubs[i].ctrl != c->hw_slot || g_hubs[i].ep == 0u) {
+        return -1;
+    }
+    *out_port = 0;
+    *out_connected = 0;
+    len = g_hubs[i].bitmap_len;
+    if (len == 0u || len > sizeof(bitmap)) len = 1u;
+
+    g_hub_polls++;
+    r = hype_xhci_int_in_poll(c, g_hubs[i].slot, g_hubs[i].ep, bitmap, len);
+    if (r < 0) g_hub_errs++;
+    if (r <= 0) {
+        return r; /* 0 = nothing changed, the normal case; -1 = a transfer error */
+    }
+    g_hub_reports++;
+    {
+        /* The raw bitmap, the first few times. A hub that reports a change hype then fails
+         * to act on, and a hub that reports nothing at all, look identical without it --
+         * which is exactly where the first version of this went wrong. */
+        static unsigned int bm_reported = 0;
+        if (bm_reported++ < 8u) {
+            hype_debug_print("host-xhci: hub slot %u status bitmap 0x%02x (nports=%u) [#746]\n",
+                             g_hubs[i].slot, (unsigned)bitmap[0], g_hubs[i].nports);
+        }
+    }
+    /*
+     * The hub's status-change bitmap: bit 0 is the hub itself, bit N is downstream port N
+     * (USB 2.0 11.12.4). One port per call -- the endpoint re-arms on the next poll and
+     * the hub re-reports anything still outstanding, so draining the rest costs 8ms and
+     * keeps this bounded, which matters because it runs from the guest dispatch loop.
+     */
+    for (port = 1u; port <= g_hubs[i].nports && port < len * 8u; port++) {
+        if (!(bitmap[port >> 3] & (1u << (port & 7u)))) {
+            continue;
+        }
+        if (hub_get_port_status(c, g_hubs[i].slot, port, st) != 0) {
+            return -1;
+        }
+        /*
+         * Clear C_PORT_CONNECTION, or the hub keeps reporting this port forever and the
+         * poll never returns to idle -- the hub twin of #744's PORTSC write-1-to-clear.
+         */
+        (void)hub_clear_port_feature(c, g_hubs[i].slot, HUB_FEAT_C_PORT_CONNECTION, port);
+        *out_port = port;
+        *out_connected = (st[0] & 0x01u) ? 1 : 0;
+        return 1;
+    }
+    return 0;
+}
+
+/*
  * Poll for one HID report. Returns 1 when a report was copied out, 0 when none has
  * arrived yet, -1 on a transfer error.
  *
@@ -1875,6 +2197,7 @@ int hype_xhci_host_init(uint64_t bar_phys, hype_xhci_ctrl_t *out) {
         }
         /* #734: release this controller's interrupt-IN endpoint blocks with it. */
         hype_xhci_int_in_release_ctrl(g_iin_key, HYPE_XHCI_INT_IN_MAX, out->hw_slot);
+        hype_xhci_hub_forget_ctrl(out->hw_slot); /* #746: and its hubs */
         /* #387: release this controller's claimed-MSC blocks with it. */
         {
             unsigned int mi;
@@ -2097,10 +2420,8 @@ unsigned int hype_xhci_detect_device(hype_xhci_ctrl_t *c, unsigned int *out_spee
 /* --- USB hub class requests (bmRequestType per USB 2.0 §11.24) --- */
 
 /* Hub-class feature selectors (USB 2.0 Table 11-17). */
-#define HUB_FEAT_PORT_RESET        4u
-#define HUB_FEAT_PORT_POWER        8u
-#define HUB_FEAT_C_PORT_CONNECTION 16u
-#define HUB_FEAT_C_PORT_RESET      20u
+/* HUB_FEAT_* and the hub control-transfer helpers are declared up beside the #746
+ * status-change poller, which is their first user. */
 
 static int hub_get_descriptor(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int desc_type,
                               uint8_t *buf, unsigned int len) {
@@ -2188,6 +2509,39 @@ int hype_xhci_hub_walk(hype_xhci_ctrl_t *c, unsigned int hub_slot,
         hype_debug_print("host-xhci:   hub slot %u Configure Endpoint (Hub=1 ports=%u ttt=%u) "
                          "FAILED -- LS/FS devices below it may not report [#737]\n",
                          hub_slot, nports, ttt);
+    }
+    /*
+     * #746: and its STATUS-CHANGE endpoint, so this hub's downstream ports can hot-plug.
+     *
+     * A hub's port changes are not xHCI Port Status Change Events -- those are root ports
+     * only. The hub reports them here, on the one interrupt-IN endpoint every hub has, and
+     * hype never configured it because until hot-plug nothing needed it.
+     *
+     * The bitmap is one bit per port plus one for the hub itself, so ceil((nports+1)/8)
+     * bytes; a hub's descriptor mps says the same thing and is used when it is sane. The
+     * endpoint address is fixed at 0x81 for every hub in the spec's own device class.
+     *
+     * A failure is NOT fatal and does not stop the descent: a hub whose status endpoint
+     * could not be configured still routes traffic perfectly, it just cannot tell hype
+     * when something is plugged into it. Registered with ep 0 in that case, so the poller
+     * skips it and the log says which hub is deaf.
+     */
+    {
+        unsigned int bmlen = ((nports + 1u) + 7u) / 8u;
+        unsigned int hub_ep = 0x81u;
+        if (bmlen == 0u) bmlen = 1u;
+        if (hype_xhci_configure_hub_int_in(c, hub_slot, hub_path, nports, ttt, hub_ep,
+                                           bmlen, ss_hub ? 8u : 12u) == 0) {
+            hub_register(c, hub_slot, nports, hub_ep, bmlen, hub_path, tier, ss_hub);
+            hype_debug_print("host-xhci:   hub slot %u status-change endpoint 0x%02x armed "
+                             "(%u byte bitmap) -- its ports can hot-plug [#746]\n",
+                             hub_slot, hub_ep, bmlen);
+        } else {
+            hub_register(c, hub_slot, nports, 0u, bmlen, hub_path, tier, ss_hub);
+            hype_debug_print("host-xhci:   hub slot %u status-change endpoint could NOT be "
+                             "configured -- traffic through it is unaffected, but hype will "
+                             "not see anything plugged into it [#746]\n", hub_slot);
+        }
     }
 
     for (port = 1u; port <= nports; port++) {
@@ -2300,6 +2654,36 @@ int hype_xhci_hub_walk(hype_xhci_ctrl_t *c, unsigned int hub_slot,
             }
             if (verdict == HYPE_XHCI_VISIT_RELEASE) {
                 hype_xhci_disable_slot(c, child_slot);
+            }
+        }
+    }
+    /*
+     * #746: throw away the hub's FIRST status report.
+     *
+     * The status-change endpoint was armed before the port loop, so the hub's first report
+     * describes the state as it was BEFORE the descent -- every populated port reads as
+     * "changed", because nothing had cleared C_PORT_CONNECTION yet. Measured in QEMU as
+     * `hub slot 2 status bitmap 0x14` a second into the boot: ports 2 and 4, the keyboard
+     * and the mouse, both of which the walk had just enumerated.
+     *
+     * Left in place that report makes the hot-plug poller re-enumerate devices that never
+     * went anywhere -- and re-enumeration RESETS the port, so it would knock out a working
+     * keyboard moments after claiming it. The loop above has now cleared every port's
+     * change bits, so one drain leaves the endpoint reporting only what happens next.
+     */
+    {
+        int hi2 = hub_reg_find(c->hw_slot, hub_slot);
+        if (hi2 >= 0 && g_hubs[hi2].ep != 0u) {
+            uint8_t discard[8];
+            unsigned int dl = g_hubs[hi2].bitmap_len;
+            unsigned int tries;
+            if (dl == 0u || dl > sizeof(discard)) dl = 1u;
+            for (tries = 0; tries < 8u; tries++) {
+                if (hype_xhci_int_in_poll(c, hub_slot, g_hubs[hi2].ep, discard, dl) != 1) {
+                    break;
+                }
+                hype_debug_print("host-xhci:   hub slot %u pre-walk status 0x%02x discarded "
+                                 "[#746]\n", hub_slot, (unsigned)discard[0]);
             }
         }
     }

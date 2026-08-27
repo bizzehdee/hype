@@ -16159,6 +16159,15 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                          "(merged from %u keyboard(s)) [#217]\n",
                                          g_hostkbd_scancodes, g_hostkbd_chords, g_hid_count);
                     }
+                    {
+                        unsigned long long hp = 0, hr = 0, he = 0;
+                        hype_xhci_hub_poll_stats(&hp, &hr, &he);
+                        if (hype_xhci_hub_count() != 0u || hp != 0ull) {
+                            hype_debug_print("fw-1 DIAG: HUBPOLL hubs=%u polls=%llu reports=%llu "
+                                             "errors=%llu [#746]\n",
+                                             hype_xhci_hub_count(), hp, hr, he);
+                        }
+                    }
                     if (g_hid_skipped != 0u) {
                         hype_debug_print("fw-1 DIAG: %u further boot keyboard(s) were NOT claimed "
                                          "-- hype polls at most %u [#742]\n",
@@ -24341,6 +24350,147 @@ static int fw_1_usb_enumerate_arrival(hype_xhci_ctrl_t *xc, unsigned int ctrl_id
     return 1;
 }
 
+/*
+ * #746: a device has appeared on a downstream port of a hub. Enumerate it there.
+ *
+ * The root-port twin above cannot serve: a device behind a hub needs the hub's route
+ * string extended by its port, and -- when it is LS/FS behind a HS hub -- the hub named as
+ * its Transaction Translator. #218 is the ticket for what happens when that TT is left at
+ * zero: the device addresses fine, its endpoint configures fine, and it never reports.
+ */
+static int fw_1_usb_enumerate_behind_hub(hype_xhci_ctrl_t *xc, unsigned int ctrl_idx,
+                                         unsigned int hub_slot, unsigned int port) {
+    static uint8_t cfgbuf[512];
+    uint8_t desc[18];
+    hype_xhci_devpath_t hpath, cp;
+    unsigned int slot = 0, cfglen = 0, child_speed = 0;
+
+    /*
+     * #746: is something ALREADY enumerated here? A hub can report a change for a port
+     * whose device never went anywhere -- a stale pre-walk report, or a change bit set for
+     * some reason other than connect. Re-enumerating resets the port, which would knock
+     * out a working device, so "already known and still slotted" means do nothing.
+     */
+    {
+        unsigned int known_route = 0;
+        if (hype_xhci_hub_child_route(xc, hub_slot, port, &known_route) == 0) {
+            int ki = hype_usb_inventory_find(&g_usb_inv, ctrl_idx, 0u, known_route);
+            if (ki < 0) {
+                /* The inventory keys on the ROOT port too; find it via the hub's own. */
+                unsigned int rp = 0;
+                if (hype_xhci_hub_root_port(xc, hub_slot, &rp) == 0) {
+                    ki = hype_usb_inventory_find(&g_usb_inv, ctrl_idx, rp, known_route);
+                }
+            }
+            if (ki >= 0 && g_usb_inv.dev[ki].slot != 0u) {
+                hype_debug_print("host-usb: hub slot %u port %u already holds slot%u -- not an "
+                                 "arrival, leaving it alone [#746]\n",
+                                 hub_slot, port, g_usb_inv.dev[ki].slot);
+                return 0; /* did no work: another port may still be enumerated this tick */
+            }
+        }
+    }
+    if (hype_xhci_hub_child_path(xc, hub_slot, port, &hpath, &cp, &child_speed) != 0) {
+        hype_debug_print("host-usb: hub slot %u port %u -- could not work out the child's "
+                         "topology, not enumerating [#746]\n", hub_slot, port);
+        return 1;
+    }
+    if (hype_xhci_enable_slot(xc, &slot) != 0 || slot == 0u) {
+        hype_debug_print("host-usb: hub slot %u port %u Enable Slot FAILED on arrival [#746]\n",
+                         hub_slot, port);
+        return 1;
+    }
+    if (hype_xhci_address_device(xc, slot, &cp) != 0) {
+        hype_debug_print("host-usb: hub slot %u port %u Address Device FAILED (route 0x%05x "
+                         "tt_hub=%u tt_port=%u) [#746]\n", hub_slot, port, cp.route,
+                         cp.tt_hub_slot, cp.tt_port);
+        (void)hype_xhci_release_device(xc, slot);
+        return 1;
+    }
+    if (hype_xhci_get_device_descriptor(xc, slot, desc) != 0) {
+        hype_debug_print("host-usb: hub slot %u port %u GET_DESCRIPTOR FAILED [#746]\n",
+                         hub_slot, port);
+        (void)hype_xhci_release_device(xc, slot);
+        return 1;
+    }
+    (void)hype_xhci_get_config_descriptor(xc, slot, cfgbuf, sizeof(cfgbuf), &cfglen);
+    (void)fw_1_usb_record(&g_usb_inv, ctrl_idx, &cp, slot, desc, cfgbuf, cfglen);
+    hype_debug_print("host-usb: hub slot %u port %u ARRIVED -- %04x:%04x slot%u speed%u "
+                     "route=0x%05x tt_hub=%u, enumerated and in the inventory [#746]\n",
+                     hub_slot, port, (unsigned)(desc[8] | (desc[9] << 8)),
+                     (unsigned)(desc[10] | (desc[11] << 8)), slot, child_speed, cp.route,
+                     cp.tt_hub_slot);
+    fw_1_claim_boot_hid(xc, HYPE_USB_PROTO_KEYBOARD, "keyboard", g_hid, &g_hid_count,
+                        HYPE_HOST_KBD_MAX, &g_hid_skipped);
+    if (!g_mouse_ready) {
+        static hype_host_kbd_t mouse_arrival2;
+        unsigned int mcount = 0, mskip = 0;
+        fw_1_claim_boot_hid(xc, HYPE_USB_PROTO_MOUSE, "mouse", &mouse_arrival2, &mcount, 1u,
+                            &mskip);
+        if (mcount != 0u) {
+            g_mouse_xc = mouse_arrival2.xc;
+            g_mouse_slot = mouse_arrival2.slot;
+            g_mouse_ep = mouse_arrival2.ep;
+            g_mouse_mps = mouse_arrival2.mps;
+            g_mouse_root_port = mouse_arrival2.root_port;
+            g_mouse_ready = 1;
+        }
+    }
+    return 1;
+}
+
+/* #746: release every claimed HID whose route says it sits behind `hub_slot` on `port`. */
+static void fw_1_usb_release_behind_hub(hype_xhci_ctrl_t *xc, unsigned int hub_slot,
+                                        unsigned int port) {
+    unsigned int j;
+    unsigned int route_bits = 0;
+
+    if (hype_xhci_hub_child_route(xc, hub_slot, port, &route_bits) != 0) {
+        return;
+    }
+    for (j = 0; j < g_hid_count && j < HYPE_HOST_KBD_MAX; j++) {
+        if (g_hid[j].xc.bar != xc->bar || g_hid[j].route != route_bits) {
+            continue;
+        }
+        hype_debug_print("host-hid: keyboard %04x:%04x behind hub slot %u port %u (route "
+                         "0x%05x) DEPARTED -- releasing its endpoint and slot [#746]\n",
+                         (unsigned)g_hid[j].vid, (unsigned)g_hid[j].pid, hub_slot, port,
+                         route_bits);
+        (void)hype_xhci_release_device(xc, g_hid[j].slot);
+        (void)hype_usb_inventory_note_departed(&g_usb_inv, g_hid[j].ctrl_idx,
+                                               g_hid[j].root_port, g_hid[j].route);
+        {
+            unsigned int m;
+            for (m = j; m + 1u < g_hid_count; m++) {
+                hype_host_kbd_t *dst = &g_hid[m];
+                const hype_host_kbd_t *src = &g_hid[m + 1u];
+                unsigned int z;
+                dst->xc = src->xc;
+                dst->slot = src->slot; dst->ep = src->ep; dst->mps = src->mps;
+                dst->root_port = src->root_port;
+                dst->ctrl_idx = src->ctrl_idx; dst->route = src->route;
+                dst->vid = src->vid; dst->pid = src->pid;
+                for (z = 0; z < HYPE_USB_HID_REPORT_LEN; z++) dst->prev[z] = src->prev[z];
+                dst->have_prev = src->have_prev;
+                dst->polls = src->polls; dst->reports = src->reports;
+                dst->errs = src->errs; dst->mods_seen = src->mods_seen;
+            }
+            g_hid_count--;
+            j--;
+        }
+    }
+    if (g_mouse_ready && g_mouse_xc.bar == xc->bar) {
+        int mi = hype_usb_inventory_find(&g_usb_inv, 0u, g_mouse_root_port, route_bits);
+        if (mi >= 0 && g_usb_inv.dev[mi].slot == g_mouse_slot) {
+            hype_debug_print("host-hid: mouse behind hub slot %u port %u DEPARTED -- releasing "
+                             "its endpoint and slot [#746]\n", hub_slot, port);
+            (void)hype_xhci_release_device(xc, g_mouse_slot);
+            g_mouse_ready = 0;
+            g_mouse_slot = 0;
+        }
+    }
+}
+
 static void fw_1_usb_hotplug_poll(void) {
     unsigned int k;
     /*
@@ -24420,6 +24570,36 @@ static void fw_1_usb_hotplug_poll(void) {
                 (void)hype_xhci_release_device(xc, g_mouse_slot);
                 g_mouse_ready = 0;
                 g_mouse_slot = 0;
+            }
+        }
+
+        /*
+         * #746: and this controller's HUBS, whose downstream ports raise nothing on the
+         * event ring. One port per hub per tick, for the same reason arrival is bounded:
+         * this is the guest dispatch loop and the hub poll is a control transfer.
+         */
+        {
+            unsigned int h;
+            for (h = 0; h < HYPE_XHCI_HUB_MAX; h++) {
+                unsigned int hctrl = 0, hslot = 0, hport = 0;
+                int hconn = 0;
+
+                if (hype_xhci_hub_at(h, &hctrl, &hslot, 0, 0) != 0 || hctrl != xc->hw_slot) {
+                    continue;
+                }
+                if (hype_xhci_hub_take_change(xc, h, &hport, &hconn) != 1 || hport == 0u) {
+                    continue;
+                }
+                hype_debug_print("host-usb: hub slot %u port %u changed -- %s [#746]\n",
+                                 hslot, hport, hconn ? "something is attached" : "now empty");
+                if (hconn) {
+                    if (!enumerated) {
+                        enumerated = fw_1_usb_enumerate_behind_hub(xc, g_live_xc_idx[k],
+                                                                   hslot, hport);
+                    }
+                } else {
+                    fw_1_usb_release_behind_hub(xc, hslot, hport);
+                }
             }
         }
     }
