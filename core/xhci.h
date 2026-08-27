@@ -358,6 +358,49 @@ void hype_xhci_set_tsc_hz(uint64_t hz);
  * device, and a block with no media slot to land in would be claimed for nothing. */
 #define HYPE_XHCI_MSC_MAX 4u
 
+/*
+ * #734: interrupt-IN endpoints hype polls for ITSELF -- a keyboard (#217) and a mouse
+ * (#219) today. Each needs its own transfer ring, report buffer and "is a transfer
+ * outstanding" flag.
+ *
+ * One shared set per controller is what this was until #734, and it made two HIDs
+ * mutually exclusive on the operator's 5950X, where keyboard and mouse are both on
+ * controller 2: whichever polled first armed the single flag, and because an idle input
+ * device never completes a transfer, the flag never cleared -- so the other endpoint's
+ * doorbell was never rung again and its reports=0 forever. Both endpoint contexts also
+ * named the SAME TR Dequeue Pointer and the same report buffer, so a completion could
+ * have been parsed as the other device's report.
+ *
+ * 4, like HYPE_XHCI_MSC_MAX: 2 covers the machines in hand, and each block is ~4 KiB.
+ */
+#define HYPE_XHCI_INT_IN_MAX 4u
+
+/*
+ * The identity of one pooled interrupt-IN endpoint. Kept separate from the DMA block it
+ * indexes so the pool arithmetic is a pure function that can be unit-tested -- the DMA
+ * blocks themselves live in xhci_hw.c, which no host test can touch.
+ */
+typedef struct {
+    int used;
+    unsigned int ctrl; /* hw_slot of the owning controller */
+    unsigned int slot;
+    unsigned int dci;
+} hype_xhci_int_in_key_t;
+
+/*
+ * Index of the pool entry for (ctrl, slot, dci), or -1.
+ *
+ * alloc = 0 looks up an existing entry only (a poll for an endpoint that was never
+ * configured must fail, not silently seize a free block). alloc = 1 claims a free entry
+ * on first sight, and returns -1 when the pool is full.
+ */
+int hype_xhci_int_in_index(hype_xhci_int_in_key_t *keys, unsigned int n, unsigned int ctrl,
+                           unsigned int slot, unsigned int dci, int alloc);
+
+/* Release every pool entry belonging to one controller (its block is being re-claimed). */
+void hype_xhci_int_in_release_ctrl(hype_xhci_int_in_key_t *keys, unsigned int n,
+                                   unsigned int ctrl);
+
 typedef struct {
     uint64_t bar;            /* xHCI MMIO BAR0 (identity-mapped) */
     uint32_t op;             /* operational-register base offset (= CAPLENGTH) */

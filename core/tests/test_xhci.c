@@ -3,6 +3,15 @@
 
 static int failures = 0;
 
+#define CHECK_INT(desc, expected, actual) \
+    do { \
+        long long _e = (long long)(expected), _a = (long long)(actual); \
+        if (_e != _a) { \
+            printf("FAIL: %s: expected %lld, got %lld\n", (desc), _e, _a); \
+            failures++; \
+        } \
+    } while (0)
+
 #define CHECK_HEX(desc, expected, actual) \
     do { \
         if ((unsigned long long)(expected) != (unsigned long long)(actual)) { \
@@ -904,6 +913,61 @@ static void test_string_desc_ascii(void) {
     }
 }
 
+/*
+ * #734: the interrupt-IN endpoint pool. The bug this replaces is the reason for every
+ * assertion here: one shared block per controller meant a keyboard and a mouse on the
+ * same controller shared one "transfer outstanding" flag, and an idle input device holds
+ * that flag forever -- so the other endpoint's doorbell was never rung again.
+ */
+static void test_int_in_pool(void) {
+    hype_xhci_int_in_key_t keys[3];
+    int kbd, mouse, i;
+
+    for (i = 0; i < 3; i++) keys[i].used = 0;
+
+    /* Two endpoints on ONE controller get two DIFFERENT blocks. */
+    kbd = hype_xhci_int_in_index(keys, 3u, 0u, 3u, 1u, 1);
+    mouse = hype_xhci_int_in_index(keys, 3u, 0u, 4u, 1u, 1);
+    CHECK_INT("keyboard gets a block", 0, kbd);
+    CHECK_INT("mouse gets a DIFFERENT block", 1, mouse);
+
+    /* A second look-up for the same endpoint returns the SAME block, so a poll never
+     * re-points the ring the configure command armed. */
+    CHECK_INT("keyboard look-up is stable", kbd, hype_xhci_int_in_index(keys, 3u, 0u, 3u, 1u, 0));
+    CHECK_INT("mouse look-up is stable", mouse, hype_xhci_int_in_index(keys, 3u, 0u, 4u, 1u, 0));
+
+    /* Two endpoints on ONE device (dci 1 and 2) are distinct too. */
+    CHECK_INT("second endpoint of the same slot is its own block", 2,
+              hype_xhci_int_in_index(keys, 3u, 0u, 3u, 2u, 1));
+
+    /* Same slot id on a different controller is a different device (slots are
+     * per-controller), so it must not alias. */
+    CHECK_INT("pool full refuses rather than aliasing", -1,
+              hype_xhci_int_in_index(keys, 3u, 1u, 3u, 1u, 1));
+
+    /* Lookup-only never claims: a poll for an endpoint nobody configured must fail. */
+    for (i = 0; i < 3; i++) keys[i].used = 0;
+    CHECK_INT("unconfigured endpoint is not silently allocated", -1,
+              hype_xhci_int_in_index(keys, 3u, 0u, 5u, 1u, 0));
+    CHECK_INT("and no block was consumed", 0, keys[0].used);
+
+    /* Rejected inputs. */
+    CHECK_INT("slot 0 is invalid", -1, hype_xhci_int_in_index(keys, 3u, 0u, 0u, 1u, 1));
+    CHECK_INT("dci 0 (EP0) is not an interrupt-IN endpoint", -1,
+              hype_xhci_int_in_index(keys, 3u, 0u, 3u, 0u, 1));
+    CHECK_INT("null pool", -1, hype_xhci_int_in_index(0, 3u, 0u, 3u, 1u, 1));
+
+    /* Releasing one controller's blocks leaves the other controller's alone. */
+    kbd = hype_xhci_int_in_index(keys, 3u, 0u, 3u, 1u, 1);
+    mouse = hype_xhci_int_in_index(keys, 3u, 1u, 3u, 1u, 1);
+    hype_xhci_int_in_release_ctrl(keys, 3u, 0u);
+    CHECK_INT("released controller 0's block is gone", -1,
+              hype_xhci_int_in_index(keys, 3u, 0u, 3u, 1u, 0));
+    CHECK_INT("controller 1's block survives", mouse,
+              hype_xhci_int_in_index(keys, 3u, 1u, 3u, 1u, 0));
+    hype_xhci_int_in_release_ctrl(0, 3u, 0u); /* null-safe */
+}
+
 int main(void) {
     test_string_desc_langid0();
     test_string_desc_ascii();
@@ -939,6 +1003,7 @@ int main(void) {
     test_parked_no_duplicates();
     test_parked_overflow_keeps_newest();
     test_parked_drop_slot();
+    test_int_in_pool();
 
     if (failures == 0) {
         printf("all tests passed\n");

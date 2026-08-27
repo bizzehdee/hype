@@ -13,11 +13,30 @@ on controller 2 ports 7 and 8 populated.
 | Ticket | What to read | Passes when |
 |---|---|---|
 | #734 | `DIAG: HID reports=` and `DIAG: MOUSE reports=` | non-zero, with the keyboard still behind the hub |
+| #734 | `host-xhci: interrupt-IN transfer FAILED ... cc=` | absent; if present, the completion code names the remaining fault |
 | #737 | `Address Device slot N ... completion code 17` | absent for the device behind the hub on controller 1 |
 | #739 | ports 7 and 8, and `host-usb: INVENTORY` | both hubs walked; no "bad hub-descriptor type 0x2a", no "GET hub-descriptor FAILED"; whatever is behind them is listed |
 | #738 | `m5-8: target_disk` | resolves; `fw-1: disk front-end` is not "no SATA disk attached" |
 | #735 | `ioio` in EXHIST, `UARTTX COM1 written` | both keep moving after `reboot`; a 0xCF9 appears in IOHIST |
 | #732 | `cfg: autostart` + `#732: vm...` | already proven in QEMU; this is a no-regression read |
+
+### What the 2026-08-27 boot 1 said about #734, and what changed since
+
+The boot read `HID polls=20745 reports=0 errors=1` and `MOUSE polls=238463
+reports=0`. Two separate things:
+
+1. Both claimed HIDs shared ONE interrupt-IN ring and ONE "transfer
+   outstanding" flag per controller. An idle input device holds that flag
+   forever, so the other endpoint's doorbell was never rung again. Fixed: each
+   endpoint now owns its own block (`HYPE_XHCI_INT_IN_MAX`), and
+   `tools/734/run-734-qemu.sh` reproduces the lock-out in QEMU -- the keyboard
+   froze at 67 reports across 100 keystrokes once the mouse went still, and
+   rises 120 -> 320 with the fix.
+2. `errors=1` says one keyboard transfer completed with a failure code, and the
+   boot could not name it. It stayed at 1 because of (1): the endpoint never
+   re-armed. With (1) fixed the endpoint retries every poll, so this next boot
+   says whether that error is transient or permanent -- read the new
+   `interrupt-IN transfer FAILED ... cc=` line for the code.
 
 A one-boot discriminator worth running for #734 if it still fails: move the
 keyboard to a root port. Reports there and not behind the hub confirms the

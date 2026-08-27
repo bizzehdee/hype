@@ -83,24 +83,9 @@ typedef struct {
     unsigned int evt_deq; /* event-ring dequeue index */
     unsigned int evt_cyc; /* event-ring consumer cycle bit */
 
-    /* USB-5 (#217): the HID keyboard's interrupt-IN transfer ring and report buffer. Kept
-     * separate from the bulk rings so a keyboard poll can never disturb the MSC datapath
-     * the log sink depends on. */
-    uint8_t int_in_ring[XPAGE] __attribute__((aligned(XPAGE)));
-    uint8_t hid_report[64] __attribute__((aligned(64)));
-    unsigned int iin_enq;
-    unsigned int iin_cyc;
-    /*
-     * Is a report transfer currently OUTSTANDING?
-     *
-     * An interrupt endpoint needs exactly ONE transfer queued at a time, re-armed after
-     * each completion. Enqueuing on every poll call -- which the guest dispatch loop makes
-     * thousands of times a second -- fills the 256-TRB ring in a fraction of a second and
-     * the keyboard goes silent, which is precisely what the first QEMU test showed: the
-     * endpoint configured, the device claimed, and not one report ever delivered.
-     */
-    int iin_armed;
-    uint64_t iin_pending_trb;
+    /* #734: the interrupt-IN rings moved to the per-ENDPOINT pool below (g_iin_hw). One
+     * set per controller could not carry a keyboard and a mouse at once -- see
+     * HYPE_XHCI_INT_IN_MAX in core/xhci.h. */
 
     /* Device pool: hub descent (#231 pt5b) needs several devices addressed at once
      * (a hub plus the device behind it), so each addressed device owns its own
@@ -164,6 +149,41 @@ typedef struct {
 } xhci_msc_hw_t;
 
 static xhci_msc_hw_t g_msc_hw[HYPE_XHCI_MSC_MAX];
+
+/*
+ * #734: per-INTERRUPT-IN-ENDPOINT transfer state -- one block per endpoint hype polls for
+ * itself, keyed by (controller, slot, dci) in g_iin_key.
+ *
+ * Kept out of xhci_hw_t for the same reason the MSC rings were: an endpoint's ring,
+ * report buffer and armed flag are per-endpoint state, and sharing one set per controller
+ * meant configuring the second HID re-pointed the first one's ring and, worse, the single
+ * armed flag serialised two independent pollers into one -- an idle device holding it
+ * silenced the other endpoint permanently.
+ *
+ * An interrupt endpoint still needs exactly ONE transfer queued at a time, re-armed after
+ * each completion; `armed` is that, now per endpoint. Enqueuing on every poll call --
+ * which the dispatch loop makes thousands of times a second -- fills the ring in a
+ * fraction of a second and the device goes silent (the original #217 QEMU finding).
+ */
+typedef struct {
+    uint8_t ring[XPAGE] __attribute__((aligned(XPAGE)));
+    uint8_t report[64] __attribute__((aligned(64)));
+    unsigned int enq;
+    unsigned int cyc;
+    int armed;
+    uint64_t pending_trb;
+} xhci_int_in_hw_t;
+
+static xhci_int_in_hw_t g_iin_hw[HYPE_XHCI_INT_IN_MAX];
+static hype_xhci_int_in_key_t g_iin_key[HYPE_XHCI_INT_IN_MAX];
+
+/* The block for (c, slot, dci); claims one on first sight when `alloc` is set. */
+static xhci_int_in_hw_t *iin_hw_for(const hype_xhci_ctrl_t *c, unsigned int slot,
+                                    unsigned int dci, int alloc) {
+    int i = hype_xhci_int_in_index(g_iin_key, HYPE_XHCI_INT_IN_MAX, c->hw_slot, slot, dci,
+                                   alloc);
+    return (i < 0) ? (xhci_int_in_hw_t *)0 : &g_iin_hw[i];
+}
 
 /* The claimed-device block for (c, slot); allocates on first sight when `alloc` is set. */
 static xhci_msc_hw_t *msc_hw_for(const hype_xhci_ctrl_t *c, unsigned int slot, int alloc) {
@@ -775,14 +795,22 @@ int hype_xhci_configure_int_in_endpoint(hype_xhci_ctrl_t *c, unsigned int slot,
     xhci_hw_t *hw = HW(c);
     unsigned int cs = c->ctx_size;
     unsigned int dci = hype_xhci_ep_dci(ep_addr);
+    xhci_int_in_hw_t *iin;
     uint32_t ctx[8], cmd[4], evt[4];
 
     if (!c->inited || slot == 0u || path == (const hype_xhci_devpath_t *)0) return -1;
-    if (mps == 0u || mps > sizeof(hw->hid_report)) return -1;
+    iin = iin_hw_for(c, slot, dci, 1);
+    if (iin == (xhci_int_in_hw_t *)0) {
+        hype_debug_print("host-xhci: no interrupt-IN block free for slot=%u ep=0x%02x "
+                         "(pool of %u) [#734]\n", slot, ep_addr,
+                         (unsigned)HYPE_XHCI_INT_IN_MAX);
+        return -1;
+    }
+    if (mps == 0u || mps > sizeof(iin->report)) return -1;
 
-    zero(hw->int_in_ring, XPAGE);
-    ring_init_link(hw->int_in_ring);
-    hw->iin_enq = 0; hw->iin_cyc = 1; hw->iin_armed = 0; hw->iin_pending_trb = 0;
+    zero(iin->ring, XPAGE);
+    ring_init_link(iin->ring);
+    iin->enq = 0; iin->cyc = 1; iin->armed = 0; iin->pending_trb = 0;
 
     zero(hw->input_ctx, XPAGE);
     hype_xhci_input_ctrl_ctx(ctx, HYPE_XHCI_ADD_SLOT | (1u << dci), 0);
@@ -792,7 +820,7 @@ int hype_xhci_configure_int_in_endpoint(hype_xhci_ctrl_t *c, unsigned int slot,
     write_ctx(hw->input_ctx, cs, ctx);
     /* #217: the Interval is what gives the controller a schedule to poll on. Without
      * it the endpoint configures cleanly and never reports. */
-    hype_xhci_ep_ctx_interval(ctx, HYPE_XHCI_EP_TYPE_INT_IN, mps, phys(hw->int_in_ring), 1,
+    hype_xhci_ep_ctx_interval(ctx, HYPE_XHCI_EP_TYPE_INT_IN, mps, phys(iin->ring), 1,
                               hype_xhci_interval_encode(path->speed, interval));
     write_ctx(hw->input_ctx, (1u + dci) * cs, ctx);
 
@@ -851,32 +879,55 @@ int hype_xhci_configure_hub_slot(hype_xhci_ctrl_t *c, unsigned int slot,
  * spin waiting for a keystroke would stall the guest -- the cost of missing a report
  * is that it is picked up on the next pass a moment later.
  */
+/*
+ * #734: name the completion code of a failed report transfer, the first few times.
+ *
+ * The per-endpoint DIAG counters say only "errors=1", and a Stall, a USB Transaction
+ * Error and a Babble need different fixes -- one bare count cannot tell them apart, and
+ * an input device that fails once per boot gives exactly one chance to read it.
+ */
+static void int_in_report_error(unsigned int slot, unsigned int dci, uint64_t trb,
+                                uint32_t cc) {
+    static unsigned int reported = 0;
+
+    if (reported++ < 8u) {
+        hype_debug_print("host-xhci: interrupt-IN transfer FAILED slot=%u ep=%u trb=0x%llx "
+                         "cc=%u [#734]\n", slot, dci, (unsigned long long)trb, cc);
+    }
+}
+
 int hype_xhci_int_in_poll(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int ep_addr,
                           uint8_t *out, unsigned int len) {
     xhci_hw_t *hw = HW(c);
     volatile uint8_t *bar;
     unsigned int dci = hype_xhci_ep_dci(ep_addr);
+    xhci_int_in_hw_t *iin;
     uint32_t t[4], evt[4];
     unsigned int spins = 0;
     uint64_t my_trb;
     unsigned int i;
 
-    if (!c->inited || slot == 0u || out == (uint8_t *)0 || len == 0u ||
-        len > sizeof(hw->hid_report)) {
+    if (!c->inited || slot == 0u || out == (uint8_t *)0 || len == 0u) {
+        return -1;
+    }
+    /* Lookup only: an endpoint that was never configured has no ring to poll, and must
+     * not be handed a free block here. */
+    iin = iin_hw_for(c, slot, dci, 0);
+    if (iin == (xhci_int_in_hw_t *)0 || len > sizeof(iin->report)) {
         return -1;
     }
     bar = (volatile uint8_t *)(uintptr_t)c->bar;
-    my_trb = phys(hw->int_in_ring) + (uint64_t)hw->iin_enq * HYPE_XHCI_TRB_BYTES;
+    my_trb = phys(iin->ring) + (uint64_t)iin->enq * HYPE_XHCI_TRB_BYTES;
 
-    /* Arm exactly one transfer, and only when none is outstanding. */
-    if (!hw->iin_armed) {
-        hype_xhci_trb_normal(t, phys(hw->hid_report), len, (int)hw->iin_cyc);
-        ring_enqueue(hw->int_in_ring, &hw->iin_enq, &hw->iin_cyc, t);
+    /* Arm exactly one transfer on THIS endpoint, and only when none is outstanding. */
+    if (!iin->armed) {
+        hype_xhci_trb_normal(t, phys(iin->report), len, (int)iin->cyc);
+        ring_enqueue(iin->ring, &iin->enq, &iin->cyc, t);
         wr32(bar, hype_xhci_doorbell_offset(c->dboff, slot), dci);
-        hw->iin_armed = 1;
-        hw->iin_pending_trb = my_trb;
+        iin->armed = 1;
+        iin->pending_trb = my_trb;
     }
-    my_trb = hw->iin_pending_trb;
+    my_trb = iin->pending_trb;
 
     /* #266: a completion for this armed transfer may already be parked from a previous
      * poll -- claim it before spinning. */
@@ -885,11 +936,12 @@ int hype_xhci_int_in_poll(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int e
         uint32_t parked_residue = 0;
         if (hype_xhci_parked_take(&hw->parked, slot, dci, my_trb, &parked_cc,
                                   &parked_residue)) {
-            hw->iin_armed = 0; /* consumed -- next poll re-arms */
+            iin->armed = 0; /* consumed -- next poll re-arms */
             if (parked_cc != HYPE_XHCI_CC_SUCCESS && parked_cc != HYPE_XHCI_CC_SHORT_PACKET) {
+                int_in_report_error(slot, dci, my_trb, parked_cc);
                 return -1;
             }
-            for (i = 0; i < len; i++) out[i] = hw->hid_report[i];
+            for (i = 0; i < len; i++) out[i] = iin->report[i];
             return 1;
         }
     }
@@ -905,12 +957,13 @@ int hype_xhci_int_in_poll(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int e
                                    hype_xhci_event_xfer_residue(evt));
         return 0;
     }
-    hw->iin_armed = 0; /* our completion arrived -- re-arm on the next poll */
+    iin->armed = 0; /* our completion arrived -- re-arm on the next poll */
     if (hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS &&
         hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SHORT_PACKET) {
+        int_in_report_error(slot, dci, my_trb, hype_xhci_event_cc(evt));
         return -1;
     }
-    for (i = 0; i < len; i++) out[i] = hw->hid_report[i];
+    for (i = 0; i < len; i++) out[i] = iin->report[i];
     return 1;
 }
 
@@ -1607,10 +1660,8 @@ int hype_xhci_host_init(uint64_t bar_phys, hype_xhci_ctrl_t *out) {
         for (k = 0; k < 256u; k++) {
             hw->slot_dev[k] = 0;
         }
-        hw->iin_enq = 0;
-        hw->iin_cyc = 1u;
-        hw->iin_armed = 0;
-        hw->iin_pending_trb = 0;
+        /* #734: release this controller's interrupt-IN endpoint blocks with it. */
+        hype_xhci_int_in_release_ctrl(g_iin_key, HYPE_XHCI_INT_IN_MAX, out->hw_slot);
         /* #387: release this controller's claimed-MSC blocks with it. */
         {
             unsigned int mi;

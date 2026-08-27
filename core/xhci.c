@@ -617,3 +617,47 @@ unsigned int hype_usb_collect_endpoints(const uint8_t *cfg, unsigned int len, hy
     }
     return n;
 }
+
+/*
+ * #734: the per-interrupt-IN-endpoint pool's bookkeeping. See core/xhci.h for why one
+ * shared ring per controller could not carry both a keyboard and a mouse.
+ */
+int hype_xhci_int_in_index(hype_xhci_int_in_key_t *keys, unsigned int n, unsigned int ctrl,
+                           unsigned int slot, unsigned int dci, int alloc) {
+    unsigned int i;
+    unsigned int free_i = n;
+
+    if (keys == (hype_xhci_int_in_key_t *)0 || slot == 0u || dci == 0u) {
+        return -1;
+    }
+    for (i = 0; i < n; i++) {
+        if (keys[i].used && keys[i].ctrl == ctrl && keys[i].slot == slot && keys[i].dci == dci) {
+            return (int)i;
+        }
+        if (!keys[i].used && free_i == n) {
+            free_i = i;
+        }
+    }
+    if (!alloc || free_i == n) {
+        return -1;
+    }
+    keys[free_i].used = 1;
+    keys[free_i].ctrl = ctrl;
+    keys[free_i].slot = slot;
+    keys[free_i].dci = dci;
+    return (int)free_i;
+}
+
+void hype_xhci_int_in_release_ctrl(hype_xhci_int_in_key_t *keys, unsigned int n,
+                                   unsigned int ctrl) {
+    unsigned int i;
+
+    if (keys == (hype_xhci_int_in_key_t *)0) {
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        if (keys[i].used && keys[i].ctrl == ctrl) {
+            keys[i].used = 0;
+        }
+    }
+}
