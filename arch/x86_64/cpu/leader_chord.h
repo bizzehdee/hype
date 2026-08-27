@@ -102,6 +102,24 @@ typedef struct {
      * key, versus modifiers the layout does not have) and need different fixes.
      */
     unsigned int screenshot_near_miss;
+    /*
+     * #734: the same idea as screenshot_near_miss, generalised to EVERY chord key, because
+     * the same question came up again and the answer was again unavailable from the log.
+     *
+     * Counted only when at LEAST ONE of the two modifiers is held. Without that condition
+     * every typed 'd' and every digit would be a near miss and the counter would be noise.
+     * With it, the counter means something specific and useful: "you were holding one half
+     * of the leader and pressed a chord key, and the other half never arrived." On a
+     * keyboard whose right-hand Alt is an AltGr or an Fn-layer key that the firmware does
+     * not report as usage 0xE6, that is exactly the trace needed -- and it distinguishes
+     * that from a chord key that never reached hype at all, which leaves both counters at
+     * zero.
+     *
+     * near_miss_mods records which half WAS held at the last near miss: bit 0 right Ctrl,
+     * bit 1 right Alt. That names the missing key rather than just saying one is missing.
+     */
+    unsigned int chord_near_miss;
+    uint8_t near_miss_mods;
 } hype_chord_state_t;
 
 void hype_chord_state_reset(hype_chord_state_t *state);

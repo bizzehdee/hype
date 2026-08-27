@@ -12,6 +12,21 @@ void hype_chord_state_reset(hype_chord_state_t *state) {
      * field-by-field reset invites.
      */
     state->screenshot_near_miss = 0u;
+    state->chord_near_miss = 0u;
+    state->near_miss_mods = 0u;
+}
+
+/*
+ * #734: record a chord key that arrived without both modifiers, when one was held.
+ * See leader_chord.h for why the "one was held" condition is what makes it a signal.
+ */
+static void note_near_miss(hype_chord_state_t *state) {
+    if (!state->right_ctrl_held && !state->right_alt_held) {
+        return;
+    }
+    state->chord_near_miss++;
+    state->near_miss_mods = (uint8_t)((state->right_ctrl_held ? 1u : 0u) |
+                                      (state->right_alt_held ? 2u : 0u));
 }
 
 hype_chord_result_t hype_chord_feed_scancode(hype_chord_state_t *state, uint8_t byte) {
@@ -47,6 +62,7 @@ hype_chord_result_t hype_chord_feed_scancode(hype_chord_state_t *state, uint8_t 
                 result.vm_index = 0;
                 return result;
             }
+            note_near_miss(state);
             return none;
         case HYPE_SCANCODE_RIGHT_ARROW_MAKE:
             if (state->right_ctrl_held && state->right_alt_held) {
@@ -54,6 +70,7 @@ hype_chord_result_t hype_chord_feed_scancode(hype_chord_state_t *state, uint8_t 
                 result.vm_index = 0;
                 return result;
             }
+            note_near_miss(state);
             return none;
         case HYPE_SCANCODE_PRINTSCREEN_MAKE_1:
             /* First half of `E0 2A E0 37` -- arm the second-half check below,
@@ -104,6 +121,7 @@ hype_chord_result_t hype_chord_feed_scancode(hype_chord_state_t *state, uint8_t 
             result.vm_index = 0;
             return result;
         }
+        note_near_miss(state);
         return none;
     }
 
@@ -121,6 +139,7 @@ hype_chord_result_t hype_chord_feed_scancode(hype_chord_state_t *state, uint8_t 
             return result;
         }
         state->screenshot_near_miss++; /* #568: seen, but without both modifiers */
+        note_near_miss(state);
         return none;
     }
     if (byte == HYPE_SCANCODE_SYSRQ_BREAK) {
@@ -133,6 +152,7 @@ hype_chord_result_t hype_chord_feed_scancode(hype_chord_state_t *state, uint8_t 
             result.vm_index = 0;
             return result;
         }
+        note_near_miss(state);
         return none;
     }
 
@@ -142,6 +162,7 @@ hype_chord_result_t hype_chord_feed_scancode(hype_chord_state_t *state, uint8_t 
             result.vm_index = (uint8_t)(byte - HYPE_SCANCODE_1_MAKE + 1u);
             return result;
         }
+        note_near_miss(state);
         return none;
     }
 

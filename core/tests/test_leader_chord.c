@@ -425,7 +425,66 @@ static void test_near_miss_distinguishes_pressed_from_never_arrived(void) {
     CHECK_HEX("a successful chord is not a near miss", 0u, state.screenshot_near_miss);
 }
 
+static void test_near_miss_names_the_half_that_was_held(void) {
+    hype_chord_state_t st;
+
+    /*
+     * #734: the operator's keyboard has a right Ctrl and an AltGr, and whether AltGr
+     * reports as usage 0xE6 (Right Alt, modifier bit 6) is a firmware question that
+     * cannot be answered from outside. If it does not, the chord silently does nothing --
+     * so hold ONE half, press a chord key, and the counter must say which half was there.
+     */
+    hype_chord_state_reset(&st);
+    (void)hype_chord_feed_scancode(&st, 0xE0u);
+    (void)hype_chord_feed_scancode(&st, 0x1Du); /* Right Ctrl down, no Right Alt */
+    (void)hype_chord_feed_scancode(&st, 0x01u); /* Escape */
+    CHECK_HEX("near miss counted", 1, st.chord_near_miss);
+    CHECK_HEX("right ctrl was the half held", 1, st.near_miss_mods);
+
+    hype_chord_state_reset(&st);
+    (void)hype_chord_feed_scancode(&st, 0xE0u);
+    (void)hype_chord_feed_scancode(&st, 0x38u); /* Right Alt down, no Right Ctrl */
+    (void)hype_chord_feed_scancode(&st, 0x20u); /* 'd' */
+    CHECK_HEX("near miss counted", 1, st.chord_near_miss);
+    CHECK_HEX("right alt was the half held", 2, st.near_miss_mods);
+}
+
+static void test_ordinary_typing_is_not_a_near_miss(void) {
+    hype_chord_state_t st;
+    unsigned i;
+
+    /*
+     * The counter is only a signal because it needs one modifier held. 'd', the digits
+     * and the arrows are ordinary keys; counting them unconditionally would bury the
+     * real case in noise.
+     */
+    hype_chord_state_reset(&st);
+    for (i = 0; i < 10u; i++) {
+        (void)hype_chord_feed_scancode(&st, 0x20u); /* 'd' */
+        (void)hype_chord_feed_scancode(&st, 0x02u); /* '1' */
+        (void)hype_chord_feed_scancode(&st, 0x01u); /* Escape */
+    }
+    CHECK_HEX("no modifier held, so nothing counted", 0, st.chord_near_miss);
+}
+
+static void test_a_complete_chord_is_not_a_near_miss(void) {
+    hype_chord_state_t st;
+    hype_chord_result_t r;
+
+    hype_chord_state_reset(&st);
+    (void)hype_chord_feed_scancode(&st, 0xE0u);
+    (void)hype_chord_feed_scancode(&st, 0x1Du);
+    (void)hype_chord_feed_scancode(&st, 0xE0u);
+    (void)hype_chord_feed_scancode(&st, 0x38u);
+    r = hype_chord_feed_scancode(&st, 0x01u);
+    CHECK_HEX("the chord fires", HYPE_CHORD_ACTION_RETURN_TO_DASHBOARD, r.action);
+    CHECK_HEX("and is not counted as a miss", 0, st.chord_near_miss);
+}
+
 int main(void) {
+    test_near_miss_names_the_half_that_was_held();
+    test_ordinary_typing_is_not_a_near_miss();
+    test_a_complete_chord_is_not_a_near_miss();
     test_reset_clears_held_state();
     test_extended_prefix_alone_produces_no_action();
     test_d_without_both_modifiers_is_ignored();

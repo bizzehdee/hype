@@ -342,6 +342,14 @@ static unsigned long long g_hid_polls;
 static unsigned long long g_hid_reports;
 static unsigned long long g_hid_poll_errs;
 /*
+ * #734: the OR of every modifier byte this keyboard has reported. Boot-report bit order
+ * is LCtrl, LShift, LAlt, LGUI, RCtrl, RShift, RAlt, RGUI -- so bits 4 and 6 are the two
+ * the leader chord needs. On a keyboard whose right-hand Alt is an AltGr, or where Fn
+ * layers are resolved inside the firmware, whether bit 6 is ever set is not something
+ * that can be reasoned about from the outside; this makes one boot answer it.
+ */
+static uint8_t g_hid_mods_seen;
+/*
  * USB-6 (#219): the claimed USB boot MOUSE. Declared here beside the keyboard counters so
  * the periodic DIAG block can read them. A separate controller copy from the keyboard's,
  * because the two can be on different controllers -- an internal touchpad and an external
@@ -15949,6 +15957,15 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                      g_hid_polls, g_hid_reports, g_hid_poll_errs,
                                      g_hid_slot, g_hid_ep, g_hostkbd_scancodes,
                                      g_hostkbd_chords);
+                    /* #734: name the modifier bits seen, and say outright whether the two
+                     * the chord needs have ever arrived. */
+                    hype_debug_print("fw-1 DIAG: HID modseen=0x%02x -- RCtrl(bit4)=%s "
+                                     "RAlt(bit6)=%s LCtrl=%s LAlt=%s [#734]\n",
+                                     (unsigned)g_hid_mods_seen,
+                                     (g_hid_mods_seen & 0x10u) ? "YES" : "never",
+                                     (g_hid_mods_seen & 0x40u) ? "YES" : "never",
+                                     (g_hid_mods_seen & 0x01u) ? "yes" : "never",
+                                     (g_hid_mods_seen & 0x04u) ? "yes" : "never");
                 }
                 /*
                  * #568: Print Screen / SysRq seen without both modifiers. Reported only when it
@@ -15962,6 +15979,21 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                      "Right-Ctrl+Right-Alt -- the chord needs all three; type "
                                      "`screenshot` at the dashboard instead [#568]\n",
                                      g_hostin.chord.screenshot_near_miss);
+                }
+                /*
+                 * #734: a chord KEY arrived while one half of the leader was held and the
+                 * other was not. Says which half was present, which names the one that is
+                 * missing -- the specific question a keyboard with an AltGr rather than a
+                 * plain right Alt raises.
+                 */
+                if (g_hostin.chord.chord_near_miss != 0u) {
+                    hype_debug_print("fw-1 DIAG: chord key seen %u time(s) with only "
+                                     "%s held -- the other half of the leader never "
+                                     "arrived [#734]\n",
+                                     g_hostin.chord.chord_near_miss,
+                                     (g_hostin.chord.near_miss_mods == 1u) ? "Right-Ctrl"
+                                     : (g_hostin.chord.near_miss_mods == 2u) ? "Right-Alt"
+                                     : "neither");
                 }
                 {
                     const hype_virtio_blk_depth_t *qd = hype_virtio_blk_depth();
@@ -23979,6 +24011,7 @@ static unsigned int usb_hid_drain(void) {
         return 0;
     }
     g_hid_reports++;
+    g_hid_mods_seen |= report[0];
     if (g_hid_reports == 1u) {
         /* Say it ONCE. "Endpoint configured" and "reports actually arrive" are
          * different claims, and only the second means the operator can type -- without
