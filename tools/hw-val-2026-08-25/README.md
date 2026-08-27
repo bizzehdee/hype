@@ -181,7 +181,47 @@ had not been captured: the failed first 2a attempt and the #387 regression
 rerun) before the drive's logs were cleared. Stale `vars-*.bin` and
 `HYPE.BOOTCOUNT` were cleared too, so 1a starts from a clean log rotation.
 
-## Currently staged: Boot 1a alone (2026-08-26)
+## Currently staged: the 2026-08-27 bugfix sweep, boot 1 (SUPERSEDES the section below)
+
+Re-staged 2026-08-27 from commit `f61f43e`. `\hype.cfg` is `hype1a.cfg` again --
+but **1535 bytes now, not 1269**: the #738 comment correction changed it, and the
+byte count in the `cfg: loaded` line is the cheapest way to tell which version a
+boot actually read.
+
+What changed on the drive relative to the 2026-08-26 staging:
+
+- `\EFI\BOOT\BOOTX64.EFI` + `\EFI\hype\hype-default.efi` = the new default
+  build (`sha256 55b38969...`), carrying #732, #734, #737, #739, #729 and #640's
+  AVIC counters.
+- `\EFI\hype\hype-avic.efi` = the `-DHYPE_ENABLE_AVIC=1` build
+  (`sha256 a9d33709...`), for boot 2 -- **both banners read `f61f43e-dirty`**, so
+  the banner cannot distinguish them; use the SHA-256 or the `ENABLING` line.
+  The stale `hype-apicv.efi` and `hype-976e71a.efi` were removed.
+- `\hype\disks\run1a-scratch.img` -- **2 GiB, fully allocated, finally present.**
+  This is #738: hype creates nothing, and its absence is why both 2026-08-26 boots
+  ran with no SATA disk attached.
+- All 18 configs refreshed (the #738/#740 comment corrections).
+- `\RUN-CARD.md` and `\QUEUE-2026-08-27.md`: the per-ticket read-list for both
+  boots. `docs/hw-validation-queue-2026-08-27.md` is the repo copy.
+- Previous run's `\HYPE.LOG` and `\RUN1A.LOG` cleared, md5-verified identical to
+  `logs/1a-desktop-5950x/` first.
+
+**The drive dropped off the USB bus during this staging** (09:05:07: `USB
+disconnect`, `Synchronize Cache(10) failed: hostbyte=DID_ERROR`, then a
+re-enumeration as a new SuperSpeed device, and exFAT flagged the volume dirty).
+Every staged file was then re-verified by re-reading it from the media after an
+unmount/mount cycle -- SHA-256s, all 18 configs byte-for-byte, and the scratch
+image's full-length cksum -- so the staged data is good. `fsck.exfat /dev/sdb2`
+has NOT been run; it needs root. A bridge that drops a SuperSpeed link under
+sustained write is worth remembering when reading I/O oddities out of any log
+this drive produced.
+
+Boot 1 also needs two PHYSICAL conditions that no staging can set: the keyboard
+and mouse stay on the USB 2.0 hub (#734/#737), and the two SuperSpeed hubs on
+controller 2 ports 7 and 8 stay connected with something behind at least one
+(#739).
+
+## Historical: Boot 1a alone (2026-08-26)
 
 `\hype.cfg` is `hype1a.cfg` — the single Alpine VM — and `\input\vm0.txt` is
 the reboot-pin script. No `\hype-state.txt`: absent means every VM starts, and
