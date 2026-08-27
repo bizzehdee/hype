@@ -289,3 +289,29 @@ trivially recovered from this repo's own cached Alpine ISO (byte-identical
 source); `apicv-test.img`'s specific prior content was NOT preserved and is
 not reconstructable from anything on hand. Worth a moment's thought if that
 image mattered, though nothing in the current runbook depends on it.
+
+## Re-staged 2026-08-27, second stage -- after the #734 fix
+
+Full detail, including what the 09:14 boot proved, is in
+[`RUN-CARD-2026-08-27.md`](RUN-CARD-2026-08-27.md) -- the byte-identical copy of
+the card written to `\RUN-CARD.md` on the drive.
+
+What landed on `/dev/sdb1` (the drive is `sdb` this session, not `sdd`):
+
+```
+21f832ac46d8fe30a030127ed3830d62af908116a1c2422e42de872be56f9c4e  \EFI\BOOT\BOOTX64.EFI = \EFI\hype\hype-default.efi
+eb9888b54cf53803e2baef00665cf5ad616fb77eca24acfdddd6cb470309f386  \EFI\hype\hype-avic.efi
+```
+
+Both are commit `3cb97e2` (`-dirty` = the `edk2` submodule only), built one at a
+time with `make clean` between them, and re-read from the media after an
+unmount/mount cycle so neither SHA came out of the page cache. `\hype.cfg`
+(1535 bytes), all 18 configs, `\input\vm0.txt` and the 2 GiB
+`\hype\disks\run1a-scratch.img` were already correct and were NOT rewritten.
+`\HYPE.LOG` and `\RUN1A.LOG` were cleared; the 09:14 pair is archived at
+`logs/1a-desktop-5950x-2026-08-27/`, md5-verified against the media first.
+
+**A SHA-256 identifies a staged FILE, not a build.** `ld.lld` stamps a timestamp
+into the PE header, so re-linking the same source gives a different SHA -- two
+default builds of `3cb97e2` differed in exactly one byte, at file offset 128.
+Compare against the staged copy, not against a fresh local build.
