@@ -366,3 +366,29 @@ vars cleared.
 Boot 4 carries `CTXDUMP`, which prints the output slot and endpoint context the
 controller holds for each claimed HID and for its TT hub -- the working mouse and the
 broken keyboard, diffable inside one boot.
+
+## Re-staged 2026-08-27, fifth stage -- the slot-recycling test
+
+Full detail in [`RUN-CARD-2026-08-27.md`](RUN-CARD-2026-08-27.md). The 11:23 boot is
+archived at `logs/1a-desktop-5950x-2026-08-27-boot4/`, md5-verified against the media
+before the drive's logs were cleared.
+
+That boot proved the keyboard works on a root port -- and moved the cc=4 failure onto the
+mouse, which had not moved. The one variable that changed for the mouse was its slot id:
+it inherited slot 3 from a released device instead of getting a fresh slot 4. Across the
+10:42 and 11:23 boots, every failing HID sat on a recycled slot id and every working one
+on a fresh id, four device-instances with no exceptions.
+
+Boot 5 tests that: the hub walk now keeps a bounded number of non-HID slots rather than
+handing them straight back. **The keyboard must go BACK on the 2.0 hub for this boot** --
+the test is both devices working behind the hub at once.
+
+```
+264dbc728a692cd3cb14084a5118b8454e064af3ef5772ee344c5e6b8f075458  \EFI\BOOT\BOOTX64.EFI = \EFI\hype\hype-default.efi
+eb789541828e08c8d0fa0c88710ebabcaabcc6b3685ecb80262af6e54f5434fe  \EFI\hype\hype-avic.efi
+```
+
+Both are commit `d74d65f`, built one at a time with `make clean` between them and re-read
+from the media after an unmount/mount cycle. The dashboard freezes the operator saw on
+the 11:23 boot were the halt-recovery path spending 3.6s of the guest dispatch loop on
+synchronous xHCI commands; that is fixed in the same commit.
