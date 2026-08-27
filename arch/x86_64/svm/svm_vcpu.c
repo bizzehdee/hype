@@ -3170,12 +3170,36 @@ int hype_svm_vcpu_handle_xhci_npf(hype_vcpu_ctx_t *ctx, hype_xhci_dev_t *dev,
  * couldn't be decoded (the caller must NOT blindly advance RIP in that case).
  * Callers must try every real device handler FIRST -- this is the fallback only
  * for genuinely-unmapped regions. */
+/*
+ * #752: the guest's DEFAULT ADDRESS SIZE, in bytes, from the segment state.
+ *
+ * Only the moffs MOV forms need it -- their length is opcode plus an absolute address of
+ * exactly this many bytes, and there is no ModRM to derive it from. Reading it from the
+ * VMCB rather than assuming 64-bit matters because hype's guests are not all in long mode:
+ * OVMF spends its early life in 32-bit protected mode, and an AP coming out of a SIPI
+ * trampoline is in 16- or 32-bit mode by construction.
+ *
+ * SVM packs the segment attributes: bit 9 is L (64-bit code) and bit 10 is D/B.
+ */
+static unsigned int svm_default_addr_bytes(const struct hype_vcpu_ctx *real) {
+    uint16_t attr = real->vmcb->save.cs.attrib;
+    int lma = (real->vmcb->save.efer & (1ull << 10)) != 0ull; /* EFER.LMA */
+    int cs_l = (attr & (1u << 9)) != 0u;
+    int cs_d = (attr & (1u << 10)) != 0u;
+
+    if (lma && cs_l) {
+        return 8u; /* 64-bit mode */
+    }
+    return cs_d ? 4u : 2u;
+}
+
 int hype_svm_vcpu_absorb_mmio_npf(hype_vcpu_ctx_t *ctx, const uint8_t *guest_insn_bytes) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     hype_mmio_decode_t decoded;
 
     if (guest_insn_bytes == 0 ||
-        hype_mmio_decode(guest_insn_bytes, HYPE_MMIO_MAX_INSTR_BYTES, &decoded) != 0) {
+        hype_mmio_decode_addr(guest_insn_bytes, HYPE_MMIO_MAX_INSTR_BYTES,
+                              svm_default_addr_bytes(real), &decoded) != 0) {
         return -1;
     }
     {

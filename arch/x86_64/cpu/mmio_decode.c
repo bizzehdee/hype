@@ -94,10 +94,18 @@ static int group1_op(uint8_t raw_reg_field, hype_mmio_alu_op_t *out_op) {
 }
 
 int hype_mmio_decode(const uint8_t *bytes, uint8_t num_bytes, hype_mmio_decode_t *out) {
+    /* 0 = "the caller did not say what the address size is", which refuses the moffs
+     * forms -- exactly what this function did before #752 added the other entry point. */
+    return hype_mmio_decode_addr(bytes, num_bytes, 0u, out);
+}
+
+int hype_mmio_decode_addr(const uint8_t *bytes, uint8_t num_bytes,
+                          unsigned int default_addr_bytes, hype_mmio_decode_t *out) {
     uint8_t i = 0;
     uint8_t rex = 0;
     int has_rex = 0;
     int operand16 = 0;
+    int addr_override = 0;
     uint8_t opcode;
     uint8_t reg_field;
     uint8_t raw_reg_field = 0;
@@ -108,8 +116,20 @@ int hype_mmio_decode(const uint8_t *bytes, uint8_t num_bytes, hype_mmio_decode_t
         return -1;
     }
 
-    if (bytes[i] == 0x66u) {
-        operand16 = 1;
+    /*
+     * #752: 0x66 and 0x67 may appear in either order, so this is a small loop rather than
+     * two sequential ifs. 0x67 is CONSUMED but only ever honoured for the moffs forms
+     * below: it also changes ModRM addressing to the 16-bit layout, which decode_modrm_tail()
+     * does not implement, so anything else carrying it is refused rather than mis-parsed.
+     * That is what happened before too -- 0x67 fell through as an unknown opcode -- so no
+     * existing caller changes behaviour.
+     */
+    while (i < num_bytes && (bytes[i] == 0x66u || bytes[i] == 0x67u)) {
+        if (bytes[i] == 0x66u) {
+            operand16 = 1;
+        } else {
+            addr_override = 1;
+        }
         i++;
     }
     if (i >= num_bytes) {
@@ -127,6 +147,64 @@ int hype_mmio_decode(const uint8_t *bytes, uint8_t num_bytes, hype_mmio_decode_t
 
     opcode = bytes[i];
     i++;
+
+    /*
+     * #752: the moffs MOV forms. NO ModRM byte -- the absolute address follows the opcode
+     * directly -- so they must be handled before decode_modrm_tail() reads the first
+     * address byte as a ModRM and produces a confident, wrong answer.
+     *
+     * The accumulator is the only register these can name, so reg is 0 (RAX) and REX.B
+     * does not apply to it.
+     */
+    if (opcode >= 0xA0u && opcode <= 0xA3u) {
+        unsigned int addr_bytes = default_addr_bytes;
+
+        if (addr_bytes == 0u) {
+            return -1; /* the caller could not say; refusing beats guessing a length */
+        }
+        /* 0x67 halves 64->32 and 32->16, and doubles 16->32. */
+        if (addr_override) {
+            addr_bytes = (addr_bytes == 8u) ? 4u : (addr_bytes == 4u) ? 2u : 4u;
+        }
+        if ((uint32_t)i + addr_bytes > num_bytes) {
+            return -1;
+        }
+        out->instr_len = (uint8_t)((uint32_t)i + addr_bytes);
+        out->op = HYPE_MMIO_ALU_MOV;
+        out->has_imm = 0;
+        out->imm_value = 0;
+        out->mem_is_dst = 0;
+        out->reg = 0u; /* AL / AX / EAX / RAX */
+        switch (opcode) {
+            case 0xA0u: /* MOV AL, moffs8 */
+                out->is_write = 0;
+                out->size_bytes = 1u;
+                out->zero_extend = 0;
+                return 0;
+            case 0xA1u: /* MOV eAX, moffs16/32 */
+                out->is_write = 0;
+                out->size_bytes = operand16 ? 2u : 4u;
+                out->zero_extend = operand16 ? 0 : 1;
+                return 0;
+            case 0xA2u: /* MOV moffs8, AL */
+                out->is_write = 1;
+                out->size_bytes = 1u;
+                out->zero_extend = 0;
+                return 0;
+            default:    /* 0xA3: MOV moffs16/32, eAX */
+                out->is_write = 1;
+                out->size_bytes = operand16 ? 2u : 4u;
+                out->zero_extend = 0;
+                return 0;
+        }
+    }
+    /*
+     * Everything below indexes a ModRM byte, whose 16-bit addressing layout is not
+     * implemented -- so a 0x67 here is refused rather than decoded as if it were absent.
+     */
+    if (addr_override) {
+        return -1;
+    }
 
     if (opcode == 0x0Fu) {
         uint8_t opcode2;

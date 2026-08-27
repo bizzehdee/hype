@@ -51,8 +51,8 @@
  *      .code32
  *      mov $0x10,%ax; mov %ax,%ds; mov %ax,%es; mov %ax,%ss
  *      mov $0xD0000004,%ebx ; mov $0x9500,%edi
- *      mov (%ebx),%eax ; mov %eax,(%edi) ; movl $0xC0DE,4(%edi)
- *      mov (%ebx),%eax ; mov %eax,8(%edi) ; movl $0x600D,12(%edi)
+ *      mov (%ebx),%eax     ; mov %eax,(%edi)  ; movl $0xC0DE,4(%edi)   <- ModRM form
+ *      mov 0xD0000004,%eax ; mov %eax,8(%edi) ; movl $0x600D,12(%edi)  <- moffs form (A1)
  *   1: hlt ; jmp 1b
  *
  * TWO traps, both paid for with a run each:
@@ -61,19 +61,21 @@
  *    0x8020 -- the AP left real mode, executed whatever was at 0x20, and triple-faulted at
  *    rip 0x303f. The trampoline is position-dependent and every absolute in it is linear.
  *
- * 2. The access uses ModRM addressing (`mov (%ebx),%eax`), not the moffs form
- *    (`mov 0xD0000004,%eax`, opcode A1). hype_mmio_decode() does not decode moffs, so the
- *    absorber could not retire it and the AP span 11,625,190 times -- the very failure
- *    this test exists to catch, reproduced by the test's own instruction encoding. ModRM
- *    is what compiled code emits and so is what this should exercise; the moffs gap is
- *    real and is filed separately.
+ * 2. The two accesses use DIFFERENT addressing forms on purpose. The first is ModRM
+ *    (`mov (%ebx),%eax`), which is what compiled code emits. The second is the moffs form
+ *    (`mov 0xD0000004,%eax`, opcode A1), which clang chose for an absolute address the
+ *    first time this was written -- and which hype_mmio_decode() could not decode, so the
+ *    absorber could not retire it and the AP span 11,625,190 times. That was #752, fixed;
+ *    mark2 only appears if BOTH forms were absorbed, so this test now guards the gap that
+ *    it found.
  */
 static const unsigned char g_tramp[] = {
     0xfa, 0x31, 0xc0, 0x8e, 0xd8, 0x0f, 0x01, 0x16, 0x00, 0x90, 0x0f, 0x20, 0xc0, 0x66, 0x83, 0xc8,
     0x01, 0x0f, 0x22, 0xc0, 0x66, 0xea, 0x20, 0x80, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x66, 0xb8, 0x10, 0x00, 0x8e, 0xd8, 0x8e, 0xc0, 0x8e, 0xd0, 0xbb, 0x04, 0x00, 0x00, 0xd0, 0xbf,
-    0x00, 0x95, 0x00, 0x00, 0x8b, 0x03, 0x89, 0x07, 0xc7, 0x47, 0x04, 0xde, 0xc0, 0x00, 0x00, 0x8b,
-    0x03, 0x89, 0x47, 0x08, 0xc7, 0x47, 0x0c, 0x0d, 0x60, 0x00, 0x00, 0xf4, 0xeb, 0xfd
+    0x00, 0x95, 0x00, 0x00, 0x8b, 0x03, 0x89, 0x07, 0xc7, 0x47, 0x04, 0xde, 0xc0, 0x00, 0x00, 0xa1,
+    0x04, 0x00, 0x00, 0xd0, 0x89, 0x47, 0x08, 0xc7, 0x47, 0x0c, 0x0d, 0x60, 0x00, 0x00, 0xf4, 0xeb,
+    0xfd
 };
 
 static void put32(unsigned int gpa, uint32_t v) {
@@ -161,11 +163,11 @@ void micro_main(uint64_t zero_page_gpa) {
         micro_halt();
     }
     if (m2 != MARK2 || r2 != 0xFFFFFFFFu) {
-        micro_fail(NAME, "the AP completed one unclaimed access but not a second");
+        micro_fail(NAME, "the AP absorbed the ModRM form but not the moffs form -- see #752");
         micro_halt();
     }
 
-    micro_puts("micro/" NAME ": vCPU 1 absorbed two unclaimed accesses and kept running\n");
+    micro_puts("micro/" NAME ": vCPU 1 absorbed a ModRM and a moffs unclaimed access\n");
     micro_pass(NAME);
     micro_halt();
 }

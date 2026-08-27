@@ -11476,6 +11476,15 @@ static unsigned long long (*g_ap_vcpu_unhandled)[HYPE_MAX_VCPUS_PER_VM];
  * `unhandled` because they are no longer unhandled -- the guest was answered and moved on
  * -- but a large or growing count still names a device window hype is missing. */
 static unsigned long long (*g_ap_vcpu_unclaimed)[HYPE_MAX_VCPUS_PER_VM];
+/*
+ * #752: how many times a vCPU may take an UNDECODABLE NPF at all before its VM is stopped.
+ *
+ * Generous, because a guest legitimately probing an odd address a few times must not be
+ * killed for it -- and small enough that a vCPU which cannot get past one instruction is
+ * stopped in well under a second rather than spinning for the rest of the boot. The
+ * measured pre-fix rate was ~350,000/s, so 4096 is about 12ms of spinning.
+ */
+#define HYPE_AP_UNDECODABLE_MAX 4096u
 static unsigned (*g_ap_vcpu_excp_dumped)[HYPE_MAX_VCPUS_PER_VM];
 static int g_ap_mpdata_sample;
 
@@ -12688,17 +12697,46 @@ wait_for_sipi:
                                          (unsigned long long)info.qualification, n);
                     }
                 } else {
-                    /* Undecodable: resuming would need a RIP advance nobody can compute, so
-                     * this one really is left alone. */
-                    if (g_ap_vcpu_unhandled[vm_idx][vi] < 8ull) {
+                    /*
+                     * #752: undecodable. Resuming needs a RIP advance nobody can compute and
+                     * inventing one lands the guest mid-instruction, so this access cannot be
+                     * completed -- but the vCPU must not be left re-executing it forever
+                     * either. That infinite spin IS #735: 37 million exits at one rip, a vCPU
+                     * making no progress, and a `reboot` pinned to it that never ran.
+                     *
+                     * So it is BOUNDED. A guest that probes an address hype cannot decode a
+                     * handful of times carries on; one that cannot get past the instruction
+                     * has its VM stopped, with the rip and the gpa named, which is a
+                     * diagnosable failure instead of a hang that looks like an idle machine.
+                     *
+                     * fw_1_mark_vm_stopped() and not fw_1_guest_fault_stop(), for the reason
+                     * the triple-fault path gives: the latter unconditionally drops the shared
+                     * device lock and this core may not hold it.
+                     */
+                    unsigned long long u = ++g_ap_vcpu_unhandled[vm_idx][vi];
+
+                    if ((u & (u - 1ull)) == 0ull) {
                         hype_debug_print("fw-1 vm%u vCPU %u: NPF at gpa 0x%llx rip 0x%llx "
-                                         "UNDECODABLE -- cannot complete or retire it, so this "
-                                         "vCPU will re-execute it [#190 #749]\n",
+                                         "UNDECODABLE -- cannot complete or retire it; "
+                                         "occurrence %llu of at most %u [#752 #749]\n",
                                          vm_idx, vi,
                                          (unsigned long long)ap_npf.guest_phys_addr,
-                                         (unsigned long long)info.guest_rip);
+                                         (unsigned long long)info.guest_rip, u,
+                                         (unsigned)HYPE_AP_UNDECODABLE_MAX);
                     }
-                    g_ap_vcpu_unhandled[vm_idx][vi]++;
+                    if (u >= (unsigned long long)HYPE_AP_UNDECODABLE_MAX) {
+                        HYPE_LOGF(HYPE_LOG_ERROR,
+                                  "fw-1 vm%u vCPU %u: %llu undecodable NPFs at gpa 0x%llx rip "
+                                  "0x%llx -- this vCPU cannot get past the instruction, so the "
+                                  "VM is STOPPED rather than left spinning. The instruction "
+                                  "form is not modelled; see #752\n",
+                                  vm_idx, vi, u,
+                                  (unsigned long long)ap_npf.guest_phys_addr,
+                                  (unsigned long long)info.guest_rip);
+                        fw_1_mark_vm_stopped(vm, "one of its vCPUs could not get past an "
+                                                 "instruction hype cannot decode");
+                        break;
+                    }
                 }
             }
         } else if (kind == HYPE_VMM_KIND_VMX &&

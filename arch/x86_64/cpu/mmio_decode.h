@@ -133,6 +133,29 @@ typedef struct {
 int hype_mmio_decode(const uint8_t *bytes, uint8_t num_bytes, hype_mmio_decode_t *out);
 
 /*
+ * #752: as above, plus the moffs MOV forms (A0-A3), which need the address size.
+ *
+ *   A0 MOV AL,moffs8    A1 MOV eAX,moffs    A2 MOV moffs8,AL    A3 MOV moffs,eAX
+ *
+ * These carry the absolute address in the instruction and have NO ModRM byte, so their
+ * length is opcode + `default_addr_bytes` (halved or doubled by a 0x67 prefix). That size
+ * is a property of the CPU MODE -- 8 in 64-bit, 4 in 32-bit, 2 in 16-bit -- which the
+ * instruction bytes alone cannot tell you, and guessing it resumes the guest at a garbage
+ * RIP. So the caller, which has the segment state, supplies it.
+ *
+ * `default_addr_bytes` of 0 means "I do not know", and the moffs forms are then refused
+ * exactly as they are today. hype_mmio_decode() is that call, so every existing caller
+ * behaves identically.
+ *
+ * Why it matters: the absorber for an access no device claims (#749) is the LAST resort,
+ * and an instruction form it cannot retire is one the guest re-executes forever. That is
+ * #735's failure reached through a different opcode -- measured at 11,625,190 spins in
+ * tests/micro/apunclaimed.c before its trampoline was changed to a ModRM form.
+ */
+int hype_mmio_decode_addr(const uint8_t *bytes, uint8_t num_bytes,
+                          unsigned int default_addr_bytes, hype_mmio_decode_t *out);
+
+/*
  * Given a decoded MMIO read's raw memory value (already masked to
  * size_bytes by the device model) and the destination register's
  * current 64-bit value, returns what that register should become:

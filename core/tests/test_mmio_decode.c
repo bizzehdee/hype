@@ -854,7 +854,109 @@ static void test_immediate_test_writes_flags_and_no_register(void) {
     CHECK_HEX("ZF set when the bit is clear", (1u << 6), (unsigned)(rflags & (1u << 6)));
 }
 
+/* ---- #752: the moffs MOV forms (A0-A3) ---- */
+
+static void expect_moffs(const char *desc, const uint8_t *b, uint8_t n, unsigned addr_bytes,
+                         int exp_write, uint8_t exp_size, uint8_t exp_len, int exp_zx) {
+    hype_mmio_decode_t out;
+    if (hype_mmio_decode_addr(b, n, addr_bytes, &out) != 0) {
+        printf("FAIL: %s: expected decode success, got failure\n", desc);
+        failures++;
+        return;
+    }
+    CHECK_HEX("is_write", exp_write, out.is_write);
+    CHECK_HEX("size_bytes", exp_size, out.size_bytes);
+    CHECK_HEX("instr_len", exp_len, out.instr_len);
+    CHECK_HEX("reg is the accumulator", 0, out.reg);
+    CHECK_HEX("zero_extend", exp_zx, out.zero_extend);
+}
+
+static void test_752_moffs_lengths_follow_the_address_size(void) {
+    /* A1 = MOV eAX, moffs. The ADDRESS bytes are what vary, and getting the length wrong
+     * resumes the guest at a garbage RIP -- which is why the size is a parameter and not
+     * an assumption. */
+    const uint8_t a1_64[] = {0xA1, 4,0,0,0xD0, 0,0,0,0};        /* 64-bit: 8-byte moffs */
+    const uint8_t a1_32[] = {0xA1, 4,0,0,0xD0};                  /* 32-bit: 4-byte moffs */
+    const uint8_t a1_16[] = {0xA1, 4,0};                         /* 16-bit: 2-byte moffs */
+
+    expect_moffs("A1 in 64-bit mode", a1_64, sizeof a1_64, 8u, 0, 4u, 9u, 1);
+    expect_moffs("A1 in 32-bit mode", a1_32, sizeof a1_32, 4u, 0, 4u, 5u, 1);
+    expect_moffs("A1 in 16-bit mode", a1_16, sizeof a1_16, 2u, 0, 4u, 3u, 1);
+}
+
+static void test_752_all_four_opcodes(void) {
+    const uint8_t a0[] = {0xA0, 4,0,0,0xD0};   /* MOV AL, moffs8   -- read, 1 byte */
+    const uint8_t a1[] = {0xA1, 4,0,0,0xD0};   /* MOV eAX, moffs   -- read, 4 bytes */
+    const uint8_t a2[] = {0xA2, 4,0,0,0xD0};   /* MOV moffs8, AL   -- write, 1 byte */
+    const uint8_t a3[] = {0xA3, 4,0,0,0xD0};   /* MOV moffs, eAX   -- write, 4 bytes */
+
+    expect_moffs("A0 load byte",  a0, sizeof a0, 4u, 0, 1u, 5u, 0);
+    expect_moffs("A1 load dword", a1, sizeof a1, 4u, 0, 4u, 5u, 1);
+    expect_moffs("A2 store byte", a2, sizeof a2, 4u, 1, 1u, 5u, 0);
+    expect_moffs("A3 store dword", a3, sizeof a3, 4u, 1, 4u, 5u, 0);
+}
+
+static void test_752_operand_size_prefix(void) {
+    /* 0x66 narrows the OPERAND to 16 bits; it does not touch the address size, so the
+     * length is unchanged and only size_bytes moves. */
+    const uint8_t a1_16op[] = {0x66, 0xA1, 4,0,0,0xD0};
+    expect_moffs("66 A1 is a 16-bit load", a1_16op, sizeof a1_16op, 4u, 0, 2u, 6u, 0);
+}
+
+static void test_752_address_size_prefix(void) {
+    /* 0x67 halves 64->32 and 32->16, and doubles 16->32. Each changes instr_len, which is
+     * the field that has to be right. */
+    const uint8_t p64[] = {0x67, 0xA1, 4,0,0,0xD0};        /* 64-bit + 67 -> 4-byte moffs */
+    const uint8_t p32[] = {0x67, 0xA1, 4,0};                /* 32-bit + 67 -> 2-byte moffs */
+    const uint8_t p16[] = {0x67, 0xA1, 4,0,0,0xD0};         /* 16-bit + 67 -> 4-byte moffs */
+
+    expect_moffs("67 in 64-bit mode", p64, sizeof p64, 8u, 0, 4u, 6u, 1);
+    expect_moffs("67 in 32-bit mode", p32, sizeof p32, 4u, 0, 4u, 4u, 1);
+    expect_moffs("67 in 16-bit mode", p16, sizeof p16, 2u, 0, 4u, 6u, 1);
+}
+
+static void test_752_prefixes_in_either_order(void) {
+    const uint8_t a[] = {0x66, 0x67, 0xA1, 4,0};
+    const uint8_t b[] = {0x67, 0x66, 0xA1, 4,0};
+    expect_moffs("66 67 A1", a, sizeof a, 4u, 0, 2u, 5u, 0);
+    expect_moffs("67 66 A1", b, sizeof b, 4u, 0, 2u, 5u, 0);
+}
+
+static void test_752_refused_when_the_address_size_is_unknown(void) {
+    hype_mmio_decode_t out;
+    const uint8_t a1[] = {0xA1, 4,0,0,0xD0};
+    /* This is the whole safety property: hype_mmio_decode() cannot know the mode, so it
+     * refuses rather than guessing a length. Every pre-#752 caller goes through it and is
+     * therefore unchanged. */
+    CHECK_HEX("plain decode still refuses moffs", -1, hype_mmio_decode(a1, sizeof a1, &out));
+    CHECK_HEX("and so does addr_bytes=0", -1, hype_mmio_decode_addr(a1, sizeof a1, 0u, &out));
+}
+
+static void test_752_truncated_moffs_is_refused(void) {
+    hype_mmio_decode_t out;
+    const uint8_t short64[] = {0xA1, 4,0,0,0xD0};  /* 5 bytes, but 64-bit needs 9 */
+    CHECK_HEX("a moffs cut short is refused", -1,
+              hype_mmio_decode_addr(short64, sizeof short64, 8u, &out));
+}
+
+static void test_752_addr_override_still_refuses_modrm_forms(void) {
+    hype_mmio_decode_t out;
+    /* 67 8B 03 = MOV eax,[ebx] with 16-bit addressing, whose ModRM layout
+     * decode_modrm_tail() does not implement. Refused rather than mis-parsed -- and
+     * refused before #752 too, because 0x67 fell through as an unknown opcode. */
+    const uint8_t b[] = {0x67, 0x8B, 0x03};
+    CHECK_HEX("67 + ModRM is refused", -1, hype_mmio_decode_addr(b, sizeof b, 4u, &out));
+}
+
 int main(void) {
+    test_752_moffs_lengths_follow_the_address_size();
+    test_752_all_four_opcodes();
+    test_752_operand_size_prefix();
+    test_752_address_size_prefix();
+    test_752_prefixes_in_either_order();
+    test_752_refused_when_the_address_size_is_unknown();
+    test_752_truncated_moffs_is_refused();
+    test_752_addr_override_still_refuses_modrm_forms();
     test_decodes_mov_m32_imm32();
     test_decodes_mov_m8_imm8();
     test_imm_length_is_added_for_each_addressing_form();
