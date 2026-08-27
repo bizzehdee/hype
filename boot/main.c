@@ -17002,19 +17002,40 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * and the wedge is downstream (SRCU/workqueue/self-wakeup). Also
                  * dumps the live pending-IRR occupancy + staged EVENTINJ. */
                 {
-                    hype_vmm_intr_state_t idg;
-                    unsigned long long ei = 0, df = 0, wn = 0, ov = 0;
-                    (void)vmm_get_int_diag(kind, ctx, &ei, &df, &wn, &ov);
-                    vmm_get_intr_state(kind, ctx, &idg);
-                    hype_debug_print("fw-1 INTDIAG: eventinj=%llu defer=%llu window=%llu coalesced=%llu "
-                                     "collisions=%llu | pending=%d(top 0x%x) staged_eventinj=0x%llx "
-                                     "IF=%d shadow=0x%llx\n",
-                                     ei, df, wn, ov,
-                                     vmm_get_eventinj_collisions(kind, ctx),
-                                     idg.pending_count, (unsigned int)idg.pending_vector,
-                                     (unsigned long long)idg.eventinj,
-                                     (int)((idg.rflags >> 9) & 1u),
-                                     (unsigned long long)idg.interrupt_shadow);
+                    /*
+                     * #750: PER vCPU. These counters have always been per-vCPU fields; this
+                     * line only ever read the BSP's, so a coalesce or a collision on an AP
+                     * was invisible.
+                     *
+                     * That is the difference the ticket now turns on. Its tripped run shows
+                     * `VECSTAT vm0/1: fc=84/83` -- one CALL_FUNCTION IPI requested on vCPU 1
+                     * and never injected -- and a whole-VM `coalesced=` cannot say whether
+                     * that was a legitimate fold into an already-pending IRR bit (correct
+                     * APIC semantics, which Linux copes with) or a genuine drop. Those need
+                     * different fixes, and from the aggregate they look identical.
+                     *
+                     * Third place this same defect has been found: VECSTAT under #735,
+                     * APVCPU under #750, now this. A per-vCPU counter reported for one vCPU
+                     * is not a per-vCPU counter.
+                     */
+                    unsigned int d_;
+                    for (d_ = 0; d_ < vm->vcpu_count && d_ < HYPE_MAX_VCPUS_PER_VM; d_++) {
+                        hype_vmm_intr_state_t idg;
+                        unsigned long long ei = 0, df = 0, wn = 0, ov = 0;
+                        if (vm->vcpu[d_] == 0) continue;
+                        (void)vmm_get_int_diag(kind, vm->vcpu[d_], &ei, &df, &wn, &ov);
+                        vmm_get_intr_state(kind, vm->vcpu[d_], &idg);
+                        hype_debug_print("fw-1 INTDIAG vm%u/%u: eventinj=%llu defer=%llu "
+                                         "window=%llu coalesced=%llu collisions=%llu | "
+                                         "pending=%d(top 0x%x) staged_eventinj=0x%llx IF=%d "
+                                         "shadow=0x%llx [#750]\n",
+                                         (unsigned)(vm - g_vms), d_, ei, df, wn, ov,
+                                         vmm_get_eventinj_collisions(kind, vm->vcpu[d_]),
+                                         idg.pending_count, (unsigned int)idg.pending_vector,
+                                         (unsigned long long)idg.eventinj,
+                                         (int)((idg.rflags >> 9) & 1u),
+                                         (unsigned long long)idg.interrupt_shadow);
+                    }
                     /*
                      * #640 criterion 4: AVIC exit totals for THIS VM. Printed unconditionally in
                      * an AVIC build (all-zero in a default build, where the exits cannot occur),

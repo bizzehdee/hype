@@ -35,8 +35,11 @@ for r in $(seq 1 "$RUNS"); do
     echo "  clean"
   fi
   # What hype was doing, either way -- a clean run's numbers are the control.
-  grep -a 'INTDIAG' "$L" | tail -1 | sed 's/^/    /' || true
-  grep -a 'VECHIST' "$L" | tail -1 | sed 's/^/    /' || true
+  # #750: per-vCPU, all four. The aggregate hid the one vCPU that lost an IPI.
+  for v in 0 1 2 3; do
+    grep -a "VECSTAT vm0/$v:" "$L" | tail -1 | sed 's/^/    /'
+    grep -a "INTDIAG vm0/$v:" "$L" | tail -1 | sed 's/^/    /'
+  done
 done
 
 echo "=== verdict ==="
