@@ -3,7 +3,12 @@
 **Status: staged onto the real drive on 2026-08-25.** `/dev/sdd` (serial
 `DB9876543214E` — see the serial note below, it is NOT what Linux reports)
 is a two-partition drive: `sdd1` FAT32 (label
-`HYPEBOOT`, boot ESP) + `sdd2` exFAT (label `EADE-CA36`, all vdisks/ISOs).
+`HYPEBOOT`, boot ESP) + `sdd2` exFAT (all vdisks/ISOs).
+
+**`EADE-CA36` is that exFAT volume's UUID, not a label** -- it has no label at all, and
+udisks names the mountpoint after the UUID, which is how this file called it a label for
+two months. `tools/hw-val-2026-08-25/stage.sh` finds it as "the exfat partition on the same
+disk as HYPEBOOT" so it depends on neither.
 Full reasoning for every boot is in `docs/hw-val-runbook-2026-08-25.md` —
 this directory is the artifacts that runbook points at, and this file is
 what actually landed where.
@@ -107,7 +112,7 @@ sdd1 (HYPEBOOT, FAT32):
   \input-1a\ ... \input-3c\    <- per-boot input-script folders, see table above
   \RUNBOOK-README.md, \hw-val-runbook-2026-08-25.md  <- reference copies
 
-sdd2 (EADE-CA36, exFAT), referenced from every cfg via source_disk/media_disk
+sdd2 (exFAT, UUID EADE-CA36 -- no label), referenced from every cfg via source_disk/media_disk
 = DB9876543214E (the DRIVE's serial -- hype's own resolver walks that
 drive's partitions to find the path, no partition number needed):
   \iso\test.iso             <- Alpine standard 3.21.7
@@ -416,3 +421,26 @@ in `a6ad16c`; the USB path now emits real Set-1.
 Both are commit `a6ad16c`, built one at a time with `make clean` between them and re-read
 from the media after an unmount/mount cycle. Boot 6 needs no re-cabling -- keyboard and
 mouse stay on the hub; it is a chord test.
+
+## stage.sh -- staging is a script now (#738)
+
+`./stage.sh` builds both variants (with `make clean` between them, which is required and
+not tidiness), stages them plus every config, **creates any missing scratch image at its
+configured size**, clears the logs, then unmounts and remounts the volume and re-reads
+every staged file so no SHA comes out of the page cache.
+
+`--check` verifies the drive and changes nothing. `--no-build` stages whatever is already
+in `rig/stage-current/`.
+
+It exists because of #738: the 2026-08-26 boots both ran with no SATA disk attached
+because `\hype\disks\run1a-scratch.img` was not on the volume, and the config comment
+claimed hype created it on demand. hype creates nothing (#331). The comments are corrected;
+this script is the other half, so the image cannot be lost on the next re-stage.
+
+Two things it refuses rather than doing:
+
+- **Writing to a drive that is not this one.** It finds the volume by label, checks the
+  exFAT partition is on the same physical disk, and checks the transport is `usb`. The
+  drive was `sdd` on 2026-08-25 and `sdb` on 2026-08-27 -- the letter moves.
+- **Clearing a non-empty log.** Archive the boot to `logs/<boot>/` first; losing a run's
+  evidence is worse than an extra manual step.
