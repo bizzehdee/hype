@@ -3908,6 +3908,25 @@ own "keeping plan.md and the board in sync" rule).
   trust tier and needs its own §10 decision when promoted; it must not
   silently become a hole in the §6g/§10 guest-isolation invariant.
 
+- **`size_gb` on a `backing = file` disk CREATES the image** (noted 2026-08-27,
+  from #740). Today both size keys are declarations hype *validates*, never
+  instructions it obeys: `target_disk_size_gb` since #331, and `[disk.*]
+  size_gb` since #740. hype has no post-`ExitBootServices` filesystem
+  allocator and only ever writes in place, so an image must already be fully
+  allocated on the volume, and both keys warn when the file's real size
+  disagrees with the config.
+
+  An operator plainly expects a `size_gb` on a file-backed disk to make the
+  file, and the machinery already exists -- the terminal's `mkdisk` builds a
+  sparse raw image through `HYPE_FS_CAP_WRITE_GROW` (§10 decision 69) -- so
+  this is wiring rather than new capability. It is deferred, not rejected,
+  because "the config file causes a multi-gigabyte allocation at boot" is a
+  behaviour change with its own failure surface that v1 has no answer for:
+  the volume filling mid-write, a partial image left behind by a boot that
+  was interrupted, and an existing file of the wrong size (grow it? refuse?
+  ignore it?). Each needs a decided answer before the key can be made to act,
+  and #331's and #740's validation is the honest behaviour until then.
+
 ## 14. Gap analysis (2026-08-21)
 
 A structured review of fifteen virtualization areas against this plan, the

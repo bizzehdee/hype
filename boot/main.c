@@ -9769,6 +9769,35 @@ static int fw_1_disk_use_image_file_unlocked(hype_fw_vm_t *vm, unsigned int slot
                               cv->target_disk_size_gb, (unsigned long long)want);
         }
     }
+    /*
+     * #740: `[disk.*] size_gb` had the same defect the sibling key above had before #331 -- it
+     * parses, range-checks and serializes, and nothing ever read it. Validated here for the
+     * reasons #331 gives, on the same terms: the real size is already known from the resolved
+     * extents so the check is free, and a config that disagrees with its image is exactly the
+     * quiet wrongness this project refuses elsewhere.
+     *
+     * NOT made to create the image. That is what an operator plainly expects a `size_gb` on a
+     * `backing = file` disk to do, and hype already has the machinery (`mkdisk`, decision 69) --
+     * but "the config file causes a multi-gigabyte allocation at boot" is a behaviour change with
+     * its own failure surface, so it needs a plan.md decision first rather than arriving under a
+     * bug label. Tracked separately.
+     *
+     * Applies to every slot, not just slot 0: a `[disk.*]` entry is the only way an extra slot
+     * exists at all, so its declared size is meaningful wherever it is attached.
+     */
+    {
+        const hype_cfg_disk_t *cd_sz = fw_1_slot_cfg(vm, slot);
+        if (cd_sz != 0 && cd_sz->has_size_gb && cd_sz->size_gb != 0u) {
+            uint64_t want = hype_cfg_size_gb_to_bytes(cd_sz->size_gb);
+            if (file.size_bytes != want) {
+                hype_serial_print("m5-8: WARNING %s is %llu bytes but [disk] size_gb = %u says "
+                                  "%llu -- using the file's real size; hype does not create or "
+                                  "resize an image, so the config or the image is stale [#740]\n",
+                                  path, (unsigned long long)file.size_bytes,
+                                  cd_sz->size_gb, (unsigned long long)want);
+            }
+        }
+    }
     if (hype_blk_image_init(&d->image, &d->raw_be, &file, g_media.part_base_lba,
                             hostdisk_read, hostdisk_write, 0) != 0) {
         /* A sparse or short-mapped image: refuse rather than serve a disk whose
