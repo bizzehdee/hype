@@ -170,9 +170,9 @@ typedef struct {
     uint8_t report[64] __attribute__((aligned(64)));
     unsigned int enq;
     unsigned int cyc;
-    unsigned int mps;       /* the endpoint's wMaxPacketSize -- the TRB length to arm */
+    unsigned int mps;        /* the endpoint's wMaxPacketSize -- the TRB length to arm */
     unsigned int recoveries; /* consecutive halt recoveries; reset by a good report */
-    int dead;               /* recovery cap hit -- stop arming and stop recovering */
+    unsigned int backoff;    /* polls to skip before the next recovery attempt */
     int armed;
     uint64_t pending_trb;
 } xhci_int_in_hw_t;
@@ -517,6 +517,53 @@ static void write_ctx(uint8_t *base, unsigned int off, const uint32_t c[8]) {
     for (i = 0; i < 8u; i++) put_le32(base + off + i * 4u, c[i]);
 }
 
+static uint32_t get_le32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+/*
+ * #734: dump the OUTPUT device context the controller wrote back for one slot.
+ *
+ * The 2026-08-27 10:42 boot left a working device and a broken one on the SAME hub, at
+ * the same speed, with the same interval: the mouse reported 548 times with 0 errors
+ * while the keyboard took cc=4 on every single transfer, recovered cleanly 8 times, and
+ * failed again each time. Everything hype BUILDS for the two is the same shape, so the
+ * question is what the CONTROLLER ended up holding -- EP State, and whether the speed,
+ * TT and Interval fields survived Configure Endpoint. This prints that, once per
+ * endpoint, so the two can be diffed inside one boot.
+ */
+static void dump_out_ctx(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int dci,
+                         const char *what) {
+    xhci_hw_t *hw = HW(c);
+    unsigned int cs = c->ctx_size;
+    const uint8_t *dctx;
+    uint32_t s0, s1, s2, e0, e1, e4;
+    int di = dev_index(hw, slot);
+
+    if (di < 0) {
+        hype_debug_print("host-xhci: CTXDUMP %s slot=%u -- no device context [#734]\n", what, slot);
+        return;
+    }
+    dctx = hw->dev_ctx[di];
+    s0 = get_le32(dctx + 0u);
+    s1 = get_le32(dctx + 4u);
+    s2 = get_le32(dctx + 8u);
+    e0 = get_le32(dctx + dci * cs + 0u);
+    e1 = get_le32(dctx + dci * cs + 4u);
+    e4 = get_le32(dctx + dci * cs + 16u);
+    hype_debug_print("host-xhci: CTXDUMP %s slot=%u dci=%u | SLOT route=0x%05x speed=%u "
+                     "entries=%u mtt=%u hub=%u rootport=%u ttslot=%u ttport=%u ttt=%u "
+                     "| EP state=%u interval=%u mult=%u maxburst=%u mps=%u cerr=%u "
+                     "type=%u esit=%u [#734]\n",
+                     what, slot, dci,
+                     s0 & 0xFFFFFu, (s0 >> 20) & 0xFu, (s0 >> 27) & 0x1Fu,
+                     (s0 >> 25) & 1u, (s0 >> 26) & 1u, (s1 >> 16) & 0xFFu,
+                     s2 & 0xFFu, (s2 >> 8) & 0xFFu, (s2 >> 16) & 0x3u,
+                     e0 & 0x7u, (e0 >> 16) & 0xFFu, (e0 >> 8) & 0x3u, (e1 >> 15) & 0x1u,
+                     (e1 >> 16) & 0xFFFFu, (e1 >> 1) & 0x3u, (e1 >> 3) & 0x7u,
+                     (e4 >> 16) & 0xFFFFu);
+}
+
 static void ep0_enqueue(xhci_hw_t *hw, unsigned int di, const uint32_t trb[4]) {
     ring_enqueue(hw->ep0_ring[di], &hw->ep0_enq[di], &hw->ep0_cyc[di], trb);
 }
@@ -821,7 +868,7 @@ int hype_xhci_configure_int_in_endpoint(hype_xhci_ctrl_t *c, unsigned int slot,
     zero(iin->ring, XPAGE);
     ring_init_link(iin->ring);
     iin->enq = 0; iin->cyc = 1; iin->armed = 0; iin->pending_trb = 0;
-    iin->mps = mps; iin->recoveries = 0; iin->dead = 0;
+    iin->mps = mps; iin->recoveries = 0; iin->backoff = 0;
 
     zero(hw->input_ctx, XPAGE);
     hype_xhci_input_ctrl_ctx(ctx, HYPE_XHCI_ADD_SLOT | (1u << dci), 0);
@@ -838,6 +885,10 @@ int hype_xhci_configure_int_in_endpoint(hype_xhci_ctrl_t *c, unsigned int slot,
     hype_xhci_trb_configure_endpoint(cmd, phys(hw->input_ctx), slot, (int)hw->cmd_cyc);
     if (cmd_submit_wait(c, cmd, evt) != 0) return -1;
     if (hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS) return -1;
+    dump_out_ctx(c, slot, dci, "int-in");
+    if (path->tt_hub_slot) {
+        dump_out_ctx(c, path->tt_hub_slot, 1u, "its-TT-hub");
+    }
     return 0;
 }
 
@@ -921,24 +972,33 @@ static int ep_recover(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int dci, 
  * `errors=1` frozen while `polls` climbed past 300000 and `reports` stayed at 0. One
  * error per boot is not a device that is failing; it is a device that got one chance.
  *
- * Bounded, because recovery is three synchronous commands and this runs from the guest
- * dispatch loop: an endpoint that cannot be brought back must not be retried thousands
- * of times a second. The count resets on the next good report, so a transient does not
- * accumulate across a long session.
+ * Rate-limited, because recovery is three synchronous commands and this runs from the
+ * guest dispatch loop: an endpoint failing every 1ms must not be reset thousands of
+ * times a second. After INT_IN_MAX_RECOVERIES back-to-back failures it BACKS OFF rather
+ * than dying -- the 10:42 boot's keyboard is exactly the case that must not be written
+ * off forever, since a device that starts answering later is still the operator's only
+ * keyboard. The counters reset on the next good report.
  */
 #define INT_IN_MAX_RECOVERIES 8u
+#define INT_IN_BACKOFF_POLLS  8192u
 
 static void int_in_recover(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int dci,
                            xhci_int_in_hw_t *iin) {
+    static unsigned int backoff_reported = 0;
+
     iin->armed = 0;
     iin->pending_trb = 0;
-    if (iin->recoveries++ >= INT_IN_MAX_RECOVERIES) {
-        iin->dead = 1;
-        hype_debug_print("host-xhci: interrupt-IN slot=%u ep=%u gave up after %u halt "
-                         "recoveries -- endpoint left stopped [#734]\n", slot, dci,
-                         (unsigned)INT_IN_MAX_RECOVERIES);
+    if (iin->recoveries >= INT_IN_MAX_RECOVERIES) {
+        iin->backoff = INT_IN_BACKOFF_POLLS;
+        if (backoff_reported++ < 4u) {
+            hype_debug_print("host-xhci: interrupt-IN slot=%u ep=%u failed %u recoveries in a "
+                             "row -- backing off for %u polls [#734]\n", slot, dci,
+                             (unsigned)INT_IN_MAX_RECOVERIES, (unsigned)INT_IN_BACKOFF_POLLS);
+        }
+        iin->recoveries = 0;
         return;
     }
+    iin->recoveries++;
     hype_debug_print("host-xhci: interrupt-IN slot=%u ep=%u halted -- recovering (%u/%u) "
                      "[#734]\n", slot, dci, iin->recoveries, (unsigned)INT_IN_MAX_RECOVERIES);
     (void)ep_recover(c, slot, dci, iin->ring, &iin->enq, &iin->cyc);
@@ -964,8 +1024,9 @@ int hype_xhci_int_in_poll(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int e
     if (iin == (xhci_int_in_hw_t *)0 || len > sizeof(iin->report)) {
         return -1;
     }
-    if (iin->dead) {
-        return -1;
+    if (iin->backoff != 0u) {
+        iin->backoff--;
+        return 0; /* idle, not an error -- the endpoint is resting, not gone */
     }
     bar = (volatile uint8_t *)(uintptr_t)c->bar;
     my_trb = phys(iin->ring) + (uint64_t)iin->enq * HYPE_XHCI_TRB_BYTES;
@@ -1003,6 +1064,7 @@ int hype_xhci_int_in_poll(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int e
                 return -1;
             }
             iin->recoveries = 0;
+            iin->backoff = 0;
             for (i = 0; i < len; i++) out[i] = iin->report[i];
             return 1;
         }
@@ -1027,6 +1089,7 @@ int hype_xhci_int_in_poll(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int e
         return -1;
     }
     iin->recoveries = 0;
+    iin->backoff = 0;
     for (i = 0; i < len; i++) out[i] = iin->report[i];
     return 1;
 }
