@@ -26,6 +26,14 @@ S="${SCRATCH:-disk-images/735}"
 B=build
 SECS="${1:-600}"
 SMP="${SMP:--smp cpus=8,cores=4,threads=2,sockets=1}"
+# MEDIA=usb puts EVERYTHING on one emulated USB device -- hype boots from it,
+# streams the ISO from it and writes its log to it, which is the 5950X's own
+# shape (one drive, hype on partition 1, the ISO on partition 2). Every other
+# rig in this tree serves the ESP over IDE and uses USB only for the log, so
+# the whole boot+media+log path shares no lock and no controller with itself.
+# That is the largest remaining difference between the rigs that PASS and the
+# hardware that does not, so it is a switch rather than a second file.
+MEDIA="${MEDIA:-ide}"
 CPU="${CPUFLAGS:-host,topoext=on}"
 ISO="${ISO:-disk-images/alpine-virt-console.iso}"
 CODE=${OVMF_CODE:-/usr/share/OVMF/OVMF_CODE.fd}
@@ -67,17 +75,24 @@ mcopy -i "$E" "$ISO" ::/iso/test.iso
 mcopy -i "$E" $S/hype.cfg ::/hype.cfg
 mcopy -i "$E" tools/hw-val-2026-08-25/input-1a/vm0.txt ::/input/vm0.txt
 
+if [ "$MEDIA" = usb ]; then
+  ESPDEV=(-drive format=raw,file=$S/esp.img,if=none,id=esp
+          -device usb-storage,bus=xhci.0,drive=esp,bootindex=0,serial=HYPE735ESP)
+else
+  ESPDEV=(-drive format=raw,file=$S/esp.img,if=none,id=esp
+          -device ide-hd,drive=esp,bus=ide.0,bootindex=0)
+fi
+echo "media path: $MEDIA (esp over ${MEDIA})"
 cp "$VARS" $S/VARS.fd
 timeout "$SECS" "$QEMU" \
   -machine q35 -m 4096 -nodefaults \
   -accel kvm -accel tcg -cpu "$CPU" $SMP \
   -drive if=pflash,format=raw,readonly=on,file="$CODE" \
   -drive if=pflash,format=raw,file=$S/VARS.fd \
-  -drive format=raw,file=$S/esp.img,if=none,id=esp \
-  -device ide-hd,drive=esp,bus=ide.0,bootindex=0 \
   -device qemu-xhci,id=xhci \
+  "${ESPDEV[@]}" \
   -drive format=raw,file=$S/usb.img,if=none,id=stick \
-  -device usb-storage,bus=xhci.0,drive=stick \
+  -device usb-storage,bus=xhci.0,drive=stick,serial=HYPE735LOG \
   -serial stdio -display none -vga none > $S/serial.txt 2>&1 || true
 
 echo "=== what the guest saw ==="
