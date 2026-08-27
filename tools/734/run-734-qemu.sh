@@ -14,6 +14,11 @@
 #
 # Unlike #736/#737, QEMU CAN prove this one: the fault is in hype's own bookkeeping, not
 # in a controller behaviour QEMU does not model.
+#
+# The greps below anchor on "DIAG: HID polls=", not "DIAG: HID". #734's modseen line also
+# starts "fw-1 DIAG: HID" and carries no reports= field, so the looser pattern selected it
+# with tail -1 and reported a keyboard that had delivered 320 reports as never having
+# reported at all. A rig that fails on a diagnostic being ADDED is worse than no rig.
 set -e
 . "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 export LC_ALL=C
@@ -52,7 +57,7 @@ cp /usr/share/edk2/ovmf/OVMF_VARS.fd $S/VARS.fd
 (
   for _ in $(seq 1 "$SECS"); do
     sleep 1
-    grep -aq "fw-1 DIAG: HID" $S/serial.log 2>/dev/null && break
+    grep -aq "fw-1 DIAG: HID polls=" $S/serial.log 2>/dev/null && break
   done
   for _ in $(seq 1 60); do
     printf 'sendkey a\n'; sleep 0.2
@@ -60,7 +65,7 @@ cp /usr/share/edk2/ovmf/OVMF_VARS.fd $S/VARS.fd
   done
   # Let a DIAG line print with phase 1's totals in it, then freeze the mouse.
   sleep 40
-  grep -a "fw-1 DIAG: HID" $S/serial.log | tail -1 | sed -n 's/.*reports=\([0-9]*\).*/\1/p' > $S/r1.txt
+  grep -a "fw-1 DIAG: HID polls=" $S/serial.log | tail -1 | sed -n 's/.*reports=\([0-9]*\).*/\1/p' > $S/r1.txt
   for _ in $(seq 1 100); do
     printf 'sendkey b\n'; sleep 0.4
   done
@@ -88,13 +93,13 @@ grep -a "host-hid: USB .* CLAIMED\|no interrupt-IN block free" $S/serial.log | h
 echo "=== transfer errors, if any"
 grep -a "interrupt-IN transfer FAILED" $S/serial.log | head -4
 echo "=== last counters"
-grep -a "fw-1 DIAG: HID\|fw-1 DIAG: MOUSE" $S/serial.log | tail -2
+grep -a "fw-1 DIAG: HID polls=\|fw-1 DIAG: MOUSE\|fw-1 DIAG: HID modseen=" $S/serial.log | tail -3
 
 fail=0
 say() { echo "$1"; fail=1; }
 grep -aq "host-hid: USB keyboard CLAIMED" $S/serial.log || say "FAIL: the keyboard was not claimed"
 grep -aq "host-hid: USB mouse CLAIMED" $S/serial.log || say "FAIL: the mouse was not claimed"
-kb=$(grep -a "fw-1 DIAG: HID" $S/serial.log | tail -1 | sed -n 's/.*reports=\([0-9]*\).*/\1/p')
+kb=$(grep -a "fw-1 DIAG: HID polls=" $S/serial.log | tail -1 | sed -n 's/.*reports=\([0-9]*\).*/\1/p')
 r1=$(cat $S/r1.txt 2>/dev/null)
 echo "keyboard reports: ${r1:-none} at the end of phase 1 -> ${kb:-none} at the end of phase 2"
 [ "${kb:-0}" -gt 0 ] 2>/dev/null || say "FAIL: the keyboard never reported at all"

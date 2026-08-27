@@ -2013,6 +2013,10 @@ static uint8_t fw_1_usb_record(hype_usb_inventory_t *inv, unsigned int controlle
     di.owner = (uint8_t)HYPE_USB_OWNER_NONE;
     di.ep_count = (uint8_t)hype_usb_collect_endpoints(cfg, cfg_len, di.eps,
                                                       HYPE_USB_MAX_ENDPOINTS);
+    /* #741: and every interface, so a composite device is not reduced to its first one. */
+    di.iface_count = (uint8_t)hype_usb_collect_interfaces(cfg, cfg_len, di.ifaces,
+                                                          HYPE_USB_MAX_IFACES,
+                                                          &di.iface_overflow);
     (void)hype_usb_inventory_add(inv, &di);
     return di.dev_class;
 }
@@ -2034,15 +2038,33 @@ static uint8_t fw_1_usb_record(hype_usb_inventory_t *inv, unsigned int controlle
 static void fw_1_claim_boot_hid(hype_xhci_ctrl_t *xc, unsigned int protocol, const char *what,
                                 int *ready, hype_xhci_ctrl_t *xc_out, unsigned int *slot_out,
                                 unsigned int *ep_out, unsigned int *mps_out) {
-    int hi = hype_usb_inventory_next_unclaimed_class(&g_usb_inv, HYPE_USB_CLASS_HID, -1);
+    /*
+     * #741: search by INTERFACE, not by the device's first-interface class triple.
+     *
+     * This used to iterate hype_usb_inventory_next_unclaimed_class(HID) and then test
+     * d->dev_subclass / d->dev_protocol -- both of which only ever describe the FIRST
+     * interface. A Logitech receiver (046d:c547 on the 5950X) presents a boot-keyboard
+     * interface and a boot-mouse interface on one device; hype recorded 03/01/02 and could
+     * only ever claim it as a pointer. On a machine whose only input is one combo dongle
+     * that means no keyboard at all, and nothing in the log to say why.
+     *
+     * The owner filter went with it, for the same reason: a device hype already owns for
+     * its keyboard interface must still be reachable for its mouse interface. "Already
+     * mine" and "somebody else's" are checked separately below, which the old
+     * next_unclaimed_class() could not distinguish.
+     */
+    int hi = hype_usb_inventory_next_iface(&g_usb_inv, HYPE_USB_CLASS_HID,
+                                           HYPE_USB_SUBCLASS_BOOT, (uint8_t)protocol, -1);
 
     while (hi >= 0 && !*ready) {
         const hype_usb_devinfo_t *d = &g_usb_inv.dev[hi];
 
         /* Boot protocol only -- a non-boot HID needs its report descriptor parsed, and
-         * misreading a report layout invents keystrokes or clicks. */
-        if (d->dev_subclass == HYPE_USB_SUBCLASS_BOOT && d->dev_protocol == protocol &&
-            d->slot != 0u) {
+         * misreading a report layout invents keystrokes or clicks. The interface search
+         * above already required it; the slot check is what is left. */
+        if (d->slot != 0u &&
+            (d->owner == (uint8_t)HYPE_USB_OWNER_NONE ||
+             d->owner == (uint8_t)HYPE_USB_OWNER_HYPE)) {
             static uint8_t hidcfg[256];
             unsigned int hidlen = 0;
             hype_usb_hid_kbd_t hid;
@@ -2124,7 +2146,8 @@ static void fw_1_claim_boot_hid(hype_xhci_ctrl_t *xc, unsigned int protocol, con
                                  (unsigned)d->vid, (unsigned)d->pid);
             }
         }
-        hi = hype_usb_inventory_next_unclaimed_class(&g_usb_inv, HYPE_USB_CLASS_HID, hi);
+        hi = hype_usb_inventory_next_iface(&g_usb_inv, HYPE_USB_CLASS_HID,
+                                           HYPE_USB_SUBCLASS_BOOT, (uint8_t)protocol, hi);
     }
 }
 

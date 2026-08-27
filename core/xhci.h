@@ -763,6 +763,15 @@ typedef enum {
  */
 #define HYPE_USB_MAX_ENDPOINTS 8u
 
+/*
+ * #741: how many interface descriptors one device's entry records.
+ *
+ * 8 covers what this project meets: a Logitech Unifying receiver presents 3, a composite
+ * QMK keyboard 3-4, a UVC webcam 2 plus its streaming alternates. A device with more is
+ * truncated and says so via iface_overflow rather than silently reporting fewer.
+ */
+#define HYPE_USB_MAX_IFACES 8u
+
 typedef struct {
     uint8_t addr;       /* bEndpointAddress, including the 0x80 IN bit */
     uint8_t attributes; /* bmAttributes: bits 1:0 are the transfer type */
@@ -783,6 +792,24 @@ typedef struct {
  */
 unsigned int hype_usb_collect_endpoints(const uint8_t *cfg, unsigned int len, hype_usb_ep_t *out,
                                         unsigned int cap);
+
+/*
+ * #741: one interface descriptor's identity.
+ *
+ * A device gets ONE class triple in the fields below, taken from its first interface, and
+ * that is wrong for anything multi-function. The 5950X's `046d:c547` is a Logitech
+ * receiver presenting a boot-KEYBOARD interface and a boot-MOUSE interface on one device;
+ * hype recorded 03/01/02 and could only ever claim it as a pointer. On a machine whose
+ * only input is a single combo dongle that means no keyboard at all, with nothing in the
+ * log to explain it.
+ */
+typedef struct {
+    uint8_t number;    /* bInterfaceNumber */
+    uint8_t cls;       /* bInterfaceClass -- `class` is a C++ keyword and this header is
+                        * included from tests that may be built as C++ */
+    uint8_t subclass;
+    uint8_t protocol;
+} hype_usb_iface_t;
 
 typedef struct {
     unsigned int controller;   /* index of the xHCI controller in PCI scan order */
@@ -810,6 +837,14 @@ typedef struct {
      * configuration descriptor could not be read, not that the device has none. */
     uint8_t ep_count;
     hype_usb_ep_t eps[HYPE_USB_MAX_ENDPOINTS];
+    /*
+     * #741: EVERY interface, not just the first. dev_class/subclass/protocol above stay as
+     * they are -- the first interface -- because existing lookups key off them and a
+     * single-function device's answer is unchanged; this is the fuller truth alongside it.
+     */
+    uint8_t iface_count;
+    uint8_t iface_overflow;    /* interfaces seen but not recorded (table full) */
+    hype_usb_iface_t ifaces[HYPE_USB_MAX_IFACES];
 } hype_usb_devinfo_t;
 
 typedef struct {
@@ -884,6 +919,45 @@ const char *hype_usb_owner_str(hype_usb_owner_t owner);
  */
 int hype_usb_first_iface_class(const uint8_t *cfg, unsigned int len, uint8_t *out_class,
                                uint8_t *out_subclass, uint8_t *out_protocol);
+
+/*
+ * #741: collect EVERY interface descriptor's identity from a configuration descriptor.
+ *
+ * Returns how many were written (capped at `cap`); *out_overflow, when given, receives the
+ * number seen beyond the cap so truncation is visible rather than silent. Pure -- walks the
+ * caller's buffer only, and a malformed length terminates the walk instead of spinning,
+ * same rule as every other descriptor walker here.
+ *
+ * Alternate settings of the same interface number are recorded as they appear: hype does
+ * not issue SET_INTERFACE, so alt 0 is what is live, and collapsing them here would hide a
+ * device whose alt 0 is a placeholder.
+ */
+unsigned int hype_usb_collect_interfaces(const uint8_t *cfg, unsigned int len,
+                                         hype_usb_iface_t *out, unsigned int cap,
+                                         uint8_t *out_overflow);
+
+/*
+ * #741: index of the first interface on `d` matching class/subclass/protocol, or -1.
+ *
+ * This is what a claim path should ask instead of comparing d->dev_subclass and
+ * d->dev_protocol, which only ever describe the first interface.
+ */
+int hype_usb_devinfo_find_iface(const hype_usb_devinfo_t *d, uint8_t cls, uint8_t subclass,
+                                uint8_t protocol);
+
+/*
+ * #741: next inventory entry (after index `after`, -1 to start) carrying an interface with
+ * this class/subclass/protocol, or -1.
+ *
+ * Deliberately does NOT filter on owner, unlike hype_usb_inventory_next_unclaimed_class().
+ * A composite dongle can legitimately be claimed twice -- once for its boot-keyboard
+ * interface and once for its boot-mouse interface -- and an owner filter here is exactly
+ * what stopped the second claim. Callers that want only unowned devices check the owner
+ * themselves, where they can tell "already mine, for a different interface" from
+ * "somebody else's".
+ */
+int hype_usb_inventory_next_iface(const hype_usb_inventory_t *inv, uint8_t cls,
+                                  uint8_t subclass, uint8_t protocol, int after);
 
 /* USB-5 (#217): configure a HID keyboard's interrupt-IN endpoint, then poll it.
  * hype_xhci_int_in_poll returns 1 = report copied, 0 = none yet (the normal idle

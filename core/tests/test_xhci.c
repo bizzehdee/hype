@@ -968,7 +968,101 @@ static void test_int_in_pool(void) {
     hype_xhci_int_in_release_ctrl(0, 3u, 0u); /* null-safe */
 }
 
+/* ---- #741: a composite device's interfaces ---- */
+
+/* config(9) + iface0 HID/boot/keyboard + iface1 HID/boot/mouse + iface2 vendor.
+ * This is the shape of a Logitech Unifying receiver, which is what #741 is about. */
+static const uint8_t k741_receiver_cfg[] = {
+    9, 0x02, 0x2D, 0x00, 3, 1, 0, 0xA0, 50,          /* config, 3 interfaces */
+    9, 0x04, 0, 0, 1, 0x03, 0x01, 0x01, 0,           /* iface 0: HID boot KEYBOARD */
+    7, 0x05, 0x81, 0x03, 8, 0, 8,                    /*   ep 0x81 int-in */
+    9, 0x04, 1, 0, 1, 0x03, 0x01, 0x02, 0,           /* iface 1: HID boot MOUSE */
+    7, 0x05, 0x82, 0x03, 8, 0, 8,                    /*   ep 0x82 int-in */
+    9, 0x04, 2, 0, 1, 0xFF, 0x00, 0x00, 0,           /* iface 2: vendor-specific */
+    7, 0x05, 0x83, 0x03, 32, 0, 1,                   /*   ep 0x83 int-in */
+};
+
+static void test_741_collects_every_interface(void) {
+    hype_usb_iface_t ifs[HYPE_USB_MAX_IFACES];
+    uint8_t over = 0xFF;
+    unsigned n = hype_usb_collect_interfaces(k741_receiver_cfg, sizeof k741_receiver_cfg,
+                                             ifs, HYPE_USB_MAX_IFACES, &over);
+    CHECK_INT("three interfaces", 3u, n);
+    CHECK_INT("no overflow", 0u, (unsigned)over);
+    CHECK_INT("iface0 number", 0u, (unsigned)ifs[0].number);
+    CHECK_INT("iface0 is a boot keyboard", 0x01u, (unsigned)ifs[0].protocol);
+    CHECK_INT("iface1 number", 1u, (unsigned)ifs[1].number);
+    CHECK_INT("iface1 is a boot mouse", 0x02u, (unsigned)ifs[1].protocol);
+    CHECK_INT("iface2 is vendor", 0xFFu, (unsigned)ifs[2].cls);
+}
+
+static void test_741_first_iface_class_still_sees_only_the_first(void) {
+    uint8_t c = 0, sc = 0, pr = 0;
+    /* The old accessor is unchanged and still reports the FIRST interface. That is the
+     * whole defect, kept working because existing lookups key off it -- the new list is
+     * the fuller truth alongside it, not a replacement. */
+    CHECK_INT("found", 1, hype_usb_first_iface_class(k741_receiver_cfg,
+                                                    sizeof k741_receiver_cfg, &c, &sc, &pr));
+    CHECK_INT("class HID", 0x03u, (unsigned)c);
+    CHECK_INT("protocol keyboard only", 0x01u, (unsigned)pr);
+}
+
+static void test_741_find_iface_matches_a_later_interface(void) {
+    hype_usb_devinfo_t d;
+    uint8_t over = 0;
+    unsigned i;
+    for (i = 0; i < sizeof d; i++) ((uint8_t *)&d)[i] = 0;
+    d.iface_count = (uint8_t)hype_usb_collect_interfaces(k741_receiver_cfg,
+                                                         sizeof k741_receiver_cfg, d.ifaces,
+                                                         HYPE_USB_MAX_IFACES, &over);
+    /* The boot MOUSE is interface 1. Matching only the first interface -- which is what
+     * the claim path did -- would miss it, and did. */
+    CHECK_INT("boot keyboard found", 0, hype_usb_devinfo_find_iface(&d, 0x03u, 0x01u, 0x01u));
+    CHECK_INT("boot mouse found too", 1, hype_usb_devinfo_find_iface(&d, 0x03u, 0x01u, 0x02u));
+    CHECK_INT("a class it does not have", -1, hype_usb_devinfo_find_iface(&d, 0x08u, 0x06u, 0x50u));
+}
+
+static void test_741_overflow_is_reported_not_hidden(void) {
+    /* 3 interfaces into a cap of 2: two recorded, one counted. A table that quietly
+     * truncated would report a device as having fewer interfaces than it does, which is
+     * the same class of wrongness #741 exists to remove. */
+    hype_usb_iface_t ifs[2];
+    uint8_t over = 0;
+    unsigned n = hype_usb_collect_interfaces(k741_receiver_cfg, sizeof k741_receiver_cfg,
+                                             ifs, 2u, &over);
+    CHECK_INT("capped", 2u, n);
+    CHECK_INT("and says how many it dropped", 1u, (unsigned)over);
+}
+
+static void test_741_malformed_descriptor_terminates(void) {
+    /* A zero length would spin forever on a device-supplied buffer. Same rule as every
+     * other descriptor walker here: stop, keeping whatever was already read. */
+    uint8_t bad[] = { 9, 0x02, 0x12, 0x00, 1, 1, 0, 0xA0, 50,
+                      9, 0x04, 0, 0, 1, 0x03, 0x01, 0x01, 0,
+                      0, 0x04, 0, 0, 0, 0, 0, 0, 0 };
+    hype_usb_iface_t ifs[HYPE_USB_MAX_IFACES];
+    uint8_t over = 0;
+    unsigned n = hype_usb_collect_interfaces(bad, sizeof bad, ifs, HYPE_USB_MAX_IFACES, &over);
+    CHECK_INT("kept the good one and stopped", 1u, n);
+}
+
+static void test_741_null_safe(void) {
+    hype_usb_iface_t ifs[2];
+    uint8_t over = 0xFF;
+    CHECK_INT("null cfg", 0u, hype_usb_collect_interfaces(0, 10, ifs, 2, &over));
+    CHECK_INT("overflow cleared even so", 0u, (unsigned)over);
+    CHECK_INT("null out", 0u, hype_usb_collect_interfaces(k741_receiver_cfg,
+                                                         sizeof k741_receiver_cfg, 0, 2, 0));
+    CHECK_INT("null devinfo", -1, hype_usb_devinfo_find_iface(0, 3, 1, 1));
+}
+
 int main(void) {
+    test_741_collects_every_interface();
+    test_741_first_iface_class_still_sees_only_the_first();
+    test_741_find_iface_matches_a_later_interface();
+    test_741_overflow_is_reported_not_hidden();
+    test_741_malformed_descriptor_terminates();
+    test_741_null_safe();
     test_string_desc_langid0();
     test_string_desc_ascii();
     test_collect_endpoints_walks_all_interfaces();

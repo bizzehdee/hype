@@ -499,6 +499,20 @@ int hype_usb_inventory_next_unclaimed_class(const hype_usb_inventory_t *inv, uin
     return -1;
 }
 
+int hype_usb_inventory_next_iface(const hype_usb_inventory_t *inv, uint8_t cls,
+                                  uint8_t subclass, uint8_t protocol, int after) {
+    unsigned int i;
+    if (inv == (const hype_usb_inventory_t *)0) {
+        return -1;
+    }
+    for (i = (after < 0) ? 0u : (unsigned int)(after + 1); i < inv->count; i++) {
+        if (hype_usb_devinfo_find_iface(&inv->dev[i], cls, subclass, protocol) >= 0) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
 unsigned int hype_usb_inventory_count_owner(const hype_usb_inventory_t *inv,
                                             hype_usb_owner_t owner) {
     unsigned int i, n = 0;
@@ -547,6 +561,61 @@ int hype_usb_first_iface_class(const uint8_t *cfg, unsigned int len, uint8_t *ou
         off += dlen;
     }
     return 0;
+}
+
+unsigned int hype_usb_collect_interfaces(const uint8_t *cfg, unsigned int len,
+                                         hype_usb_iface_t *out, unsigned int cap,
+                                         uint8_t *out_overflow) {
+    unsigned int off = 0;
+    unsigned int n = 0;
+    unsigned int over = 0;
+
+    if (out_overflow != (uint8_t *)0) {
+        *out_overflow = 0u;
+    }
+    if (cfg == (const uint8_t *)0 || out == (hype_usb_iface_t *)0) {
+        return 0;
+    }
+    while (off + 2u <= len) {
+        unsigned int dlen = cfg[off];
+        unsigned int dtype = cfg[off + 1u];
+
+        if (dlen < 2u || off + dlen > len) {
+            break; /* malformed: stop, keeping what was already read */
+        }
+        if (dtype == HYPE_USB_DESC_INTERFACE && dlen >= 9u) {
+            if (n < cap) {
+                out[n].number = cfg[off + 2u];
+                out[n].cls = cfg[off + 5u];
+                out[n].subclass = cfg[off + 6u];
+                out[n].protocol = cfg[off + 7u];
+                n++;
+            } else {
+                over++;
+            }
+        }
+        off += dlen;
+    }
+    if (out_overflow != (uint8_t *)0) {
+        *out_overflow = (uint8_t)((over > 255u) ? 255u : over);
+    }
+    return n;
+}
+
+int hype_usb_devinfo_find_iface(const hype_usb_devinfo_t *d, uint8_t cls, uint8_t subclass,
+                                uint8_t protocol) {
+    unsigned int i;
+
+    if (d == (const hype_usb_devinfo_t *)0) {
+        return -1;
+    }
+    for (i = 0; i < d->iface_count && i < HYPE_USB_MAX_IFACES; i++) {
+        if (d->ifaces[i].cls == cls && d->ifaces[i].subclass == subclass &&
+            d->ifaces[i].protocol == protocol) {
+            return (int)i;
+        }
+    }
+    return -1;
 }
 
 unsigned int hype_xhci_interval_encode(unsigned int speed_id, unsigned int b_interval) {
