@@ -3761,6 +3761,25 @@ isn't lost.
     mass storage's departed-device state, which is the data-integrity half and is
     independent of #745/#746.
 
+    **Built 2026-08-27, #744-#746; #747 outstanding.** Two findings worth keeping with the
+    decision rather than only in the tickets:
+
+    - **A hub's first status report describes the state BEFORE the walk.** The endpoint is
+      armed before the port loop, so every populated port reads as "changed". Acting on it
+      re-enumerates devices that never moved, and re-enumeration RESETS the port -- which
+      would knock out a working keyboard moments after claiming it. The walk discards that
+      first report, and an arrival on a port the inventory already knows is slotted is
+      ignored. Any future hot-plug work has to keep both.
+    - **QEMU cannot validate the hub half.** Measured, not assumed: hype arms the endpoint
+      and polls it 18400 times with zero errors across a run that did a runtime detach and
+      attach, and QEMU's `usb-hub` reports nothing. Root ports validate fully in QEMU;
+      #746's bar needs the 5950X. The `HUBPOLL` counters exist so that "hype is not
+      polling" and "the hub is not reporting" can never be confused again.
+
+    The #743 risk this decision named as a blocker was tested and downgraded: hype's
+    handling of a recycled slot id is correct (`tools/743`), so hot-plug's constant slot
+    recycling is a hardware risk to measure on the 5950X, not a design flaw to fix first.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what
