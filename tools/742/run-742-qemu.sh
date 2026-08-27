@@ -1,30 +1,23 @@
 #!/bin/bash
-# #734: an IDLE mouse must not silence the keyboard.
+# #742: hype must claim EVERY boot keyboard, not the first one, and merge them into one
+# scancode stream.
 #
-# The topology is tools/737's -- a keyboard and a mouse behind a hub on ONE xHCI -- with
-# one deliberate difference: this rig NEVER moves the mouse. That is the desktop
-# condition the 2026-08-27 5950X boot ran in, and it is what tools/737 cannot show,
-# because it drives both devices and a device that reports frequently keeps handing the
-# shared state back.
+# TWO usb-kbd devices behind the same hub, plus the mouse, which is the topology the
+# operator has minus one keyboard. Before #742 hype claimed the first and left the second
+# `owner=free`, doing nothing for the rest of the boot.
 #
-# Before the fix, the two claimed HIDs shared ONE interrupt-IN ring and ONE "transfer
-# outstanding" flag per controller. An idle input device holds that flag forever, so the
-# other endpoint's doorbell was never rung again: measured on the 5950X as
-# "HID polls=20745 reports=0" alongside "MOUSE polls=238463 reports=0".
+# What QEMU can and cannot prove here, stated so the verdict is not over-read:
 #
-# Unlike #736/#737, QEMU CAN prove this one: the fault is in hype's own bookkeeping, not
-# in a controller behaviour QEMU does not model.
+#   CAN: that hype claims BOTH, that each gets its own counters and its own previous-report
+#        state, that the second claim does not disturb the first, and that the merged
+#        scancode stream still reaches the chord decoder.
+#   CANNOT: that typing on the second one specifically works. `sendkey` goes through QEMU's
+#        input subsystem to ONE keyboard, so there is no way from here to direct keystrokes
+#        at a chosen device. That half needs the two-keyboard hardware run, which is why
+#        the hardware ticket stays open.
 #
-# The greps below select the keyboard COUNTER line by requiring `reports=` on it, not by
-# matching the "DIAG: HID" prefix. Two diagnostics added in one day share that prefix and
-# carry no counters -- #734's modseen line and #742's per-keyboard header -- and a looser
-# pattern with tail -1 picked one of them, found no reports= field, and declared a keyboard
-# that had delivered 320 reports to have never reported at all. A rig that fails because a
-# diagnostic was ADDED is worse than no rig, so match on the field being read.
-#
-# #742 also made the line per-keyboard (`DIAG: HID[0/1] vvvv:pppp polls=...`), so this sums
-# every keyboard's reports rather than reading one: the rig's claim is "the keyboard kept
-# reporting while the mouse was idle", and with more than one claimed that is the total.
+# The pass bar is therefore: two claimed, two DIAG lines, reports arriving, and the
+# mouse-idle property from #734 still holding.
 set -e
 . "$(git rev-parse --show-toplevel)/tools/qemu-env.sh"
 export LC_ALL=C
@@ -40,7 +33,7 @@ kb_n() {
   echo "${n:-1}"
 }
 cd "$(git rev-parse --show-toplevel)"
-S=rig/i734
+S=rig/i742
 SECS="${1:-180}"
 mkdir -p $S
 rm -f $S/serial.log $S/esp.img $S/usb.img $S/r1.txt
@@ -102,9 +95,14 @@ cp /usr/share/edk2/ovmf/OVMF_VARS.fd $S/VARS.fd
   -device usb-storage,bus=xhci.0,port=1,drive=stick,serial=HYPE734USB \
   -device usb-hub,id=hub1,bus=xhci.0,port=2,ports=4 \
   -device usb-kbd,bus=xhci.0,port=2.2 \
+  -device usb-kbd,bus=xhci.0,port=2.3 \
   -device usb-mouse,bus=xhci.0,port=2.4 \
   -serial "file:$S/serial.log" -monitor stdio -display none -vga std >$S/mon.log 2>$S/qemu.err || true
 
+echo "=== how many keyboards hype claimed"
+claimed=$(grep -a -c "host-hid: USB keyboard CLAIMED" $S/serial.log)
+echo "keyboard CLAIMED lines: $claimed"
+grep -a -o "fw-1 DIAG: HID\[[0-9]*/[0-9]*\]" $S/serial.log | sort -u
 echo "=== claims"
 grep -a "host-hid: USB .* CLAIMED\|no interrupt-IN block free" $S/serial.log | head -4
 echo "=== transfer errors, if any"
@@ -118,10 +116,21 @@ grep -aq "host-hid: USB keyboard CLAIMED" $S/serial.log || say "FAIL: the keyboa
 grep -aq "host-hid: USB mouse CLAIMED" $S/serial.log || say "FAIL: the mouse was not claimed"
 kb=$(kb_reports $S/serial.log)
 r1=$(cat $S/r1.txt 2>/dev/null)
+# #742's own bar, checked before #734's.
+if [ "$claimed" != 2 ]; then
+  say "FAIL: expected 2 keyboards claimed, saw $claimed [#742]"
+else
+  echo "PASS: both keyboards claimed [#742]"
+fi
+if [ "$(kb_n $S/serial.log)" != 2 ]; then
+  say "FAIL: the DIAG lines do not report 2 keyboards [#742]"
+else
+  echo "PASS: per-keyboard DIAG lines for both [#742]"
+fi
 echo "keyboard reports: ${r1:-none} at the end of phase 1 -> ${kb:-none} at the end of phase 2"
 [ "${kb:-0}" -gt 0 ] 2>/dev/null || say "FAIL: the keyboard never reported at all"
 [ -n "$r1" ] || say "FAIL: no phase-1 count captured -- the run did not reach phase 2"
 [ "${kb:-0}" -gt "${r1:-0}" ] 2>/dev/null ||
   say "FAIL: the keyboard stopped reporting once the mouse went idle [#734]"
-[ $fail -eq 0 ] && echo "ALL PASS: an idle claimed mouse does not silence the keyboard"
+[ $fail -eq 0 ] && echo "ALL PASS: both keyboards claimed, merged stream live, idle mouse silences neither"
 exit $fail

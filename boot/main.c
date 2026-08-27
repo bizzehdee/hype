@@ -334,21 +334,55 @@ static void usb_log_fatal_flush(void); /* #513: registered as the panic flush ho
  * the #233 confirm gate, both of which appear earlier in this file. */
 static unsigned int usb_hid_drain(void);
 static int usb_mouse_drain(hype_ps2_mouse_t *dst);
-/* #217: HID poll counters, declared early so the periodic DIAG block can read them. */
-static int g_hid_ready;
-static unsigned int g_hid_slot;
-static unsigned int g_hid_ep;
-static unsigned long long g_hid_polls;
-static unsigned long long g_hid_reports;
-static unsigned long long g_hid_poll_errs;
 /*
- * #734: the OR of every modifier byte this keyboard has reported. Boot-report bit order
- * is LCtrl, LShift, LAlt, LGUI, RCtrl, RShift, RAlt, RGUI -- so bits 4 and 6 are the two
- * the leader chord needs. On a keyboard whose right-hand Alt is an AltGr, or where Fn
- * layers are resolved inside the firmware, whether bit 6 is ever set is not something
- * that can be reasoned about from the outside; this makes one boot answer it.
+ * #742: EVERY claimed keyboard, not the first one.
+ *
+ * hype used to claim one boot keyboard and leave every other one `owner=free`, doing
+ * nothing. The operator asked for all of them to work and to be indistinguishable, which
+ * is also the robust answer: the 2026-08-27 boots had a keyboard whose endpoint failed
+ * behind a hub while a second keyboard sat unclaimed on a root port, and hype had no input
+ * at all until the first one was fixed.
+ *
+ * Bounded by the transport, not by taste: HYPE_XHCI_INT_IN_MAX interrupt-IN blocks exist
+ * in total and the mouse needs one of them, so more keyboards than this cannot be polled
+ * even if they were claimed. Anything past the cap is logged, not dropped silently.
  */
-static uint8_t g_hid_mods_seen;
+#define HYPE_HOST_KBD_MAX 3u
+
+typedef struct {
+    hype_xhci_ctrl_t xc;   /* a COPY, as the MSC path does -- BAR/rtsoff/dboff values, not
+                            * pointers into the sweep's locals */
+    unsigned int slot;
+    unsigned int ep;
+    unsigned int mps;
+    uint16_t vid;
+    uint16_t pid;
+    /*
+     * Per-DEVICE, and it must be: hype_usb_hid_report_to_scancodes() diffs against the
+     * previous report to find the transitions, so sharing one `prev` across keyboards
+     * would make a key held on one board look released the moment another board reported.
+     */
+    uint8_t prev[HYPE_USB_HID_REPORT_LEN];
+    int have_prev;
+    unsigned long long polls;
+    unsigned long long reports;
+    unsigned long long errs;
+    /*
+     * #734: the OR of every modifier byte this keyboard has reported. Boot-report bit
+     * order is LCtrl, LShift, LAlt, LGUI, RCtrl, RShift, RAlt, RGUI -- so bits 4 and 6 are
+     * the two the leader chord needs. On a keyboard whose right-hand Alt is an AltGr, or
+     * where Fn layers are resolved inside the firmware, whether bit 6 is ever set is not
+     * something that can be reasoned about from the outside; this makes one boot answer
+     * it. Per-device because the answer is a property of the keyboard, not of hype.
+     */
+    uint8_t mods_seen;
+} hype_host_kbd_t;
+
+static hype_host_kbd_t g_hid[HYPE_HOST_KBD_MAX];
+static unsigned int g_hid_count;
+static unsigned int g_hid_skipped; /* boot keyboards found past the cap */
+/* "At least one keyboard is claimed" -- the question almost every caller actually asks. */
+#define g_hid_ready (g_hid_count != 0u)
 /*
  * USB-6 (#219): the claimed USB boot MOUSE. Declared here beside the keyboard counters so
  * the periodic DIAG block can read them. A separate controller copy from the keyboard's,
@@ -2035,9 +2069,18 @@ static uint8_t fw_1_usb_record(hype_usb_inventory_t *inv, unsigned int controlle
  * Searched through the inventory rather than by re-walking the bus, which is what #241
  * exists to make possible.
  */
+/*
+ * #742: claim EVERY boot HID of this protocol into `out`, up to `cap`.
+ *
+ * Was "claim the first one and stop". The loop already walked the whole inventory; it just
+ * gave up as soon as it had one. `*count` is both the in/out running total (this runs once
+ * per controller, so a second controller's keyboards append to the first's) and what the
+ * caller polls. `*skipped` counts devices found past the cap, so a machine with more
+ * keyboards than hype can poll says so rather than appearing to have fewer.
+ */
 static void fw_1_claim_boot_hid(hype_xhci_ctrl_t *xc, unsigned int protocol, const char *what,
-                                int *ready, hype_xhci_ctrl_t *xc_out, unsigned int *slot_out,
-                                unsigned int *ep_out, unsigned int *mps_out) {
+                                hype_host_kbd_t *out, unsigned int *count, unsigned int cap,
+                                unsigned int *skipped) {
     /*
      * #741: search by INTERFACE, not by the device's first-interface class triple.
      *
@@ -2056,7 +2099,7 @@ static void fw_1_claim_boot_hid(hype_xhci_ctrl_t *xc, unsigned int protocol, con
     int hi = hype_usb_inventory_next_iface(&g_usb_inv, HYPE_USB_CLASS_HID,
                                            HYPE_USB_SUBCLASS_BOOT, (uint8_t)protocol, -1);
 
-    while (hi >= 0 && !*ready) {
+    while (hi >= 0) {
         const hype_usb_devinfo_t *d = &g_usb_inv.dev[hi];
 
         /* Boot protocol only -- a non-boot HID needs its report descriptor parsed, and
@@ -2124,18 +2167,37 @@ static void fw_1_claim_boot_hid(hype_xhci_ctrl_t *xc, unsigned int protocol, con
                                      "REFUSED -- reports may not be boot-format [#734]\n", what,
                                      (unsigned)d->vid, (unsigned)d->pid, hid.interface_num);
                 }
-                if (hype_xhci_configure_int_in_endpoint(xc, d->slot, &hpath, hid.int_in_ep,
+                if (*count >= cap) {
+                    /* Past the cap. Counted and named rather than skipped in silence: the
+                     * interrupt-IN pool is what bounds this, and an operator whose third
+                     * keyboard does nothing deserves to read why. */
+                    (*skipped)++;
+                    hype_debug_print("host-hid: %s %04x:%04x found but hype already polls %u "
+                                     "of them (cap %u) -- not claimed [#742]\n", what,
+                                     (unsigned)d->vid, (unsigned)d->pid, *count, cap);
+                } else if (hype_xhci_configure_int_in_endpoint(xc, d->slot, &hpath, hid.int_in_ep,
                                                         hid.mps, hid.interval) == 0) {
-                    *xc_out = *xc;
-                    *slot_out = d->slot;
-                    *ep_out = hid.int_in_ep;
-                    *mps_out = hid.mps;
-                    *ready = 1;
+                    hype_host_kbd_t *e = &out[*count];
+                    unsigned int z;
+                    e->xc = *xc;
+                    e->slot = d->slot;
+                    e->ep = hid.int_in_ep;
+                    e->mps = hid.mps;
+                    e->vid = d->vid;
+                    e->pid = d->pid;
+                    /* Field by field, and zeroed here rather than relying on the BSS: a
+                     * device claimed into a slot a previous claim used would inherit its
+                     * `prev` report and diff the first real report against a stranger's. */
+                    for (z = 0; z < HYPE_USB_HID_REPORT_LEN; z++) e->prev[z] = 0u;
+                    e->have_prev = 0;
+                    e->polls = 0; e->reports = 0; e->errs = 0; e->mods_seen = 0u;
+                    (*count)++;
                     hype_usb_inventory_claim(&g_usb_inv, hi, HYPE_USB_OWNER_HYPE);
                     hype_debug_print("host-hid: USB %s CLAIMED -- %04x:%04x port%u slot%u "
-                                     "ep=0x%02x mps=%u; host input now reaches hype\n",
+                                     "ep=0x%02x mps=%u (%u claimed); host input now reaches "
+                                     "hype\n",
                                      what, (unsigned)d->vid, (unsigned)d->pid, d->root_port,
-                                     d->slot, hid.int_in_ep, hid.mps);
+                                     d->slot, hid.int_in_ep, hid.mps, *count);
                 } else {
                     hype_debug_print("host-hid: %s %04x:%04x found but Configure Endpoint "
                                      "FAILED -- no host %s\n", what, (unsigned)d->vid,
@@ -16045,22 +16107,41 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                      g_mouse_polls, g_mouse_reports, g_mouse_poll_errs,
                                      g_mouse_packets, g_mouse_slot, g_mouse_ep);
                 }
-                if (g_hid_ready) {
-                    hype_debug_print("fw-1 DIAG: HID polls=%llu reports=%llu errors=%llu "
-                                     "(slot%u ep=0x%02x) | host-kbd scancodes=%llu chords=%llu "
-                                     "[#217]\n",
-                                     g_hid_polls, g_hid_reports, g_hid_poll_errs,
-                                     g_hid_slot, g_hid_ep, g_hostkbd_scancodes,
-                                     g_hostkbd_chords);
-                    /* #734: name the modifier bits seen, and say outright whether the two
-                     * the chord needs have ever arrived. */
-                    hype_debug_print("fw-1 DIAG: HID modseen=0x%02x -- RCtrl(bit4)=%s "
-                                     "RAlt(bit6)=%s LCtrl=%s LAlt=%s [#734]\n",
-                                     (unsigned)g_hid_mods_seen,
-                                     (g_hid_mods_seen & 0x10u) ? "YES" : "never",
-                                     (g_hid_mods_seen & 0x40u) ? "YES" : "never",
-                                     (g_hid_mods_seen & 0x01u) ? "yes" : "never",
-                                     (g_hid_mods_seen & 0x04u) ? "yes" : "never");
+                /*
+                 * #742: ONE LINE PER KEYBOARD. A summed count could not answer the question
+                 * these counters exist for -- "is one of my three keyboards dead" reads as
+                 * a healthy total when the other two are busy.
+                 */
+                {
+                    unsigned int kq;
+                    for (kq = 0; kq < g_hid_count && kq < HYPE_HOST_KBD_MAX; kq++) {
+                        const hype_host_kbd_t *kb = &g_hid[kq];
+                        hype_debug_print("fw-1 DIAG: HID[%u/%u] %04x:%04x polls=%llu reports=%llu "
+                                         "errors=%llu (slot%u ep=0x%02x) [#217 #742]\n",
+                                         kq, g_hid_count, (unsigned)kb->vid, (unsigned)kb->pid,
+                                         kb->polls, kb->reports, kb->errs, kb->slot, kb->ep);
+                        /* #734: name the modifier bits seen, and say outright whether the two
+                         * the chord needs have ever arrived. Per keyboard, because whether a
+                         * board's right-hand Alt reports as usage 0xE6 is a property of that
+                         * board -- on a machine with two, one may chord and the other not. */
+                        hype_debug_print("fw-1 DIAG: HID[%u] modseen=0x%02x -- RCtrl(bit4)=%s "
+                                         "RAlt(bit6)=%s LCtrl=%s LAlt=%s [#734]\n",
+                                         kq, (unsigned)kb->mods_seen,
+                                         (kb->mods_seen & 0x10u) ? "YES" : "never",
+                                         (kb->mods_seen & 0x40u) ? "YES" : "never",
+                                         (kb->mods_seen & 0x01u) ? "yes" : "never",
+                                         (kb->mods_seen & 0x04u) ? "yes" : "never");
+                    }
+                    if (g_hid_ready) {
+                        hype_debug_print("fw-1 DIAG: host-kbd scancodes=%llu chords=%llu "
+                                         "(merged from %u keyboard(s)) [#217]\n",
+                                         g_hostkbd_scancodes, g_hostkbd_chords, g_hid_count);
+                    }
+                    if (g_hid_skipped != 0u) {
+                        hype_debug_print("fw-1 DIAG: %u further boot keyboard(s) were NOT claimed "
+                                         "-- hype polls at most %u [#742]\n",
+                                         g_hid_skipped, (unsigned)HYPE_HOST_KBD_MAX);
+                    }
                 }
                 /*
                  * #568: Print Screen / SysRq seen without both modifiers. Reported only when it
@@ -24072,11 +24153,7 @@ static hype_xhci_ctrl_t g_usb_xc;
  * A copy of the controller struct, as the MSC path does -- it holds BAR/rtsoff/dboff
  * values, not pointers into the sweep's locals.
  */
-static hype_xhci_ctrl_t g_hid_xc;
-static hype_xhci_ctrl_t g_mouse_xc; /* #219: may be a DIFFERENT controller from g_hid_xc */
-static unsigned int g_hid_mps;
-static uint8_t g_hid_prev[HYPE_USB_HID_REPORT_LEN];
-static int g_hid_have_prev;
+static hype_xhci_ctrl_t g_mouse_xc; /* #219: may be a DIFFERENT controller from the keyboards */
 
 /*
  * Poll the claimed USB keyboard and inject any resulting scancodes into the host
@@ -24088,42 +24165,60 @@ static int g_hid_have_prev;
 static unsigned int usb_hid_drain(void) {
     uint8_t report[HYPE_USB_HID_REPORT_LEN];
     uint8_t codes[HYPE_USB_HID_MAX_SCANCODES];
-    unsigned int n, i;
+    unsigned int n, i, k;
+    unsigned int injected = 0;
     int r;
 
-    if (!g_hid_ready) {
-        return 0;
+    /*
+     * #742: every claimed keyboard, into ONE scancode stream.
+     *
+     * They all inject into the same queue hype_host_kbd_inject_scancode() feeds, which is
+     * the same queue the PS/2 ISR pushes into, so the leader chord, the dashboard and the
+     * guest cannot tell which board a keystroke came from -- which is the point. Each
+     * device keeps its OWN previous report, because the scancode conversion is a diff and
+     * sharing that state would make a key held on one board look released as soon as
+     * another board reported.
+     */
+    for (k = 0; k < g_hid_count && k < HYPE_HOST_KBD_MAX; k++) {
+        hype_host_kbd_t *kb = &g_hid[k];
+
+        kb->polls++;
+        r = hype_xhci_int_in_poll(&kb->xc, kb->slot, kb->ep, report, HYPE_USB_HID_REPORT_LEN);
+        if (r < 0) {
+            kb->errs++;
+        }
+        if (r <= 0) {
+            /* 0 = idle, the normal case. -1 = a transfer error; #734 recovers the halted
+             * endpoint down in the poll and re-arms it, so a single failed transfer costs
+             * one report rather than the keyboard. Either way the OTHER keyboards are
+             * still polled -- one dead board must not silence the rest, which is half of
+             * why claiming them all is worth doing. */
+            continue;
+        }
+        kb->reports++;
+        kb->mods_seen |= report[0];
+        if (kb->reports == 1u) {
+            /* Say it ONCE PER KEYBOARD. "Endpoint configured" and "reports actually
+             * arrive" are different claims, and only the second means the operator can
+             * type -- without this line a keyboard that enumerates but never reports looks
+             * identical to a working one in the log, on machines where the log is all
+             * there is. */
+            hype_debug_print("host-hid: FIRST report received from %04x:%04x slot%u -- that "
+                             "USB keyboard is live [#217 #742]\n",
+                             (unsigned)kb->vid, (unsigned)kb->pid, kb->slot);
+        }
+        n = hype_usb_hid_report_to_scancodes(kb->have_prev ? kb->prev : 0, report, codes,
+                                             (unsigned)sizeof(codes));
+        for (i = 0; i < HYPE_USB_HID_REPORT_LEN; i++) {
+            kb->prev[i] = report[i];
+        }
+        kb->have_prev = 1;
+        for (i = 0; i < n; i++) {
+            hype_host_kbd_inject_scancode(codes[i]);
+        }
+        injected += n;
     }
-    g_hid_polls++;
-    r = hype_xhci_int_in_poll(&g_hid_xc, g_hid_slot, g_hid_ep, report, HYPE_USB_HID_REPORT_LEN);
-    if (r < 0) {
-        g_hid_poll_errs++;
-    }
-    if (r <= 0) {
-        /* 0 = idle, the normal case. -1 = a transfer error; #734 recovers the halted
-         * endpoint down in the poll and re-arms it, so a single failed transfer costs
-         * one report rather than the keyboard. */
-        return 0;
-    }
-    g_hid_reports++;
-    g_hid_mods_seen |= report[0];
-    if (g_hid_reports == 1u) {
-        /* Say it ONCE. "Endpoint configured" and "reports actually arrive" are
-         * different claims, and only the second means the operator can type -- without
-         * this line a keyboard that enumerates but never reports looks identical to a
-         * working one in the log, on machines where the log is all there is. */
-        hype_debug_print("host-hid: FIRST report received -- USB keyboard is live [#217]\n");
-    }
-    n = hype_usb_hid_report_to_scancodes(g_hid_have_prev ? g_hid_prev : 0, report, codes,
-                                        (unsigned)sizeof(codes));
-    for (i = 0; i < HYPE_USB_HID_REPORT_LEN; i++) {
-        g_hid_prev[i] = report[i];
-    }
-    g_hid_have_prev = 1;
-    for (i = 0; i < n; i++) {
-        hype_host_kbd_inject_scancode(codes[i]);
-    }
-    return n;
+    return injected;
 }
 
 /*
@@ -27289,16 +27384,32 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                  * already claimed so hype's own boot medium can never be mistaken for an
                  * input device.
                  */
-                fw_1_claim_boot_hid(&xc, HYPE_USB_PROTO_KEYBOARD, "keyboard", &g_hid_ready,
-                                    &g_hid_xc, &g_hid_slot, &g_hid_ep, &g_hid_mps);
-                if (g_hid_ready) {
-                    g_hid_have_prev = 0; /* first report has no predecessor to diff against */
-                }
+                fw_1_claim_boot_hid(&xc, HYPE_USB_PROTO_KEYBOARD, "keyboard", g_hid,
+                                    &g_hid_count, HYPE_HOST_KBD_MAX, &g_hid_skipped);
                 /* USB-6 (#219): and a pointer, independently. It may be on a different
                  * controller from the keyboard -- an internal touchpad and an external
                  * keyboard routinely are -- which is only reachable at all since #299. */
-                fw_1_claim_boot_hid(&xc, HYPE_USB_PROTO_MOUSE, "mouse", &g_mouse_ready,
-                                    &g_mouse_xc, &g_mouse_slot, &g_mouse_ep, &g_mouse_mps);
+                /*
+                 * #742 claims every keyboard; the pointer stays at one. Two mice merging
+                 * into one cursor is standard and harmless, but nothing asked for it and
+                 * the drain below converts a report straight into a single PS/2 packet
+                 * stream, so a second pointer is scope this ticket did not have. Same
+                 * claim implementation, cap of 1.
+                 */
+                {
+                    static hype_host_kbd_t mouse_slot0;
+                    unsigned int mcount = g_mouse_ready ? 1u : 0u;
+                    unsigned int mskip = 0;
+                    fw_1_claim_boot_hid(&xc, HYPE_USB_PROTO_MOUSE, "mouse", &mouse_slot0,
+                                        &mcount, 1u, &mskip);
+                    if (mcount != 0u && !g_mouse_ready) {
+                        g_mouse_xc = mouse_slot0.xc;
+                        g_mouse_slot = mouse_slot0.slot;
+                        g_mouse_ep = mouse_slot0.ep;
+                        g_mouse_mps = mouse_slot0.mps;
+                        g_mouse_ready = 1;
+                    }
+                }
                 /* The "nothing found" verdicts are printed once AFTER the whole sweep, not
                  * here: this runs per controller, so on a two-controller machine it
                  * announced "no USB boot keyboard" for the storage controller and then
@@ -27315,7 +27426,16 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 if (msc_found) {
                     msc_found_any = 1;
                 }
-                if (!msc_found && !(g_hid_ready && g_hid_xc.bar == xc.bar) &&
+                /* #742: keep this controller Running if ANY claimed keyboard is on it,
+                 * not just the one that used to be the only one. */
+                int kb_here = 0;
+                {
+                    unsigned int kq;
+                    for (kq = 0; kq < g_hid_count && kq < HYPE_HOST_KBD_MAX; kq++) {
+                        if (g_hid[kq].xc.bar == xc.bar) { kb_here = 1; break; }
+                    }
+                }
+                if (!msc_found && !kb_here &&
                     !(g_mouse_ready && g_mouse_xc.bar == xc.bar)) {
                     hype_xhci_host_quiesce(&xc);
                     hype_debug_print("host-xhci: controller[%u] quiesced -- nothing kept on it; "
