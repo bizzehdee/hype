@@ -2045,6 +2045,23 @@ static void fw_1_claim_boot_hid(hype_xhci_ctrl_t *xc, unsigned int protocol, con
                             ? (hype_usb_hid_find_keyboard(hidcfg, hidlen, &hid) == 0)
                             : (hype_usb_hid_find_mouse(hidcfg, hidlen, &hid) == 0);
             }
+            /*
+             * #734: say what was parsed and what was picked. The Keychron 3434:0da4 is a
+             * composite device with THREE interrupt-IN endpoints (0x81 mps=8, 0x82 and
+             * 0x83 mps=32); "hype claimed ep=0x81" and "ep=0x81 is the endpoint the boot
+             * keyboard interface actually reports on" are different claims, and a boot
+             * that reads reports=0 cannot tell them apart. hidlen == the buffer size also
+             * means the descriptor was TRUNCATED, which the port-1 device on this host
+             * already hits -- a truncated walk can bind to the wrong endpoint silently.
+             */
+            hype_debug_print("host-hid: %s %04x:%04x cfg %u bytes%s -- %s iface=%u ep=0x%02x "
+                             "mps=%u interval=%u cfgval=%u [#734]\n", what,
+                             (unsigned)d->vid, (unsigned)d->pid, hidlen,
+                             (hidlen >= sizeof(hidcfg)) ? " TRUNCATED" : "",
+                             found ? "picked" : "NO BOOT INTERFACE FOUND;",
+                             found ? hid.interface_num : 0u, found ? hid.int_in_ep : 0u,
+                             found ? hid.mps : 0u, found ? hid.interval : 0u,
+                             found ? hid.config_value : 0u);
             if (found && hype_xhci_set_configuration(xc, d->slot, hid.config_value) == 0) {
                 hype_xhci_devpath_t hpath;
                 hpath.root_port = d->root_port;
