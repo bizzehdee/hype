@@ -3755,6 +3755,12 @@ isn't lost.
     foundation would produce a feature that works intermittently and appears to be its own
     fault. #743 must be understood first.
 
+    **Decomposed into four tickets, not one.** #744 port-change events and departure
+    teardown (root ports); #745 arrival and claim on a root port; #746 the hub
+    status-change endpoint, which is what covers the machine that asked for this; #747
+    mass storage's departed-device state, which is the data-integrity half and is
+    independent of #745/#746.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what
