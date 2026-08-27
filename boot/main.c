@@ -12656,6 +12656,22 @@ wait_for_sipi:
                  * log line now reports the COUNT so the next reader cannot make the same
                  * mistake.
                  */
+                /*
+                 * #749: the real GUEST-PHYSICAL ADDRESS, from vmm_get_last_npf().
+                 *
+                 * NOT info.qualification, which this message used until the AP microtest
+                 * caught it. On SVM that field is EXITINFO1 -- the NPF ERROR CODE -- whose
+                 * bit 32 means "a guest physical address caused this". So it reads
+                 * 0x100000004 for a fault at 0xD0000004, and read 0x100000004 on the 5950X
+                 * too, for a fault at an address nobody now knows. Five hardware logs name
+                 * "gpa 0x100000004" and none of them means it: it is bit 32 plus the error
+                 * bits, printed under a label that says address.
+                 *
+                 * I spent real time reasoning about what device might sit at 4 GiB + 4. The
+                 * answer is nothing; the number was never an address.
+                 */
+                hype_vmm_npf_t ap_npf;
+                vmm_get_last_npf(kind, ctx, &ap_npf);
                 if (vmm_absorb_mmio_npf(kind, ctx, insn) == 0) {
                     unsigned long long n = ++g_ap_vcpu_unclaimed[vm_idx][vi];
                     /* Powers of two: loud when it starts, loud again if it becomes a
@@ -12663,20 +12679,23 @@ wait_for_sipi:
                      * address once. A flat cap is what hid this for five boots. */
                     if ((n & (n - 1ull)) == 0ull) {
                         hype_debug_print("fw-1 vm%u vCPU %u: NPF at gpa 0x%llx rip 0x%llx "
-                                         "claimed by NO device -- completed as an unclaimed "
-                                         "bus access (all-ones read / dropped write), "
-                                         "occurrence %llu [#749]\n",
-                                         vm_idx, vi, (unsigned long long)info.qualification,
-                                         (unsigned long long)info.guest_rip, n);
+                                         "(npf err 0x%llx) claimed by NO device -- completed "
+                                         "as an unclaimed bus access (all-ones read / dropped "
+                                         "write), occurrence %llu [#749]\n",
+                                         vm_idx, vi,
+                                         (unsigned long long)ap_npf.guest_phys_addr,
+                                         (unsigned long long)info.guest_rip,
+                                         (unsigned long long)info.qualification, n);
                     }
                 } else {
                     /* Undecodable: resuming would need a RIP advance nobody can compute, so
                      * this one really is left alone. */
                     if (g_ap_vcpu_unhandled[vm_idx][vi] < 8ull) {
                         hype_debug_print("fw-1 vm%u vCPU %u: NPF at gpa 0x%llx rip 0x%llx "
-                                         "UNDECODABLE -- cannot complete or retire it "
-                                         "[#190 #749]\n",
-                                         vm_idx, vi, (unsigned long long)info.qualification,
+                                         "UNDECODABLE -- cannot complete or retire it, so this "
+                                         "vCPU will re-execute it [#190 #749]\n",
+                                         vm_idx, vi,
+                                         (unsigned long long)ap_npf.guest_phys_addr,
                                          (unsigned long long)info.guest_rip);
                     }
                     g_ap_vcpu_unhandled[vm_idx][vi]++;
