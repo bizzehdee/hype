@@ -341,3 +341,28 @@ were refreshed. `\hype.cfg` (1535 bytes), all 18 configs, `\input\vm0.txt` and t
 2 GiB `\hype\disks\run1a-scratch.img` were already correct and were NOT rewritten.
 `\HYPE.LOG`, `\RUN1A.LOG`, `\HYPE.BOOTCOUNT` and `\vars-run1a.bin` were cleared, so
 boot 3 starts from a clean log rotation.
+
+## Re-staged 2026-08-27, fourth stage -- the keyboard is the only thing left
+
+Full detail in [`RUN-CARD-2026-08-27.md`](RUN-CARD-2026-08-27.md).
+
+The 10:42 boot is archived at `logs/1a-desktop-5950x-2026-08-27-boot3/`, md5-verified
+against the media before the drive's logs were cleared. It passed #732, #737, #738 and
+#739 for the third boot running, **passed the mouse half of #734** (548 reports, 0
+errors), and reproduced #735 again. The keyboard's cc=4 is now known to be permanent:
+eight halt recoveries all completed cleanly and the next transfer failed each time.
+
+```
+7b1bf6bf69f23b630d4f558ec1b982cdcdaf0b4c12fd5ffc39c00a59af74fec5  \EFI\BOOT\BOOTX64.EFI = \EFI\hype\hype-default.efi
+75f102da603670a39d5e6f271a021888436d4316fe3721bc5135d9bd464f9731  \EFI\hype\hype-avic.efi
+```
+
+Both are commit `02da239`, built one at a time with `make clean` between them, and
+re-read from the media after an unmount/mount cycle. `\RUN-CARD.md` and
+`\QUEUE-2026-08-27.md` refreshed; `\hype.cfg`, the 18 configs, `\input\vm0.txt` and the
+2 GiB scratch image were already correct and were NOT rewritten. Logs, bootcount and
+vars cleared.
+
+Boot 4 carries `CTXDUMP`, which prints the output slot and endpoint context the
+controller holds for each claimed HID and for its TT hub -- the working mouse and the
+broken keyboard, diffable inside one boot.
