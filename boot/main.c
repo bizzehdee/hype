@@ -17025,6 +17025,17 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         if (vm->vcpu[d_] == 0) continue;
                         (void)vmm_get_int_diag(kind, vm->vcpu[d_], &ei, &df, &wn, &ov);
                         vmm_get_intr_state(kind, vm->vcpu[d_], &idg);
+                        {
+                            /* #750: WHY the deferrals -- the guest having interrupts off is
+                             * a different problem from hype's own priority gate refusing. */
+                            unsigned long long nac = 0, vpr = 0;
+                            if (kind == HYPE_VMM_KIND_SVM) {
+                                hype_svm_vcpu_get_defer_reasons(vm->vcpu[d_], &nac, &vpr);
+                            }
+                            hype_debug_print("fw-1 INTDEFER vm%u/%u: cannot_accept=%llu "
+                                             "vintr_prio=%llu [#750]\n",
+                                             (unsigned)(vm - g_vms), d_, nac, vpr);
+                        }
                         hype_debug_print("fw-1 INTDIAG vm%u/%u: eventinj=%llu defer=%llu "
                                          "window=%llu coalesced=%llu collisions=%llu | "
                                          "pending=%d(top 0x%x) staged_eventinj=0x%llx IF=%d "

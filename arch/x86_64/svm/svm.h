@@ -686,6 +686,10 @@ void hype_svm_vcpu_get_intr_state(hype_vcpu_ctx_t *ctx, hype_svm_intr_state_t *o
  * deliver a deferred vector, and how many deferrals clobbered a still-
  * undelivered pending vector. defer >> window (or overwrite > 0) means
  * deferred injections are getting stuck/lost. */
+/* #750: the two reasons a request could not take the direct-injection fast path. */
+void hype_svm_vcpu_get_defer_reasons(hype_vcpu_ctx_t *ctx, unsigned long long *cannot_accept,
+                                     unsigned long long *vintr_prio);
+
 void hype_svm_vcpu_get_int_diag(hype_vcpu_ctx_t *ctx, unsigned long long *eventinj,
                                  unsigned long long *defer,
                                  unsigned long long *window, unsigned long long *overwrite);

@@ -151,6 +151,17 @@ struct hype_vcpu_ctx {
     unsigned long long int_overwrite; /* vector already pending -> coalesced, not lost */
     unsigned long long int_collision; /* wanted to inject, an event was already staged */
     /*
+     * #750: WHY a request had to be deferred rather than injected directly.
+     *
+     * The fast path needs three things at once -- EVENTINJ free, the guest able to accept
+     * (IF set, no STI shadow), and the VINTR priority to allow the vector. int_collision
+     * already counts the first, and it is 5-17 out of thousands, so it is not the one.
+     * Which of the other two it is decides whether an AP's ~99% deferral rate is the guest
+     * genuinely running with interrupts off or hype's own priority gate refusing.
+     */
+    unsigned long long int_defer_cannot_accept; /* IF clear or in an STI shadow */
+    unsigned long long int_defer_vintr_prio;    /* VINTR priority refused the vector */
+    /*
      * #456: the vectors staged into EVENTINJ since the caller last drained this,
      * as a 256-bit set. The guest's emulated LAPIC ISR must be marked at the
      * moment a vector is COMMITTED to the guest, not when it is requested --
@@ -1468,6 +1479,14 @@ int hype_svm_vcpu_handle_acpi_pm_timer_ioio(hype_vcpu_ctx_t *ctx) {
  * arch/x86_64/vmm_device_ops.c (#694) along with process_ahci_command_slot(),
  * their sole writer. */
 
+/* #750: why the deferrals happened -- IF/shadow versus the VINTR priority gate. */
+void hype_svm_vcpu_get_defer_reasons(hype_vcpu_ctx_t *ctx, unsigned long long *cannot_accept,
+                                     unsigned long long *vintr_prio) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    if (cannot_accept) *cannot_accept = (real != 0) ? real->int_defer_cannot_accept : 0ull;
+    if (vintr_prio) *vintr_prio = (real != 0) ? real->int_defer_vintr_prio : 0ull;
+}
+
 void hype_svm_vcpu_get_int_diag(hype_vcpu_ctx_t *ctx, unsigned long long *eventinj,
                                  unsigned long long *defer, unsigned long long *window,
                                  unsigned long long *overwrite) {
@@ -1625,6 +1644,11 @@ trace_done:
      * vector coalesces (correct IRR semantics: one delivery per set bit). */
     if (eventinj_busy) {
         real->int_collision++;
+    } else if (!hype_svm_can_accept_interrupt(real->vmcb->save.rflags,
+                                              real->vmcb->control.interrupt_shadow)) {
+        real->int_defer_cannot_accept++; /* #750 */
+    } else {
+        real->int_defer_vintr_prio++;    /* #750: the only condition left */
     }
     if ((real->pending_irr[vector >> 5] & ((uint32_t)1u << (vector & 31u))) != 0) {
         real->int_overwrite++; /* vector already pending -> coalesced (not lost) */
