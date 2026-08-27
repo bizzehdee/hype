@@ -1,0 +1,64 @@
+# #735 DIAGNOSTIC boot. Not a pass/fail run -- its job is to make the guest say where it
+# stops, which five hardware boots have completely failed to do.
+#
+# WHY THOSE BOOTS SHOWED NOTHING. Alpine's live-ISO cmdline sends kernel output to tty0,
+# and the serial prompts come from inittab -- so \RUN1A.LOG has never contained a single
+# kernel message. Every #735 log therefore ends at the shell prompt after `reboot` and
+# says nothing whatsoever about what the kernel did next. That absence has been read four
+# times as "the guest wedged immediately"; it is equally consistent with the kernel getting
+# most of the way through a shutdown it could not report.
+#
+# `dmesg -w` does not care what console= says. Backgrounded onto /dev/ttyS0 before the
+# reboot, it streams the kernel ring buffer to a console hype DOES capture, for as long as
+# userspace lives. That is the whole point of this boot.
+#
+# The heartbeat separates the two failures the logs cannot currently tell apart:
+#   HB ticks stop, dmesg silent   -> userspace died first (init, or the shell's own group)
+#   HB ticks stop, dmesg CONTINUES -> the kernel is alive and past userspace, which is
+#                                     where the 0xfb CALL_FUNCTION_SINGLE storm lives
+#   both continue forever          -> nothing is wedged; the reboot request itself is lost
+#
+# Expected to end in a TIMEOUT, not a pass. That is fine: the evidence is the log.
+
+timeout 900000
+fail-if soft lockup
+
+expect localhost login:
+send root\n
+expect ~#
+
+# Kernel ring buffer -> serial. setsid so it is not in the shell's process group and does
+# not die with it -- if it did, it would go quiet exactly when the interesting part starts.
+send setsid sh -c 'dmesg -w > /dev/ttyS0' &\n
+send dmesg -n 8\n
+send echo DMESG-STREAMING-NOW\n
+expect DMESG-STREAMING-NOW
+
+# One-second heartbeat, same reasoning: setsid so init killing the shell's group does not
+# take the clock with it. Numbered from uptime so the log dates the moment it stops.
+send setsid sh -c 'while :; do echo HB-$(cut -d. -f1 /proc/uptime) > /dev/ttyS0; sleep 1; done' &\n
+send echo HEARTBEAT-STARTED\n
+expect HEARTBEAT-STARTED
+
+# A marker only a genuinely restarted kernel can fail to have, exactly as the reboot-pin
+# script does -- so a stale shell is still detectable if the guest never restarts (#728).
+send touch /tmp/preboot-marker; echo CPUS-BEFORE-$(nproc)-UP-$(cut -d. -f1 /proc/uptime)\n
+expect CPUS-BEFORE-
+
+send echo 1 > /sys/kernel/reboot/cpu && echo CPU-PINNED-$(cat /sys/kernel/reboot/cpu)\n
+expect CPU-PINNED-1
+
+# And the same `reboot` the other five boots ran. No `clear` this time: nothing here
+# depends on matching a login prompt, and clearing the screen would throw away the last
+# thing on it if the wedge is fast.
+send reboot\n
+
+# This is expected to TIME OUT. If it does not -- if a second login prompt arrives -- then
+# the guest restarted and #735 did not reproduce on this boot, which is itself worth
+# knowing and is why the expect is here rather than a bare wait.
+expect localhost login:
+send root\n
+expect ~#
+send test -e /tmp/preboot-marker && echo STALE-S''HELL || echo FRESH-B''OOT\n
+expect FRESH-BOOT
+pass 735-diagnostic-guest-restarted-after-all
