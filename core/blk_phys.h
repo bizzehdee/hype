@@ -59,6 +59,20 @@ typedef struct {
      * second place to forget one.
      */
     uint64_t base_lba;
+    /*
+     * #747: the device behind this backend has been unplugged.
+     *
+     * Kept HERE, in the chunker, because it is the one layer both physical paths funnel
+     * through: AHCI/NVMe reach it directly and USB MSC reaches it via hype_blk_usb_init(),
+     * which wires its callbacks into this same struct. One flag, checked in one place, for
+     * every physical-backed disk, log sink and guest volume -- #576's rule applied before
+     * it can be broken rather than after.
+     *
+     * STICKY. A re-plug does NOT clear it: a half-written cluster chain is not made good by
+     * the device coming back, and resuming onto it is how #596's broken chain would be
+     * extended rather than noticed. Clearing it is an explicit operator action (attach).
+     */
+    int departed;
 } hype_blk_phys_t;
 
 /*
@@ -132,3 +146,15 @@ void hype_blk_phys_enable_writev(hype_blk_phys_t *p, hype_blk_backend_t *be,
                                  uint32_t max_sectors);
 
 #endif /* HYPE_CORE_BLK_PHYS_H */
+
+/*
+ * #747: the device behind this backend is gone. Every subsequent read, write and writev
+ * fails with HYPE_BLK_ERR_GONE without touching the hardware.
+ *
+ * Idempotent, and safe to call from the USB departure path with I/O in flight: the flag is
+ * only ever set, and each entry point tests it before it touches `hw`.
+ */
+void hype_blk_phys_mark_departed(hype_blk_phys_t *p);
+
+/* #747: has it? 0 when `p` is NULL, so a caller with no physical backend reads as present. */
+int hype_blk_phys_is_departed(const hype_blk_phys_t *p);

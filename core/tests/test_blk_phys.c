@@ -343,7 +343,83 @@ static void test_enable_writev_refuses_read_only_and_null(void) {
     CHECK_HEX("zero max_sectors not armed", 1, be.writev == 0);
 }
 
+/* ---- #747: a departed device fails cleanly instead of touching the hardware ---- */
+
+static int g_747_hw_calls;
+static int t747_read(void *hw, uint64_t lba, uint32_t count, void *buf) {
+    (void)hw; (void)lba; (void)count; (void)buf; g_747_hw_calls++; return 0;
+}
+static int t747_write(void *hw, uint64_t lba, uint32_t count, const void *buf) {
+    (void)hw; (void)lba; (void)count; (void)buf; g_747_hw_calls++; return 0;
+}
+static int t747_writev(void *hw, uint64_t lba, const hype_blk_seg_t *segs, uint32_t nsegs) {
+    (void)hw; (void)lba; (void)segs; (void)nsegs; g_747_hw_calls++; return 0;
+}
+
+static void test_747_departed_fails_every_direction(void) {
+    hype_blk_phys_t p;
+    hype_blk_backend_t be;
+    uint8_t buf[512];
+    hype_blk_seg_t seg;
+
+    hype_blk_phys_init(&p, &be, t747_read, t747_write, 0, 64);
+    hype_blk_phys_enable_writev(&p, &be, t747_writev, 8u, 64u);
+    seg.buf = buf; seg.count = 1u;
+
+    g_747_hw_calls = 0;
+    CHECK_HEX("read works while present", 0, be.read(be.ctx, 0, 1, buf));
+    CHECK_HEX("write works while present", 0, be.write(be.ctx, 0, 1, buf));
+    CHECK_HEX("hw was actually called", 2, g_747_hw_calls);
+
+    hype_blk_phys_mark_departed(&p);
+    CHECK_HEX("now departed", 1, hype_blk_phys_is_departed(&p));
+
+    g_747_hw_calls = 0;
+    CHECK_HEX("read fails GONE", HYPE_BLK_ERR_GONE, be.read(be.ctx, 0, 1, buf));
+    CHECK_HEX("write fails GONE", HYPE_BLK_ERR_GONE, be.write(be.ctx, 0, 1, buf));
+    CHECK_HEX("writev fails GONE", HYPE_BLK_ERR_GONE, be.writev(be.ctx, 0, &seg, 1u));
+    /* The point: the hw layer is never entered. Its own timeout is measured in seconds per
+     * request, from the guest dispatch loop, so "fails eventually" is not good enough. */
+    CHECK_HEX("and the hardware was NOT touched", 0, g_747_hw_calls);
+}
+
+static void test_747_gone_is_distinct_from_a_failed_io(void) {
+    /* -1 means "this I/O failed" and may succeed on retry; GONE never will. A caller that
+     * cannot tell them apart either retries forever or gives up on a transient. */
+    CHECK_HEX("GONE is not -1", 1, (HYPE_BLK_ERR_GONE != -1));
+    CHECK_HEX("GONE is still non-zero", 1, (HYPE_BLK_ERR_GONE != 0));
+}
+
+static void test_747_departure_is_sticky_but_init_clears_it(void) {
+    hype_blk_phys_t p;
+    hype_blk_backend_t be;
+    uint8_t buf[512];
+
+    hype_blk_phys_init(&p, &be, t747_read, t747_write, 0, 64);
+    hype_blk_phys_mark_departed(&p);
+    hype_blk_phys_mark_departed(&p); /* idempotent */
+    CHECK_HEX("still departed", 1, hype_blk_phys_is_departed(&p));
+    CHECK_HEX("and still refusing", HYPE_BLK_ERR_GONE, be.read(be.ctx, 0, 1, buf));
+
+    /* A re-plug does not clear it -- only an explicit re-init does, which is what `attach`
+     * runs. A half-written cluster chain is not made good by the device coming back. */
+    hype_blk_phys_init(&p, &be, t747_read, t747_write, 0, 64);
+    CHECK_HEX("re-init brings it back present", 0, hype_blk_phys_is_departed(&p));
+    CHECK_HEX("and I/O works again", 0, be.read(be.ctx, 0, 1, buf));
+}
+
+static void test_747_null_is_not_departed(void) {
+    /* A caller with no physical backend at all (a file-backed disk) must read as present,
+     * not as gone. */
+    CHECK_HEX("NULL reads as present", 0, hype_blk_phys_is_departed(0));
+    hype_blk_phys_mark_departed(0); /* must not fault */
+}
+
 int main(void) {
+    test_747_departed_fails_every_direction();
+    test_747_gone_is_distinct_from_a_failed_io();
+    test_747_departure_is_sticky_but_init_clears_it();
+    test_747_null_is_not_departed();
     test_single_chunk();
     test_exact_chunk_boundary();
     test_three_chunks();

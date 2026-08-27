@@ -36,6 +36,19 @@ typedef struct {
     int active;           /* 1 once the volume mounted and the file was created */
     int filter;           /* #338: HYPE_LOG_SINK_ALL / _HYPE / a VM index */
     int ordered;          /* prefix each record with its capture-buffer offset */
+    /*
+     * #747: the volume this sink writes to has been unplugged.
+     *
+     * Set explicitly by the departure path rather than inferred from an append failure,
+     * because an append failure arrives through hype_fs_append() as a plain -1 -- the
+     * filesystem layer has no channel for "the device is gone" and giving it one would
+     * mean threading a code through FAT32, exFAT, ext and NTFS to reach here.
+     *
+     * The sink is the sharpest case in #747: it is how hype reports everything, INCLUDING
+     * this. Losing the medium must not lose the explanation, so a gone sink stops writing
+     * and says so once, rather than failing every flush for the rest of the boot.
+     */
+    int device_gone;
 } hype_log_sink_t;
 
 /*
@@ -50,6 +63,7 @@ typedef struct {
 #define HYPE_LOG_SINK_ERR_MOUNT (-1)  /* no writable (create+append) volume at this base LBA */
 #define HYPE_LOG_SINK_ERR_CREATE (-2) /* mounted, but the file could not be created */
 #define HYPE_LOG_SINK_ERR_WRITE (-3)  /* created, but the first append failed (block I/O) */
+#define HYPE_LOG_SINK_ERR_GONE (-4)   /* #747: the volume was unplugged; nothing will be written */
 
 /*
  * Mounts the volume (any registered driver with create+append), creates
@@ -144,3 +158,18 @@ int hype_log_sink_flush(hype_log_sink_t *s);
 int hype_log_sink_flush_budget(hype_log_sink_t *s, unsigned int max_source_bytes);
 
 #endif /* HYPE_CORE_LOG_SINK_H */
+
+/*
+ * #747: the volume behind this sink is gone. Every subsequent flush returns
+ * HYPE_LOG_SINK_ERR_GONE without touching the filesystem or the block layer.
+ *
+ * Deliberately does NOT close the file or unmount: the in-memory FAT/exFAT state describes
+ * a medium that is no longer there, and writing anything more to it -- including a tidy
+ * close -- is the torn-write this ticket exists to prevent. It is abandoned, not finished.
+ *
+ * Sticky. A re-plug does not resume it; re-opening is an explicit operator action.
+ */
+void hype_log_sink_mark_device_gone(hype_log_sink_t *s);
+
+/* #747: has it? 0 for a NULL sink, which is "no sink" rather than "a gone one". */
+int hype_log_sink_device_gone(const hype_log_sink_t *s);

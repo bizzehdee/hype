@@ -94,6 +94,10 @@ static unsigned int order_prefix(char *buf, uint64_t off) {
 static int sink_start(hype_log_sink_t *s, hype_fs_t *fs, const char *filename,
                       const hype_rtc_time_t *now, int filter, int ordered) {
     s->active = 0;
+    /* #747: HERE, not in sink_open() -- every open funnels through this function, including
+     * the shared-fs one, and clearing it in only one of the two callers is how the shared
+     * path would have quietly stayed gone forever after a re-attach. */
+    s->device_gone = 0;
     s->flushed = 0;
     s->filter = filter;
     /*
@@ -249,6 +253,16 @@ static int flush_filtered(hype_log_sink_t *s, const char *data, unsigned int len
     return 0;
 }
 
+void hype_log_sink_mark_device_gone(hype_log_sink_t *s) {
+    if (s != (hype_log_sink_t *)0) {
+        s->device_gone = 1;
+    }
+}
+
+int hype_log_sink_device_gone(const hype_log_sink_t *s) {
+    return (s != (const hype_log_sink_t *)0) && s->device_gone;
+}
+
 int hype_log_sink_flush_budget(hype_log_sink_t *s, unsigned int max_source_bytes) {
 #ifdef HYPE_596_JOURNAL
     {
@@ -258,6 +272,13 @@ int hype_log_sink_flush_budget(hype_log_sink_t *s, unsigned int max_source_bytes
     }
 #endif
     unsigned int len;
+    /*
+     * #747: checked BEFORE `active`, and before anything reaches the filesystem. A gone
+     * volume is not an inactive sink -- it mounted, it has a file, and its in-memory FAT
+     * state describes a medium that is no longer there. Every further append would be a
+     * write into that state, which is exactly the torn chain #596 is about.
+     */
+    if (s->device_gone) return HYPE_LOG_SINK_ERR_GONE;
     if (!s->active) return -1;
     if (max_source_bytes == 0u) return 0;
     len = hype_logbuf_len();

@@ -90,6 +90,16 @@ int hype_blk_range_in_bounds(uint64_t total_sectors, uint64_t lba, uint32_t coun
  * diagnostics, and a lost increment under concurrency is preferable to putting a lock
  * on the I/O path.
  */
+/*
+ * #747: the backing DEVICE IS GONE -- distinct from -1, "this I/O failed".
+ *
+ * A read or write that fails may well succeed on retry; one against a device that has been
+ * unplugged never will, and the difference decides whether a caller retries, gives up, or
+ * must treat what it has already written as torn. Every layer returns non-zero for both, so
+ * a caller that does not care is unaffected; one that does can ask.
+ */
+#define HYPE_BLK_ERR_GONE (-2)
+
 #define HYPE_BLK_WSTATS_BUCKETS 6u
 
 typedef struct {

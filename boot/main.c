@@ -335,6 +335,8 @@ static void usb_log_fatal_flush(void); /* #513: registered as the panic flush ho
 static unsigned int usb_hid_drain(void);
 static int usb_mouse_drain(hype_ps2_mouse_t *dst);
 static void fw_1_usb_hotplug_poll(void); /* #744 */
+static void fw_1_usb_storage_departed(hype_xhci_ctrl_t *xc, unsigned int ctrl_idx,
+                                      unsigned int root_port, unsigned int route); /* #747 */
 /*
  * #745: the controllers the sweep left RUNNING, and their inventory-facing indices.
  *
@@ -15948,11 +15950,20 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                          (unsigned long long)g_bsp_ipi_drained[_vmi]);
                     {   /* #512: request-vs-injection per suspect vector on vCPU 0. A req that
                          * inj never follows = staged but never delivered. */
-                        uint32_t rq[5], ij[5];
-                        /* #563: const, so one-per-host is correct -- read-only, cannot race. */
-                        static const uint8_t vv[5] = {0xfbu, 0x22u, 0xecu, 0xf9u, 0xfau};
+                        uint32_t rq[6], ij[6];
+                        /*
+                         * #563: const, so one-per-host is correct -- read-only, cannot race.
+                         *
+                         * #750: 0xfc joins them. Linux's CALL_FUNCTION_VECTOR is what
+                         * smp_call_function_many_cond() broadcasts and then spins waiting to
+                         * be acked -- the exact loop the soft lockup sits in -- and it was
+                         * the one vector with no per-vCPU visibility at all. The aggregate
+                         * VECHIST showed a 0xfc requested and never injected in the run that
+                         * locked up, and there was no way to ask WHICH vCPU lost it.
+                         */
+                        static const uint8_t vv[6] = {0xfbu, 0xfcu, 0x22u, 0xecu, 0xf9u, 0xfau};
                         unsigned q_;
-                        for (q_ = 0; q_ < 5u; q_++) {
+                        for (q_ = 0; q_ < 6u; q_++) {
                             rq[q_] = ij[q_] = 0u;
                             if (kind == HYPE_VMM_KIND_SVM) {
                                 hype_svm_vcpu_get_vec_counts(vm->vcpu[0], vv[q_], &rq[q_],
@@ -15976,18 +15987,18 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                             for (v_ = 0; v_ < vm->vcpu_count && v_ < HYPE_MAX_VCPUS_PER_VM;
                                  v_++) {
                                 if (vm->vcpu[v_] == 0) continue;
-                                for (q_ = 0; q_ < 5u; q_++) {
+                                for (q_ = 0; q_ < 6u; q_++) {
                                     rq[q_] = ij[q_] = 0u;
                                     if (kind == HYPE_VMM_KIND_SVM) {
                                         hype_svm_vcpu_get_vec_counts(vm->vcpu[v_], vv[q_],
                                                                      &rq[q_], &ij[q_]);
                                     }
                                 }
-                                hype_debug_print("fw-1 VECSTAT vm%u/%u: fb=%u/%u s22=%u/%u "
-                                                 "ec=%u/%u f9=%u/%u fa=%u/%u (req/inj) "
-                                                 "[#512 #735]\n", _vmi, v_,
+                                hype_debug_print("fw-1 VECSTAT vm%u/%u: fb=%u/%u fc=%u/%u "
+                                                 "s22=%u/%u ec=%u/%u f9=%u/%u fa=%u/%u "
+                                                 "(req/inj) [#512 #735 #750]\n", _vmi, v_,
                                                  rq[0], ij[0], rq[1], ij[1], rq[2], ij[2],
-                                                 rq[3], ij[3], rq[4], ij[4]);
+                                                 rq[3], ij[3], rq[4], ij[4], rq[5], ij[5]);
                             }
                         }
                         {   /* #512: if a vector is sitting in a vCPU's pending IRR, say WHICH
@@ -16047,7 +16058,24 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                          (unsigned long long)vm->lapic[_av].ipi_out_dropped,
                                          (unsigned)vm->lapic[_av].ipi_out_valid);
                     }
-                    for (_av = 1u; _av < vm->vcpu_count && _av < HYPE_MAX_VCPUS_PER_VM; _av++) {
+                    /*
+                     * #750: every LIVE vCPU, not `vcpu_count` of them.
+                     *
+                     * `vcpu_count` is the configured PHYSICAL core count -- 2 on this host --
+                     * while the guest gets that many cores' worth of logical CPUs, four with
+                     * the SMT bonus (#564). So this loop printed vCPU 1 and stopped, and
+                     * vCPUs 2 and 3 had no exits, no unhandled count, no lock-wait and no
+                     * timer figures in any log. Chasing #750 -- a cross-call that never
+                     * completes -- with two of the four CPUs invisible is not chasing it.
+                     *
+                     * Same defect as the VECSTAT one fixed under #735, in a second place:
+                     * the rule is that a per-vCPU diagnostic is bounded by how many vCPUs
+                     * there ARE, and `vcpu_count` is not that number.
+                     */
+                    for (_av = 1u; _av < HYPE_MAX_VCPUS_PER_VM; _av++) {
+                        if (!g_ap_vcpu_live[_vmi][_av] && g_ap_vcpu_exits[_vmi][_av] == 0ull) {
+                            continue; /* never started -- silence beats a row of zeroes */
+                        }
                         hype_debug_print(
                             "fw-1 APVCPU vm%u/%u: live=%u exits=%llu unhandled=%llu "
                             "unclaimed=%llu "
@@ -16086,7 +16114,24 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                      * CPU_AP_DATA is 0xD8 and the array sits directly before CpuInfoInHob.
                      * Idtr.Base inside the record is the self-check.
                      */
-                    for (_av = 1u; _av < vm->vcpu_count && _av < HYPE_MAX_VCPUS_PER_VM; _av++) {
+                    /*
+                     * #750: every LIVE vCPU, not `vcpu_count` of them.
+                     *
+                     * `vcpu_count` is the configured PHYSICAL core count -- 2 on this host --
+                     * while the guest gets that many cores' worth of logical CPUs, four with
+                     * the SMT bonus (#564). So this loop printed vCPU 1 and stopped, and
+                     * vCPUs 2 and 3 had no exits, no unhandled count, no lock-wait and no
+                     * timer figures in any log. Chasing #750 -- a cross-call that never
+                     * completes -- with two of the four CPUs invisible is not chasing it.
+                     *
+                     * Same defect as the VECSTAT one fixed under #735, in a second place:
+                     * the rule is that a per-vCPU diagnostic is bounded by how many vCPUs
+                     * there ARE, and `vcpu_count` is not that number.
+                     */
+                    for (_av = 1u; _av < HYPE_MAX_VCPUS_PER_VM; _av++) {
+                        if (!g_ap_vcpu_live[_vmi][_av] && g_ap_vcpu_exits[_vmi][_av] == 0ull) {
+                            continue; /* never started -- silence beats a row of zeroes */
+                        }
                         hype_svm_debug_state_t ad;
                         if (g_ap_vcpu_exits[_vmi][_av] < 200ull ||
                             g_ap_apdata_dumped[_vmi][_av] || vm->vcpu[_av] == 0) {
@@ -24566,6 +24611,19 @@ static void fw_1_usb_release_behind_hub(hype_xhci_ctrl_t *xc, unsigned int hub_s
     if (hype_xhci_hub_child_route(xc, hub_slot, port, &route_bits) != 0) {
         return;
     }
+    /* #747: the same for a medium behind a hub -- which is where the operator's actually is. */
+    {
+        unsigned int rp = 0;
+        if (hype_xhci_hub_root_port(xc, hub_slot, &rp) == 0) {
+            unsigned int ci;
+            for (ci = 0; ci < g_live_xc_count && ci < HYPE_LIVE_XHCI_MAX; ci++) {
+                if (g_live_xc[ci].bar == xc->bar) {
+                    fw_1_usb_storage_departed(xc, g_live_xc_idx[ci], rp, route_bits);
+                    break;
+                }
+            }
+        }
+    }
     for (j = 0; j < g_hid_count && j < HYPE_HOST_KBD_MAX; j++) {
         if (g_hid[j].xc.bar != xc->bar || g_hid[j].route != route_bits) {
             continue;
@@ -24644,6 +24702,9 @@ static void fw_1_usb_hotplug_poll(void) {
              * not by slot, because the slot is exactly what stops being meaningful when a
              * device leaves.
              */
+            /* #747: storage first -- a departing medium must stop accepting I/O before
+             * anything else runs, and it is not a HID so the loop below would miss it. */
+            fw_1_usb_storage_departed(xc, g_live_xc_idx[k], port, 0u);
             for (j = 0; j < g_hid_count && j < HYPE_HOST_KBD_MAX; j++) {
                 if (g_hid[j].xc.bar != xc->bar || g_hid[j].root_port != port) {
                     continue;
@@ -24785,6 +24846,69 @@ static int usblog_sync(void *ctx) {
     (void)ctx;
     return hype_blk_usb_sync(&g_usb_ubk);
 }
+
+/*
+ * #747: a departing MASS-STORAGE device must fail its I/O, not corrupt it.
+ *
+ * A keyboard leaving costs a keystroke. hype BOOTS from USB mass storage and writes its own
+ * log there (plan.md decision 28), and a `[disk.*]` entry can be physically backed by it --
+ * so an unplug mid-write is not an enumeration event, it is a torn write.
+ *
+ * #596 is the precedent for how that goes when it is not thought about: a FAT32 writer left
+ * a broken cluster chain in a per-VM log on real hardware, and it took a dedicated
+ * end-to-end suite to characterise. A device vanishing under the same writer is strictly
+ * worse, because the writer has no reason to suspect anything. This drive has form, too --
+ * the SABRENT bridge dropped its link under sustained write during staging on 2026-08-27.
+ *
+ * The identity is the inventory's: (controller, root port, route) -> slot. That is the same
+ * key #744's teardown uses, so a departure cannot be attributed to one subsystem and missed
+ * by the other.
+ *
+ * Marking is STICKY on purpose. A re-plug does not resume anything: a half-written cluster
+ * chain is not made good by the device coming back, and resuming onto it would extend the
+ * damage rather than notice it. Re-attaching is an operator action.
+ */
+static void fw_1_usb_storage_departed(hype_xhci_ctrl_t *xc, unsigned int ctrl_idx,
+                                      unsigned int root_port, unsigned int route) {
+    int ii = hype_usb_inventory_find(&g_usb_inv, ctrl_idx, root_port, route);
+    unsigned int slot;
+    unsigned int k;
+
+    if (ii < 0) {
+        return;
+    }
+    slot = g_usb_inv.dev[ii].slot;
+    if (slot == 0u) {
+        return; /* already torn down, or never had a slot */
+    }
+
+    /*
+     * hype's OWN boot/log medium. The sharpest case in the whole ticket: this is how hype
+     * reports everything, including this. Losing the medium must not lose the explanation,
+     * so the sink is abandoned rather than closed -- a tidy close would write FAT metadata
+     * to a device that is not there.
+     */
+    if (g_usb_ubk.slot == slot && g_usb_ubk.ctrl != 0 && g_usb_ubk.ctrl->bar == xc->bar) {
+        hype_blk_phys_mark_departed(&g_usb_uphys);
+        hype_log_sink_mark_device_gone(&g_hype_log);
+        /* Straight to the serial console, NOT through the log sink that just died. */
+        hype_serial_print("host-usb: the LOG/BOOT medium (slot%u) DEPARTED -- the log sink is "
+                          "abandoned, not closed, and every further block I/O to it fails. "
+                          "Anything not already on the stick is lost [#747]\n", slot);
+    }
+
+    /* Any stick registered as a MEDIA source: guest ISOs and physically-backed disks. */
+    for (k = 0; k < HYPE_MEDIA_USBX; k++) {
+        if (g_musbx_hw[k].slot == slot && g_musbx_hw[k].ctrl != 0 &&
+            g_musbx_hw[k].ctrl->bar == xc->bar) {
+            hype_blk_phys_mark_departed(&g_musbx_phys[k]);
+            hype_serial_print("host-usb: media device %u (slot%u) DEPARTED -- every read and "
+                              "write to it now fails; a guest backed by it will see its disk "
+                              "error rather than hang [#747]\n", k, slot);
+        }
+    }
+}
+
 
 /* Try to mount a FAT32 volume on the stick and open the log file on it. The FAT
  * can live at LBA 0 (superfloppy), inside an MBR partition (LBA 0 is a Master
