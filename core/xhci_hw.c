@@ -170,6 +170,9 @@ typedef struct {
     uint8_t report[64] __attribute__((aligned(64)));
     unsigned int enq;
     unsigned int cyc;
+    unsigned int mps;       /* the endpoint's wMaxPacketSize -- the TRB length to arm */
+    unsigned int recoveries; /* consecutive halt recoveries; reset by a good report */
+    int dead;               /* recovery cap hit -- stop arming and stop recovering */
     int armed;
     uint64_t pending_trb;
 } xhci_int_in_hw_t;
@@ -722,6 +725,13 @@ int hype_xhci_set_configuration(hype_xhci_ctrl_t *c, unsigned int slot, unsigned
     return control_transfer(c, slot, 0x00, 9, (uint16_t)config_value, 0, 0, 0u, 0);
 }
 
+int hype_xhci_hid_set_boot_protocol(hype_xhci_ctrl_t *c, unsigned int slot,
+                                    unsigned int interface_num) {
+    /* SET_PROTOCOL: bmRequestType=0x21 (OUT/class/interface), bRequest=0x0B,
+     * wValue=0 (Boot), wIndex=interface, no data stage. */
+    return control_transfer(c, slot, 0x21, 0x0B, 0, (uint16_t)interface_num, 0, 0u, 0);
+}
+
 /* Stamp a Link TRB (toggle-cycle, cycle=1) at the end of a fresh transfer ring. */
 static void ring_init_link(uint8_t *ring) {
     uint32_t link[4];
@@ -811,6 +821,7 @@ int hype_xhci_configure_int_in_endpoint(hype_xhci_ctrl_t *c, unsigned int slot,
     zero(iin->ring, XPAGE);
     ring_init_link(iin->ring);
     iin->enq = 0; iin->cyc = 1; iin->armed = 0; iin->pending_trb = 0;
+    iin->mps = mps; iin->recoveries = 0; iin->dead = 0;
 
     zero(hw->input_ctx, XPAGE);
     hype_xhci_input_ctrl_ctx(ctx, HYPE_XHCI_ADD_SLOT | (1u << dci), 0);
@@ -896,6 +907,43 @@ static void int_in_report_error(unsigned int slot, unsigned int dci, uint64_t tr
     }
 }
 
+static int ep_recover(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int dci, uint8_t *ring,
+                      unsigned int *enq, unsigned int *cyc);
+
+/*
+ * #734: an error completion on an interrupt endpoint HALTS it (xHCI 4.10.2.1) -- the
+ * controller stops running that ring and ignores its doorbell until software issues
+ * Reset Endpoint and Set TR Dequeue Pointer (xHCI 4.6.8/4.6.10). Clearing `armed` and
+ * ringing again, which is all this path used to do, arms into a dead endpoint forever.
+ *
+ * That is exactly what the 2026-08-27 09:46 boot recorded: ONE error each on the
+ * keyboard (cc=4, USB Transaction Error) and the mouse (cc=3, Babble Detected), then
+ * `errors=1` frozen while `polls` climbed past 300000 and `reports` stayed at 0. One
+ * error per boot is not a device that is failing; it is a device that got one chance.
+ *
+ * Bounded, because recovery is three synchronous commands and this runs from the guest
+ * dispatch loop: an endpoint that cannot be brought back must not be retried thousands
+ * of times a second. The count resets on the next good report, so a transient does not
+ * accumulate across a long session.
+ */
+#define INT_IN_MAX_RECOVERIES 8u
+
+static void int_in_recover(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int dci,
+                           xhci_int_in_hw_t *iin) {
+    iin->armed = 0;
+    iin->pending_trb = 0;
+    if (iin->recoveries++ >= INT_IN_MAX_RECOVERIES) {
+        iin->dead = 1;
+        hype_debug_print("host-xhci: interrupt-IN slot=%u ep=%u gave up after %u halt "
+                         "recoveries -- endpoint left stopped [#734]\n", slot, dci,
+                         (unsigned)INT_IN_MAX_RECOVERIES);
+        return;
+    }
+    hype_debug_print("host-xhci: interrupt-IN slot=%u ep=%u halted -- recovering (%u/%u) "
+                     "[#734]\n", slot, dci, iin->recoveries, (unsigned)INT_IN_MAX_RECOVERIES);
+    (void)ep_recover(c, slot, dci, iin->ring, &iin->enq, &iin->cyc);
+}
+
 int hype_xhci_int_in_poll(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int ep_addr,
                           uint8_t *out, unsigned int len) {
     xhci_hw_t *hw = HW(c);
@@ -916,12 +964,24 @@ int hype_xhci_int_in_poll(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int e
     if (iin == (xhci_int_in_hw_t *)0 || len > sizeof(iin->report)) {
         return -1;
     }
+    if (iin->dead) {
+        return -1;
+    }
     bar = (volatile uint8_t *)(uintptr_t)c->bar;
     my_trb = phys(iin->ring) + (uint64_t)iin->enq * HYPE_XHCI_TRB_BYTES;
 
-    /* Arm exactly one transfer on THIS endpoint, and only when none is outstanding. */
+    /* Arm exactly one transfer on THIS endpoint, and only when none is outstanding.
+     *
+     * #734: the TRB is sized by the ENDPOINT's wMaxPacketSize, not by the caller's
+     * buffer. A device that sends more than the TRB asked for is a Babble Detected
+     * (cc=3), which halts the endpoint -- and the mouse's endpoint is mps=64 while the
+     * caller wants 8 bytes of boot-protocol packet. The block's report buffer is sized
+     * for the largest mps configure-time accepts, so the extra bytes have somewhere to
+     * land; only the first `len` are handed back. */
     if (!iin->armed) {
-        hype_xhci_trb_normal(t, phys(iin->report), len, (int)iin->cyc);
+        unsigned int xfer = (iin->mps != 0u && iin->mps <= sizeof(iin->report)) ? iin->mps : len;
+        for (i = 0; i < sizeof(iin->report); i++) iin->report[i] = 0;
+        hype_xhci_trb_normal(t, phys(iin->report), xfer, (int)iin->cyc);
         ring_enqueue(iin->ring, &iin->enq, &iin->cyc, t);
         wr32(bar, hype_xhci_doorbell_offset(c->dboff, slot), dci);
         iin->armed = 1;
@@ -939,8 +999,10 @@ int hype_xhci_int_in_poll(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int e
             iin->armed = 0; /* consumed -- next poll re-arms */
             if (parked_cc != HYPE_XHCI_CC_SUCCESS && parked_cc != HYPE_XHCI_CC_SHORT_PACKET) {
                 int_in_report_error(slot, dci, my_trb, parked_cc);
+                int_in_recover(c, slot, dci, iin);
                 return -1;
             }
+            iin->recoveries = 0;
             for (i = 0; i < len; i++) out[i] = iin->report[i];
             return 1;
         }
@@ -961,8 +1023,10 @@ int hype_xhci_int_in_poll(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int e
     if (hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS &&
         hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SHORT_PACKET) {
         int_in_report_error(slot, dci, my_trb, hype_xhci_event_cc(evt));
+        int_in_recover(c, slot, dci, iin);
         return -1;
     }
+    iin->recoveries = 0;
     for (i = 0; i < len; i++) out[i] = iin->report[i];
     return 1;
 }

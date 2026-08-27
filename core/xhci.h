@@ -529,6 +529,22 @@ int hype_xhci_get_config_descriptor(hype_xhci_ctrl_t *c, unsigned int slot, uint
 int hype_xhci_set_configuration(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int config_value);
 
 /*
+ * #734: SET_PROTOCOL(Boot) on a HID interface. 0 on success.
+ *
+ * A boot-subclass interface descriptor says the device CAN speak boot protocol, not that
+ * it is doing so: HID 1.11 7.2.6 says every device powers up in REPORT protocol, and the
+ * host must ask for boot. hype only ever parses boot reports (core/usb_hid.c), so without
+ * this it reads report-protocol data with a boot-protocol layout -- and a report-protocol
+ * report is usually LONGER than the boot one, which on the wire is a Babble Detected
+ * (cc=3) against a boot-sized TRB rather than a misread key.
+ *
+ * A device that refuses the request is not fatal: some report the boot subclass and
+ * answer boot reports regardless, so the caller logs and continues.
+ */
+int hype_xhci_hid_set_boot_protocol(hype_xhci_ctrl_t *c, unsigned int slot,
+                                    unsigned int interface_num);
+
+/*
  * Issues a Configure Endpoint command adding the MSC bulk IN + bulk OUT
  * endpoints (from *msc) to `slot`'s device context, each with a fresh transfer
  * ring. root_port/speed re-provide the input Slot Context. Returns 0 on success.

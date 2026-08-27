@@ -2066,6 +2066,17 @@ static void fw_1_claim_boot_hid(hype_xhci_ctrl_t *xc, unsigned int protocol, con
                  */
                 hpath.tt_hub_slot = d->tt_hub_slot;
                 hpath.tt_port = d->tt_port;
+                /*
+                 * #734: ask for boot protocol. The boot SUBCLASS above says the device can
+                 * speak it; HID 1.11 7.2.6 says it powers up in report protocol anyway, and
+                 * hype parses nothing but boot reports. Not fatal if refused -- some devices
+                 * answer boot reports regardless -- so this logs and continues.
+                 */
+                if (hype_xhci_hid_set_boot_protocol(xc, d->slot, hid.interface_num) != 0) {
+                    hype_debug_print("host-hid: %s %04x:%04x SET_PROTOCOL(boot) on interface %u "
+                                     "REFUSED -- reports may not be boot-format [#734]\n", what,
+                                     (unsigned)d->vid, (unsigned)d->pid, hid.interface_num);
+                }
                 if (hype_xhci_configure_int_in_endpoint(xc, d->slot, &hpath, hid.int_in_ep,
                                                         hid.mps, hid.interval) == 0) {
                     *xc_out = *xc;
@@ -23913,9 +23924,9 @@ static unsigned int usb_hid_drain(void) {
         g_hid_poll_errs++;
     }
     if (r <= 0) {
-        /* 0 = idle, the normal case. -1 = a transfer error; the endpoint is left armed
-         * and retried next pass rather than torn down, since a single failed poll on
-         * an input device is not worth losing the keyboard over. */
+        /* 0 = idle, the normal case. -1 = a transfer error; #734 recovers the halted
+         * endpoint down in the poll and re-arms it, so a single failed transfer costs
+         * one report rather than the keyboard. */
         return 0;
     }
     g_hid_reports++;
@@ -23962,7 +23973,7 @@ static int usb_mouse_drain(hype_ps2_mouse_t *dst) {
         g_mouse_poll_errs++;
     }
     if (r <= 0) {
-        return 0; /* 0 = idle, the normal case; -1 leaves the endpoint armed for a retry */
+        return 0; /* 0 = idle, the normal case; -1 is recovered and re-armed by #734 */
     }
     g_mouse_reports++;
     if (g_mouse_reports == 1u) {
