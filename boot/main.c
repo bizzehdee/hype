@@ -15858,21 +15858,36 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                                              &ij[q_]);
                             }
                         }
-                        hype_debug_print("fw-1 VECSTAT vm%u/0: fb=%u/%u s22=%u/%u ec=%u/%u "
-                                         "f9=%u/%u fa=%u/%u (req/inj) [#512]\n", _vmi,
-                                         rq[0], ij[0], rq[1], ij[1], rq[2], ij[2],
-                                         rq[3], ij[3], rq[4], ij[4]);
-                        if (kind == HYPE_VMM_KIND_SVM && vm->vcpu_count > 1u &&
-                            vm->vcpu[1] != 0) {
-                            for (q_ = 0; q_ < 5u; q_++) {
-                                rq[q_] = ij[q_] = 0u;
-                                hype_svm_vcpu_get_vec_counts(vm->vcpu[1], vv[q_], &rq[q_],
-                                                             &ij[q_]);
+                        /*
+                         * #735: EVERY vCPU, not vCPU 0 and 1.
+                         *
+                         * This printed exactly two lines, hardcoded, since #512. On this host
+                         * `vcpus = 2` means two whole physical cores whose SMT siblings come
+                         * free (#564), so the guest has FOUR -- and half of them have been
+                         * invisible in every log. #735's whole shape is which vCPU is sending
+                         * and which is receiving, so a diagnostic that omits half the vCPUs
+                         * cannot answer it: boot 6's IPIOUT showed vCPU 1 sending 10981 IPIs
+                         * against ~2700 from the others, and there was no VECSTAT for vCPU 2
+                         * or 3 to say where any of them landed.
+                         */
+                        {
+                            unsigned v_;
+                            for (v_ = 0; v_ < vm->vcpu_count && v_ < HYPE_MAX_VCPUS_PER_VM;
+                                 v_++) {
+                                if (vm->vcpu[v_] == 0) continue;
+                                for (q_ = 0; q_ < 5u; q_++) {
+                                    rq[q_] = ij[q_] = 0u;
+                                    if (kind == HYPE_VMM_KIND_SVM) {
+                                        hype_svm_vcpu_get_vec_counts(vm->vcpu[v_], vv[q_],
+                                                                     &rq[q_], &ij[q_]);
+                                    }
+                                }
+                                hype_debug_print("fw-1 VECSTAT vm%u/%u: fb=%u/%u s22=%u/%u "
+                                                 "ec=%u/%u f9=%u/%u fa=%u/%u (req/inj) "
+                                                 "[#512 #735]\n", _vmi, v_,
+                                                 rq[0], ij[0], rq[1], ij[1], rq[2], ij[2],
+                                                 rq[3], ij[3], rq[4], ij[4]);
                             }
-                            hype_debug_print("fw-1 VECSTAT vm%u/1: fb=%u/%u s22=%u/%u ec=%u/%u "
-                                             "f9=%u/%u fa=%u/%u (req/inj) [#512]\n", _vmi,
-                                             rq[0], ij[0], rq[1], ij[1], rq[2], ij[2],
-                                             rq[3], ij[3], rq[4], ij[4]);
                         }
                         {   /* #512: if a vector is sitting in a vCPU's pending IRR, say WHICH
                              * and name the gate that is refusing delivery. */
