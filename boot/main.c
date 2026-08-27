@@ -10986,6 +10986,49 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
     uint64_t npt_root_phys = (uint64_t)(uintptr_t)vm->npt_pml4;
 
     /*
+     * #735: PARK EVERY AP BEFORE TOUCHING ANYTHING THE GUEST CAN SEE.
+     *
+     * This function restores pristine firmware, zeroes the whole of guest RAM and resets every
+     * LAPIC. Until this loop existed it did all of that with the other vCPUs still RUNNABLE and
+     * still executing the old guest, so their next instruction fetch came out of memory that had
+     * just been zeroed underneath them. They took an architectural SHUTDOWN, and #538's policy
+     * turns an AP triple fault into "stop the whole VM" -- so the restart completed onto a VM
+     * that had already been stopped, and the guest never came back:
+     *
+     *     vm0 vCPU 1 guest reset via ACPI reset register (0xCF9) -> restart
+     *     vm0 vCPU 2: architectural SHUTDOWN (triple fault) at rip 0xffffffff94055bd7
+     *     vm0 'run735' STOPPED -- an AP-hosted vCPU took an architectural SHUTDOWN
+     *     vm0 vCPU 3: architectural SHUTDOWN (triple fault) at rip 0xffffffff94055bd7
+     *     fw-1: vm0 restarted (M8-4): pristine firmware restored, RAM zeroed, vcpu reset
+     *
+     * Why it hid for so long: the reset is requested by whichever vCPU runs the guest's reboot
+     * path, and the BSP is the one that runs this function. With TWO vCPUs and the reboot pinned
+     * to vCPU 1, the only other vCPU is the BSP itself -- there is no bystander AP left to fault,
+     * which is why tools/525's 2-vCPU rig passes. It takes a THIRD vCPU for the bug to have a
+     * victim, and on this host `vcpus = 2` means two whole physical cores, whose SMT siblings
+     * come free (#564), so the guest actually has four.
+     *
+     * The handshake is the one INIT already uses -- ask the vCPU to leave the guest, then wait
+     * until it says it has -- for the identical reason: rebuilding a VMCB or resetting a LAPIC
+     * while its core is inside VMRUN is undefined. fw_1_wait_vcpu_parked() skips the BSP and any
+     * AP that was never started, and is bounded and loud if one will not park.
+     *
+     * The APs stay parked. A restarted guest brings its own APs up with INIT/SIPI, exactly as it
+     * did on the first boot, and that path already sets them RUNNABLE again.
+     */
+    {
+        unsigned n_ap = vm->vcpu_count ? vm->vcpu_count : 1u;
+        unsigned ap;
+        if (n_ap > HYPE_MAX_VCPUS_PER_VM) n_ap = HYPE_MAX_VCPUS_PER_VM;
+        for (ap = 1u; ap < n_ap; ap++) {
+            vm->vcpu_state[ap] = HYPE_VCPU_STATE_WAIT_SIPI;
+        }
+        for (ap = 1u; ap < n_ap; ap++) {
+            fw_1_wait_vcpu_parked(vm, ap);
+        }
+    }
+
+    /*
      * M8-1: per-VM dashboard identity, moved to the TOP of this function (#441) -- the varstore
      * save/restore immediately below needs vm->name for its per-VM filename, and this is the
      * first point in fw_1_vm_reinit() it is available (this is also where it is first assigned
