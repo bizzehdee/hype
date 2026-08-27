@@ -334,6 +334,7 @@ static void usb_log_fatal_flush(void); /* #513: registered as the panic flush ho
  * the #233 confirm gate, both of which appear earlier in this file. */
 static unsigned int usb_hid_drain(void);
 static int usb_mouse_drain(hype_ps2_mouse_t *dst);
+static void fw_1_usb_hotplug_poll(void); /* #744 */
 /*
  * #742: EVERY claimed keyboard, not the first one.
  *
@@ -355,6 +356,9 @@ typedef struct {
     unsigned int slot;
     unsigned int ep;
     unsigned int mps;
+    unsigned int root_port;  /* #744: which root port it hangs off, for departure */
+    unsigned int ctrl_idx;   /* #744: this controller's index in the inventory's terms */
+    unsigned int route;      /* #744: 0 = directly on the root port */
     uint16_t vid;
     uint16_t pid;
     /*
@@ -397,6 +401,7 @@ static unsigned long long g_mouse_polls;
 static unsigned long long g_mouse_reports;
 static unsigned long long g_mouse_poll_errs;
 static unsigned long long g_mouse_packets;
+static unsigned int g_mouse_root_port; /* #744: for departure */
 /* #284: scancodes handed to the guest's keyboard by `sendkey`, and how many it has not
  * yet read. The pair is the proof the transport works: a guest DRAINING them means the
  * bytes reached its keyboard driver, which is a different (and checkable) claim from
@@ -2183,6 +2188,9 @@ static void fw_1_claim_boot_hid(hype_xhci_ctrl_t *xc, unsigned int protocol, con
                     e->slot = d->slot;
                     e->ep = hid.int_in_ep;
                     e->mps = hid.mps;
+                    e->root_port = d->root_port;
+                    e->ctrl_idx = d->controller;
+                    e->route = d->route;
                     e->vid = d->vid;
                     e->pid = d->pid;
                     /* Field by field, and zeroed here rather than relying on the BSS: a
@@ -8300,6 +8308,7 @@ static void fw_1_host_input_poll(void) {
             if (hid_last == 0 || now_h - hid_last >= hz / 125u) {
                 hid_last = now_h;
                 (void)usb_hid_drain();
+                fw_1_usb_hotplug_poll(); /* #744 */
             }
         }
     }
@@ -24222,6 +24231,105 @@ static unsigned int usb_hid_drain(void) {
 }
 
 /*
+ * #744: notice a device leaving, and tear it down.
+ *
+ * hype enumerated once, at boot, and never looked at a port again. A device that left was
+ * never released and a device that arrived was never seen -- there was no Port Status
+ * Change Event handling anywhere in the tree; `core/xhci.h` named the event type and
+ * nothing consumed it, and cmd_submit_wait() described port events only as noise to skip.
+ *
+ * Measured on the 2026-08-27 boot 6: the operator unplugged the keyboard, both HIDs on
+ * that hub took cc=4, #734's recovery backed off correctly, and `reports=` stayed frozen
+ * for the remaining minute of the run because nothing ever looked at that port again.
+ *
+ * THIS TICKET IS ROOT PORTS AND DEPARTURE ONLY. Arrival is #745. A device behind a hub is
+ * #746 and is not covered here at all -- unplugging it leaves the ROOT port connected
+ * (the hub is still there), so nothing below fires. That is the operator's own topology,
+ * which is why #746 exists and why this one is not the whole answer.
+ *
+ * Runs from the same 125 Hz input tick as the HID drain, so it costs a register read per
+ * changed port and nothing at all when no port has changed.
+ */
+static void fw_1_usb_hotplug_poll(void) {
+    unsigned int k;
+
+    /*
+     * Only the controllers hype kept something on are polled. Every other controller was
+     * quiesced after the sweep (#299) and reading its PORTSC would be reading a halted
+     * controller. Walking the claimed devices rather than a controller list also keeps
+     * this honest about scope: hype can only act on a departure of something it owns.
+     */
+    for (k = 0; k < g_hid_count && k < HYPE_HOST_KBD_MAX; k++) {
+        hype_xhci_ctrl_t *xc = &g_hid[k].xc;
+        unsigned int port;
+
+        while ((port = hype_xhci_take_port_change(xc)) != 0u) {
+            int connected = 0;
+            unsigned int j;
+
+            if (hype_xhci_port_connected(xc, port, &connected) != 0) {
+                continue;
+            }
+            hype_debug_print("host-usb: port %u on this controller changed -- %s [#744]\n",
+                             port, connected ? "something is attached" : "now empty");
+            if (connected) {
+                continue; /* arrival is #745 */
+            }
+            /*
+             * Release every claimed keyboard on that root port. Compared by root port and
+             * not by slot, because the slot is exactly what stops being meaningful when a
+             * device leaves.
+             */
+            for (j = 0; j < g_hid_count && j < HYPE_HOST_KBD_MAX; j++) {
+                if (g_hid[j].xc.bar != xc->bar || g_hid[j].root_port != port) {
+                    continue;
+                }
+                hype_debug_print("host-hid: keyboard %04x:%04x on port %u slot%u DEPARTED -- "
+                                 "releasing its endpoint and slot [#744]\n",
+                                 (unsigned)g_hid[j].vid, (unsigned)g_hid[j].pid, port,
+                                 g_hid[j].slot);
+                (void)hype_xhci_release_device(xc, g_hid[j].slot);
+                /* And say so in the inventory, or the dashboard keeps listing a device
+                 * that is not there. */
+                (void)hype_usb_inventory_note_departed(&g_usb_inv, g_hid[j].ctrl_idx,
+                                                       g_hid[j].root_port, g_hid[j].route);
+                /*
+                 * Compact the array rather than leaving a hole. The drain walks 0..count,
+                 * and a hole would either be polled as a dead device forever or need a
+                 * per-entry live flag that every reader would have to remember to check.
+                 */
+                {
+                    unsigned int m;
+                    for (m = j; m + 1u < g_hid_count; m++) {
+                        hype_host_kbd_t *dst = &g_hid[m];
+                        const hype_host_kbd_t *src = &g_hid[m + 1u];
+                        unsigned int z;
+                        dst->xc = src->xc;
+                        dst->slot = src->slot; dst->ep = src->ep; dst->mps = src->mps;
+                        dst->root_port = src->root_port;
+                        dst->ctrl_idx = src->ctrl_idx; dst->route = src->route;
+                        dst->vid = src->vid; dst->pid = src->pid;
+                        for (z = 0; z < HYPE_USB_HID_REPORT_LEN; z++) dst->prev[z] = src->prev[z];
+                        dst->have_prev = src->have_prev;
+                        dst->polls = src->polls; dst->reports = src->reports;
+                        dst->errs = src->errs; dst->mods_seen = src->mods_seen;
+                    }
+                    g_hid_count--;
+                    j--; /* re-test this index, it now holds the next device */
+                }
+            }
+            if (g_mouse_ready && g_mouse_xc.bar == xc->bar && g_mouse_root_port == port) {
+                hype_debug_print("host-hid: mouse on port %u slot%u DEPARTED -- releasing its "
+                                 "endpoint and slot [#744]\n", port, g_mouse_slot);
+                (void)hype_xhci_release_device(xc, g_mouse_slot);
+                g_mouse_ready = 0;
+                g_mouse_slot = 0;
+            }
+        }
+    }
+}
+
+/*
  * USB-6 (#219): poll the claimed USB mouse and hand any movement to a guest's PS/2 mouse.
  *
  * Delivered to the guest rather than to a host-side layer, because unlike a keystroke --
@@ -27407,6 +27515,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                         g_mouse_slot = mouse_slot0.slot;
                         g_mouse_ep = mouse_slot0.ep;
                         g_mouse_mps = mouse_slot0.mps;
+                        g_mouse_root_port = mouse_slot0.root_port;
                         g_mouse_ready = 1;
                     }
                 }

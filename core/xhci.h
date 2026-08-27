@@ -49,6 +49,15 @@
 #define HYPE_XHCI_PORTSC_PP       (1u << 9)  /* Port Power */
 #define HYPE_XHCI_PORTSC_PRC      (1u << 21) /* Port Reset Change */
 #define HYPE_XHCI_PORTSC_CSC      (1u << 17) /* Connect Status Change */
+/*
+ * #744: every RW1C change bit in PORTSC, as one mask.
+ *
+ * CSC(17) PEC(18) WRC(19) OCC(20) PRC(21) PLC(22) CEC(23). Writing them back is what ACKs
+ * a port event -- the controller raises no further Port Status Change Event for a port
+ * whose change bits are still set, so a reader that only reads sees the first unplug and
+ * then nothing ever again.
+ */
+#define HYPE_XHCI_PORTSC_CHANGE_MASK 0x00FE0000u
 #define HYPE_XHCI_PORTSC_SPEED_SHIFT 10u
 #define HYPE_XHCI_PORTSC_SPEED_MASK  0x0Fu
 /* Writing PORTSC: bits that are RW1CS (change bits) must be preserved carefully;
@@ -398,6 +407,17 @@ int hype_xhci_int_in_index(hype_xhci_int_in_key_t *keys, unsigned int n, unsigne
                            unsigned int slot, unsigned int dci, int alloc);
 
 /* Release every pool entry belonging to one controller (its block is being re-claimed). */
+/*
+ * #744: release the pooled interrupt-IN block(s) of ONE slot on one controller.
+ *
+ * The controller-wide twin below is for tearing a controller down. A departed device needs
+ * just its own blocks back, and needs it before the next device inherits its slot id --
+ * otherwise that device finds a block already keyed to its (slot, dci) holding the
+ * previous tenant's ring, cycle state and armed flag.
+ */
+void hype_xhci_int_in_release_slot(hype_xhci_int_in_key_t *keys, unsigned int n,
+                                   unsigned int ctrl, unsigned int slot);
+
 void hype_xhci_int_in_release_ctrl(hype_xhci_int_in_key_t *keys, unsigned int n,
                                    unsigned int ctrl);
 
@@ -481,6 +501,28 @@ void hype_xhci_host_quiesce(hype_xhci_ctrl_t *c);
 /* Disable (free) a device slot -- used to release a slot between enumeration
  * probes when the device isn't the one we're after. */
 int hype_xhci_disable_slot(hype_xhci_ctrl_t *c, unsigned int slot);
+
+/*
+ * #744: the next root port whose status changed, 1-based, or 0 when none is pending.
+ * Clears the port's flag, so a caller loops until it returns 0.
+ */
+unsigned int hype_xhci_take_port_change(hype_xhci_ctrl_t *c);
+
+/* #744: how many Port Status Change Events this controller has produced, ever. */
+unsigned long long hype_xhci_port_event_count(const hype_xhci_ctrl_t *c);
+
+/*
+ * #744: is anything attached to `port` now? Also ACKS the port's change bits, which is
+ * what lets the controller raise the NEXT event for it. 0 on success.
+ */
+int hype_xhci_port_connected(hype_xhci_ctrl_t *c, unsigned int port, int *out_connected);
+
+/*
+ * #744: tear a departed device down -- its pooled interrupt-IN blocks, its slot, and its
+ * DCBAA entry. Use this rather than hype_xhci_disable_slot() for anything that was
+ * actually in use; disable_slot alone leaks the endpoint blocks.
+ */
+int hype_xhci_release_device(hype_xhci_ctrl_t *c, unsigned int slot);
 
 /*
  * USB-1 (#213) pt3: issue an Enable Slot command on the command ring and wait
@@ -871,6 +913,16 @@ void hype_usb_inventory_reset(hype_usb_inventory_t *inv);
  * two ports are two devices.
  */
 int hype_usb_inventory_add(hype_usb_inventory_t *inv, const hype_usb_devinfo_t *d);
+
+/*
+ * #744: mark the device at this position as gone -- slot 0 (which the struct already
+ * defines as "the slot was released") and owner NONE.
+ *
+ * The entry is kept rather than removed: removing it would shift every later index, and
+ * callers hold indices across the sweep. Returns 1 if an entry was found and updated.
+ */
+int hype_usb_inventory_note_departed(hype_usb_inventory_t *inv, unsigned int controller,
+                                     unsigned int root_port, unsigned int route);
 
 /* Position lookup; -1 if absent. */
 int hype_usb_inventory_find(const hype_usb_inventory_t *inv, unsigned int controller,

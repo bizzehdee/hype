@@ -484,6 +484,18 @@ void hype_usb_inventory_claim(hype_usb_inventory_t *inv, int index, hype_usb_own
     inv->dev[index].owner = (uint8_t)owner;
 }
 
+int hype_usb_inventory_note_departed(hype_usb_inventory_t *inv, unsigned int controller,
+                                     unsigned int root_port, unsigned int route) {
+    int i = hype_usb_inventory_find(inv, controller, root_port, route);
+
+    if (i < 0) {
+        return 0;
+    }
+    inv->dev[i].slot = 0u;
+    inv->dev[i].owner = (uint8_t)HYPE_USB_OWNER_NONE;
+    return 1;
+}
+
 int hype_usb_inventory_next_unclaimed_class(const hype_usb_inventory_t *inv, uint8_t dev_class,
                                             int after) {
     unsigned int i;
@@ -715,6 +727,20 @@ int hype_xhci_int_in_index(hype_xhci_int_in_key_t *keys, unsigned int n, unsigne
     keys[free_i].slot = slot;
     keys[free_i].dci = dci;
     return (int)free_i;
+}
+
+void hype_xhci_int_in_release_slot(hype_xhci_int_in_key_t *keys, unsigned int n,
+                                   unsigned int ctrl, unsigned int slot) {
+    unsigned int i;
+
+    if (keys == (hype_xhci_int_in_key_t *)0 || slot == 0u) {
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        if (keys[i].used && keys[i].ctrl == ctrl && keys[i].slot == slot) {
+            keys[i].used = 0;
+        }
+    }
 }
 
 void hype_xhci_int_in_release_ctrl(hype_xhci_int_in_key_t *keys, unsigned int n,

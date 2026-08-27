@@ -1056,7 +1056,96 @@ static void test_741_null_safe(void) {
     CHECK_INT("null devinfo", -1, hype_usb_devinfo_find_iface(0, 3, 1, 1));
 }
 
+/* ---- #744: departure bookkeeping ---- */
+
+static void t744_dev(hype_usb_devinfo_t *d, unsigned ctrl, unsigned port, unsigned route,
+                     unsigned slot) {
+    unsigned i;
+    for (i = 0; i < sizeof *d; i++) ((uint8_t *)d)[i] = 0;
+    d->controller = ctrl; d->root_port = port; d->route = route; d->slot = slot;
+    d->owner = (uint8_t)HYPE_USB_OWNER_HYPE;
+}
+
+static void test_744_note_departed_clears_slot_and_owner(void) {
+    hype_usb_inventory_t inv;
+    hype_usb_devinfo_t d;
+    int idx;
+
+    hype_usb_inventory_reset(&inv);
+    t744_dev(&d, 0, 3, 0, 7);
+    idx = hype_usb_inventory_add(&inv, &d);
+    CHECK_INT("added", 0, idx);
+
+    CHECK_INT("found and marked", 1, hype_usb_inventory_note_departed(&inv, 0, 3, 0));
+    /* slot 0 is the struct's own documented "the slot was released", so a reader that
+     * already honours that needs no new flag to check. */
+    CHECK_INT("slot released", 0u, inv.dev[0].slot);
+    CHECK_INT("no longer owned", (int)HYPE_USB_OWNER_NONE, (int)inv.dev[0].owner);
+    /* The ENTRY stays. Removing it would shift every later index, and callers hold
+     * indices across a sweep. */
+    CHECK_INT("entry kept", 1u, inv.count);
+}
+
+static void test_744_note_departed_is_a_no_op_for_a_position_with_nothing_on_it(void) {
+    hype_usb_inventory_t inv;
+    hype_usb_devinfo_t d;
+
+    hype_usb_inventory_reset(&inv);
+    t744_dev(&d, 0, 3, 0, 7);
+    (void)hype_usb_inventory_add(&inv, &d);
+    CHECK_INT("wrong port", 0, hype_usb_inventory_note_departed(&inv, 0, 4, 0));
+    CHECK_INT("wrong controller", 0, hype_usb_inventory_note_departed(&inv, 1, 3, 0));
+    CHECK_INT("wrong route", 0, hype_usb_inventory_note_departed(&inv, 0, 3, 2));
+    CHECK_INT("the real one is untouched", 7u, inv.dev[0].slot);
+}
+
+static void test_744_release_slot_frees_only_that_slot(void) {
+    hype_xhci_int_in_key_t keys[4];
+    unsigned i;
+    for (i = 0; i < 4u; i++) keys[i].used = 0;
+
+    /* Two endpoints on slot 3, one on slot 4, all on controller 0. */
+    CHECK_INT("a", 0, hype_xhci_int_in_index(keys, 4u, 0u, 3u, 3u, 1));
+    CHECK_INT("b", 1, hype_xhci_int_in_index(keys, 4u, 0u, 3u, 5u, 1));
+    CHECK_INT("c", 2, hype_xhci_int_in_index(keys, 4u, 0u, 4u, 3u, 1));
+
+    hype_xhci_int_in_release_slot(keys, 4u, 0u, 3u);
+
+    /* Both of slot 3's blocks come back; slot 4's is untouched. Releasing the whole
+     * controller here would have taken the surviving device's endpoint with it. */
+    CHECK_INT("slot 3 block 0 freed", 0, (int)keys[0].used);
+    CHECK_INT("slot 3 block 1 freed", 0, (int)keys[1].used);
+    CHECK_INT("slot 4 block kept", 1, (int)keys[2].used);
+}
+
+static void test_744_release_slot_ignores_other_controllers(void) {
+    hype_xhci_int_in_key_t keys[4];
+    unsigned i;
+    for (i = 0; i < 4u; i++) keys[i].used = 0;
+    CHECK_INT("ctrl0 slot3", 0, hype_xhci_int_in_index(keys, 4u, 0u, 3u, 3u, 1));
+    CHECK_INT("ctrl1 slot3", 1, hype_xhci_int_in_index(keys, 4u, 1u, 3u, 3u, 1));
+    /* Same slot id on a DIFFERENT controller is a different device -- slot ids are
+     * per-controller, and freeing across them would silence an innocent keyboard. */
+    hype_xhci_int_in_release_slot(keys, 4u, 0u, 3u);
+    CHECK_INT("ctrl0 freed", 0, (int)keys[0].used);
+    CHECK_INT("ctrl1 kept", 1, (int)keys[1].used);
+}
+
+static void test_744_release_slot_null_and_zero_safe(void) {
+    hype_xhci_int_in_key_t keys[2];
+    keys[0].used = 1; keys[0].ctrl = 0; keys[0].slot = 3; keys[0].dci = 3;
+    keys[1].used = 0;
+    hype_xhci_int_in_release_slot(0, 2u, 0u, 3u);            /* must not fault */
+    hype_xhci_int_in_release_slot(keys, 2u, 0u, 0u);          /* slot 0 is not a slot */
+    CHECK_INT("slot 0 released nothing", 1, (int)keys[0].used);
+}
+
 int main(void) {
+    test_744_note_departed_clears_slot_and_owner();
+    test_744_note_departed_is_a_no_op_for_a_position_with_nothing_on_it();
+    test_744_release_slot_frees_only_that_slot();
+    test_744_release_slot_ignores_other_controllers();
+    test_744_release_slot_null_and_zero_safe();
     test_741_collects_every_interface();
     test_741_first_iface_class_still_sees_only_the_first();
     test_741_find_iface_matches_a_later_interface();

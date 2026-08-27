@@ -101,6 +101,13 @@ typedef struct {
     unsigned int dev_used[DEVPOOL]; /* 1 if this pool slot is in use */
     unsigned int slot_dev[256];     /* slot id -> pool index + 1 (0 = none) */
     uint8_t slot_seen[256];         /* #734: slot id has been Enable-Slot'd at least once */
+    /*
+     * #744: root ports whose status changed since anyone last looked, one bit per port,
+     * and a count of the events behind them. Set from the event-ring dequeue below, which
+     * is the only place events leave the ring, so no caller can miss one by not looking.
+     */
+    uint32_t port_changed;
+    unsigned long long port_events;
 
     /* #387: the MSC bulk rings + BOT state moved to the per-claimed-device pool below --
      * per-CONTROLLER they were the reason a second stick could not be brought up at all. */
@@ -399,6 +406,27 @@ static int next_event_budget(xhci_hw_t *hw, volatile uint8_t *bar, uint32_t rtso
             /* ERDP = address of the new dequeue slot, with EHB (bit3) written 1 to clear. */
             wr64(bar, hype_xhci_ir0_offset(rtsoff, HYPE_XHCI_IR_ERDP),
                  (phys(hw->evt_ring) + (uint64_t)hw->evt_deq * HYPE_XHCI_TRB_BYTES) | (1u << 3));
+            /*
+             * #744: a Port Status Change Event is recorded HERE and not handed back.
+             *
+             * This is the only place an event leaves the ring, so recording it here is the
+             * only way no caller can miss one by not looking -- and every caller that does
+             * look is waiting for a transfer or a command completion and has no idea what
+             * to do with a port event. cmd_submit_wait() documented them as noise to be
+             * skipped, spending its 64-event guard to do it; now they never reach it.
+             *
+             * DW0 bits 31:24 are the Port ID, 1-based. The bitmap covers ports 1..31, which
+             * is every port an xHCI can have on one controller in practice; a port number
+             * outside that is counted but not flagged, rather than shifting out of range.
+             */
+            if (((d3 >> 10) & 0x3Fu) == (uint32_t)HYPE_XHCI_TRB_PORT_STATUS) {
+                unsigned int pid = (out[0] >> 24) & 0xFFu;
+                hw->port_events++;
+                if (pid >= 1u && pid <= 31u) {
+                    hw->port_changed |= (1u << pid);
+                }
+                continue; /* consumed: keep waiting for what the caller actually asked for */
+            }
             {
                 unsigned int used = budget - spins - 1u;
                 if (spins_used != 0) *spins_used = used;
@@ -2325,6 +2353,80 @@ int hype_xhci_hub_find_msc(hype_xhci_ctrl_t *c, unsigned int hub_slot,
 }
 
 
+
+unsigned int hype_xhci_take_port_change(hype_xhci_ctrl_t *c) {
+    xhci_hw_t *hw;
+    unsigned int p;
+
+    if (c == (hype_xhci_ctrl_t *)0 || !c->inited) {
+        return 0;
+    }
+    hw = HW(c);
+    for (p = 1u; p <= 31u; p++) {
+        if (hw->port_changed & (1u << p)) {
+            hw->port_changed &= ~(1u << p);
+            return p;
+        }
+    }
+    return 0;
+}
+
+unsigned long long hype_xhci_port_event_count(const hype_xhci_ctrl_t *c) {
+    return (c == (const hype_xhci_ctrl_t *)0 || !c->inited) ? 0ull : HW(c)->port_events;
+}
+
+int hype_xhci_port_connected(hype_xhci_ctrl_t *c, unsigned int port, int *out_connected) {
+    volatile uint8_t *bar;
+    uint32_t sc;
+
+    if (c == (hype_xhci_ctrl_t *)0 || !c->inited || port == 0u || out_connected == (int *)0) {
+        return -1;
+    }
+    bar = (volatile uint8_t *)(uintptr_t)c->bar;
+    sc = rd32(bar, c->op + hype_xhci_portsc_offset(port));
+    /*
+     * #744: ACK the change bits while we are here, by writing them back. PORTSC's change
+     * bits are write-1-to-clear and the controller will not raise another event for this
+     * port until they are cleared -- so a reader that only read would see the first
+     * unplug and nothing ever again. The status bits (CCS, PED) are write-ignored, and
+     * PORT_LINK_STATE's strobe (bit 16) is deliberately not set, so this writes back only
+     * what it means to clear.
+     */
+    wr32(bar, c->op + hype_xhci_portsc_offset(port), sc & HYPE_XHCI_PORTSC_CHANGE_MASK);
+    *out_connected = (sc & HYPE_XHCI_PORTSC_CCS) ? 1 : 0;
+    return 0;
+}
+
+int hype_xhci_release_device(hype_xhci_ctrl_t *c, unsigned int slot) {
+    xhci_hw_t *hw;
+    int rc;
+
+    if (c == (hype_xhci_ctrl_t *)0 || !c->inited || slot == 0u) {
+        return -1;
+    }
+    hw = HW(c);
+    /*
+     * #744: drop this slot's interrupt-IN blocks BEFORE the Disable Slot.
+     *
+     * They are a fixed pool of HYPE_XHCI_INT_IN_MAX keyed by (controller, slot, dci). A
+     * departed device that keeps its block starves the pool -- and worse, the next device
+     * to take that slot id would find a block already claimed for its (slot, dci) holding
+     * the previous tenant's ring, cycle state and armed flag, which is #734's shared-state
+     * bug wearing a different hat.
+     */
+    hype_xhci_int_in_release_slot(g_iin_key, HYPE_XHCI_INT_IN_MAX, c->hw_slot, slot);
+    rc = hype_xhci_disable_slot(c, slot);
+    /*
+     * And the DCBAA entry. dev_free() (inside disable_slot) releases hype's pool index but
+     * left DCBAA[slot] pointing at a device-context page that has gone back into the pool,
+     * so the controller held a live pointer to memory hype had reassigned. Harmless in
+     * practice today -- hype_xhci_address_device() rewrites the entry before it issues the
+     * command -- but "correct only because nobody reads it in between" is not a state to
+     * leave a DMA structure in, and #743 is a live question about exactly this transition.
+     */
+    put_le64(hw->dcbaa + (slot & 0xFFu) * 8u, 0ull);
+    return rc;
+}
 
 int hype_xhci_disable_slot(hype_xhci_ctrl_t *c, unsigned int slot) {
     xhci_hw_t *hw = HW(c);
