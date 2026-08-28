@@ -1609,6 +1609,28 @@ int hype_xhci_hub_take_change(hype_xhci_ctrl_t *c, unsigned int i, unsigned int 
             return -1;
         }
         /*
+         * #758, on the hub path this time. A port that has just changed is still settling,
+         * and one read can catch it mid-transition -- rig 746 read a keyboard's UNPLUG as
+         * "something is attached", cleared the change bits in the same breath, and the
+         * departure was gone for good. The stale inventory entry then made the re-plug look
+         * like a device already present, so it was never re-enumerated either: one bad read
+         * cost both halves of the cycle.
+         *
+         * Read again and require agreement on the connect bit. Disagreement means do not
+         * clear and do not classify -- the hub will report the port again and the next pass
+         * gets a settled answer. The root-port path does the same, for the same reason.
+         */
+        {
+            uint8_t st2[4];
+            if (hub_get_port_status(c, g_hubs[i].slot, port, st2) != 0) {
+                return -1;
+            }
+            if (((st[0] ^ st2[0]) & 0x01u) != 0u) {
+                return 0; /* unsettled: leave the change standing and come back to it */
+            }
+            st[0] = st2[0]; st[1] = st2[1]; st[2] = st2[2]; st[3] = st2[3];
+        }
+        /*
          * Clear EVERY change bit that is set, not just C_PORT_CONNECTION -- the hub twin
          * of #744's PORTSC write-1-to-clear.
          *
