@@ -664,6 +664,16 @@ int hype_svm_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx);
  * wait deadlocks: the shadow that covered the HLT is never consumed (we
  * intercept the HLT before it retires), so the pending interrupt stays
  * blocked and the guest never wakes. Exempt VMCB glue. */
+/*
+ * #750: clear ONLY the STI interrupt shadow, leaving RIP alone.
+ *
+ * For a HLT exit: the shadowed instruction has executed, so the shadow is spent. Without
+ * this, can_accept_interrupt() refuses every delivery while the shadow is set, and the only
+ * thing that clears it (wake_hlt) needs a delivery to have happened -- a deadlock that
+ * stranded a LAPIC timer in the IRR for 284 seconds.
+ */
+void hype_svm_vcpu_clear_intr_shadow(hype_vcpu_ctx_t *ctx);
+
 void hype_svm_vcpu_wake_hlt(hype_vcpu_ctx_t *ctx);
 
 /*

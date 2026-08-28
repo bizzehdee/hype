@@ -12853,7 +12853,21 @@ wait_for_sipi:
              * sources (NMI, LAPIC timer, self-IPI, cross-vCPU IPI, and anything already
              * deferred in pending_irr) -- retiring unconditionally, as this branch used to,
              * answered every halt with a wake nothing caused.
+             *
+             * #750: but DO clear the STI shadow. The shadow covers exactly one instruction
+             * after STI, Linux idles at `sti; hlt`, and a HLT exit means that instruction
+             * executed -- so the shadow is spent. Keeping it set is not conservative, it
+             * deadlocks: can_accept_interrupt() refuses every delivery while it is set, and
+             * the only thing that clears it is wake_hlt(), which #641 rightly made
+             * conditional on an injection having happened. Nothing can be injected, so
+             * nothing clears it, so nothing can be injected.
+             *
+             * Measured: a vCPU entered every ~410ms with a LAPIC timer pending in its IRR
+             * for 284 seconds, and the guest reporting `swapper/2 stuck for 265s`.
              */
+            if (kind == HYPE_VMM_KIND_SVM) {
+                hype_svm_vcpu_clear_intr_shadow(ctx);
+            }
             ap_at_hlt = 1;
         } else if (vmm_reason_is_intr_window(kind, info.reason)) {
             vmm_handle_intr_window(kind, ctx, lapic);

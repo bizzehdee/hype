@@ -1806,6 +1806,34 @@ void hype_svm_vcpu_handle_vintr_window(hype_vcpu_ctx_t *ctx) {
  * halted guest without coming through here -- see #580. Anything that injects into a guest that is
  * sitting at a hlt must retire it first.
  */
+/*
+ * #750: the STI shadow is SPENT once the shadowed instruction has executed.
+ *
+ * An STI shadow blocks interrupts for exactly one instruction after the STI. Linux idles at
+ * `sti; hlt`, so the HLT is that instruction -- and a HLT exit means it executed. Leaving
+ * the shadow set afterwards is not conservative, it is wrong, and it deadlocks:
+ *
+ *   hype_svm_can_accept_interrupt() returns 0 while the shadow is set, REGARDLESS of IF.
+ *   Every delivery path -- request_interrupt's fast path, deliver_pending_if_ready, the
+ *   VINTR window drain -- gates on it. And the only thing that clears the shadow is
+ *   wake_hlt(), which #641 correctly made conditional on something having been injected.
+ *
+ *   So: shadow set -> nothing can be injected -> wake_hlt never runs -> shadow stays set.
+ *
+ * Measured as #750: a vCPU entered every ~410ms (so hype is running it) with a LAPIC timer
+ * pending in its IRR for up to 284 SECONDS, and the guest's watchdog reporting
+ * `swapper/2 stuck for 265s` -- the idle task executing, taking no timer, scheduling
+ * nothing. INTDIAG read `IF=1 shadow=0x1` throughout.
+ *
+ * Separate from wake_hlt() on purpose: this clears ONLY the shadow. Retiring the HLT is
+ * #641's decision and stays coupled to an actual injection, because a wake nothing caused
+ * is its own bug (187M HLT exits in 26 minutes).
+ */
+void hype_svm_vcpu_clear_intr_shadow(hype_vcpu_ctx_t *ctx) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    real->vmcb->control.interrupt_shadow &= ~(uint64_t)HYPE_SVM_INTERRUPT_SHADOW_ACTIVE;
+}
+
 void hype_svm_vcpu_wake_hlt(hype_vcpu_ctx_t *ctx) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     /* Model an interrupt waking a halted CPU: the HLT retires (so the
