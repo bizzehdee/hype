@@ -69,8 +69,21 @@ source.** It is at `/mnt/data/dev/qemu-build/qemu-11.1.0/`, and `-trace enable=<
 writes tracepoints to the rig's `qemu.err`. A measurement of zero is a measurement of the
 whole system, not of the component you happen to suspect.
 
-## What to do about it
+## What was done about it
 
-Build one rig whose topology mirrors the desk: two controllers, hubs on both, a composite
-device, a hub behind a hub, and something that fails to enumerate. Most of the table above
-would have been caught by it. Tracked separately.
+`tools/767/run-767-qemu.sh` now runs that topology: two controllers, four hub devices, a hub
+behind a hub, the boot medium on one controller and every input device on the other, a
+composite HID claimed twice on one slot, and a device that cannot be enumerated.
+
+The last two needed additions to QEMU itself (`tools/767/qemu-composite-hid.patch`):
+`usb-kbd-mouse`, one device with a boot mouse on endpoint 1 and a boot keyboard on endpoint
+2; and `usb-badaddr`, which stalls every control transfer. Neither exists in stock QEMU, and
+their absence is why #755, #763, #770 and #771 all reached hardware unreproduced.
+
+**The rig passes.** Which means the topology is no longer the difference. Boot 15 still killed
+the keyboard within seconds with three ring-drift reports, and the rig reproduces none of
+that -- so whatever is left is a property of the hardware rather than of the test bench, and
+#764 is where it is tracked.
+
+That is worth stating plainly: closing the topology gap did not close the bug list. It closed
+the excuse.
