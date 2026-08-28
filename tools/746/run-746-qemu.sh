@@ -156,25 +156,39 @@ he=$(echo "$hubline" | sed -n 's/.*errors=\([0-9]*\).*/\1/p')
 [ "${he:-1}" -eq 0 ] 2>/dev/null ||
   say "FAIL: the hub status endpoint is erroring (errors=$he) [#746]"
 
-# What it CANNOT: QEMU's usb-hub does not deliver a status-change report for a runtime
-# attach or detach. Measured, not assumed -- polls=18400 errors=0 reports=0 across a run
-# that did a device_del and a device_add. So the cycle below is reported, not asserted;
-# asserting it would make this rig fail forever on a limitation that is not hype's.
-if [ "${hr:-0}" -gt 0 ] 2>/dev/null; then
-  echo "the hub DID report ($hr time(s)) -- checking the full cycle"
-  grep -aq "host-usb: hub slot .* ARRIVED" $S/serial.log ||
-    say "FAIL: the hub reported but the re-plug was never enumerated [#746]"
-else
-  echo "NOTE: the hub never reported (reports=0). QEMU's usb-hub does not raise"
-  echo "      status-change reports for runtime attach/detach, so the behind-hub cycle"
-  echo "      cannot be demonstrated here. hype's side is proven as far as it goes:"
-  echo "      the endpoint is armed and polled $hp times with $he errors."
-  echo "      #746's own bar needs the 5950X, where the keyboard is behind a 2.0 hub."
+# QEMU's usb-hub DOES deliver status-change reports. hw/usb/dev-hub.c returns the
+# port-change bitmap on an IN token to endpoint 1 and NAKs when idle, and its detach path
+# sets wPortChange. This rig used to claim the opposite -- "measured, not assumed,
+# reports=0 across a run that did a device_del and a device_add" -- and treat the whole
+# behind-hub cycle as unassertable.
+#
+# That reading was wrong, and being wrong here is what let #746 ship to hardware broken
+# twice. reports=0 WAS the measurement, but it measured hype, not QEMU: control_transfer
+# and cmd_submit_wait dropped foreign Transfer Events, so the hub's first completion was
+# eaten during enumeration and the endpoint -- armed, never re-armed -- was deaf for the
+# rest of the boot (#761). A dropped int-in completion is permanent, not one lost report.
+#
+# So the cycle is ASSERTED now. If a future change breaks it, this fails here rather than
+# on the operator's desk.
+[ "${hr:-0}" -gt 0 ] 2>/dev/null ||
+  say "FAIL: the hub never reported a status change (reports=0) across a device_del and a
+      device_add -- QEMU's usb-hub does deliver these, so this is hype dropping the
+      completion, not a QEMU limitation [#746 #761]"
+grep -aq "host-hid: .* behind hub slot .* DEPARTED" $S/serial.log ||
+  say "FAIL: the behind-hub departure was never acted on [#746]"
+grep -aq "host-usb: hub slot .* ARRIVED" $S/serial.log ||
+  say "FAIL: the behind-hub re-plug was never enumerated [#746]"
+# The change bits must actually clear, or the hub re-reports the same port forever and the
+# poll never returns to idle -- 5,504 reports of an unchanging bitmap from one unplug
+# (#762). A handful per plug event is right; hundreds is the bug.
+if [ "${hr:-0}" -gt 200 ] 2>/dev/null; then
+  say "FAIL: the hub reported $hr times -- the port change bits are not being cleared [#762]"
 fi
+
 # Two CLAIMED lines: the boot one and the re-plug one. One means the arrival enumerated
 # but was not claimed, which is a keyboard that exists and does nothing.
 nclaim=$(grep -a -c "host-hid: USB keyboard CLAIMED" $S/serial.log)
-echo "keyboard CLAIMED lines: $nclaim (2 once the hub reports; 1 while QEMU cannot)"
+echo "keyboard CLAIMED lines: $nclaim (2 expected: the boot claim and the re-plug)"
 if [ "${hr:-0}" -gt 0 ] 2>/dev/null; then
   [ "$nclaim" -ge 2 ] || say "FAIL: the arrived keyboard was not claimed [#746]"
 fi
@@ -197,5 +211,5 @@ echo "mouse reports at the end: ${mouse_after:-none}"
 grep -aq "fw-1 DIAG: host-kbd" $S/serial.log ||
   say "FAIL: no host-kbd DIAG after the unplug -- the input tick stopped [#744]"
 
-[ $fail -eq 0 ] && echo "PASS as far as QEMU reaches: hub endpoint armed and polled cleanly; the behind-hub cycle itself needs hardware"
+[ $fail -eq 0 ] && echo "ALL PASS: a device behind a hub departed, was re-plugged, re-enumerated and reported again [#746]"
 exit $fail

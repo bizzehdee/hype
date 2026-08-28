@@ -56,6 +56,7 @@
 #define SPIN 20000000u
 /* #759: one look at the event ring, for pollers rather than waiters. See int_in_poll. */
 #define XHCI_POLL_PEEK 1u
+
 /* #266: one second, chosen against the measured distribution (mean 493,692 spins,
  * worst observed ~36,000,000 spins). Generous by design -- being early is what
  * caused the bug. */
@@ -185,6 +186,20 @@ typedef struct {
     unsigned int backoff;    /* polls to skip before the next recovery attempt */
     int armed;
     uint64_t pending_trb;
+    /*
+     * #761: a completion for THIS endpoint that some other endpoint's poll dequeued.
+     *
+     * Every int-in endpoint owns this block, so a completion has an obvious home and does
+     * not need the shared parked table -- which holds 8 entries, evicts round-robin, and
+     * is now polled against by up to HYPE_XHCI_INT_IN_MAX endpoints. Losing the entry is
+     * not a dropped report: `armed` clears only on a CLAIMED completion, so a lost one
+     * leaves the endpoint armed forever and it is never re-armed. The endpoint goes
+     * permanently deaf after a single eviction.
+     *
+     * The DMA has already written this block's own `report`, so nothing is copied here.
+     */
+    int have_completion;
+    uint32_t comp_cc;
 } xhci_int_in_hw_t;
 
 static xhci_int_in_hw_t g_iin_hw[HYPE_XHCI_INT_IN_MAX];
@@ -504,6 +519,33 @@ static int next_event(xhci_hw_t *hw, volatile uint8_t *bar, uint32_t rtsoff, uin
  * from the BULK path, which stays strict and now has BOT reset recovery. A
  * mismatched pointer is logged so the behaviour stays visible.
  */
+/*
+ * #761: route a Transfer Event that is not the one this caller is waiting for.
+ *
+ * An interrupt-IN endpoint owns its block, so its completion has a home; anything else
+ * goes to the parked table for the MSC datapath (#266). What must NEVER happen is the
+ * third option -- dropping it. `armed` clears only on a CLAIMED completion, so a dropped
+ * int-in completion leaves the endpoint armed forever, never re-armed, and permanently
+ * deaf. One lost event is not one lost report.
+ */
+static void route_foreign_event(hype_xhci_ctrl_t *c, xhci_hw_t *hw, const uint32_t evt[4]) {
+    unsigned int oslot = hype_xhci_event_slot_id(evt);
+    unsigned int odci = hype_xhci_event_ep_id(evt);
+    xhci_int_in_hw_t *other;
+
+    if (hype_xhci_trb_type(evt) != HYPE_XHCI_TRB_TRANSFER_EVENT) {
+        return; /* command completions and the rest are the caller's business */
+    }
+    other = iin_hw_for(c, oslot, odci, 0);
+    if (other != (xhci_int_in_hw_t *)0) {
+        other->comp_cc = hype_xhci_event_cc(evt);
+        other->have_completion = 1;
+        return;
+    }
+    hype_xhci_parked_put(&hw->parked, oslot, odci, hype_xhci_event_trb_ptr(evt),
+                         hype_xhci_event_cc(evt), hype_xhci_event_xfer_residue(evt));
+}
+
 static int cmd_submit_wait(hype_xhci_ctrl_t *c, uint32_t cmd[4], uint32_t evt[4]) {
     xhci_hw_t *hw = HW(c);
     volatile uint8_t *bar = (volatile uint8_t *)(uintptr_t)c->bar;
@@ -531,7 +573,16 @@ static int cmd_submit_wait(hype_xhci_ctrl_t *c, uint32_t cmd[4], uint32_t evt[4]
             }
             return 0;
         }
-        /* else: a Port Status Change or other event queued earlier -- skip it. */
+        /*
+         * #761: NOT "skip it". A Transfer Event that arrives while a command is in flight
+         * used to be dropped here, and for an interrupt-IN endpoint that is permanent --
+         * the endpoint stays armed, is never re-armed, and never reports again. A hub's
+         * status-change endpoint is armed during enumeration, when commands are flying,
+         * so it lost its first completion essentially every boot: measured as one transfer
+         * event for the hub's slot in a whole run, then silence, with HUBPOLL reports=0
+         * against 18,400 polls.
+         */
+        route_foreign_event(c, hw, evt);
     }
     return -1;
 }
@@ -781,7 +832,15 @@ static int control_transfer(hype_xhci_ctrl_t *c, unsigned int slot, uint8_t bm_r
             if (next_event(hw, bar, c->rtsoff, evt) != 0) return -1;
             if (hype_xhci_trb_type(evt) != HYPE_XHCI_TRB_TRANSFER_EVENT) continue;
             if (hype_xhci_event_slot_id(evt) != slot || hype_xhci_event_ep_id(evt) != 1u) {
-                continue; /* another endpoint's (or a stale) event */
+                /*
+                 * #761: route it, do not drop it. Control transfers run constantly during
+                 * enumeration -- descriptor reads, SET_CONFIGURATION, SET_PROTOCOL -- which
+                 * is exactly when an interrupt-IN endpoint armed moments earlier delivers
+                 * its first completion. Dropping it leaves that endpoint armed forever and
+                 * never re-armed: permanently deaf, from one lost event.
+                 */
+                route_foreign_event(c, hw, evt);
+                continue;
             }
             p = hype_xhci_event_trb_ptr(evt);
             if (p != setup_trb && p != data_trb && p != status_trb) {
@@ -950,6 +1009,7 @@ int hype_xhci_configure_int_in_endpoint(hype_xhci_ctrl_t *c, unsigned int slot,
     ring_init_link(iin->ring);
     iin->enq = 0; iin->cyc = 1; iin->armed = 0; iin->pending_trb = 0;
     iin->mps = mps; iin->recoveries = 0; iin->backoff = 0;
+    iin->have_completion = 0; iin->comp_cc = 0;
 
     zero(hw->input_ctx, XPAGE);
     hype_xhci_input_ctrl_ctx(ctx, HYPE_XHCI_ADD_SLOT | (1u << dci), 0);
@@ -1041,6 +1101,9 @@ int hype_xhci_configure_hub_slot(hype_xhci_ctrl_t *c, unsigned int slot,
 #define HUB_FEAT_PORT_RESET        4u
 #define HUB_FEAT_PORT_POWER        8u
 #define HUB_FEAT_C_PORT_CONNECTION 16u
+#define HUB_FEAT_C_PORT_ENABLE     17u
+#define HUB_FEAT_C_PORT_SUSPEND    18u
+#define HUB_FEAT_C_PORT_OVERCURRENT 19u
 #define HUB_FEAT_C_PORT_RESET      20u
 static int hub_set_port_feature(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int feat,
                                 unsigned int port);
@@ -1103,6 +1166,7 @@ int hype_xhci_configure_hub_int_in(hype_xhci_ctrl_t *c, unsigned int slot,
     ring_init_link(iin->ring);
     iin->enq = 0; iin->cyc = 1; iin->armed = 0; iin->pending_trb = 0;
     iin->mps = mps; iin->recoveries = 0; iin->backoff = 0;
+    iin->have_completion = 0; iin->comp_cc = 0;
 
     zero(hw->input_ctx, XPAGE);
     hype_xhci_input_ctrl_ctx(ctx, HYPE_XHCI_ADD_SLOT | (1u << dci), 0);
@@ -1341,10 +1405,36 @@ int hype_xhci_hub_take_change(hype_xhci_ctrl_t *c, unsigned int i, unsigned int 
             return -1;
         }
         /*
-         * Clear C_PORT_CONNECTION, or the hub keeps reporting this port forever and the
-         * poll never returns to idle -- the hub twin of #744's PORTSC write-1-to-clear.
+         * Clear EVERY change bit that is set, not just C_PORT_CONNECTION -- the hub twin
+         * of #744's PORTSC write-1-to-clear.
+         *
+         * #762: a hub reports a port while ANY bit of wPortChange is set (USB 2.0
+         * §11.12.4), and one physical unplug sets several: losing the connection also
+         * disables and un-suspends the port, each with its own change bit. Clearing only
+         * the connection bit left the others standing, so the hub re-reported the same
+         * port forever -- measured at 5,504 reports of an unchanging bitmap 0x14 from a
+         * single unplug, with the poll never returning to idle.
+         *
+         * wPortChange is the second half of the 4-byte port status, bit per feature from
+         * C_PORT_CONNECTION (§11.24.2.7.2), so the feature selector is 16 + bit.
          */
-        (void)hub_clear_port_feature(c, g_hubs[i].slot, HUB_FEAT_C_PORT_CONNECTION, port);
+        {
+            unsigned int chg = (unsigned int)st[2] | ((unsigned int)st[3] << 8);
+            unsigned int b;
+            for (b = 0; b < 5u; b++) {
+                if (chg & (1u << b)) {
+                    (void)hub_clear_port_feature(c, g_hubs[i].slot,
+                                                 HUB_FEAT_C_PORT_CONNECTION + b, port);
+                }
+            }
+            /* Always clear the connection bit, even if the hub reported none set: the
+             * port is in this bitmap for a reason, and leaving it uncleared is the
+             * failure this exists to prevent. */
+            if ((chg & 0x1Fu) == 0u) {
+                (void)hub_clear_port_feature(c, g_hubs[i].slot,
+                                             HUB_FEAT_C_PORT_CONNECTION, port);
+            }
+        }
         *out_port = port;
         *out_connected = (st[0] & 0x01u) ? 1 : 0;
         return 1;
@@ -1480,6 +1570,25 @@ int hype_xhci_int_in_poll(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int e
     }
     my_trb = iin->pending_trb;
 
+    /*
+     * #761: a completion another endpoint's poll handed us directly. Checked first: it is
+     * the same event the parked table used to carry, minus the eviction.
+     */
+    if (iin->have_completion) {
+        uint32_t cc = iin->comp_cc;
+        iin->have_completion = 0;
+        iin->armed = 0; /* consumed -- next poll re-arms */
+        if (cc != HYPE_XHCI_CC_SUCCESS && cc != HYPE_XHCI_CC_SHORT_PACKET) {
+            int_in_report_error(slot, dci, my_trb, cc);
+            int_in_recover(c, slot, dci, iin);
+            return -1;
+        }
+        iin->recoveries = 0;
+        iin->backoff = 0;
+        for (i = 0; i < len; i++) out[i] = iin->report[i];
+        return 1;
+    }
+
     /* #266: a completion for this armed transfer may already be parked from a previous
      * poll -- claim it before spinning. */
     {
@@ -1520,12 +1629,19 @@ int hype_xhci_int_in_poll(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int e
         return 0; /* idle -- the common case, NOT an error */
     }
     if (hype_xhci_event_slot_id(evt) != slot || hype_xhci_event_ep_id(evt) != dci) {
-        /* Someone else's completion. Park it rather than discard: discarding is the
-         * #266 bug, and the MSC datapath may be waiting for exactly this. */
-        (void)hype_xhci_parked_put(&hw->parked, hype_xhci_event_slot_id(evt),
-                                   hype_xhci_event_ep_id(evt),
-                                   hype_xhci_event_trb_ptr(evt), hype_xhci_event_cc(evt),
-                                   hype_xhci_event_xfer_residue(evt));
+        unsigned int oslot = hype_xhci_event_slot_id(evt);
+        unsigned int odci = hype_xhci_event_ep_id(evt);
+        /*
+         * #761: if it belongs to another INT-IN endpoint hype owns, hand it straight to
+         * that endpoint's own block. The parked table is 8 entries with round-robin
+         * eviction and was written for the MSC datapath (#266); with up to
+         * HYPE_XHCI_INT_IN_MAX endpoints polling, a hub's rare completion is reliably
+         * evicted by a keyboard's frequent ones long before the hub polls again -- and a
+         * lost int-in completion is permanent, because `armed` never clears and the
+         * endpoint is never re-armed.
+         */
+        (void)oslot; (void)odci;
+        route_foreign_event(c, hw, evt);
         return 0;
     }
     iin->armed = 0; /* our completion arrived -- re-arm on the next poll */
