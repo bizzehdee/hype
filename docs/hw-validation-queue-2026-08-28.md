@@ -28,7 +28,7 @@ interval is one event and tests nothing.
 
 | Ticket | Why not, and what it needs |
 |---|---|
-| #747 | Needs a **second, sanctioned scratch USB storage device** to pull during a sustained write. The `HYPEBOOT` drive cannot be it -- it is the log medium, and pulling it destroys the run's own evidence. Blocked on hardware being available, not on code |
+| #754 | #747 itself is **closed** -- every clause of its definition of done is tested and passing in QEMU. What is left is the USB-SATA bridge's own behaviour under a physical yank, which `device_del` cannot model, and that is #754. Needs a **second, sanctioned scratch USB device**: `HYPEBOOT` cannot be it, since pulling the log medium destroys the run's own evidence |
 | #743 | The recycled-slot fault does not reproduce in QEMU and hype's own bookkeeping is correct, so it is controller behaviour. Needs its own instrumented boot, not a shared one |
 | #748 | A VM restart zeroing guest RAM under running APs. Fixed and QEMU-proven; needs a 3+ vCPU guest to have a victim at all, so it wants a config this boot does not use |
 | #640 | The AVIC comparison boot. `hype-avic.efi` is staged alongside the default and unchanged; it is a separate boot because the point is the difference between the two |
