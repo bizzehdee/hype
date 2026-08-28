@@ -554,7 +554,24 @@ static void route_foreign_event(hype_xhci_ctrl_t *c, xhci_hw_t *hw, const uint32
         return; /* command completions and the rest are the caller's business */
     }
     other = iin_hw_for(c, oslot, odci, 0);
-    if (other != (xhci_int_in_hw_t *)0) {
+    /*
+     * #766: the TRB pointer must match too, not just (slot, dci).
+     *
+     * The parked table this replaced matched on all three and said why: "the parked event
+     * can only ever be claimed by the exact (slot, dci, trb) it names". Dropping the TRB
+     * check let a stale or duplicate event for the same endpoint be claimed as the CURRENT
+     * transfer -- `armed` clears, hype re-arms and advances `enq`, and the controller never
+     * consumed the TRB that was actually outstanding.
+     *
+     * The pointers then drift apart. Measured on hardware: four endpoints with the
+     * controller's dequeue sitting at the RING BASE while hype had enqueued ten TRBs past
+     * it, all four permanently silent -- the controller waiting on a TRB whose cycle bit
+     * says not-ready, hype waiting on a completion that can never come. Every interrupt-IN
+     * endpoint on that controller went deaf at once, which is why re-plugging the keyboard
+     * three times changed nothing: hype could not see the unplug either.
+     */
+    if (other != (xhci_int_in_hw_t *)0 && other->armed &&
+        hype_xhci_event_trb_ptr(evt) == other->pending_trb) {
         other->comp_cc = hype_xhci_event_cc(evt);
         other->have_completion = 1;
         return;
@@ -1623,8 +1640,16 @@ int hype_xhci_int_in_poll(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int e
     if (iin->armed && ++iin->silent_polls >= HYPE_INT_IN_SILENT_MAX) {
         uint64_t deq = 0;
         iin->silent_polls = 0;
+        /*
+         * #764: the LINK TRB is not drift. The ring is RING_TRBS entries with a link in the
+         * last slot, so a dequeue pointer sitting there means the controller is about to
+         * wrap to index 0 -- which is exactly where hype will have armed. Comparing raw
+         * pointers flagged that as a lost completion 5-6 times per rig run, and it was the
+         * unexplained residue that kept this check from being trusted.
+         */
+        uint64_t link_trb = phys(iin->ring) + (uint64_t)(RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES;
         if (int_in_ctx_dequeue(c, slot, dci, &deq) == 0 && deq != 0ull &&
-            deq != iin->pending_trb) {
+            deq != link_trb && deq != iin->pending_trb) {
             /*
              * REPORT ONLY -- deliberately does not re-arm.
              *
