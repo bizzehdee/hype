@@ -2098,7 +2098,8 @@ static uint8_t fw_1_usb_record(hype_usb_inventory_t *inv, unsigned int controlle
  * caller polls. `*skipped` counts devices found past the cap, so a machine with more
  * keyboards than hype can poll says so rather than appearing to have fewer.
  */
-static void fw_1_claim_boot_hid(hype_xhci_ctrl_t *xc, unsigned int protocol, const char *what,
+static void fw_1_claim_boot_hid(hype_xhci_ctrl_t *xc, unsigned int ctrl_idx,
+                                unsigned int protocol, const char *what,
                                 hype_host_kbd_t *out, unsigned int *count, unsigned int cap,
                                 unsigned int *skipped) {
     /*
@@ -2125,6 +2126,28 @@ static void fw_1_claim_boot_hid(hype_xhci_ctrl_t *xc, unsigned int protocol, con
         /* Boot protocol only -- a non-boot HID needs its report descriptor parsed, and
          * misreading a report layout invents keystrokes or clicks. The interface search
          * above already required it; the slot check is what is left. */
+        /*
+         * #768: only devices on the controller we were handed.
+         *
+         * The inventory spans EVERY controller and a slot id is per-controller, so an entry
+         * from another controller names a slot that exists here too and belongs to
+         * something else entirely. The control transfer below is issued to `xc`, so
+         * matching an entry from elsewhere reads the WRONG DEVICE and records the result
+         * against the matched entry's name.
+         *
+         * Boot 13: a keyboard arriving on controller 1 slot 5 was claimed under the name of
+         * the Logitech receiver, which sits on controller 2 slot 5 --
+         * "USB keyboard CLAIMED -- 046d:c547 port4 slot5 ep=0x81 mps=8", the receiver's
+         * name with the Keychron's endpoint and packet size. Neither device then worked.
+         *
+         * Invisible at boot, because each controller is claimed while only its own devices
+         * are in the inventory. It needed a hot-plug, with the inventory complete.
+         */
+        if (d->controller != ctrl_idx) {
+            hi = hype_usb_inventory_next_iface(&g_usb_inv, HYPE_USB_CLASS_HID,
+                                               HYPE_USB_SUBCLASS_BOOT, (uint8_t)protocol, hi);
+            continue;
+        }
         if (d->slot != 0u &&
             (d->owner == (uint8_t)HYPE_USB_OWNER_NONE ||
              d->owner == (uint8_t)HYPE_USB_OWNER_HYPE)) {
@@ -24622,12 +24645,12 @@ static int fw_1_usb_enumerate_arrival(hype_xhci_ctrl_t *xc, unsigned int ctrl_id
      * room. If it is anything else it stays in the inventory as `owner=free`, which is what
      * a device hype does not drive should look like.
      */
-    fw_1_claim_boot_hid(xc, HYPE_USB_PROTO_KEYBOARD, "keyboard", g_hid, &g_hid_count,
+    fw_1_claim_boot_hid(xc, ctrl_idx, HYPE_USB_PROTO_KEYBOARD, "keyboard", g_hid, &g_hid_count,
                         HYPE_HOST_KBD_MAX, &g_hid_skipped);
     if (!g_mouse_ready) {
         static hype_host_kbd_t mouse_arrival;
         unsigned int mcount = 0, mskip = 0;
-        fw_1_claim_boot_hid(xc, HYPE_USB_PROTO_MOUSE, "mouse", &mouse_arrival, &mcount, 1u,
+        fw_1_claim_boot_hid(xc, ctrl_idx, HYPE_USB_PROTO_MOUSE, "mouse", &mouse_arrival, &mcount, 1u,
                             &mskip);
         if (mcount != 0u) {
             g_mouse_xc = mouse_arrival.xc;
@@ -24794,12 +24817,12 @@ static int fw_1_usb_enumerate_behind_hub(hype_xhci_ctrl_t *xc, unsigned int ctrl
                      hub_slot, port, (unsigned)(desc[8] | (desc[9] << 8)),
                      (unsigned)(desc[10] | (desc[11] << 8)), slot, child_speed, cp.route,
                      cp.tt_hub_slot);
-    fw_1_claim_boot_hid(xc, HYPE_USB_PROTO_KEYBOARD, "keyboard", g_hid, &g_hid_count,
+    fw_1_claim_boot_hid(xc, ctrl_idx, HYPE_USB_PROTO_KEYBOARD, "keyboard", g_hid, &g_hid_count,
                         HYPE_HOST_KBD_MAX, &g_hid_skipped);
     if (!g_mouse_ready) {
         static hype_host_kbd_t mouse_arrival2;
         unsigned int mcount = 0, mskip = 0;
-        fw_1_claim_boot_hid(xc, HYPE_USB_PROTO_MOUSE, "mouse", &mouse_arrival2, &mcount, 1u,
+        fw_1_claim_boot_hid(xc, ctrl_idx, HYPE_USB_PROTO_MOUSE, "mouse", &mouse_arrival2, &mcount, 1u,
                             &mskip);
         if (mcount != 0u) {
             g_mouse_xc = mouse_arrival2.xc;
@@ -24892,6 +24915,14 @@ static void fw_1_usb_hotplug_poll(void) {
     for (k = 0; k < g_live_xc_count && k < HYPE_LIVE_XHCI_MAX; k++) {
         hype_xhci_ctrl_t *xc = &g_live_xc[k];
         unsigned int port;
+
+        /*
+         * #769: drain this controller's event ring first. Port-change events are banked
+         * where events are dequeued, and nothing dequeues a controller that has no claimed
+         * interrupt-IN endpoint -- so its root ports could never hot-plug. Bounded, because
+         * this runs from the guest dispatch loop.
+         */
+        (void)hype_xhci_pump_events(xc, 16u);
 
         while ((port = hype_xhci_take_port_change(xc)) != 0u) {
             int connected = 0;
@@ -28239,7 +28270,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                  * already claimed so hype's own boot medium can never be mistaken for an
                  * input device.
                  */
-                fw_1_claim_boot_hid(&xc, HYPE_USB_PROTO_KEYBOARD, "keyboard", g_hid,
+                fw_1_claim_boot_hid(&xc, xhci_count, HYPE_USB_PROTO_KEYBOARD, "keyboard", g_hid,
                                     &g_hid_count, HYPE_HOST_KBD_MAX, &g_hid_skipped);
                 /* USB-6 (#219): and a pointer, independently. It may be on a different
                  * controller from the keyboard -- an internal touchpad and an external
@@ -28255,7 +28286,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                     static hype_host_kbd_t mouse_slot0;
                     unsigned int mcount = g_mouse_ready ? 1u : 0u;
                     unsigned int mskip = 0;
-                    fw_1_claim_boot_hid(&xc, HYPE_USB_PROTO_MOUSE, "mouse", &mouse_slot0,
+                    fw_1_claim_boot_hid(&xc, xhci_count, HYPE_USB_PROTO_MOUSE, "mouse", &mouse_slot0,
                                         &mcount, 1u, &mskip);
                     if (mcount != 0u && !g_mouse_ready) {
                         g_mouse_xc = mouse_slot0.xc;

@@ -535,6 +535,25 @@ unsigned int hype_xhci_take_port_change(hype_xhci_ctrl_t *c);
  * Call once, after enumeration and before the first sweep. Events raised after that are
  * genuine hot-plug and must NOT be discarded.
  */
+/*
+ * #769: drain up to `budget` events from this controller's ring, and report how many.
+ *
+ * A Port Status Change Event is only noticed when something dequeues the event ring, and
+ * the only things that do are transfers and commands ON THAT CONTROLLER. A controller with
+ * no claimed interrupt-IN endpoint is therefore never drained once enumeration is over, and
+ * a device plugged into one of its root ports is never seen.
+ *
+ * Boot 13 measured exactly that: the keyboard and mouse are on controller 2, so controller 2
+ * is pumped by HID polling and its hot-plug works. Controller 1 had no polled endpoint, and
+ * its ring was drained only incidentally by the guest's ISO reads -- so the FIRST plug into
+ * its front USB-C port was seen (the kernel was still loading) and every later one produced
+ * no event at all. Five port events on that controller for the whole run.
+ *
+ * Called from the hot-plug sweep for every live controller, so noticing a plug does not
+ * depend on something else happening to be busy.
+ */
+unsigned int hype_xhci_pump_events(hype_xhci_ctrl_t *c, unsigned int budget);
+
 unsigned int hype_xhci_discard_port_changes(hype_xhci_ctrl_t *c);
 
 /* #744: how many Port Status Change Events this controller has produced, ever. */

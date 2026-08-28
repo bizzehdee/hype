@@ -3067,6 +3067,28 @@ unsigned int hype_xhci_take_port_change(hype_xhci_ctrl_t *c) {
     return 0;
 }
 
+unsigned int hype_xhci_pump_events(hype_xhci_ctrl_t *c, unsigned int budget) {
+    xhci_hw_t *hw;
+    volatile uint8_t *bar;
+    unsigned int n = 0, spins = 0;
+    uint32_t evt[4];
+
+    if (c == (hype_xhci_ctrl_t *)0 || !c->inited) {
+        return 0u;
+    }
+    hw = HW(c);
+    bar = (volatile uint8_t *)(uintptr_t)c->bar;
+    while (n < budget &&
+           next_event_budget(hw, bar, c->rtsoff, evt, XHCI_POLL_PEEK, &spins) == 0) {
+        /* Port-change events are banked inside next_event_budget and never reach here.
+         * Anything that does is a transfer or command event, and route_foreign_event
+         * gives it to its owner or parks it -- never drops it (#761). */
+        route_foreign_event(c, hw, evt);
+        n++;
+    }
+    return n;
+}
+
 unsigned int hype_xhci_discard_port_changes(hype_xhci_ctrl_t *c) {
     xhci_hw_t *hw;
     unsigned int n = 0u, p;
