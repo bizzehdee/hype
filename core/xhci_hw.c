@@ -58,6 +58,8 @@
 #define XHCI_POLL_PEEK 1u
 /* #764: polls an interrupt-IN endpoint may sit armed and silent before hype re-arms it. */
 #define HYPE_INT_IN_SILENT_MAX 4000u
+/* #764 capture: how often to compare the controller's dequeue against ours while armed. */
+#define HYPE_INT_IN_CHECK_POLLS 64u
 
 /* #266: one second, chosen against the measured distribution (mean 493,692 spins,
  * worst observed ~36,000,000 spins). Generous by design -- being early is what
@@ -217,6 +219,19 @@ typedef struct {
      */
     unsigned int silent_polls;
     unsigned long long rearms;
+    /*
+     * #764 capture: what this endpoint was doing when it diverged.
+     *
+     * The existing report fires after HYPE_INT_IN_SILENT_MAX polls, which on a 125 Hz tick
+     * is half a minute after the fact -- long enough that the ring state it prints is no
+     * longer the state that went wrong. These record the last few completions actually
+     * CLAIMED, so the moment of divergence can be read against what led to it.
+     */
+    uint64_t claim_trb[8];
+    uint8_t claim_cc[8];
+    unsigned int claim_n;
+    int diverged;            /* reported once; the first sighting is the useful one */
+    unsigned long long reports;
 } xhci_int_in_hw_t;
 
 static xhci_int_in_hw_t g_iin_hw[HYPE_XHCI_INT_IN_MAX];
@@ -712,6 +727,45 @@ static int int_in_ctx_dequeue(hype_xhci_ctrl_t *c, unsigned int slot, unsigned i
     return 0;
 }
 
+static int int_in_poll_body(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int ep_addr,
+                            uint8_t *out, unsigned int len);
+
+/* #764 capture: note a completion this endpoint actually claimed. */
+static void int_in_note_claim(xhci_int_in_hw_t *iin, uint64_t trb, uint32_t cc) {
+    unsigned int i = iin->claim_n % 8u;
+    iin->claim_trb[i] = trb;
+    iin->claim_cc[i] = (uint8_t)cc;
+    iin->claim_n++;
+    iin->reports++;
+}
+
+/*
+ * #764 capture: the ring state at the moment this endpoint stopped tracking the controller.
+ *
+ * Printed ONCE per endpoint, the first time the controller's dequeue pointer and hype's
+ * outstanding TRB disagree. Everything needed to reconstruct what happened is on one line:
+ * where each side thinks it is, how hype's enqueue cursor sits, and the last completions
+ * hype claimed -- so a claim from a TRB that was never armed is visible rather than inferred.
+ */
+static void int_in_report_divergence(xhci_int_in_hw_t *iin, unsigned int slot, unsigned int dci,
+                                     uint64_t deq, uint64_t base) {
+    unsigned int i, n = (iin->claim_n < 8u) ? iin->claim_n : 8u;
+
+    hype_debug_print("host-xhci: #764 DIVERGED slot=%u ep=%u | controller deq=+0x%llx "
+                     "hype trb=+0x%llx enq=%u cyc=%u armed=%d | reports=%llu silent=%u "
+                     "rearms=%llu\n", slot, dci,
+                     (unsigned long long)(deq - base),
+                     (unsigned long long)(iin->pending_trb - base),
+                     iin->enq, iin->cyc, iin->armed, iin->reports, iin->silent_polls,
+                     iin->rearms);
+    for (i = 0; i < n; i++) {
+        unsigned int k = (iin->claim_n >= 8u) ? ((iin->claim_n + i) % 8u) : i;
+        hype_debug_print("host-xhci: #764   claim[-%u] trb=+0x%llx cc=%u\n", n - i,
+                         (unsigned long long)(iin->claim_trb[k] - base),
+                         (unsigned)iin->claim_cc[k]);
+    }
+}
+
 static unsigned int out_ctx_entries(hype_xhci_ctrl_t *c, unsigned int slot) {
     xhci_hw_t *hw = HW(c);
     int di = dev_index(hw, slot);
@@ -1066,6 +1120,7 @@ int hype_xhci_configure_int_in_endpoint(hype_xhci_ctrl_t *c, unsigned int slot,
     iin->mps = mps; iin->recoveries = 0; iin->backoff = 0;
     iin->have_completion = 0; iin->comp_cc = 0;
     iin->silent_polls = 0; iin->rearms = 0;
+    iin->claim_n = 0; iin->diverged = 0; iin->reports = 0;
 
     zero(hw->input_ctx, XPAGE);
     hype_xhci_input_ctrl_ctx(ctx, HYPE_XHCI_ADD_SLOT | (1u << dci), 0);
@@ -1239,6 +1294,7 @@ int hype_xhci_configure_hub_int_in(hype_xhci_ctrl_t *c, unsigned int slot,
     iin->mps = mps; iin->recoveries = 0; iin->backoff = 0;
     iin->have_completion = 0; iin->comp_cc = 0;
     iin->silent_polls = 0; iin->rearms = 0;
+    iin->claim_n = 0; iin->diverged = 0; iin->reports = 0;
 
     zero(hw->input_ctx, XPAGE);
     hype_xhci_input_ctrl_ctx(ctx, HYPE_XHCI_ADD_SLOT | (1u << dci), 0);
@@ -1603,6 +1659,32 @@ static void int_in_recover(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int 
 
 int hype_xhci_int_in_poll(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int ep_addr,
                           uint8_t *out, unsigned int len) {
+    /*
+     * #764 capture: the operator reports a DASHBOARD FREEZE at the moment the keyboard
+     * stops. A freeze is something blocking, and the input tick's only blocking calls are
+     * in here -- endpoint recovery issues commands and waits on them. Timing the whole poll
+     * says whether the stall is here at all, and which endpoint owns it, which no counter
+     * in the periodic DIAG can.
+     */
+    uint64_t t_enter = rdtsc_now();
+    int poll_rc = int_in_poll_body(c, slot, ep_addr, out, len);
+    if (g_tsc_hz != 0u) {
+        uint64_t took = rdtsc_now() - t_enter;
+        if (took > g_tsc_hz / 50u) { /* 20 ms -- an order above any healthy poll */
+            static unsigned int slow_n = 0;
+            if (slow_n++ < 32u) {
+                hype_debug_print("host-xhci: #764 SLOW POLL slot=%u ep=0x%02x took %llu ms "
+                                 "(rc=%d) -- this is what a dashboard freeze is made of\n",
+                                 slot, ep_addr,
+                                 (unsigned long long)((took * 1000ull) / g_tsc_hz), poll_rc);
+            }
+        }
+    }
+    return poll_rc;
+}
+
+static int int_in_poll_body(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int ep_addr,
+                            uint8_t *out, unsigned int len) {
     xhci_hw_t *hw = HW(c);
     volatile uint8_t *bar;
     unsigned int dci = hype_xhci_ep_dci(ep_addr);
@@ -1656,6 +1738,22 @@ int hype_xhci_int_in_poll(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int e
      *
      * NOT ACTED ON yet -- see the body. It reports; it does not re-arm.
      */
+    /*
+     * #764 capture: look for divergence every HYPE_INT_IN_CHECK_POLLS, not only after
+     * HYPE_INT_IN_SILENT_MAX. At 125 Hz the long threshold is half a minute after the
+     * event, by which time the ring state printed is no longer the state that failed. This
+     * catches the FIRST disagreement, reports it once, and says nothing further.
+     */
+    if (iin->armed && !iin->diverged &&
+        (iin->silent_polls % HYPE_INT_IN_CHECK_POLLS) == (HYPE_INT_IN_CHECK_POLLS - 1u)) {
+        uint64_t d = 0, b = phys(iin->ring);
+        uint64_t link = b + (uint64_t)(RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES;
+        if (int_in_ctx_dequeue(c, slot, dci, &d) == 0 && d != 0ull && d != link &&
+            d != iin->pending_trb) {
+            iin->diverged = 1;
+            int_in_report_divergence(iin, slot, dci, d, b);
+        }
+    }
     if (iin->armed && ++iin->silent_polls >= HYPE_INT_IN_SILENT_MAX) {
         uint64_t deq = 0;
         iin->silent_polls = 0;
@@ -1724,6 +1822,7 @@ int hype_xhci_int_in_poll(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int e
         }
         iin->recoveries = 0;
         iin->backoff = 0;
+        int_in_note_claim(iin, my_trb, cc);
         for (i = 0; i < len; i++) out[i] = iin->report[i];
         return 1;
     }
@@ -1744,6 +1843,7 @@ int hype_xhci_int_in_poll(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int e
             }
             iin->recoveries = 0;
             iin->backoff = 0;
+            int_in_note_claim(iin, my_trb, parked_cc);
             for (i = 0; i < len; i++) out[i] = iin->report[i];
             return 1;
         }
@@ -1794,6 +1894,9 @@ int hype_xhci_int_in_poll(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int e
     }
     iin->recoveries = 0;
     iin->backoff = 0;
+    /* #764 capture: the event carries the TRB it completed, so record THAT rather than what
+     * hype thought was outstanding -- a claim from a TRB never armed is the thing to see. */
+    int_in_note_claim(iin, hype_xhci_event_trb_ptr(evt), hype_xhci_event_cc(evt));
     for (i = 0; i < len; i++) out[i] = iin->report[i];
     return 1;
 }

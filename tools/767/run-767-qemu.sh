@@ -206,8 +206,23 @@ dup=$(grep -a "fw-1 DIAG: HID\[" $S/serial.log | grep -v modseen | tail -"${nlas
 
 # #764/#766: the ring must not drift. `grep -c` exits non-zero on zero matches and this
 # script runs under `set -e`, which silently truncated an earlier version of this verdict.
+# #764: ANY divergence fails. An earlier version only counted the late "NOT re-armed" line
+# and passed a run in which a hot-plugged keyboard had enumerated, been claimed, and never
+# reported -- because a different keyboard was carrying the scancodes. One deaf endpoint is
+# the whole bug; it does not stop being one because another device is healthy.
+ndv=$(grep -a -c "#764 DIVERGED" $S/serial.log || true)
+echo "endpoints that diverged: $ndv"
+[ "${ndv:-0}" -eq 0 ] 2>/dev/null || {
+  grep -a "#764 DIVERGED\|#764   claim" $S/serial.log | head -12
+  say "FAIL: $ndv endpoint(s) lost track of the controller's dequeue pointer [#764]"
+}
+nsp=$(grep -a -c "#764 SLOW POLL" $S/serial.log || true)
+echo "slow polls (>20ms): $nsp"
+[ "${nsp:-0}" -eq 0 ] 2>/dev/null ||
+  say "FAIL: $nsp interrupt-IN poll(s) blocked for over 20 ms -- that is a visible freeze [#764]"
+
 nd=$(grep -a -c "NOT re-armed" $S/serial.log || true)
-echo "ring-drift reports: $nd"
+echo "late drift reports: $nd"
 [ "${nd:-0}" -eq 0 ] 2>/dev/null ||
   say "FAIL: $nd interrupt-IN endpoint(s) drifted from the controller's dequeue pointer [#764 #766]"
 
