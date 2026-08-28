@@ -16372,8 +16372,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         unsigned long long hp = 0, hr = 0, he = 0;
                         hype_xhci_hub_poll_stats(&hp, &hr, &he);
                         if (hype_xhci_hub_count() != 0u || hp != 0ull) {
-                            hype_debug_print("fw-1 DIAG: HUBPOLL hubs=%u polls=%llu reports=%llu "
-                                             "errors=%llu [#746]\n",
+                            hype_debug_print("fw-1 DIAG: HUBPOLL hub-devices=%u polls=%llu reports=%llu "
+                                             "errors=%llu (a USB-3 hub is TWO devices, a 2.0 "
+                                             "and a 3.0 half) [#746 #765]\n",
                                              hype_xhci_hub_count(), hp, hr, he);
                         }
                     }
@@ -24648,12 +24649,92 @@ static int fw_1_usb_enumerate_arrival(hype_xhci_ctrl_t *xc, unsigned int ctrl_id
  * its Transaction Translator. #218 is the ticket for what happens when that TT is left at
  * zero: the device addresses fine, its endpoint configures fine, and it never reports.
  */
+/*
+ * #763: ports whose arrival could not be enumerated, so hype stops retrying them.
+ *
+ * A device hype cannot address is not a transient. Boot 11 had one behind a SuperSpeed hub
+ * -- Address Device cc=4 (Transaction Error), three tries, every time -- and retrying it
+ * was self-sustaining: the retry resets the port, the reset sets C_PORT_RESET, the hub
+ * reports the change, hype retries. 28 hub reports and 38 Address Device attempts in one
+ * run, each a command timeout, from the 125 Hz input tick. That is the hitching, and it
+ * starves the tick that the keyboard's own polling rides on.
+ *
+ * Keyed by (controller, hub slot, port) and NOT cleared by a later report from the same
+ * port, because a later report from the same port is exactly the loop. It IS cleared when
+ * the port reads as empty -- the device physically left, so the next thing to arrive
+ * deserves a fresh set of attempts.
+ */
+#define HYPE_ARRIVAL_FAIL_MAX   3u
+#define HYPE_ARRIVAL_FAIL_SLOTS 16u
+typedef struct {
+    unsigned int used;
+    unsigned int ctrl_idx;
+    unsigned int hub_slot; /* 0 = a root port */
+    unsigned int port;
+    unsigned int fails;
+    unsigned int reported;
+} fw_1_arrival_fail_t;
+static fw_1_arrival_fail_t g_arrival_fail[HYPE_ARRIVAL_FAIL_SLOTS];
+
+static fw_1_arrival_fail_t *fw_1_arrival_fail_for(unsigned int ctrl_idx, unsigned int hub_slot,
+                                                  unsigned int port, int alloc) {
+    unsigned int i, free_i = HYPE_ARRIVAL_FAIL_SLOTS;
+    for (i = 0; i < HYPE_ARRIVAL_FAIL_SLOTS; i++) {
+        if (g_arrival_fail[i].used && g_arrival_fail[i].ctrl_idx == ctrl_idx &&
+            g_arrival_fail[i].hub_slot == hub_slot && g_arrival_fail[i].port == port) {
+            return &g_arrival_fail[i];
+        }
+        if (!g_arrival_fail[i].used && free_i == HYPE_ARRIVAL_FAIL_SLOTS) free_i = i;
+    }
+    if (!alloc || free_i == HYPE_ARRIVAL_FAIL_SLOTS) return (fw_1_arrival_fail_t *)0;
+    g_arrival_fail[free_i].used = 1;
+    g_arrival_fail[free_i].ctrl_idx = ctrl_idx;
+    g_arrival_fail[free_i].hub_slot = hub_slot;
+    g_arrival_fail[free_i].port = port;
+    g_arrival_fail[free_i].fails = 0;
+    g_arrival_fail[free_i].reported = 0;
+    return &g_arrival_fail[free_i];
+}
+
+/* Give up on this port for now, and say so exactly once. */
+static void fw_1_arrival_failed(unsigned int ctrl_idx, unsigned int hub_slot,
+                                unsigned int port, const char *why) {
+    fw_1_arrival_fail_t *f = fw_1_arrival_fail_for(ctrl_idx, hub_slot, port, 1);
+    if (f == (fw_1_arrival_fail_t *)0) return;
+    f->fails++;
+    if (f->fails >= HYPE_ARRIVAL_FAIL_MAX && !f->reported) {
+        f->reported = 1;
+        hype_debug_print("host-usb: giving up on hub slot %u port %u after %u failed "
+                         "arrivals (%s) -- it will not be retried until the port reports "
+                         "empty [#763]\n", hub_slot, port, f->fails, why);
+    }
+}
+
+/* Has hype given up on it? */
+static int fw_1_arrival_given_up(unsigned int ctrl_idx, unsigned int hub_slot,
+                                 unsigned int port) {
+    const fw_1_arrival_fail_t *f = fw_1_arrival_fail_for(ctrl_idx, hub_slot, port, 0);
+    return (f != (const fw_1_arrival_fail_t *)0) && (f->fails >= HYPE_ARRIVAL_FAIL_MAX);
+}
+
+/* The device left: whatever it was that could not be addressed is gone with it. */
+static void fw_1_arrival_reset(unsigned int ctrl_idx, unsigned int hub_slot,
+                               unsigned int port) {
+    fw_1_arrival_fail_t *f = fw_1_arrival_fail_for(ctrl_idx, hub_slot, port, 0);
+    if (f != (fw_1_arrival_fail_t *)0) f->used = 0;
+}
+
 static int fw_1_usb_enumerate_behind_hub(hype_xhci_ctrl_t *xc, unsigned int ctrl_idx,
                                          unsigned int hub_slot, unsigned int port) {
     static uint8_t cfgbuf[512];
     uint8_t desc[18];
     hype_xhci_devpath_t hpath, cp;
     unsigned int slot = 0, cfglen = 0, child_speed = 0;
+
+    /* #763: already given up on this port -- do not spend three command timeouts again. */
+    if (fw_1_arrival_given_up(ctrl_idx, hub_slot, port)) {
+        return 0;
+    }
 
     /*
      * #746: is something ALREADY enumerated here? A hub can report a change for a port
@@ -24688,6 +24769,7 @@ static int fw_1_usb_enumerate_behind_hub(hype_xhci_ctrl_t *xc, unsigned int ctrl
     if (hype_xhci_enable_slot(xc, &slot) != 0 || slot == 0u) {
         hype_debug_print("host-usb: hub slot %u port %u Enable Slot FAILED on arrival [#746]\n",
                          hub_slot, port);
+        fw_1_arrival_failed(ctrl_idx, hub_slot, port, "Enable Slot");
         return 1;
     }
     if (hype_xhci_address_device(xc, slot, &cp) != 0) {
@@ -24695,12 +24777,14 @@ static int fw_1_usb_enumerate_behind_hub(hype_xhci_ctrl_t *xc, unsigned int ctrl
                          "tt_hub=%u tt_port=%u) [#746]\n", hub_slot, port, cp.route,
                          cp.tt_hub_slot, cp.tt_port);
         (void)hype_xhci_release_device(xc, slot);
+        fw_1_arrival_failed(ctrl_idx, hub_slot, port, "Address Device");
         return 1;
     }
     if (hype_xhci_get_device_descriptor(xc, slot, desc) != 0) {
         hype_debug_print("host-usb: hub slot %u port %u GET_DESCRIPTOR FAILED [#746]\n",
                          hub_slot, port);
         (void)hype_xhci_release_device(xc, slot);
+        fw_1_arrival_failed(ctrl_idx, hub_slot, port, "GET_DESCRIPTOR");
         return 1;
     }
     (void)hype_xhci_get_config_descriptor(xc, slot, cfgbuf, sizeof(cfgbuf), &cfglen);

@@ -388,7 +388,10 @@ void hype_xhci_set_tsc_hz(uint64_t hz);
  * for a hub-heavy desk rather than for the two HIDs it originally served; the cost is one
  * page-aligned ring plus a 64-byte report each.
  */
-#define HYPE_XHCI_INT_IN_MAX 12u
+/* #765: one block per polled interrupt-IN endpoint. Must cover HYPE_XHCI_HUB_MAX hub
+ * devices (each hub has a status-change endpoint) PLUS every claimed HID, or a keyboard
+ * arrives to find no block free and is enumerated but never polled. */
+#define HYPE_XHCI_INT_IN_MAX 24u
 
 /*
  * The identity of one pooled interrupt-IN endpoint. Kept separate from the DMA block it
@@ -599,7 +602,23 @@ int hype_xhci_configure_hub_int_in(hype_xhci_ctrl_t *c, unsigned int slot,
                                    unsigned int interval);
 
 /* #746: how many hubs the walk registered, and one's identity. */
-#define HYPE_XHCI_HUB_MAX 6u
+/*
+ * #765: hub DEVICES hype will track, which is not the same as hubs a person plugged in.
+ *
+ * A USB-3 hub is two USB devices -- a 2.0 hub and a 3.0 hub, each with its own
+ * status-change endpoint that has to be polled separately. So the 5950X's "two hubs plus
+ * one on the motherboard" is FIVE entries here, and 6 left room for exactly one more
+ * device.
+ *
+ * That is too tight to survive ordinary hardware. A keyboard with a built-in hub -- common,
+ * and the reason a keyboard can appear behind two tiers -- adds one entry, or two if it is
+ * USB 3. Running out means the hub is registered with ep 0 and is silently unable to report
+ * hot-plug for anything below it.
+ *
+ * Not to be confused with the xHCI route string's limit of five hub TIERS, which is a
+ * chain depth and unrelated to how many hubs exist.
+ */
+#define HYPE_XHCI_HUB_MAX 16u
 unsigned int hype_xhci_hub_count(void);
 int hype_xhci_hub_at(unsigned int i, unsigned int *out_ctrl, unsigned int *out_slot,
                      unsigned int *out_nports, unsigned int *out_ep);

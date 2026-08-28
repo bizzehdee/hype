@@ -56,6 +56,8 @@
 #define SPIN 20000000u
 /* #759: one look at the event ring, for pollers rather than waiters. See int_in_poll. */
 #define XHCI_POLL_PEEK 1u
+/* #764: polls an interrupt-IN endpoint may sit armed and silent before hype re-arms it. */
+#define HYPE_INT_IN_SILENT_MAX 4000u
 
 /* #266: one second, chosen against the measured distribution (mean 493,692 spins,
  * worst observed ~36,000,000 spins). Generous by design -- being early is what
@@ -200,6 +202,21 @@ typedef struct {
      */
     int have_completion;
     uint32_t comp_cc;
+    /*
+     * #764: polls this endpoint has been armed without a completion.
+     *
+     * `armed` is a latch: it clears only when a completion is claimed, so ANY completion
+     * that goes missing leaves the endpoint armed forever and it is never re-armed. #761
+     * fixed the known way to lose one (three event waits that dropped foreign transfer
+     * events), but "the endpoint is now permanently deaf" is too severe a consequence to
+     * leave resting on having found every such path.
+     *
+     * Boot 11 showed the shape again on real hardware -- the keyboard sat at reports=8
+     * while polls climbed past 9,000, with errors=0. So: re-arm after a long silence, and
+     * COUNT it, so a recovered endpoint is visibly different from one that never broke.
+     */
+    unsigned int silent_polls;
+    unsigned long long rearms;
 } xhci_int_in_hw_t;
 
 static xhci_int_in_hw_t g_iin_hw[HYPE_XHCI_INT_IN_MAX];
@@ -657,6 +674,27 @@ static uint32_t get_le32(const uint8_t *p) {
  * Returns 0 when the slot has no device context, so a caller's max() falls through to its
  * own DCI and behaves exactly as before.
  */
+/*
+ * #764: the controller's TR Dequeue Pointer for one endpoint, from the OUTPUT context.
+ *
+ * Endpoint Context DW2/DW3 hold it, with the low 4 bits carrying DCS and reserved bits --
+ * masked off so the comparison is against a TRB address. Returns -1 when the slot has no
+ * device context, so the caller leaves the endpoint alone.
+ */
+static int int_in_ctx_dequeue(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int dci,
+                              uint64_t *out) {
+    xhci_hw_t *hw = HW(c);
+    unsigned int cs = c->ctx_size;
+    const uint8_t *dctx;
+    int di = dev_index(hw, slot);
+
+    if (di < 0 || out == (uint64_t *)0) return -1;
+    dctx = hw->dev_ctx[di];
+    *out = ((uint64_t)get_le32(dctx + dci * cs + 8u) |
+            ((uint64_t)get_le32(dctx + dci * cs + 12u) << 32)) & ~0xFull;
+    return 0;
+}
+
 static unsigned int out_ctx_entries(hype_xhci_ctrl_t *c, unsigned int slot) {
     xhci_hw_t *hw = HW(c);
     int di = dev_index(hw, slot);
@@ -1010,6 +1048,7 @@ int hype_xhci_configure_int_in_endpoint(hype_xhci_ctrl_t *c, unsigned int slot,
     iin->enq = 0; iin->cyc = 1; iin->armed = 0; iin->pending_trb = 0;
     iin->mps = mps; iin->recoveries = 0; iin->backoff = 0;
     iin->have_completion = 0; iin->comp_cc = 0;
+    iin->silent_polls = 0; iin->rearms = 0;
 
     zero(hw->input_ctx, XPAGE);
     hype_xhci_input_ctrl_ctx(ctx, HYPE_XHCI_ADD_SLOT | (1u << dci), 0);
@@ -1167,6 +1206,7 @@ int hype_xhci_configure_hub_int_in(hype_xhci_ctrl_t *c, unsigned int slot,
     iin->enq = 0; iin->cyc = 1; iin->armed = 0; iin->pending_trb = 0;
     iin->mps = mps; iin->recoveries = 0; iin->backoff = 0;
     iin->have_completion = 0; iin->comp_cc = 0;
+    iin->silent_polls = 0; iin->rearms = 0;
 
     zero(hw->input_ctx, XPAGE);
     hype_xhci_input_ctrl_ctx(ctx, HYPE_XHCI_ADD_SLOT | (1u << dci), 0);
@@ -1506,6 +1546,7 @@ static void int_in_recover(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int 
 
     iin->armed = 0;
     iin->pending_trb = 0;
+    iin->silent_polls = 0;
     if (iin->recoveries >= INT_IN_MAX_RECOVERIES) {
         iin->backoff = INT_IN_BACKOFF_POLLS;
         if (backoff_reported++ < 4u) {
@@ -1559,6 +1600,59 @@ int hype_xhci_int_in_poll(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int e
      * caller wants 8 bytes of boot-protocol packet. The block's report buffer is sized
      * for the largest mps configure-time accepts, so the extra bytes have somewhere to
      * land; only the first `len` are handed back. */
+    /*
+     * #764: re-arm an endpoint whose completion was LOST, without touching one that is
+     * merely idle.
+     *
+     * Silence alone cannot tell those apart. An interrupt IN transfer stays outstanding
+     * while the device NAKs, so "armed, no completion" is exactly what a keyboard nobody
+     * is typing on looks like. Re-arming on a timer would queue a second TRB every time
+     * and refill the ring -- #217's original bug, arrived at slowly.
+     *
+     * The controller's own TR Dequeue Pointer is the discriminator. It names the next TRB
+     * the controller will process: still equal to ours means the transfer is genuinely
+     * outstanding and the device is simply quiet; advanced past ours means the TRB was
+     * consumed, a completion was generated, and hype did not see it -- which is the case
+     * `armed` would otherwise latch on forever.
+     *
+     * Checked only after a long silence, so a healthy endpoint pays one context read per
+     * HYPE_INT_IN_SILENT_MAX polls and nothing else.
+     *
+     * NOT ACTED ON yet -- see the body. It reports; it does not re-arm.
+     */
+    if (iin->armed && ++iin->silent_polls >= HYPE_INT_IN_SILENT_MAX) {
+        uint64_t deq = 0;
+        iin->silent_polls = 0;
+        if (int_in_ctx_dequeue(c, slot, dci, &deq) == 0 && deq != 0ull &&
+            deq != iin->pending_trb) {
+            /*
+             * REPORT ONLY -- deliberately does not re-arm.
+             *
+             * The reasoning was: dequeue past our TRB means the controller consumed it, so
+             * a completion happened and hype missed it. Re-arming would then rescue an
+             * endpoint that `armed` has latched deaf.
+             *
+             * It fires 31-46 times per QEMU rig run on endpoints that are working
+             * normally -- rig 734 still counts its usual 120 reports -- so the comparison
+             * is catching something ordinary that this reasoning does not explain, and
+             * acting on it would queue a second TRB each time. That is #217's bug (a ring
+             * filled by over-enqueuing, and the device goes silent) reached slowly.
+             *
+             * So it counts and says so, and nothing more, until the discriminator is
+             * understood. #761 fixed the KNOWN way to lose a completion -- three event
+             * waits that dropped foreign transfer events -- and that one is proven.
+             */
+            iin->rearms++;
+            if (iin->rearms <= 4ull || (iin->rearms % 64ull) == 0ull) {
+                hype_debug_print("host-xhci: interrupt-IN slot=%u ep=%u dequeue 0x%llx is "
+                                 "past our TRB 0x%llx after %u silent polls -- NOT re-armed, "
+                                 "counting only (%llu so far) [#764]\n", slot, dci,
+                                 (unsigned long long)deq,
+                                 (unsigned long long)iin->pending_trb,
+                                 (unsigned)HYPE_INT_IN_SILENT_MAX, iin->rearms);
+            }
+        }
+    }
     if (!iin->armed) {
         unsigned int xfer = (iin->mps != 0u && iin->mps <= sizeof(iin->report)) ? iin->mps : len;
         for (i = 0; i < sizeof(iin->report); i++) iin->report[i] = 0;
@@ -1578,6 +1672,7 @@ int hype_xhci_int_in_poll(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int e
         uint32_t cc = iin->comp_cc;
         iin->have_completion = 0;
         iin->armed = 0; /* consumed -- next poll re-arms */
+        iin->silent_polls = 0;
         if (cc != HYPE_XHCI_CC_SUCCESS && cc != HYPE_XHCI_CC_SHORT_PACKET) {
             int_in_report_error(slot, dci, my_trb, cc);
             int_in_recover(c, slot, dci, iin);
@@ -1597,6 +1692,7 @@ int hype_xhci_int_in_poll(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int e
         if (hype_xhci_parked_take(&hw->parked, slot, dci, my_trb, &parked_cc,
                                   &parked_residue)) {
             iin->armed = 0; /* consumed -- next poll re-arms */
+            iin->silent_polls = 0;
             if (parked_cc != HYPE_XHCI_CC_SUCCESS && parked_cc != HYPE_XHCI_CC_SHORT_PACKET) {
                 int_in_report_error(slot, dci, my_trb, parked_cc);
                 int_in_recover(c, slot, dci, iin);
@@ -1645,6 +1741,7 @@ int hype_xhci_int_in_poll(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int e
         return 0;
     }
     iin->armed = 0; /* our completion arrived -- re-arm on the next poll */
+    iin->silent_polls = 0;
     if (hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS &&
         hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SHORT_PACKET) {
         int_in_report_error(slot, dci, my_trb, hype_xhci_event_cc(evt));
