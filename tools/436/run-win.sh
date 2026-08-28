@@ -39,7 +39,7 @@ cp -f "$REPO/fw/OVMF_VARS.fd" "$RIG/host-vars.fd"
 # long), and `pgrep -f` matches any shell whose command line merely mentions
 # QEMU -- including the one running this script, which makes the guard fire on
 # itself every time.
-if pgrep -x qemu-system-x86 >/dev/null; then
+if pidof qemu-system-x86_64 >/dev/null; then
     echo "a QEMU is still running -- refusing to start a second"; exit 1
 fi
 

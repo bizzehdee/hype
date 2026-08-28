@@ -30,7 +30,7 @@ rm -f $S/serial.log $S/esp.img $S/usb.img $S/mon.sock
 
 killall -9 "$(basename "$QEMU")" 2>/dev/null || true
 sleep 1
-pgrep -f "[q]emu-system-x86_64" >/dev/null && { echo "FAIL: a qemu is still running"; exit 1; }
+pidof qemu-system-x86_64 >/dev/null && { echo "FAIL: a qemu is still running"; exit 1; }
 
 dd if=/dev/zero of=$S/usb.img bs=1M count=64 status=none
 mkfs.vfat -F 32 -n HYPEUSB $S/usb.img >/dev/null
