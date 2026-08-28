@@ -232,6 +232,24 @@ typedef struct {
     unsigned int claim_n;
     int diverged;            /* reported once; the first sighting is the useful one */
     unsigned long long reports;
+    /*
+     * #764: where this endpoint's completions went. A completion can reach its owner three
+     * ways and be lost one, and only counting them apart says which happened:
+     *   deliv      handed straight to this block by another poll (#761)
+     *   from_park  claimed out of the shared parked table
+     *   own        dequeued by this endpoint's own poll
+     *   to_park    seen for this endpoint but NOT matching its outstanding TRB, so parked --
+     *              and the parked table holds 8 entries and evicts round-robin, so this is
+     *              the count that can turn into a permanently deaf endpoint
+     */
+    unsigned long long deliv, from_park, own, to_park;
+    /*
+     * #764: handed INTO this block by another poll, counted at the moment of handover.
+     * `deliv` counts handovers the owner went on to CLAIM. The difference between the two
+     * is a completion that arrived, was filed correctly, and was then never picked up --
+     * which no other counter can distinguish from one that never arrived at all.
+     */
+    unsigned long long handed;
 } xhci_int_in_hw_t;
 
 static xhci_int_in_hw_t g_iin_hw[HYPE_XHCI_INT_IN_MAX];
@@ -589,7 +607,15 @@ static void route_foreign_event(hype_xhci_ctrl_t *c, xhci_hw_t *hw, const uint32
         hype_xhci_event_trb_ptr(evt) == other->pending_trb) {
         other->comp_cc = hype_xhci_event_cc(evt);
         other->have_completion = 1;
+        other->handed++;
         return;
+    }
+    if (other != (xhci_int_in_hw_t *)0) {
+        /* #764: an int-in endpoint's completion that did NOT match its outstanding TRB.
+         * It goes to the parked table, which evicts, so this is the one route by which a
+         * completion can be lost outright. Counted so the DIVERGED report can say whether
+         * that is what happened. */
+        other->to_park++;
     }
     hype_xhci_parked_put(&hw->parked, oslot, odci, hype_xhci_event_trb_ptr(evt),
                          hype_xhci_event_cc(evt), hype_xhci_event_xfer_residue(evt));
@@ -753,11 +779,13 @@ static void int_in_report_divergence(xhci_int_in_hw_t *iin, unsigned int slot, u
 
     hype_debug_print("host-xhci: #764 DIVERGED slot=%u ep=%u | controller deq=+0x%llx "
                      "hype trb=+0x%llx enq=%u cyc=%u armed=%d | reports=%llu silent=%u "
-                     "rearms=%llu\n", slot, dci,
+                     "rearms=%llu | handed=%llu deliv=%llu from_park=%llu own=%llu to_park=%llu\n",
+                     slot, dci,
                      (unsigned long long)(deq - base),
                      (unsigned long long)(iin->pending_trb - base),
                      iin->enq, iin->cyc, iin->armed, iin->reports, iin->silent_polls,
-                     iin->rearms);
+                     iin->rearms, iin->handed, iin->deliv, iin->from_park, iin->own,
+                     iin->to_park);
     for (i = 0; i < n; i++) {
         unsigned int k = (iin->claim_n >= 8u) ? ((iin->claim_n + i) % 8u) : i;
         hype_debug_print("host-xhci: #764   claim[-%u] trb=+0x%llx cc=%u\n", n - i,
@@ -1121,6 +1149,7 @@ int hype_xhci_configure_int_in_endpoint(hype_xhci_ctrl_t *c, unsigned int slot,
     iin->have_completion = 0; iin->comp_cc = 0;
     iin->silent_polls = 0; iin->rearms = 0;
     iin->claim_n = 0; iin->diverged = 0; iin->reports = 0;
+    iin->deliv = 0; iin->from_park = 0; iin->own = 0; iin->to_park = 0; iin->handed = 0;
 
     zero(hw->input_ctx, XPAGE);
     hype_xhci_input_ctrl_ctx(ctx, HYPE_XHCI_ADD_SLOT | (1u << dci), 0);
@@ -1150,6 +1179,45 @@ int hype_xhci_configure_int_in_endpoint(hype_xhci_ctrl_t *c, unsigned int slot,
     dump_out_ctx(c, slot, dci, "int-in");
     if (path->tt_hub_slot) {
         dump_out_ctx(c, path->tt_hub_slot, 1u, "its-TT-hub");
+    }
+    /*
+     * #772: make the controller's dequeue pointer agree with the ring we just reset.
+     *
+     * Configure Endpoint takes the TR Dequeue Pointer from the input context, and hype had
+     * been trusting that. On a RE-configure -- a device re-claimed after a hot-plug, on a
+     * recycled slot id, reusing this same block and therefore the same ring addresses --
+     * the controller can be left pointing where it was, while hype resets its own cursor to
+     * index 0. Neither side is wrong on its own terms and neither can make progress: hype
+     * arms TRB 0, the controller waits at TRB 1 for a cycle bit that will never be set
+     * there, nothing completes, and no event is ever generated.
+     *
+     * That is not a lost completion. It is a completion that never happens, which is why
+     * every routing counter reads zero when it is caught:
+     *
+     *   #764 DIVERGED slot=3 ep=3 | controller deq=+0x10 hype trb=+0x0 enq=1 cyc=1 armed=1
+     *                             | reports=0 | deliv=0 from_park=0 own=0 to_park=0
+     *
+     * Reproduced in the #767 rig on a hot-plugged keyboard: enumerated, claimed, and deaf
+     * from its first poll.
+     *
+     * Read it back and force it if it differs. A Set TR Dequeue on an endpoint hype has
+     * just configured is cheap and happens once per claim.
+     */
+    {
+        uint64_t want = phys(iin->ring), have = 0;
+        if (int_in_ctx_dequeue(c, slot, dci, &have) == 0 && have != want) {
+            hype_debug_print("host-xhci: #772 slot=%u ep=%u dequeue is 0x%llx after Configure "
+                             "Endpoint, not the ring base 0x%llx -- forcing it, or this "
+                             "endpoint would never report\n", slot, dci,
+                             (unsigned long long)have, (unsigned long long)want);
+            hype_xhci_trb_set_tr_dequeue(cmd, want | 1u /* DCS=1 */, slot, dci, (int)hw->cmd_cyc);
+            if (cmd_submit_wait(c, cmd, evt) != 0 ||
+                hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS) {
+                hype_debug_print("host-xhci: #772 slot=%u ep=%u Set TR Dequeue FAILED -- the "
+                                 "endpoint is configured but will not report\n", slot, dci);
+                return -1;
+            }
+        }
     }
     return 0;
 }
@@ -1295,6 +1363,7 @@ int hype_xhci_configure_hub_int_in(hype_xhci_ctrl_t *c, unsigned int slot,
     iin->have_completion = 0; iin->comp_cc = 0;
     iin->silent_polls = 0; iin->rearms = 0;
     iin->claim_n = 0; iin->diverged = 0; iin->reports = 0;
+    iin->deliv = 0; iin->from_park = 0; iin->own = 0; iin->to_park = 0; iin->handed = 0;
 
     zero(hw->input_ctx, XPAGE);
     hype_xhci_input_ctrl_ctx(ctx, HYPE_XHCI_ADD_SLOT | (1u << dci), 0);
@@ -1822,6 +1891,7 @@ static int int_in_poll_body(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int
         }
         iin->recoveries = 0;
         iin->backoff = 0;
+        iin->deliv++;
         int_in_note_claim(iin, my_trb, cc);
         for (i = 0; i < len; i++) out[i] = iin->report[i];
         return 1;
@@ -1843,6 +1913,7 @@ static int int_in_poll_body(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int
             }
             iin->recoveries = 0;
             iin->backoff = 0;
+            iin->from_park++;
             int_in_note_claim(iin, my_trb, parked_cc);
             for (i = 0; i < len; i++) out[i] = iin->report[i];
             return 1;
@@ -1896,6 +1967,7 @@ static int int_in_poll_body(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int
     iin->backoff = 0;
     /* #764 capture: the event carries the TRB it completed, so record THAT rather than what
      * hype thought was outstanding -- a claim from a TRB never armed is the thing to see. */
+    iin->own++;
     int_in_note_claim(iin, hype_xhci_event_trb_ptr(evt), hype_xhci_event_cc(evt));
     for (i = 0; i < len; i++) out[i] = iin->report[i];
     return 1;
