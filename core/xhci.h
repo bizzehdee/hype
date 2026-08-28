@@ -565,6 +565,12 @@ void hype_xhci_hub_ignore_port(hype_xhci_ctrl_t *c, unsigned int hub_slot, unsig
 
 unsigned int hype_xhci_pump_events(hype_xhci_ctrl_t *c, unsigned int budget);
 
+/* #775: how many times this interrupt-IN endpoint has been armed. With the report count
+ * beside it, "armed once and never answered" is distinguishable from "armed repeatedly and
+ * answering", which no other pair of numbers says. */
+unsigned long long hype_xhci_int_in_arms(hype_xhci_ctrl_t *c, unsigned int slot,
+                                         unsigned int ep_addr);
+
 unsigned int hype_xhci_discard_port_changes(hype_xhci_ctrl_t *c);
 
 /* #744: how many Port Status Change Events this controller has produced, ever. */

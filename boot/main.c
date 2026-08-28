@@ -16444,10 +16444,11 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     unsigned int kq;
                     for (kq = 0; kq < g_hid_count && kq < HYPE_HOST_KBD_MAX; kq++) {
                         const hype_host_kbd_t *kb = &g_hid[kq];
-                        hype_debug_print("fw-1 DIAG: HID[%u/%u] %04x:%04x polls=%llu reports=%llu "
+                        hype_debug_print("fw-1 DIAG: HID[%u/%u] %04x:%04x polls=%llu reports=%llu arms=%llu "
                                          "errors=%llu (slot%u ep=0x%02x) [#217 #742]\n",
                                          kq, g_hid_count, (unsigned)kb->vid, (unsigned)kb->pid,
-                                         kb->polls, kb->reports, kb->errs, kb->slot, kb->ep);
+                                         kb->polls, kb->reports,
+                                         hype_xhci_int_in_arms(&kb->xc, kb->slot, kb->ep), kb->errs, kb->slot, kb->ep);
                         /* #734: name the modifier bits seen, and say outright whether the two
                          * the chord needs have ever arrived. Per keyboard, because whether a
                          * board's right-hand Alt reports as usage 0xE6 is a property of that
