@@ -57,7 +57,7 @@ boot = installer
 install_media = \iso\test.iso
 firmware = uefi
 os_hint = linux
-target_disk = file:\hype\disks\run735.img
+target_disk = file:\hype\disks\run747.img
 CFG
 
 dd if=/dev/zero of=$S/esp.img bs=1M count=512 status=none
@@ -72,7 +72,11 @@ mcopy -i "$E" $B/hype.efi ::/EFI/BOOT/BOOTX64.EFI
 mcopy -i "$E" fw/OVMF_CODE.fd fw/OVMF_VARS.fd ::/EFI/hype/
 mcopy -i "$E" "$ISO" ::/iso/test.iso
 mcopy -i "$E" $S/hype.cfg ::/hype.cfg
-mcopy -i "$E" tools/hw-val-2026-08-25/input-1a/vm0.txt ::/input/vm0.txt
+# #747 needs the guest WRITING at the moment of the unplug, not sitting at a login prompt.
+mcopy -i "$E" tools/747/input-write/vm0.txt ::/input/vm0.txt
+# The guest's disk, on the ESP -- which under MEDIA=usb is the device that gets pulled.
+dd if=/dev/zero of=$S/run747.img bs=1M count=32 status=none
+mcopy -i "$E" $S/run747.img ::/hype/disks/run747.img
 
 if [ "$MEDIA" = usb ]; then
   ESPDEV=(-drive format=raw,file=$S/esp.img,if=none,id=esp
@@ -88,11 +92,17 @@ cp "$VARS" $S/VARS.fd
   # its ISO -- so the unplug lands on live I/O rather than on an idle device.
   for _ in $(seq 1 "$SECS"); do
     sleep 1
-    grep -aq "usb-log:.*opened\|localhost login:\|CPUS-BEFORE-" $S/serial.txt 2>/dev/null && break
+    grep -aq "WRITING-NOW" $S/serial.txt 2>/dev/null && break
   done
-  sleep 5
+  # Long enough that dd is past its first requests and there is genuinely I/O in flight,
+  # short enough that the 32 MiB disk has not been written end to end.
+  sleep 8
   printf 'device_del espdev\n'
-  sleep 45
+  sleep 40
+  # #747 clause 4: re-plug, the SAME backing file. If anything resumed it would resume onto
+  # the half-written chain, which is exactly what this clause exists to catch.
+  printf 'device_add usb-storage,bus=xhci.0,drive=esp,id=espdev,serial=HYPE747ESP\n'
+  sleep 30
   printf 'quit\n'
 ) | timeout "$SECS" "$QEMU" \
   -machine q35 -m 4096 -nodefaults \
@@ -148,4 +158,99 @@ fi
 # 4. and it must not keep hammering a device that is gone.
 STUCK=$(grep -a -c "usb-log: BEHIND" $S/serial.txt)
 echo "usb-log BEHIND lines: $STUCK"
+
+# 5. the I/O must be REFUSED, not merely un-attempted. This is the clause the rig could not
+#    test before it drove a write: an idle device that departs logs identically to a busy
+#    one, so detection was all that was ever being proved.
+# 5a. FIRST: was the guest genuinely writing? Everything below is meaningless otherwise,
+#     and an earlier version of this rig reported a healthy refusal count from hype's own
+#     log writes while the guest's dd had been failing silently into /dev/null the whole
+#     run. Prove the write before trusting the refusal.
+echo "=== was the guest actually writing when it was pulled? ==="
+grep -a "DISK-IS-\|WROTE-" $S/serial.txt | tail -2
+WROTE=$(grep -a "WROTE-" $S/serial.txt | grep -oE 'WROTE-[0-9]+' | cut -d- -f2 | sort -n | tail -1)
+if [ -z "${WROTE:-}" ]; then
+  echo "FAIL: the guest never reported a write count -- the write loop did not start [#747]"
+  rc=1
+elif [ "$WROTE" -gt 0 ]; then
+  echo "PASS: the guest had written $WROTE sectors before the pull [#747]"
+else
+  echo "FAIL: the guest wrote 0 sectors -- the pull landed on an IDLE device, so this run"
+  echo "      proves detection only, which is what the rig already did [#747]"
+  rc=1
+fi
+
+echo "=== was live I/O actually refused? ==="
+grep -a "DIAG: GONE" $S/serial.txt | tail -3
+REFUSED=$(grep -a "DIAG: GONE" $S/serial.txt | grep -oE 'refused=[0-9]+' | cut -d= -f2 | sort -n | tail -1)
+if [ -z "$REFUSED" ]; then
+  echo "FAIL: no GONE diagnostic at all -- nothing recorded the departed state [#747]"; rc=1
+elif [ "$REFUSED" -gt 0 ]; then
+  echo "PASS: $REFUSED requests refused with a named error, not timed out [#747]"
+else
+  echo "FAIL: the device is marked departed but refused=0 -- the guest was not writing, so"
+  echo "      the refusal path was never exercised and this run proves only detection [#747]"
+  rc=1
+fi
+
+# 6. the guest must be TOLD, not left hanging. The heartbeat is what makes this decidable:
+#    it does not touch the disk, so if it keeps ticking the kernel is alive, and if it stops
+#    the guest is blocked on a request that will never complete -- the failure the ticket
+#    names. Counting console lines cannot separate those, and an earlier version of this rig
+#    recorded "no guest-side I/O error" without being able to say which had happened.
+echo "=== was the guest told, or left hanging? ==="
+DEPLINE=$(grep -a -n "DEPARTED" $S/serial.txt | head -1 | cut -d: -f1)
+HB_AFTER=$(tail -n +"${DEPLINE:-1}" $S/serial.txt | grep -a -c "GHB-")
+echo "guest heartbeats after the departure: $HB_AFTER"
+if [ "${HB_AFTER:-0}" -lt 2 ]; then
+  echo "FAIL: the guest stopped ticking at the unplug -- blocked on I/O that will never"
+  echo "      complete, which is exactly what clause 6 forbids [#747]"
+  rc=1
+else
+  echo "PASS: the guest kept running after its disk vanished [#747]"
+fi
+if grep -aq "I/O error\|end_request\|Buffer I/O error\|blk_update_request\|dd: " $S/serial.txt; then
+  echo "PASS: and it was told -- a guest-visible error, not a silent stall [#747]"
+else
+  echo "FAIL: the guest kept running but was never told its write failed. A write that"
+  echo "      silently does nothing is the torn-write case this ticket exists for [#747]"
+  rc=1
+fi
+
+# 7. a re-plug must NOT silently resume. The sticky flag is the whole design: a half-written
+#    chain is not made good by the device coming back.
+echo "=== did anything resume on the re-plug? ==="
+RELINE=$(grep -a -n "device_add\|ARRIVED" $S/serial.txt | tail -1 | cut -d: -f1)
+if grep -aq "usb-log:.*opened" <(tail -n +"${RELINE:-1}" $S/serial.txt) 2>/dev/null; then
+  echo "FAIL: the log sink re-opened by itself after the re-plug -- departed must be sticky"
+  echo "      until an explicit attach [#747]"
+  rc=1
+else
+  echo "PASS: nothing resumed on its own; re-attach stays an operator action [#747]"
+fi
+LASTGONE=$(grep -a "DIAG: GONE" $S/serial.txt | tail -1)
+if [ -n "$LASTGONE" ]; then
+  echo "PASS: still reporting GONE after the re-plug: $LASTGONE"
+fi
+
+# 8. and the medium must not have been left corrupt. #596 is the precedent: a broken cluster
+#    chain that a resume would extend. fsck reads the image the guest and hype were both
+#    writing when it was pulled.
+echo "=== filesystem integrity of the pulled medium ==="
+if command -v fsck.vfat >/dev/null 2>&1; then
+  # fsck.vfat has no offset option -- @@1M is mtools syntax, and passing it just gets
+  # "open: No such file or directory". Cut the partition out instead; 2048 sectors in,
+  # matching the sfdisk layout above.
+  dd if=$S/esp.img of=$S/esp-part.img bs=512 skip=2048 status=none
+  # -n = read-only check. Non-zero means dirty or inconsistent.
+  if fsck.vfat -n "$S/esp-part.img" >$S/fsck.txt 2>&1; then
+    echo "PASS: the ESP FAT is consistent after the pull [#747 #596]"
+  else
+    echo "FAIL: the ESP FAT is inconsistent after the pull -- a torn write survived [#747]"
+    sed -n '1,12p' $S/fsck.txt
+    rc=1
+  fi
+else
+  echo "SKIP: fsck.vfat not installed -- integrity unverified"
+fi
 exit "$rc"

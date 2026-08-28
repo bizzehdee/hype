@@ -1,0 +1,55 @@
+# #747: the guest's only job is to be WRITING when the device is pulled.
+#
+# Clause 2 of the ticket's definition of done is "start a sustained write, pull the
+# device". Without this the rig unplugs an idle stick, and an idle stick produces exactly
+# the same departure message as a busy one -- so detection was all that earlier runs ever
+# proved.
+#
+# The disk is `target_disk = file:\hype\disks\run747.img`, a file on the ESP, and under
+# MEDIA=usb the ESP *is* the device being unplugged. So a write loop to the guest's own
+# disk is a sustained write to the departing medium, through the whole stack the ticket
+# names: guest front-end -> blk_backend -> blk_phys -> USB MSC.
+
+timeout 900000
+fail-if soft lockup
+
+expect localhost login:
+send root\n
+expect ~#
+
+# Find the disk rather than assuming its name. This config's front-end is AHCI, so it is
+# /dev/sda, not /dev/vda -- an earlier version of this script wrote to /dev/vda with
+# stderr discarded, so dd failed silently, nothing was ever written, and the run still
+# reported a refusal count from hype's own log writes. Print what was chosen.
+send D=$(ls /dev/vda /dev/sda /dev/nvme0n1 2>/dev/null | head -1); echo DISK-IS-$D\n
+expect DISK-IS-/dev
+
+# A heartbeat that does NOT touch the disk, started BEFORE the write loop. This is what
+# distinguishes the two ways the guest can go quiet after the pull:
+#   ticks continue  -> the kernel is alive; a silent dd means its errors went somewhere
+#                      unread, and the front-end did report the failure
+#   ticks STOP      -> the guest is blocked on a request that will never complete, which
+#                      is the exact failure clause 6 of the ticket names
+# setsid so it outlives the shell's process group, and /dev/ttyS0 directly so it does not
+# depend on the shell being schedulable.
+send setsid sh -c 'while :; do echo GHB-$(cut -d. -f1 /proc/uptime) > /dev/ttyS0; sleep 2; done' &\n
+send echo HEARTBEAT-STARTED\n
+expect HEARTBEAT-STARTED
+
+# oflag=direct so the writes reach the device rather than the guest's page cache. A cached
+# write would complete long before the unplug and test nothing.
+#
+# dd's stderr goes to the CONSOLE, not to a file. An earlier version sent it to /tmp/e,
+# which meant the one message proving the guest had been told about the failure was
+# written to the disk that had just disappeared.
+send (while :; do dd if=/dev/zero of=$D bs=64k count=256 oflag=direct; done) &\n
+send sleep 2; echo WROTE-$(cat /sys/block/$(basename $D)/stat | awk '{print $5}')\n
+expect WROTE-
+
+send echo WRITING-NOW\n
+expect WRITING-NOW
+
+# Held here while the rig does the unplug. The guest is expected to start erroring: that is
+# the point -- "a guest whose physical disk departs is told, rather than being left to hang
+# on a request that will never complete".
+expect THIS-MARKER-NEVER-ARRIVES

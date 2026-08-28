@@ -2365,6 +2365,10 @@ static int g_phys_usb_tgt; /* set to -1 in fw_1_arm_physical_targets */
 #define HYPE_MEDIA_USBX 3u
 static hype_blk_usb_t g_musbx_hw[HYPE_MEDIA_USBX];
 static hype_blk_phys_t g_musbx_phys[HYPE_MEDIA_USBX];
+/* #747: hype's own boot/log medium. Defined with the USB departure path far below, where
+ * everything else that touches it lives; forward-declared here only so the periodic DIAG
+ * can report its departed state without moving the whole USB block above the dispatch loop. */
+static hype_blk_phys_t g_usb_uphys;
 static hype_blk_backend_t g_musbx_be[HYPE_MEDIA_USBX];
 static hype_xhci_ctrl_t g_musbx_xc[HYPE_MEDIA_USBX];
 static hype_xhci_msc_eps_t g_musbx_eps[HYPE_MEDIA_USBX];
@@ -16378,6 +16382,33 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                          "-- hype polls at most %u [#742]\n",
                                          g_hid_skipped, (unsigned)HYPE_HOST_KBD_MAX);
                     }
+                    /*
+                     * #747: departed storage, and how much I/O has actually been refused.
+                     *
+                     * Through hype_serial_print, NOT hype_debug_print: the commonest reason
+                     * this line exists at all is that the log sink is the thing that died,
+                     * and reporting a dead sink through the dead sink says nothing.
+                     *
+                     * The COUNT is the point. A departure message alone cannot distinguish
+                     * "every subsequent write was refused with a named error" from "nothing
+                     * tried to write after the unplug" -- a device that leaves while idle
+                     * logs identically, and only one of those exercises the refusal path.
+                     */
+                    {
+                        unsigned int mk;
+                        if (hype_blk_phys_is_departed(&g_usb_uphys)) {
+                            hype_serial_print("fw-1 DIAG: GONE boot/log medium departed, "
+                                              "refused=%llu requests [#747]\n",
+                                              hype_blk_phys_gone_refused(&g_usb_uphys));
+                        }
+                        for (mk = 0; mk < HYPE_MEDIA_USBX; mk++) {
+                            if (hype_blk_phys_is_departed(&g_musbx_phys[mk])) {
+                                hype_serial_print("fw-1 DIAG: GONE media device %u departed, "
+                                                  "refused=%llu requests [#747]\n", mk,
+                                                  hype_blk_phys_gone_refused(&g_musbx_phys[mk]));
+                            }
+                        }
+                    }
                 }
                 /*
                  * #568: Print Screen / SysRq seen without both modifiers. Reported only when it
@@ -24926,7 +24957,7 @@ static int usb_mouse_drain(hype_ps2_mouse_t *dst) {
 }
 static hype_xhci_msc_eps_t g_usb_msc;
 static hype_blk_usb_t g_usb_ubk;
-static hype_blk_phys_t g_usb_uphys;
+/* g_usb_uphys is declared near g_musbx_phys, so the #747 DIAG above can see it. */
 static hype_blk_backend_t g_usb_ube;
 
 static int usblog_read(void *ctx, uint64_t lba, uint32_t count, void *dst) {

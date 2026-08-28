@@ -73,6 +73,13 @@ typedef struct {
      * extended rather than noticed. Clearing it is an explicit operator action (attach).
      */
     int departed;
+    /*
+     * #747: how many requests have been refused because of it. Distinguishes "the I/O was
+     * refused with a named error" from "no I/O was attempted", which the departure message
+     * alone cannot -- a device that leaves while nothing is writing produces the same log
+     * either way, and only one of those two tests the refusal path.
+     */
+    uint64_t gone_refused;
 } hype_blk_phys_t;
 
 /*
@@ -145,7 +152,6 @@ void hype_blk_phys_enable_writev(hype_blk_phys_t *p, hype_blk_backend_t *be,
                                  hype_blk_phys_writev_fn writev_sectors, uint32_t max_segs,
                                  uint32_t max_sectors);
 
-#endif /* HYPE_CORE_BLK_PHYS_H */
 
 /*
  * #747: the device behind this backend is gone. Every subsequent read, write and writev
@@ -158,3 +164,8 @@ void hype_blk_phys_mark_departed(hype_blk_phys_t *p);
 
 /* #747: has it? 0 when `p` is NULL, so a caller with no physical backend reads as present. */
 int hype_blk_phys_is_departed(const hype_blk_phys_t *p);
+
+/* #747: requests refused because the device departed. 0 when `p` is NULL. */
+uint64_t hype_blk_phys_gone_refused(const hype_blk_phys_t *p);
+
+#endif /* HYPE_CORE_BLK_PHYS_H */

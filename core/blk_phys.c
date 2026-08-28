@@ -16,6 +16,10 @@ int hype_blk_phys_is_departed(const hype_blk_phys_t *p) {
     return (p != (const hype_blk_phys_t *)0) && p->departed;
 }
 
+uint64_t hype_blk_phys_gone_refused(const hype_blk_phys_t *p) {
+    return (p != (const hype_blk_phys_t *)0) ? p->gone_refused : 0ull;
+}
+
 static int phys_read(void *ctx, uint64_t lba, uint32_t count, void *buf) {
     hype_blk_phys_t *p = (hype_blk_phys_t *)ctx;
     uint8_t *dst = (uint8_t *)buf;
@@ -24,6 +28,7 @@ static int phys_read(void *ctx, uint64_t lba, uint32_t count, void *buf) {
      * a slow read, it is a read that will never complete -- and the hw layer's own timeout
      * is measured in seconds, per request, from the guest dispatch loop. */
     if (p->departed) {
+        p->gone_refused++;
         return HYPE_BLK_ERR_GONE;
     }
     lba += p->base_lba;
@@ -44,6 +49,7 @@ static int phys_write(void *ctx, uint64_t lba, uint32_t count, const void *buf) 
     const uint8_t *src = (const uint8_t *)buf;
 
     if (p->departed) {
+        p->gone_refused++;
         return HYPE_BLK_ERR_GONE; /* #747 */
     }
     lba += p->base_lba;
@@ -76,6 +82,7 @@ static int phys_writev(void *ctx, uint64_t lba, const hype_blk_seg_t *segs, uint
     uint32_t i = 0;
 
     if (p->departed) {
+        p->gone_refused++;
         return HYPE_BLK_ERR_GONE; /* #747 */
     }
     lba += p->base_lba;
@@ -156,6 +163,7 @@ void hype_blk_phys_init_scoped(hype_blk_phys_t *p, hype_blk_backend_t *be,
      * silently refuse every I/O -- and #359 is the ticket for what a recycled slot inherits
      * when a field is left to whatever was there before. */
     p->departed = 0;
+    p->gone_refused = 0ull;
 
     be->read = phys_read;
     be->write = (write_sectors != (hype_blk_phys_write_fn)0) ? phys_write : (int (*)(void *, uint64_t, uint32_t, const void *))0;

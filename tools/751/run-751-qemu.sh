@@ -47,6 +47,12 @@ mkfs.vfat -F 32 -n HYPEESP --offset 2048 $S/esp.img >/dev/null
 mmd -i "$E" ::/EFI ::/EFI/BOOT ::/EFI/hype ::/EFI/hype/micro
 mcopy -i "$E" $B/hype.efi ::/EFI/BOOT/BOOTX64.EFI
 mcopy -i "$E" fw/OVMF_CODE.fd fw/OVMF_VARS.fd ::/EFI/hype/
+# `make test` removes build/micro, so a rig run straight after one dies with a bare
+# "build/micro/apunclaimed.bin: No such file or directory" -- which reads like a broken rig
+# rather than a missing build step. It has cost two false failures. Build it here
+# instead of depending on the caller's ordering.
+[ -f $B/micro/apunclaimed.bin ] || make micro >/dev/null 2>&1 || \
+  { echo "FAIL: could not build the microtests"; exit 1; }
 mcopy -i "$E" $B/micro/apunclaimed.bin ::/EFI/hype/micro/apunclaimed.bin
 mcopy -i "$E" $S/hype.cfg ::/hype.cfg
 
