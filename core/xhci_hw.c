@@ -578,6 +578,27 @@ static uint32_t get_le32(const uint8_t *p) {
  * TT and Interval fields survived Configure Endpoint. This prints that, once per
  * endpoint, so the two can be diffed inside one boot.
  */
+/*
+ * #755: the Context Entries the controller currently holds for this slot.
+ *
+ * Slot Context dword 0 bits 31:27, read from the OUTPUT context -- the controller's own
+ * view, which is the only authority on what is configured right now.
+ *
+ * Needed because Configure Endpoint REPLACES the Slot Context wholesale when A0 is set.
+ * Building one from the endpoint being added sets Context Entries to that endpoint's DCI,
+ * and since the field means "index of the last valid Endpoint Context", a second endpoint
+ * with a LOWER DCI silently invalidates the higher one that is already configured.
+ *
+ * Returns 0 when the slot has no device context, so a caller's max() falls through to its
+ * own DCI and behaves exactly as before.
+ */
+static unsigned int out_ctx_entries(hype_xhci_ctrl_t *c, unsigned int slot) {
+    xhci_hw_t *hw = HW(c);
+    int di = dev_index(hw, slot);
+    if (di < 0) return 0u;
+    return (get_le32(hw->dev_ctx[di] + 0u) >> 27) & 0x1Fu;
+}
+
 static void dump_out_ctx(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int dci,
                          const char *what) {
     xhci_hw_t *hw = HW(c);
@@ -919,8 +940,18 @@ int hype_xhci_configure_int_in_endpoint(hype_xhci_ctrl_t *c, unsigned int slot,
     zero(hw->input_ctx, XPAGE);
     hype_xhci_input_ctrl_ctx(ctx, HYPE_XHCI_ADD_SLOT | (1u << dci), 0);
     write_ctx(hw->input_ctx, 0, ctx);
-    hype_xhci_slot_ctx(ctx, path->route, path->speed, dci, path->root_port,
-                       path->tt_hub_slot, path->tt_port);
+    /*
+     * #755: never LOWER Context Entries. A composite device -- a wireless receiver
+     * presenting a keyboard interface and a mouse interface -- is claimed twice on one
+     * slot, and the second claim used to rebuild the Slot Context with its own DCI, so
+     * claiming ep 0x81 (DCI 3) after ep 0x82 (DCI 5) invalidated the endpoint just
+     * configured. Observed on hardware: entries=5 then entries=3 on slot 5.
+     */
+    {
+        unsigned int have = out_ctx_entries(c, slot);
+        hype_xhci_slot_ctx(ctx, path->route, path->speed, (have > dci) ? have : dci,
+                           path->root_port, path->tt_hub_slot, path->tt_port);
+    }
     write_ctx(hw->input_ctx, cs, ctx);
     /* #217: the Interval is what gives the controller a schedule to poll on. Without
      * it the endpoint configures cleanly and never reports. */
@@ -947,8 +978,13 @@ int hype_xhci_configure_int_in_endpoint(hype_xhci_ctrl_t *c, unsigned int slot,
  * addressed through the hub names it as its Transaction Translator by slot id while
  * that slot still says Hub=0, which is what the controller rejects.
  *
- * A0 only: no endpoint contexts are added or dropped, and Context Entries stays at 1
- * (EP0) because hype never configures a hub's own status-change endpoint.
+ * A0 only: no endpoint contexts are added or dropped.
+ *
+ * #755: Context Entries is carried over from the output context rather than forced to 1.
+ * It used to be hardcoded, with the comment "hype never configures a hub's own
+ * status-change endpoint" -- true when this was written, false since #746 armed exactly
+ * that endpoint. Forcing 1 after it is configured would invalidate it, and a hub whose
+ * status-change endpoint has quietly gone away is a hub that can no longer hot-plug.
  */
 int hype_xhci_configure_hub_slot(hype_xhci_ctrl_t *c, unsigned int slot,
                                  const hype_xhci_devpath_t *path, unsigned int nbr_ports,
@@ -962,8 +998,11 @@ int hype_xhci_configure_hub_slot(hype_xhci_ctrl_t *c, unsigned int slot,
     zero(hw->input_ctx, XPAGE);
     hype_xhci_input_ctrl_ctx(ctx, HYPE_XHCI_ADD_SLOT, 0);
     write_ctx(hw->input_ctx, 0, ctx);
-    hype_xhci_slot_ctx(ctx, path->route, path->speed, 1, path->root_port,
-                       path->tt_hub_slot, path->tt_port);
+    {
+        unsigned int have = out_ctx_entries(c, slot); /* #755: >=1, never lower */
+        hype_xhci_slot_ctx(ctx, path->route, path->speed, (have > 1u) ? have : 1u,
+                           path->root_port, path->tt_hub_slot, path->tt_port);
+    }
     hype_xhci_slot_ctx_set_hub(ctx, nbr_ports, ttt, 0u);
     write_ctx(hw->input_ctx, cs, ctx);
 
@@ -1054,8 +1093,12 @@ int hype_xhci_configure_hub_int_in(hype_xhci_ctrl_t *c, unsigned int slot,
     zero(hw->input_ctx, XPAGE);
     hype_xhci_input_ctrl_ctx(ctx, HYPE_XHCI_ADD_SLOT | (1u << dci), 0);
     write_ctx(hw->input_ctx, 0, ctx);
-    hype_xhci_slot_ctx(ctx, path->route, path->speed, dci, path->root_port,
-                       path->tt_hub_slot, path->tt_port);
+    /* #755: never lower Context Entries -- see out_ctx_entries(). */
+    {
+        unsigned int have = out_ctx_entries(c, slot);
+        hype_xhci_slot_ctx(ctx, path->route, path->speed, (have > dci) ? have : dci,
+                           path->root_port, path->tt_hub_slot, path->tt_port);
+    }
     /* THE POINT OF THIS FUNCTION: still a hub afterwards. */
     hype_xhci_slot_ctx_set_hub(ctx, nbr_ports, ttt, 0u);
     write_ctx(hw->input_ctx, cs, ctx);
@@ -2753,6 +2796,23 @@ unsigned int hype_xhci_take_port_change(hype_xhci_ctrl_t *c) {
         }
     }
     return 0;
+}
+
+unsigned int hype_xhci_discard_port_changes(hype_xhci_ctrl_t *c) {
+    xhci_hw_t *hw;
+    unsigned int n = 0u, p;
+
+    if (c == (hype_xhci_ctrl_t *)0 || !c->inited) {
+        return 0u;
+    }
+    hw = HW(c);
+    for (p = 1u; p <= 31u; p++) {
+        if (hw->port_changed & (1u << p)) {
+            n++;
+        }
+    }
+    hw->port_changed = 0u;
+    return n;
 }
 
 unsigned long long hype_xhci_port_event_count(const hype_xhci_ctrl_t *c) {

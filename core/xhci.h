@@ -514,6 +514,26 @@ int hype_xhci_disable_slot(hype_xhci_ctrl_t *c, unsigned int slot);
  */
 unsigned int hype_xhci_take_port_change(hype_xhci_ctrl_t *c);
 
+/*
+ * #757: drop every port-change bit banked so far, and report how many there were.
+ *
+ * The bitmap is filled by the single event-dequeue point, which also runs throughout
+ * ENUMERATION -- so by the time the dispatch loop takes its first hot-plug sweep, one bit
+ * is set for every port that changed while hype was bringing devices up. Nothing had
+ * cleared them.
+ *
+ * Re-processing those is not hot-plug detection. `hype_xhci_port_connected()` is evaluated
+ * when the bit is DRAINED, not when the event arrived, so a port hype already enumerated
+ * and settled is re-judged against a fresh PORTSC read seconds later. A port that reads
+ * back not-connected at that moment produces a DEPARTURE for a device that never left --
+ * which releases its slot, and for the boot medium marks the log sink gone STICKILY
+ * (#747), so the failure erases its own evidence.
+ *
+ * Call once, after enumeration and before the first sweep. Events raised after that are
+ * genuine hot-plug and must NOT be discarded.
+ */
+unsigned int hype_xhci_discard_port_changes(hype_xhci_ctrl_t *c);
+
 /* #744: how many Port Status Change Events this controller has produced, ever. */
 unsigned long long hype_xhci_port_event_count(const hype_xhci_ctrl_t *c);
 

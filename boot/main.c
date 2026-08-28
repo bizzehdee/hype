@@ -28674,6 +28674,20 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     hype_debug_set_gop_enabled(0);
     hype_debug_print("gop: BSP transferred exclusive framebuffer ownership to the view renderer "
                      "[#380]\n");
+    /*
+     * #756: from here to the dispatch loop, nothing drains the USB log.
+     *
+     * The streaming drain is owned by the BSP dispatch loop, so every line printed between
+     * the last pre-dispatch flush and that loop lives only in RAM. Boot 8 stopped somewhere
+     * in this window and the log ended mid-sentence at the media setup, with NO record of
+     * the GOP handoff, the dashboard, SMP, or the AP smoketests -- all of which had been
+     * printed. Four candidate failure points and no way to tell them apart cost a whole
+     * hardware boot, on a machine with no serial port where the log IS the evidence.
+     *
+     * One flush per step. Each costs a few ms once per boot, and it converts "it stopped
+     * somewhere in here" into a line number.
+     */
+    usb_log_flush();
 
     /* #379: the dashboard belongs to the BSP and must exist even when every
      * AP dispatch fails. Initializing it inside vm0's AP routine made the
@@ -28681,6 +28695,39 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     if (!g_dashboard_ready) {
         hype_vt_screen_init(&g_dashboard_term, g_gop_console.cols, g_gop_console.rows);
         g_dashboard_ready = 1;
+    }
+    hype_debug_print("fw-1 STEP: dashboard ready (%ux%u) [#756]\n",
+                     g_gop_console.cols, g_gop_console.rows);
+    usb_log_flush();
+
+    /*
+     * #757: throw away the port-change bits banked during enumeration, before the dispatch
+     * loop takes its first hot-plug sweep.
+     *
+     * Every Port Status Change Event seen since reset set a bit, including the ones hype
+     * itself caused while bringing devices up -- resets, a failed Address Device, a Disable
+     * Slot. Nothing cleared them. The sweep would then re-judge each of those ports against
+     * a PORTSC read taken seconds later and call any that read not-connected a DEPARTURE,
+     * for a device that never left.
+     *
+     * That is not a cosmetic misreport. A departure releases the device's slot, and for the
+     * boot medium it marks the log sink gone -- STICKY by design (#747), because a
+     * half-written chain is not made good by a re-plug. So the failure would silence the
+     * one channel that could have reported it, and survive the operator re-plugging
+     * everything.
+     *
+     * Deliberately once, and here: anything that changes AFTER this point is genuine
+     * hot-plug and must still be seen.
+     */
+    {
+        unsigned int ci, dropped = 0u;
+        for (ci = 0; ci < g_live_xc_count && ci < HYPE_LIVE_XHCI_MAX; ci++) {
+            dropped += hype_xhci_discard_port_changes(&g_live_xc[ci]);
+        }
+        hype_debug_print("fw-1 STEP: dropped %u port-change bit(s) banked during enumeration "
+                         "across %u controller(s) -- hot-plug starts from here [#757]\n",
+                         dropped, g_live_xc_count);
+        usb_log_flush();
     }
 
 #if HYPE_AP_SMOKETEST
@@ -28713,7 +28760,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
              * core starts -- on this core, which is the only one that can read the
              * keyboard right now. */
             fw_1_await_phys_confirm_on_bsp();
+            hype_debug_print("fw-1 STEP: phys-confirm gate passed [#756]\n");
+            usb_log_flush();
             usb_log_latch_bsp_core();
+            hype_debug_print("fw-1 STEP: USB log owner latched to the BSP [#756]\n");
+            usb_log_flush();
             /*
              * #414: start one AP per configured VM (vi = 0..g_vm_count-1), each
              * running fw_1_ap_main(vi) -> run_fw_1_test(&g_vms[vi]) on its own
@@ -28841,6 +28892,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                 (rc == 0) ? "yes" : "NO", (unsigned int)g_hype_ap_last_phase,
                                 (unsigned int)g_hype_ap_c_alive,
                                 (unsigned int)g_fw_1_ap_vmm_ok);
+                            /* #756: per AP, so a stall during bring-up names the vCPU it
+                             * stalled on instead of losing every smoketest line at once. */
+                            usb_log_flush();
                             if (rc != 0) {
                                 HYPE_LOGF(HYPE_LOG_ERROR, 
                                     "fw-1 AP[vm%u vCPU %u]: START FAILED (rc=%d) -- not reusing "

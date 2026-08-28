@@ -1,0 +1,674 @@
+[0000000000] hype: build 4446ca9-dirty
+[0000000026] hype: version 2026.8.28-alpha (#4446ca9-dirty)
+[0000000073] hype: CR4.SMEP enabled on the BSP [#604]
+[0000000114] hype: EFER.NXE enabled on the BSP [#604]
+[0000000155] hype: own image base=0x140000000 size=0x1cc4000 [#604]
+[0000000210] rtc: host clock 2026-08-28 08:58:56
+[0000000246] memory map: 348 entries
+[0000000270]   [0] Conventional phys=0x0 pages=159
+[0000000308]   [1] BootServicesData phys=0x9f000 pages=1
+[0000000352]   [2] Conventional phys=0x100000 pages=3840
+[0000000396]   [3] BootServicesData phys=0x1000000 pages=128
+[0000000444]   [4] Conventional phys=0x1080000 pages=36226
+[0000000490]   [5] Reserved phys=0x9e02000 pages=510
+[0000000530]   [6] Conventional phys=0xa000000 pages=512
+[0000000574]   [7] ACPIMemoryNVS phys=0xa200000 pages=14
+[0000000618]   [8] Conventional phys=0xa20e000 pages=3570
+[0000000663]   [9] Reserved phys=0xb000000 pages=32
+[0000000702]   [10] Conventional phys=0xb020000 pages=20448
+[0000000749]   [11] BootServicesCode phys=0x10000000 pages=11
+[0000000798]   [12] Conventional phys=0x1000b000 pages=800210
+[0000000847]   [13] BootServicesData phys=0xd35dd000 pages=879
+[0000000897]   [14] Conventional phys=0xd394c000 pages=12
+[0000000942]   [15] BootServicesData phys=0xd3958000 pages=19
+[0000000991]   [16] Conventional phys=0xd396b000 pages=7
+[0000001035]   [17] LoaderData phys=0xd3972000 pages=5
+[0000001077]   [18] BootServicesData phys=0xd3977000 pages=7
+[0000001125]   [19] LoaderData phys=0xd397e000 pages=1
+[0000001167]   [20] BootServicesData phys=0xd397f000 pages=492
+[0000001217]   [21] Conventional phys=0xd3b6b000 pages=1
+[0000001261]   [22] BootServicesData phys=0xd3b6c000 pages=11931
+[0000001313]   [23] LoaderData phys=0xd6a07000 pages=5
+[0000001355]   [24] BootServicesData phys=0xd6a0c000 pages=19
+[0000001404]   [25] LoaderData phys=0xd6a1f000 pages=7
+[0000001446]   [26] BootServicesData phys=0xd6a26000 pages=98
+[0000001495]   [27] BootServicesCode phys=0xd6a88000 pages=78
+[0000001544]   [28] LoaderData phys=0xd6ad6000 pages=3
+[0000001586]   [29] BootServicesData phys=0xd6ad9000 pages=12
+[0000001635]   [30] BootServicesCode phys=0xd6ae5000 pages=7
+[0000001683]   [31] BootServicesData phys=0xd6aec000 pages=214
+[0000001733]   [32] BootServicesCode phys=0xd6bc2000 pages=335
+[0000001783]   [33] BootServicesData phys=0xd6d11000 pages=3
+[0000001831]   [34] BootServicesCode phys=0xd6d14000 pages=5
+[0000001879]   [35] BootServicesData phys=0xd6d19000 pages=93
+[0000001928]   [36] Conventional phys=0xd6d76000 pages=1
+[0000001972]   [37] BootServicesData phys=0xd6d77000 pages=156
+[0000002022]   [38] BootServicesCode phys=0xd6e13000 pages=7
+[0000002070]   [39] BootServicesData phys=0xd6e1a000 pages=10
+[0000002119]   [40] BootServicesCode phys=0xd6e24000 pages=7
+[0000002167]   [41] BootServicesData phys=0xd6e2b000 pages=4
+[0000002215]   [42] BootServicesCode phys=0xd6e2f000 pages=1
+[0000002263]   [43] BootServicesData phys=0xd6e30000 pages=1
+[0000002311]   [44] BootServicesCode phys=0xd6e31000 pages=2
+[0000002359]   [45] BootServicesData phys=0xd6e33000 pages=3
+[0000002407]   [46] BootServicesCode phys=0xd6e36000 pages=1
+[0000002455]   [47] BootServicesData phys=0xd6e37000 pages=41
+[0000002504]   [48] BootServicesCode phys=0xd6e60000 pages=15
+[0000002553]   [49] BootServicesData phys=0xd6e6f000 pages=8
+[0000002601]   [50] BootServicesCode phys=0xd6e77000 pages=1
+[0000002649]   [51] BootServicesData phys=0xd6e78000 pages=3011
+[0000002700]   [52] BootServicesCode phys=0xd7a3b000 pages=2164
+[0000002751]   [53] BootServicesData phys=0xd82af000 pages=478
+[0000002801]   [54] BootServicesCode phys=0xd848d000 pages=14
+[0000002850]   [55] BootServicesData phys=0xd849b000 pages=134
+[0000002900]   [56] BootServicesCode phys=0xd8521000 pages=43
+[0000002949]   [57] BootServicesData phys=0xd854c000 pages=43
+[0000002998]   [58] BootServicesCode phys=0xd8577000 pages=33
+[0000003047]   [59] BootServicesData phys=0xd8598000 pages=9
+[0000003095]   [60] BootServicesCode phys=0xd85a1000 pages=87
+[0000003144]   [61] BootServicesData phys=0xd85f8000 pages=1
+[0000003192]   [62] BootServicesCode phys=0xd85f9000 pages=8
+[0000003240]   [63] BootServicesData phys=0xd8601000 pages=8
+[0000003288]   [64] BootServicesCode phys=0xd8609000 pages=13
+[0000003337]   [65] BootServicesData phys=0xd8616000 pages=1197
+[0000003388]   [66] BootServicesCode phys=0xd8ac3000 pages=6
+[0000003436]   [67] BootServicesData phys=0xd8ac9000 pages=6
+[0000003484]   [68] BootServicesCode phys=0xd8acf000 pages=14
+[0000003533]   [69] BootServicesData phys=0xd8add000 pages=21
+[0000003582]   [70] BootServicesCode phys=0xd8af2000 pages=4
+[0000003630]   [71] BootServicesData phys=0xd8af6000 pages=45
+[0000003679]   [72] BootServicesCode phys=0xd8b23000 pages=10
+[0000003728]   [73] BootServicesData phys=0xd8b2d000 pages=10
+[0000003777]   [74] BootServicesCode phys=0xd8b37000 pages=15
+[0000003826]   [75] BootServicesData phys=0xd8b46000 pages=5
+[0000003874]   [76] BootServicesCode phys=0xd8b4b000 pages=37
+[0000003923]   [77] BootServicesData phys=0xd8b70000 pages=2
+[0000003971]   [78] BootServicesCode phys=0xd8b72000 pages=4
+[0000004019]   [79] BootServicesData phys=0xd8b76000 pages=2
+[0000004067]   [80] BootServicesCode phys=0xd8b78000 pages=20
+[0000004116]   [81] BootServicesData phys=0xd8b8c000 pages=18
+[0000004165]   [82] BootServicesCode phys=0xd8b9e000 pages=1
+[0000004213]   [83] BootServicesData phys=0xd8b9f000 pages=2
+[0000004261]   [84] BootServicesCode phys=0xd8ba1000 pages=3
+[0000004309]   [85] BootServicesData phys=0xd8ba4000 pages=2
+[0000004357]   [86] BootServicesCode phys=0xd8ba6000 pages=13
+[0000004406]   [87] BootServicesData phys=0xd8bb3000 pages=2
+[0000004454]   [88] BootServicesCode phys=0xd8bb5000 pages=2
+[0000004502]   [89] BootServicesData phys=0xd8bb7000 pages=2
+[0000004550]   [90] BootServicesCode phys=0xd8bb9000 pages=9
+[0000004598]   [91] BootServicesData phys=0xd8bc2000 pages=18
+[0000004647]   [92] BootServicesCode phys=0xd8bd4000 pages=18
+[0000004696]   [93] BootServicesData phys=0xd8be6000 pages=3
+[0000004744]   [94] BootServicesCode phys=0xd8be9000 pages=9
+[0000004792]   [95] BootServicesData phys=0xd8bf2000 pages=2
+[0000004840]   [96] BootServicesCode phys=0xd8bf4000 pages=21
+[0000004889]   [97] BootServicesData phys=0xd8c09000 pages=1
+[0000004937]   [98] BootServicesCode phys=0xd8c0a000 pages=7
+[0000004985]   [99] BootServicesData phys=0xd8c11000 pages=1
+[0000005033]   [100] BootServicesCode phys=0xd8c12000 pages=2
+[0000005082]   [101] BootServicesData phys=0xd8c14000 pages=4
+[0000005131]   [102] BootServicesCode phys=0xd8c18000 pages=40
+[0000005181]   [103] BootServicesData phys=0xd8c40000 pages=9
+[0000005230]   [104] BootServicesCode phys=0xd8c49000 pages=20
+[0000005280]   [105] BootServicesData phys=0xd8c5d000 pages=9
+[0000005329]   [106] BootServicesCode phys=0xd8c66000 pages=27
+[0000005379]   [107] BootServicesData phys=0xd8c81000 pages=110
+[0000005430]   [108] BootServicesCode phys=0xd8cef000 pages=2
+[0000005479]   [109] BootServicesData phys=0xd8cf1000 pages=438
+[0000005530]   [110] BootServicesCode phys=0xd8ea7000 pages=8
+[0000005579]   [111] BootServicesData phys=0xd8eaf000 pages=8
+[0000005628]   [112] BootServicesCode phys=0xd8eb7000 pages=5
+[0000005677]   [113] BootServicesData phys=0xd8ebc000 pages=5
+[0000005726]   [114] BootServicesCode phys=0xd8ec1000 pages=25
+[0000005776]   [115] BootServicesData phys=0xd8eda000 pages=1
+[0000005825]   [116] BootServicesCode phys=0xd8edb000 pages=2
+[0000005874]   [117] BootServicesData phys=0xd8edd000 pages=2
+[0000005923]   [118] BootServicesCode phys=0xd8edf000 pages=18
+[0000005973]   [119] BootServicesData phys=0xd8ef1000 pages=1
+[0000006022]   [120] BootServicesCode phys=0xd8ef2000 pages=1
+[0000006071]   [121] BootServicesData phys=0xd8ef3000 pages=2
+[0000006120]   [122] BootServicesCode phys=0xd8ef5000 pages=1
+[0000006169]   [123] BootServicesData phys=0xd8ef6000 pages=1
+[0000006218]   [124] BootServicesCode phys=0xd8ef7000 pages=1
+[0000006267]   [125] BootServicesData phys=0xd8ef8000 pages=1
+[0000006316]   [126] BootServicesCode phys=0xd8ef9000 pages=3
+[0000006365]   [127] BootServicesData phys=0xd8efc000 pages=773
+[0000006416]   [128] BootServicesCode phys=0xd9201000 pages=21
+[0000006466]   [129] BootServicesData phys=0xd9216000 pages=5
+[0000006515]   [130] BootServicesCode phys=0xd921b000 pages=2
+[0000006564]   [131] BootServicesData phys=0xd921d000 pages=3
+[0000006613]   [132] BootServicesCode phys=0xd9220000 pages=15
+[0000006663]   [133] BootServicesData phys=0xd922f000 pages=4
+[0000006712]   [134] BootServicesCode phys=0xd9233000 pages=4
+[0000006761]   [135] BootServicesData phys=0xd9237000 pages=32
+[0000006811]   [136] BootServicesCode phys=0xd9257000 pages=17
+[0000006861]   [137] BootServicesData phys=0xd9268000 pages=1
+[0000006910]   [138] BootServicesCode phys=0xd9269000 pages=2
+[0000006959]   [139] BootServicesData phys=0xd926b000 pages=3
+[0000007008]   [140] BootServicesCode phys=0xd926e000 pages=7
+[0000007057]   [141] BootServicesData phys=0xd9275000 pages=3
+[0000007106]   [142] BootServicesCode phys=0xd9278000 pages=22
+[0000007156]   [143] BootServicesData phys=0xd928e000 pages=2
+[0000007205]   [144] BootServicesCode phys=0xd9290000 pages=7
+[0000007254]   [145] BootServicesData phys=0xd9297000 pages=1
+[0000007303]   [146] BootServicesCode phys=0xd9298000 pages=1
+[0000007352]   [147] BootServicesData phys=0xd9299000 pages=10
+[0000007402]   [148] BootServicesCode phys=0xd92a3000 pages=11
+[0000007452]   [149] BootServicesData phys=0xd92ae000 pages=9
+[0000007501]   [150] BootServicesCode phys=0xd92b7000 pages=1
+[0000007550]   [151] BootServicesData phys=0xd92b8000 pages=1
+[0000007599]   [152] BootServicesCode phys=0xd92b9000 pages=308
+[0000007650]   [153] BootServicesData phys=0xd93ed000 pages=1
+[0000007699]   [154] BootServicesCode phys=0xd93ee000 pages=1
+[0000007748]   [155] BootServicesData phys=0xd93ef000 pages=6
+[0000007797]   [156] BootServicesCode phys=0xd93f5000 pages=10
+[0000007847]   [157] BootServicesData phys=0xd93ff000 pages=4
+[0000007896]   [158] BootServicesCode phys=0xd9403000 pages=17
+[0000007946]   [159] BootServicesData phys=0xd9414000 pages=64
+[0000007996]   [160] BootServicesCode phys=0xd9454000 pages=15
+[0000008046]   [161] BootServicesData phys=0xd9463000 pages=8
+[0000008095]   [162] BootServicesCode phys=0xd946b000 pages=2
+[0000008144]   [163] BootServicesData phys=0xd946d000 pages=3
+[0000008193]   [164] BootServicesCode phys=0xd9470000 pages=12
+[0000008243]   [165] BootServicesData phys=0xd947c000 pages=4
+[0000008292]   [166] BootServicesCode phys=0xd9480000 pages=7
+[0000008341]   [167] BootServicesData phys=0xd9487000 pages=1
+[0000008390]   [168] BootServicesCode phys=0xd9488000 pages=11
+[0000008440]   [169] BootServicesData phys=0xd9493000 pages=11
+[0000008490]   [170] BootServicesCode phys=0xd949e000 pages=94
+[0000008540]   [171] BootServicesData phys=0xd94fc000 pages=12
+[0000008590]   [172] BootServicesCode phys=0xd9508000 pages=1
+[0000008639]   [173] BootServicesData phys=0xd9509000 pages=1
+[0000008688]   [174] BootServicesCode phys=0xd950a000 pages=3
+[0000008737]   [175] BootServicesData phys=0xd950d000 pages=1
+[0000008786]   [176] BootServicesCode phys=0xd950e000 pages=2
+[0000008835]   [177] BootServicesData phys=0xd9510000 pages=2
+[0000008884]   [178] BootServicesCode phys=0xd9512000 pages=4
+[0000008933]   [179] BootServicesData phys=0xd9516000 pages=1
+[0000008982]   [180] BootServicesCode phys=0xd9517000 pages=1
+[0000009031]   [181] BootServicesData phys=0xd9518000 pages=1
+[0000009080]   [182] BootServicesCode phys=0xd9519000 pages=3
+[0000009129]   [183] BootServicesData phys=0xd951c000 pages=2
+[0000009178]   [184] BootServicesCode phys=0xd951e000 pages=1
+[0000009227]   [185] BootServicesData phys=0xd951f000 pages=1
+[0000009276]   [186] BootServicesCode phys=0xd9520000 pages=30
+[0000009326]   [187] BootServicesData phys=0xd953e000 pages=1
+[0000009375]   [188] BootServicesCode phys=0xd953f000 pages=21
+[0000009425]   [189] BootServicesData phys=0xd9554000 pages=4
+[0000009474]   [190] BootServicesCode phys=0xd9558000 pages=1
+[0000009523]   [191] BootServicesData phys=0xd9559000 pages=2
+[0000009572]   [192] BootServicesCode phys=0xd955b000 pages=4
+[0000009621]   [193] BootServicesData phys=0xd955f000 pages=2
+[0000009670]   [194] BootServicesCode phys=0xd9561000 pages=5
+[0000009719]   [195] BootServicesData phys=0xd9566000 pages=2
+[0000009768]   [196] BootServicesCode phys=0xd9568000 pages=1
+[0000009817]   [197] BootServicesData phys=0xd9569000 pages=2
+[0000009866]   [198] BootServicesCode phys=0xd956b000 pages=21
+[0000009916]   [199] BootServicesData phys=0xd9580000 pages=1
+[0000009965]   [200] BootServicesCode phys=0xd9581000 pages=3
+[0000010014]   [201] BootServicesData phys=0xd9584000 pages=2
+[0000010063]   [202] BootServicesCode phys=0xd9586000 pages=7
+[0000010112]   [203] BootServicesData phys=0xd958d000 pages=1
+[0000010161]   [204] BootServicesCode phys=0xd958e000 pages=15
+[0000010211]   [205] BootServicesData phys=0xd959d000 pages=2
+[0000010260]   [206] BootServicesCode phys=0xd959f000 pages=2
+[0000010309]   [207] BootServicesData phys=0xd95a1000 pages=2
+[0000010358]   [208] BootServicesCode phys=0xd95a3000 pages=1
+[0000010407]   [209] BootServicesData phys=0xd95a4000 pages=1
+[0000010456]   [210] BootServicesCode phys=0xd95a5000 pages=1
+[0000010505]   [211] BootServicesData phys=0xd95a6000 pages=1
+[0000010554]   [212] BootServicesCode phys=0xd95a7000 pages=8
+[0000010603]   [213] BootServicesData phys=0xd95af000 pages=6
+[0000010652]   [214] BootServicesCode phys=0xd95b5000 pages=1
+[0000010701]   [215] BootServicesData phys=0xd95b6000 pages=2
+[0000010750]   [216] BootServicesCode phys=0xd95b8000 pages=2
+[0000010799]   [217] BootServicesData phys=0xd95ba000 pages=1
+[0000010848]   [218] BootServicesCode phys=0xd95bb000 pages=3
+[0000010897]   [219] BootServicesData phys=0xd95be000 pages=8
+[0000010946]   [220] BootServicesCode phys=0xd95c6000 pages=9
+[0000010995]   [221] BootServicesData phys=0xd95cf000 pages=9
+[0000011044]   [222] BootServicesCode phys=0xd95d8000 pages=28
+[0000011094]   [223] BootServicesData phys=0xd95f4000 pages=1
+[0000011143]   [224] BootServicesCode phys=0xd95f5000 pages=3
+[0000011192]   [225] BootServicesData phys=0xd95f8000 pages=1
+[0000011241]   [226] BootServicesCode phys=0xd95f9000 pages=1
+[0000011290]   [227] BootServicesData phys=0xd95fa000 pages=1
+[0000011339]   [228] BootServicesCode phys=0xd95fb000 pages=7
+[0000011388]   [229] BootServicesData phys=0xd9602000 pages=3
+[0000011437]   [230] BootServicesCode phys=0xd9605000 pages=3
+[0000011486]   [231] BootServicesData phys=0xd9608000 pages=6
+[0000011535]   [232] BootServicesCode phys=0xd960e000 pages=8
+[0000011584]   [233] BootServicesData phys=0xd9616000 pages=2
+[0000011633]   [234] BootServicesCode phys=0xd9618000 pages=2
+[0000011682]   [235] BootServicesData phys=0xd961a000 pages=1
+[0000011731]   [236] BootServicesCode phys=0xd961b000 pages=1
+[0000011780]   [237] BootServicesData phys=0xd961c000 pages=1
+[0000011829]   [238] BootServicesCode phys=0xd961d000 pages=5
+[0000011878]   [239] BootServicesData phys=0xd9622000 pages=1
+[0000011927]   [240] BootServicesCode phys=0xd9623000 pages=1
+[0000011976]   [241] BootServicesData phys=0xd9624000 pages=1
+[0000012025]   [242] BootServicesCode phys=0xd9625000 pages=2
+[0000012074]   [243] BootServicesData phys=0xd9627000 pages=61
+[0000012124]   [244] BootServicesCode phys=0xd9664000 pages=18
+[0000012174]   [245] BootServicesData phys=0xd9676000 pages=4
+[0000012223]   [246] BootServicesCode phys=0xd967a000 pages=3
+[0000012272]   [247] BootServicesData phys=0xd967d000 pages=5
+[0000012321]   [248] BootServicesCode phys=0xd9682000 pages=1
+[0000012370]   [249] BootServicesData phys=0xd9683000 pages=1
+[0000012419]   [250] BootServicesCode phys=0xd9684000 pages=1
+[0000012468]   [251] BootServicesData phys=0xd9685000 pages=3
+[0000012517]   [252] BootServicesCode phys=0xd9688000 pages=3
+[0000012566]   [253] BootServicesData phys=0xd968b000 pages=1
+[0000012615]   [254] BootServicesCode phys=0xd968c000 pages=14
+[0000012665]   [255] BootServicesData phys=0xd969a000 pages=1
+[0000012714]   [256] BootServicesCode phys=0xd969b000 pages=14
+[0000012764]   [257] BootServicesData phys=0xd96a9000 pages=5
+[0000012813]   [258] BootServicesCode phys=0xd96ae000 pages=2
+[0000012862]   [259] BootServicesData phys=0xd96b0000 pages=1
+[0000012911]   [260] BootServicesCode phys=0xd96b1000 pages=1
+[0000012960]   [261] BootServicesData phys=0xd96b2000 pages=2
+[0000013009]   [262] BootServicesCode phys=0xd96b4000 pages=4
+[0000013058]   [263] BootServicesData phys=0xd96b8000 pages=1
+[0000013107]   [264] BootServicesCode phys=0xd96b9000 pages=2
+[0000013156]   [265] BootServicesData phys=0xd96bb000 pages=2
+[0000013205]   [266] BootServicesCode phys=0xd96bd000 pages=3
+[0000013254]   [267] BootServicesData phys=0xd96c0000 pages=1
+[0000013303]   [268] BootServicesCode phys=0xd96c1000 pages=2
+[0000013352]   [269] BootServicesData phys=0xd96c3000 pages=1
+[0000013401]   [270] BootServicesCode phys=0xd96c4000 pages=7
+[0000013450]   [271] BootServicesData phys=0xd96cb000 pages=3
+[0000013499]   [272] BootServicesCode phys=0xd96ce000 pages=1
+[0000013548]   [273] BootServicesData phys=0xd96cf000 pages=1
+[0000013597]   [274] BootServicesCode phys=0xd96d0000 pages=6
+[0000013646]   [275] BootServicesData phys=0xd96d6000 pages=1
+[0000013695]   [276] BootServicesCode phys=0xd96d7000 pages=28
+[0000013745]   [277] BootServicesData phys=0xd96f3000 pages=1
+[0000013794]   [278] BootServicesCode phys=0xd96f4000 pages=1
+[0000013843]   [279] BootServicesData phys=0xd96f5000 pages=1
+[0000013892]   [280] BootServicesCode phys=0xd96f6000 pages=13
+[0000013942]   [281] BootServicesData phys=0xd9703000 pages=1
+[0000013991]   [282] BootServicesCode phys=0xd9704000 pages=1
+[0000014040]   [283] BootServicesData phys=0xd9705000 pages=1
+[0000014089]   [284] BootServicesCode phys=0xd9706000 pages=1
+[0000014138]   [285] BootServicesData phys=0xd9707000 pages=1
+[0000014187]   [286] BootServicesCode phys=0xd9708000 pages=1
+[0000014236]   [287] BootServicesData phys=0xd9709000 pages=1025
+[0000014288]   [288] BootServicesCode phys=0xd9b0a000 pages=12
+[0000014338]   [289] BootServicesData phys=0xd9b16000 pages=1
+[0000014387]   [290] BootServicesCode phys=0xd9b17000 pages=5
+[0000014436]   [291] BootServicesData phys=0xd9b1c000 pages=4
+[0000014485]   [292] BootServicesCode phys=0xd9b20000 pages=1
+[0000014534]   [293] BootServicesData phys=0xd9b21000 pages=63
+[0000014584]   [294] BootServicesCode phys=0xd9b60000 pages=1
+[0000014633]   [295] BootServicesData phys=0xd9b61000 pages=418
+[0000014684]   [296] BootServicesCode phys=0xd9d03000 pages=4
+[0000014733]   [297] BootServicesData phys=0xd9d07000 pages=1
+[0000014782]   [298] BootServicesCode phys=0xd9d08000 pages=1
+[0000014831]   [299] BootServicesData phys=0xd9d09000 pages=1
+[0000014880]   [300] BootServicesCode phys=0xd9d0a000 pages=1
+[0000014929]   [301] BootServicesData phys=0xd9d0b000 pages=10
+[0000014979]   [302] BootServicesCode phys=0xd9d15000 pages=7
+[0000015028]   [303] BootServicesData phys=0xd9d1c000 pages=2175
+[0000015080]   [304] BootServicesCode phys=0xda59b000 pages=3
+[0000015129]   [305] BootServicesData phys=0xda59e000 pages=3
+[0000015178]   [306] BootServicesCode phys=0xda5a1000 pages=1
+[0000015227]   [307] BootServicesData phys=0xda5a2000 pages=1
+[0000015276]   [308] BootServicesCode phys=0xda5a3000 pages=1
+[0000015325]   [309] BootServicesData phys=0xda5a4000 pages=2730
+[0000015377]   [310] Reserved phys=0xdb04e000 pages=1026
+[0000015421]   [311] ACPIReclaim phys=0xdb450000 pages=100
+[0000015467]   [312] ACPIMemoryNVS phys=0xdb4b4000 pages=5887
+[0000015516]   [313] RuntimeServicesData phys=0xdcbb3000 pages=3990
+[0000015571]   [314] RuntimeServicesCode phys=0xddb49000 pages=182
+[0000015625]   [315] BootServicesData phys=0xddbff000 pages=1025
+[0000015677]   [316] Conventional phys=0xde000000 pages=297
+[0000015724]   [317] BootServicesData phys=0xde129000 pages=256
+[0000015775]   [318] BootServicesCode phys=0xde229000 pages=26
+[0000015825]   [319] BootServicesData phys=0xde243000 pages=42
+[0000015875]   [320] BootServicesCode phys=0xde26d000 pages=40
+[0000015925]   [321] BootServicesData phys=0xde295000 pages=24
+[0000015975]   [322] BootServicesCode phys=0xde2ad000 pages=18
+[0000016025]   [323] BootServicesData phys=0xde2bf000 pages=3333
+[0000016077]   [324] BootServicesCode phys=0xdefc4000 pages=3
+[0000016126]   [325] BootServicesData phys=0xdefc7000 pages=19
+[0000016176]   [326] BootServicesCode phys=0xdefda000 pages=2
+[0000016225]   [327] BootServicesData phys=0xdefdc000 pages=18
+[0000016275]   [328] BootServicesCode phys=0xdefee000 pages=18
+[0000016325]   [329] Conventional phys=0x100000000 pages=262144
+[0000016376]   [330] LoaderCode phys=0x140000000 pages=7364
+[0000016423]   [331] Conventional phys=0x141cc4000 pages=7198268
+[0000016475]   [332] Reserved phys=0xa0000 pages=96
+[0000016514]   [333] Reserved phys=0xdf000000 pages=4096
+[0000016558]   [334] MMIO phys=0xf0000000 pages=32768
+[0000016599]   [335] MMIO phys=0xfd200000 pages=256
+[0000016638]   [336] MMIO phys=0xfd600000 pages=512
+[0000016677]   [337] MMIO phys=0xfea00000 pages=16
+[0000016715]   [338] MMIO phys=0xfeb80000 pages=130
+[0000016754]   [339] MMIO phys=0xfec10000 pages=1
+[0000016791]   [340] MMIO phys=0xfec30000 pages=1
+[0000016828]   [341] MMIO phys=0xfed00000 pages=1
+[0000016865]   [342] MMIO phys=0xfed40000 pages=5
+[0000016902]   [343] MMIO phys=0xfed80000 pages=16
+[0000016940]   [344] MMIO phys=0xfedc2000 pages=14
+[0000016978]   [345] MMIO phys=0xfedd4000 pages=2
+[0000017015]   [346] MMIO phys=0xff000000 pages=4096
+[0000017055]   [347] Reserved phys=0x81f300000 pages=3328
+[0000017100] fw-1 RAMPOOL: reserved 26076 MiB at host-physical 0x1c1600000 (usable 32663 MiB, margin 2041 MiB) [#449]
+[0000017205] cpu: 16 physical core(s), 16 with SMT -- on an Intel hybrid part that is the P-core count (E-cores are single-threaded); UEFI cannot tell them apart, CPUID leaf 0x1A can [#360]
+[0000017382] cpu: APIC IDs 0[p0/c0/t0](BSP) 1[p0/c0/t1] 2[p0/c1/t0] 3[p0/c1/t1] 4[p0/c2/t0] 5[p0/c2/t1] 6[p0/c3/t0] 7[p0/c3/t1] 8[p0/c4/t0] 9[p0/c4/t1] 10[p0/c5/t0] 11[p0/c5/t1] 12[p0/c6/t0] 13[p0/c6/t1] 14[p0/c7/t0] 15[p0/c7/t1] 16[p0/c8/t0] 17[p0/c8/t1] 18[p0/c9/t0] 19[p0/c9/t1] 20[p0/c10/t0] 21[p0/c10/t1] 22[p0/c11/t0] 23[p0/c1 -- 32 usable, 31 AP(s), consecutive=1 [#360]
+[0000017747] RT-1b: no prior boot log found in RAM (expected after a cold power cycle; persistent live-run capture is on USB)
+[0000017860] fw-1: Phase 0 sizes per-VM state for 31 VM(s) -- 32 usable core(s), BSP reserved (decision 33) [#450]
+[0000017962] fw-1: g_vms arena 31 VM(s) x 4726784 B, page-aligned @0xcaa1f000 [#394]
+[0000018034] fw-1: per-VM aux arena for 31 VM(s) allocated [#394]
+[0000018087] fw-1: vm0 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000018296] fw-1: vm1 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000018505] fw-1: vm2 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000018714] fw-1: vm3 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000018923] fw-1: vm4 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000019132] fw-1: vm5 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000019341] fw-1: vm6 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000019550] fw-1: vm7 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000019759] fw-1: vm8 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000019968] fw-1: vm9 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000020177] fw-1: vm10 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000020387] fw-1: vm11 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000020597] fw-1: vm12 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000020807] fw-1: vm13 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000021017] fw-1: vm14 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000021227] fw-1: vm15 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000021437] fw-1: vm16 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000021647] fw-1: vm17 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000021857] fw-1: vm18 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000022067] fw-1: vm19 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000022277] fw-1: vm20 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000022487] fw-1: vm21 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000022697] fw-1: vm22 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000022907] fw-1: vm23 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000023117] fw-1: vm24 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000023327] fw-1: vm25 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000023537] fw-1: vm26 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000023747] fw-1: vm27 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000023957] fw-1: vm28 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000024167] fw-1: vm29 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000024377] fw-1: vm30 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000024587] fw-1: vCPU pools sized for 32 vCPU(s) -- the host's bound across up to 31 VM(s) [#185 #450]
+[0000024679] TERM-7: GOP reports 9 mode(s), snapshotted pre-ExitBootServices [#443 #462]
+[0000024755] TERM-7: GOP mode set to 1920x1080 -- nearest of 9 offered to the 1920x1080 target [#529]
+[0000024844] gop: FrameBufferBase=0x7800000000 FrameBufferSize=0x7e9000
+[0000024903] cpu: vendor=AMD vmx=0 svm=1
+[0000024931] cpu: GUEST-CPUID leaf0 vendor='AuthenticAMD' -- this is the string a guest reads; it must match vendor= above [#298]
+[0000025048] cpu: svm_feature_edx=0x101bbcff pause_filter=1 pause_threshold=1
+[0000025113] host-pci: storage[1]=NVMe at 01:00.0 vid=144d did=a80a bar=0xfcf00000
+[0000025183] host-pci: storage[2]=AHCI at 02:00.1 vid=1022 did=43eb bar=0xfc880000
+[0000025253] host-pci: storage[3]=NVMe at 04:00.0 vid=15b7 did=5063 bar=0xfc700000
+[0000025323] vmm: SVM detected
+[0000025341] fw-1: guest RAM 0 MiB backed at host-physical 0x0
+[0000025391] fw-1 RAMPOOL: vm0 vdisk backing carve 64 MiB @0x1c1600000 (26012 MiB left) [#449]
+[0000025473] fw-1: vm0 virtio-blk fallback RAM scratch reserved @0x1c1600000 (64 MiB) -- backend chosen later
+[0000025570] fw-1: host TSC calibrated at 3400853400 Hz (3400 MHz)
+[0000025624] about to call ExitBootServices...
+[0000025658] ExitBootServices returned
+[0000025684] interrupts masked (cli)
+[0000025708] about to load own GDT...
+[0000025733] own GDT loaded
+[0000025748] about to load own paging (identity-mapping 64 GB)...
+[0000025801] paging: framebuffer BAR 0x7800000000+0x7e9000 is above the 64GB map -- mapped 1 extra GB slot(s)
+[0000025898] paging: high framebuffer 0x7800000000+0x7e9000 marked write-combining (PERF-2, 1 GB slot(s))
+[0000025991] paging: NX applied to every host page except hype's own image (0x140000000+0x1cc4000) [#604]
+[0000026084] own paging loaded
+[0000026102] about to load own IDT...
+[0000026127] own IDT loaded
+[0000026142] hype: Boot Services exited, hypervisor now running
+[0000026193] vmm: about to enable SVM...
+[0000026221] svm: VM_CR=0x8 SVMDIS=0
+[0000026245] svm: about to enable SVM (hsave=0x141c60000)...
+[0000026293] svm: SVM enable complete
+[0000026318] vmm: SVM enabled
+[0000026335] about to enable interrupts (sti)...
+[0000026371] interrupts enabled -- host timer live
+[0000026409] pci-dump: full device census (buses 0-255)
+[0000026452] pci-dump: 00:00.0 vid=1022 did=1480 class=06 sub=00 pi=00
+[0000026510] pci-dump: 00:00.2 vid=1022 did=1481 class=08 sub=06 pi=00
+[0000026568] pci-dump: 00:01.0 vid=1022 did=1482 class=06 sub=00 pi=00
+[0000026626] pci-dump: 00:01.1 vid=1022 did=1483 class=06 sub=04 pi=00
+[0000026684] pci-dump: 00:01.2 vid=1022 did=1483 class=06 sub=04 pi=00
+[0000026742] pci-dump: 00:02.0 vid=1022 did=1482 class=06 sub=00 pi=00
+[0000026800] pci-dump: 00:03.0 vid=1022 did=1482 class=06 sub=00 pi=00
+[0000026858] pci-dump: 00:03.1 vid=1022 did=1483 class=06 sub=04 pi=00
+[0000026916] pci-dump: 00:04.0 vid=1022 did=1482 class=06 sub=00 pi=00
+[0000026974] pci-dump: 00:05.0 vid=1022 did=1482 class=06 sub=00 pi=00
+[0000027032] pci-dump: 00:07.0 vid=1022 did=1482 class=06 sub=00 pi=00
+[0000027090] pci-dump: 00:07.1 vid=1022 did=1484 class=06 sub=04 pi=00
+[0000027148] pci-dump: 00:08.0 vid=1022 did=1482 class=06 sub=00 pi=00
+[0000027206] pci-dump: 00:08.1 vid=1022 did=1484 class=06 sub=04 pi=00
+[0000027264] pci-dump: 00:14.0 vid=1022 did=790b class=0c sub=05 pi=00
+[0000027322] pci-dump: 00:14.3 vid=1022 did=790e class=06 sub=01 pi=00
+[0000027380] pci-dump: 00:18.0 vid=1022 did=1440 class=06 sub=00 pi=00
+[0000027438] pci-dump: 00:18.1 vid=1022 did=1441 class=06 sub=00 pi=00
+[0000027496] pci-dump: 00:18.2 vid=1022 did=1442 class=06 sub=00 pi=00
+[0000027554] pci-dump: 00:18.3 vid=1022 did=1443 class=06 sub=00 pi=00
+[0000027612] pci-dump: 00:18.4 vid=1022 did=1444 class=06 sub=00 pi=00
+[0000027670] pci-dump: 00:18.5 vid=1022 did=1445 class=06 sub=00 pi=00
+[0000027728] pci-dump: 00:18.6 vid=1022 did=1446 class=06 sub=00 pi=00
+[0000027786] pci-dump: 00:18.7 vid=1022 did=1447 class=06 sub=00 pi=00
+[0000027844] pci-dump: 01:00.0 vid=144d did=a80a class=01 sub=08 pi=02
+[0000027902] pci-dump: 02:00.0 vid=1022 did=43ee class=0c sub=03 pi=30
+[0000027960] pci-dump: 02:00.1 vid=1022 did=43eb class=01 sub=06 pi=01
+[0000028018] pci-dump: 02:00.2 vid=1022 did=43e9 class=06 sub=04 pi=00
+[0000028076] pci-dump: 03:00.0 vid=1022 did=43ea class=06 sub=04 pi=00
+[0000028134] pci-dump: 03:07.0 vid=1022 did=43ea class=06 sub=04 pi=00
+[0000028192] pci-dump: 03:09.0 vid=1022 did=43ea class=06 sub=04 pi=00
+[0000028250] pci-dump: 04:00.0 vid=15b7 did=5063 class=01 sub=08 pi=02
+[0000028308] pci-dump: 05:00.0 vid=10ec did=8168 class=02 sub=00 pi=00
+[0000028366] pci-dump: 2a:00.0 vid=10ec did=8125 class=02 sub=00 pi=00
+[0000028424] pci-dump: 2b:00.0 vid=1002 did=1478 class=06 sub=04 pi=00
+[0000028482] pci-dump: 2c:00.0 vid=1002 did=1479 class=06 sub=04 pi=00
+[0000028540] pci-dump: 2d:00.0 vid=1002 did=73df class=03 sub=00 pi=00
+[0000028598] pci-dump: 2d:00.1 vid=1002 did=ab28 class=04 sub=03 pi=00
+[0000028656] pci-dump: 2e:00.0 vid=1022 did=148a class=13 sub=00 pi=00
+[0000028714] pci-dump: 2f:00.0 vid=1022 did=1485 class=13 sub=00 pi=00
+[0000028772] pci-dump: 2f:00.1 vid=1022 did=1486 class=10 sub=80 pi=00
+[0000028830] pci-dump: 2f:00.3 vid=1022 did=149c class=0c sub=03 pi=30
+[0000028888] pci-dump: 2f:00.4 vid=1022 did=1487 class=04 sub=03 pi=00
+[0000028946] pci-dump: 43 PCI functions total
+[0000028979] host-nvme: 01:00.0 woke to D0, Command=0x0406
+[0000029025] #255dbg nvme: queues allocated NSQA=1 NCQA=1 (dw0=0x00000000)
+[0000029087] host-nvme: init OK, LBA0 read OK -- mbrsig=55aa
+[0000029135] media: registered host device 0 = nvme serial='S6WSNJ0W127664M'
+[0000029199] host-nvme: serial='S6WSNJ0W127664M' model='Samsung SSD 980 PRO with Heatsink 1TB' sectors=1953525168 (953869 MiB)
+[0000029313] host-nvme: 04:00.0 woke to D0, Command=0x0407
+[0000029359] #255dbg nvme: queues allocated NSQA=64 NCQA=64 (dw0=0x003f003f)
+[0000029423] host-nvme: init OK, LBA0 read OK -- mbrsig=55aa
+[0000029471] host-nvme: serial='25435A802951' model='WD Blue SN5100 2TB' sectors=3907029168 (1907729 MiB)
+[0000029564] net: NIC 1 at 05:00.0 10ec:8168 BAR0=0x0 -- no hype driver for this device [#80]
+[0000029645] net: NIC 2 at 2a:00.0 10ec:8125 BAR0=0x0 -- no hype driver for this device [#80]
+[0000029726] net: 2 NIC(s) present, none hype can drive -- networking unavailable [#80]
+[0000029801] host-xhci: controller[1] at 02:00.0 vid=1022 did=43ee bar=0xfc8a0000
+[0000029870] host-xhci: caps -- slots=127 ports=14 ctx=32B scratchpads=31 pagesize=0x0001
+[0000029947] host-xhci: up -- slots=127 ports=14 ctx=32B
+[0000029991] host-xhci:   port 1 down: PORTSC=0x000002a0 (CCS=0 PED=0 PP=1 PR=0 speed=0)
+[0000030067] host-xhci:   port 2 down: PORTSC=0x000002a0 (CCS=0 PED=0 PP=1 PR=0 speed=0)
+[0000030143] host-xhci:   port 3 down: PORTSC=0x000002a0 (CCS=0 PED=0 PP=1 PR=0 speed=0)
+[0000030219] host-xhci: port 4 connected (speed id 4)
+[0000030260] host-xhci: port 4 dev -- USB 3.00 class=00 mps0=9 vid=152d pid=1561
+[0000030328] host-xhci: MSC -- slot 1 cfg=1 iface=0 bulk-in=0x81 bulk-out=0x02 mps=1024
+[0000030403] host-xhci: bulk endpoints configured -- MSC datapath ready
+[0000030462] host-xhci: MSC identity serial='DB9876543214E' source=inquiry-vpd80 [#340]
+[0000030537] host-xhci: USB disk -- last LBA 1000215215, block 512 bytes (488386 MiB)
+[0000030610] host-xhci: SCSI READ(10) LBA0 OK -- mbrsig=55aa
+[0000030658] host-xhci: blk_usb backend read LBA0 OK -- mbrsig=55aa (cap 1000215216 sectors)
+[0000030738] usb-log: base LBA 0 -- mounts, but is not the volume hype booted from -- leaving it alone [#638]
+[0000030835] usb-log: base LBA 1 -- mounts, but is not the volume hype booted from -- leaving it alone [#638]
+[0000030932] fw-1: boot #1 on this volume [#643]
+[0000030968] usb-log: \HYPE.LOG + per-VM logs on FAT32 at disk LBA 2048; \HYPEFULL.LOG is retired -- merge the split files by their [offset] prefix to recover the combined stream [#338]
+[0000031141] usb-log: split diagnostics -- 0 of 0 per-VM log(s) open; hype's own output to \HYPE.LOG, each guest's serial to its own file; the combined stream lives on the serial port and is recoverable from the [offset] prefixes [#338 #558]
+[0000031370] media: registered host device 1 = usb serial='DB9876543214E'
+[0000031431] host-xhci:   port 5 down: PORTSC=0x000002a0 (CCS=0 PED=0 PP=1 PR=0 speed=0)
+[0000031507] host-xhci: port 6 connected (speed id 3)
+[0000031548] host-xhci: port 6 dev -- USB 2.00 class=09 mps0=64 vid=05e3 pid=0608
+[0000031617] host-xhci: port 6 is a USB hub -- descending (#231 pt5b)
+[0000031674] host-xhci:   hub slot 2 (tier 1) has 4 downstream port(s)
+[0000031732] host-xhci: CTXDUMP hub-status slot=2 dci=3 | SLOT route=0x00000 speed=3 entries=3 mtt=0 hub=1 rootport=6 ttslot=0 ttport=0 ttt=3 | EP state=1 interval=11 mult=0 maxburst=0 mps=1 cerr=3 type=7 esit=1 [#734]
+[0000031938] host-xhci:   hub slot 2 status-change endpoint 0x81 armed (1 byte bitmap) -- its ports can hot-plug [#746]
+[0000032045] host-xhci:   hub slot 2 port 4: device attached (speed id 1)
+[0000032106] host-xhci:   hub slot 2 port 4 dev class=00 vid=1e71 pid=2007
+[0000032168] host-usb:   behind-hub device ctrl1 port6 route=0x00004 slot3 1e71:2007 class=03 -- recorded [#241]
+[0000032268] host-xhci: no storage behind hub on port 6 (its devices are still in the inventory)
+[0000032352] host-xhci:   port 7 down: PORTSC=0x000002a0 (CCS=0 PED=0 PP=1 PR=0 speed=0)
+[0000032428] host-xhci:   port 8 down: PORTSC=0x000002a0 (CCS=0 PED=0 PP=1 PR=0 speed=0)
+[0000032504] host-xhci:   port 9 down: PORTSC=0x000002a0 (CCS=0 PED=0 PP=1 PR=0 speed=0)
+[0000032580] host-xhci:   port 10 down: PORTSC=0x000002a0 (CCS=0 PED=0 PP=1 PR=0 speed=0)
+[0000032657] host-xhci:   port 11 down: PORTSC=0x000002a0 (CCS=0 PED=0 PP=1 PR=0 speed=0)
+[0000032734] host-xhci: port 12 connected (speed id 1)
+[0000032776] host-xhci: port 12 dev -- USB 1.10 class=00 mps0=64 vid=1462 pid=7c91
+[0000032846] host-xhci: port 12 dev is not MSC or hub (class=00, cfg 41 bytes) -- HID: slot RETAINED for #217
+[0000032943] host-xhci:   port 13 down: PORTSC=0x000002a0 (CCS=0 PED=0 PP=1 PR=0 speed=0)
+[0000033020] host-xhci:   port 14 down: PORTSC=0x000002a0 (CCS=0 PED=0 PP=1 PR=0 speed=0)
+[0000033097] usb-probe: ctrl[1] 02:00.0 ports=14 CCS=0x0828 PED=0x0828 PP=0x3fff (bit0=port1)
+[0000033178] host-xhci: controller[2] at 2f:00.3 vid=1022 did=149c bar=0xfc900000
+[0000033247] host-xhci: caps -- slots=64 ports=8 ctx=64B scratchpads=2 pagesize=0x0001
+[0000033321] host-xhci: up -- slots=64 ports=8 ctx=64B
+[0000033363] host-xhci: port 1 connected (speed id 3)
+[0000033404] host-xhci: port 1 dev -- USB 2.01 class=ef mps0=64 vid=1bcf pid=2284
+[0000033473] host-xhci: port 1 dev is not MSC or hub (class=ef, cfg 256 bytes) -- skipping
+[0000033551] host-xhci:     Disable Slot: 1 [#734]
+[0000033589] host-xhci:   port 2 down: PORTSC=0x000002a0 (CCS=0 PED=0 PP=1 PR=0 speed=0)
+[0000033665] host-xhci: port 3 connected (speed id 3)
+[0000033706] host-xhci:     Enable Slot: 1 -- RECYCLED, this id was enabled and disabled before [#734]
+[0000033796] host-xhci: port 3 dev -- USB 2.10 class=09 mps0=64 vid=0bda pid=5411
+[0000033865] host-xhci: port 3 is a USB hub -- descending (#231 pt5b)
+[0000033922] host-xhci:   hub slot 1 (tier 1) has 4 downstream port(s)
+[0000033980] host-xhci: CTXDUMP hub-status slot=1 dci=3 | SLOT route=0x00000 speed=3 entries=3 mtt=0 hub=1 rootport=3 ttslot=0 ttport=0 ttt=1 | EP state=1 interval=11 mult=0 maxburst=0 mps=1 cerr=3 type=7 esit=1 [#734]
+[0000034186] host-xhci:   hub slot 1 status-change endpoint 0x81 armed (1 byte bitmap) -- its ports can hot-plug [#746]
+[0000034293] host-xhci: no storage behind hub on port 3 (its devices are still in the inventory)
+[0000034377] host-xhci: port 4 connected (speed id 3)
+[0000034418] host-xhci: port 4 dev -- USB 2.10 class=09 mps0=64 vid=05e3 pid=0610
+[0000034487] host-xhci: port 4 is a USB hub -- descending (#231 pt5b)
+[0000034544] host-xhci:   hub slot 2 (tier 1) has 4 downstream port(s)
+[0000034602] host-xhci: CTXDUMP hub-status slot=2 dci=3 | SLOT route=0x00000 speed=3 entries=3 mtt=0 hub=1 rootport=4 ttslot=0 ttport=0 ttt=3 | EP state=1 interval=11 mult=0 maxburst=0 mps=1 cerr=3 type=7 esit=1 [#734]
+[0000034808] host-xhci:   hub slot 2 status-change endpoint 0x81 armed (1 byte bitmap) -- its ports can hot-plug [#746]
+[0000034915] host-xhci:   hub slot 2 port 1: device attached (speed id 3)
+[0000034976] host-xhci:   hub slot 2 port 1 dev class=ef vid=eba4 pid=6579
+[0000035038] host-usb:   behind-hub device ctrl2 port4 route=0x00001 slot3 eba4:6579 class=ef -- recorded [#241]
+[0000035138] host-xhci:   hub slot 2 port 2: device attached (speed id 1)
+[0000035199] host-xhci:   hub slot 2 port 2 dev class=00 vid=3434 pid=0da4
+[0000035261] host-usb:   behind-hub device ctrl2 port4 route=0x00002 slot4 3434:0da4 class=03 -- recorded [#241]
+[0000035361] host-xhci:   hub slot 2 port 4: device attached (speed id 1)
+[0000035422] host-xhci:   hub slot 2 port 4 dev class=00 vid=046d pid=c547
+[0000035484] host-usb:   behind-hub device ctrl2 port4 route=0x00004 slot5 046d:c547 class=03 -- recorded [#241]
+[0000035584] host-xhci: no storage behind hub on port 4 (its devices are still in the inventory)
+[0000035668] host-xhci:   port 5 down: PORTSC=0x000002a0 (CCS=0 PED=0 PP=1 PR=0 speed=0)
+[0000035744] host-xhci:   port 6 down: PORTSC=0x000002a0 (CCS=0 PED=0 PP=1 PR=0 speed=0)
+[0000035820] host-xhci: port 7 connected (speed id 4)
+[0000035861] host-xhci: port 7 dev -- USB 3.10 class=09 mps0=9 vid=0bda pid=0411
+[0000035929] host-xhci: port 7 is a USB hub -- descending (#231 pt5b)
+[0000035986] host-xhci:   hub slot 6 (tier 1) has 4 downstream port(s)
+[0000036044] host-xhci: CTXDUMP hub-status slot=6 dci=3 | SLOT route=0x00000 speed=4 entries=3 mtt=0 hub=1 rootport=7 ttslot=0 ttport=0 ttt=0 | EP state=1 interval=7 mult=0 maxburst=0 mps=1 cerr=3 type=7 esit=1 [#734]
+[0000036249] host-xhci:   hub slot 6 status-change endpoint 0x81 armed (1 byte bitmap) -- its ports can hot-plug [#746]
+[0000036356] host-xhci:   hub slot 6 port 1: device attached (speed id 4)
+[0000036417] host-xhci:     Address Device slot 7 try 1: completion code 4 (ctx_size=64B speed=4 route=0x00001)
+[0000036516] host-xhci:     Address Device slot 7 try 2: completion code 4 (ctx_size=64B speed=4 route=0x00001)
+[0000036615] host-xhci:     Address Device slot 7 try 3: completion code 4 (ctx_size=64B speed=4 route=0x00001)
+[0000036714] host-xhci:   hub slot 6 port 1 Address Device FAILED (route 0x00001 tt_hub=0 tt_port=0)
+[0000036802] host-xhci:     Disable Slot: 7 [#734]
+[0000036840] host-xhci: no storage behind hub on port 7 (its devices are still in the inventory)
+[0000036924] host-xhci: port 8 connected (speed id 4)
+[0000036965] host-xhci:     Enable Slot: 7 -- RECYCLED, this id was enabled and disabled before [#734]
+[0000037055] host-xhci: port 8 dev -- USB 3.20 class=09 mps0=9 vid=05e3 pid=0626
+[0000037123] host-xhci: port 8 is a USB hub -- descending (#231 pt5b)
+[0000037180] host-xhci:   hub slot 7 (tier 1) has 4 downstream port(s)
+[0000037238] host-xhci: CTXDUMP hub-status slot=7 dci=3 | SLOT route=0x00000 speed=4 entries=3 mtt=0 hub=1 rootport=8 ttslot=0 ttport=0 ttt=0 | EP state=1 interval=7 mult=0 maxburst=0 mps=1 cerr=3 type=7 esit=1 [#734]
+[0000037443] host-xhci:   hub slot 7 status-change endpoint 0x81 armed (1 byte bitmap) -- its ports can hot-plug [#746]
+[0000037550] host-xhci: no storage behind hub on port 8 (its devices are still in the inventory)
+[0000037634] usb-probe: ctrl[2] 2f:00.3 ports=8 CCS=0x00cd PED=0x00cd PP=0x00ff (bit0=port1)
+[0000037714] host-xhci: controller[2] -- no USB mass-storage on any root port or behind any hub
+[0000037797] host-hid: keyboard 3434:0da4 cfg 91 bytes -- picked iface=0 ep=0x81 mps=8 interval=1 cfgval=1 [#734]
+[0000037898] host-xhci: CTXDUMP int-in slot=4 dci=3 | SLOT route=0x00002 speed=1 entries=3 mtt=0 hub=0 rootport=4 ttslot=2 ttport=2 ttt=0 | EP state=1 interval=3 mult=0 maxburst=0 mps=8 cerr=3 type=7 esit=8 [#734]
+[0000038099] host-xhci: CTXDUMP its-TT-hub slot=2 dci=1 | SLOT route=0x00000 speed=3 entries=3 mtt=0 hub=1 rootport=4 ttslot=0 ttport=0 ttt=3 | EP state=1 interval=0 mult=0 maxburst=0 mps=64 cerr=3 type=4 esit=0 [#734]
+[0000038305] host-hid: USB keyboard CLAIMED -- 3434:0da4 port4 slot4 ep=0x81 mps=8 (1 claimed); host input now reaches hype
+[0000038416] host-hid: keyboard 046d:c547 cfg 84 bytes -- picked iface=1 ep=0x82 mps=64 interval=1 cfgval=1 [#734]
+[0000038518] host-xhci: CTXDUMP int-in slot=5 dci=5 | SLOT route=0x00004 speed=1 entries=5 mtt=0 hub=0 rootport=4 ttslot=2 ttport=4 ttt=0 | EP state=1 interval=3 mult=0 maxburst=0 mps=64 cerr=3 type=7 esit=64 [#734]
+[0000038721] host-xhci: CTXDUMP its-TT-hub slot=2 dci=1 | SLOT route=0x00000 speed=3 entries=3 mtt=0 hub=1 rootport=4 ttslot=0 ttport=0 ttt=3 | EP state=1 interval=0 mult=0 maxburst=0 mps=64 cerr=3 type=4 esit=0 [#734]
+[0000038927] host-hid: USB keyboard CLAIMED -- 046d:c547 port4 slot5 ep=0x82 mps=64 (2 claimed); host input now reaches hype
+[0000039039] host-hid: mouse 046d:c547 cfg 84 bytes -- picked iface=0 ep=0x81 mps=64 interval=1 cfgval=1 [#734]
+[0000039138] host-xhci: CTXDUMP int-in slot=5 dci=3 | SLOT route=0x00004 speed=1 entries=3 mtt=0 hub=0 rootport=4 ttslot=2 ttport=4 ttt=0 | EP state=1 interval=3 mult=0 maxburst=0 mps=64 cerr=3 type=7 esit=64 [#734]
+[0000039341] host-xhci: CTXDUMP its-TT-hub slot=2 dci=1 | SLOT route=0x00000 speed=3 entries=3 mtt=0 hub=1 rootport=4 ttslot=0 ttport=0 ttt=3 | EP state=1 interval=0 mult=0 maxburst=0 mps=64 cerr=3 type=4 esit=0 [#734]
+[0000039547] host-hid: USB mouse CLAIMED -- 046d:c547 port4 slot5 ep=0x81 mps=64 (1 claimed); host input now reaches hype
+[0000039656] host-usb: INVENTORY -- 12 device(s) across 2 controller(s) (3 claimed by hype, 9 free) [#241]
+[0000039750] host-usb:   [0] ctrl1 port4 route=0x00000 slot1 speed4 152d:1561 class=08/06/50 owner=hype
+[0000039841] host-usb:        ep 0x81 bulk-in mps=1024 interval=0
+[0000039894] host-usb:        ep 0x02 bulk-out mps=1024 interval=0
+[0000039948] host-usb:        ep 0x01 bulk-out mps=1024 interval=0
+[0000040002] host-usb:        ep 0x82 bulk-in mps=1024 interval=0
+[0000040055] host-usb:        ep 0x83 bulk-in mps=1024 interval=0
+[0000040108] host-usb:        ep 0x04 bulk-out mps=1024 interval=0
+[0000040162] host-usb:   [1] ctrl1 port6 route=0x00000 slot2 speed3 05e3:0608 class=09/00/01 owner=free
+[0000040253] host-usb:        ep 0x81 int-in mps=1 interval=12
+[0000040303] host-usb:   [2] ctrl1 port6 route=0x00004 slot3 speed1 1e71:2007 class=03/00/00 owner=free
+[0000040394] host-usb:        ep 0x81 int-in mps=64 interval=1
+[0000040444] host-usb:        ep 0x01 int-out mps=64 interval=1
+[0000040495] host-usb:   [3] ctrl1 port12 route=0x00000 slot4 speed1 1462:7c91 class=03/00/00 owner=free
+[0000040587] host-usb:        ep 0x81 int-in mps=64 interval=5
+[0000040637] host-usb:        ep 0x02 int-out mps=64 interval=5
+[0000040688] host-usb:   [4] ctrl2 port1 route=0x00000 slot0 speed3 1bcf:2284 class=ef/02/01 owner=free
+[0000040779] host-usb:        ep 0x87 int-in mps=16 interval=8
+[0000040829] host-usb:   [5] ctrl2 port3 route=0x00000 slot1 speed3 0bda:5411 class=09/00/02 owner=free
+[0000040920] host-usb:        ep 0x81 int-in mps=1 interval=12
+[0000040970] host-usb:        ep 0x81 int-in mps=1 interval=12
+[0000041020] host-usb:   [6] ctrl2 port4 route=0x00000 slot2 speed3 05e3:0610 class=09/00/01 owner=free
+[0000041111] host-usb:        ep 0x81 int-in mps=1 interval=12
+[0000041161] host-usb:   [7] ctrl2 port4 route=0x00001 slot3 speed3 eba4:6579 class=ef/02/01 owner=free
+[0000041252] host-usb:        ep 0x81 int-in mps=16 interval=8
+[0000041302] host-usb:   [8] ctrl2 port4 route=0x00002 slot4 speed1 3434:0da4 class=03/01/01 owner=hype
+[0000041393] host-usb:        ep 0x81 int-in mps=8 interval=1
+[0000041442] host-usb:        ep 0x82 int-in mps=32 interval=1
+[0000041492] host-usb:        ep 0x02 int-out mps=32 interval=1
+[0000041543] host-usb:        ep 0x83 int-in mps=32 interval=1
+[0000041593] host-usb:   [9] ctrl2 port4 route=0x00004 slot5 speed1 046d:c547 class=03/01/02 owner=hype
+[0000041684] host-usb:        ep 0x81 int-in mps=64 interval=1
+[0000041734] host-usb:        ep 0x82 int-in mps=64 interval=1
+[0000041784] host-usb:        ep 0x83 int-in mps=64 interval=1
+[0000041834] host-usb:   [10] ctrl2 port7 route=0x00000 slot6 speed4 0bda:0411 class=09/00/03 owner=free
+[0000041926] host-usb:        ep 0x81 int-in mps=2 interval=8
+[0000041975] host-usb:   [11] ctrl2 port8 route=0x00000 slot7 speed4 05e3:0626 class=09/00/03 owner=free
+[0000042067] host-usb:        ep 0x81 int-in mps=2 interval=8
+[0000042116] host-ahci: 02:00.1 woke to D0, Command=0x0406 (MEM=1 BME=1)
+[0000042176] host-disk: inventory + 02:00.1 port 4 serial='PNY1220003922210D6B2' model='PNY CS900 960GB SSD' sectors=1875385008 [#258]
+[0000042298] media: registered host device 2 = ahci serial='(unknown)'
+[0000042356] ahci-rd[1] enter lba=0 cnt=1 tfd=0x50 ci=0x0
+[0000042401] ahci-rd[1] ready, issuing
+[0000042427] ahci-rd[1] done rc=0
+[0000042448] host-ahci: port 4 LBA0 read OK -- mbrsig=55aa
+[0000042494] host-disk: serial='PNY1220003922210D6B2' model='PNY CS900 960GB SSD' sectors=1875385008 (915715 MiB)
+[0000042595] ahci-rd[2] enter lba=1 cnt=1 tfd=0x50 ci=0x0
+[0000042640] ahci-rd[2] ready, issuing
+[0000042666] ahci-rd[2] done rc=0
+[0000042687] host-disk: gpt-guid dc3fd39d-87e6-1c4d-a5ac-137f4da2e07c
+[0000042744] ahci-rd[3] enter lba=1 cnt=1 tfd=0x50 ci=0x0
+[0000042789] ahci-rd[3] ready, issuing
+[0000042815] ahci-rd[3] done rc=0
+[0000042836] ahci-rd[4] enter lba=0 cnt=1 tfd=0x50 ci=0x0
+[0000042881] ahci-rd[4] ready, issuing
+[0000042907] ahci-rd[4] done rc=0
+[0000042928] ahci-rd[5] enter lba=1 cnt=1 tfd=0x50 ci=0x0
+[0000042973] ahci-rd[5] ready, issuing
+[0000042999] ahci-rd[5] done rc=0
+[0000043020] media: registered host device 3 = nvme serial='S6WSNJ0W127664M'
+[0000043084] fw-1 BOOTVOL: hype's boot volume mounted for writing -- fat32 on device 1 at LBA 2048, \hype.cfg verified byte-identical [#447]
+[0000043212] cfg: loaded \hype.cfg (1535 bytes) -- 1 VM(s)
+[0000043258] cfg: autostart = all -- a VM it excludes is left OFF at boot and started with 'start <name>' [#732]
+[0000043358] cfg:   vm[0] 'run1a' vcpus=2 mem=1024MB target=file:\hype\disks\run1a-scratch.img
+[0000043440] log: level 'debug' -- from hype.cfg. Lines below are filtered to it; Phase 0 above is always complete, and a panic is never filtered [#533]
+[0000043580] fw-1 RAMPOOL: vm0 firmware carve 4 MiB @0x1c5600000 (26008 MiB left) [#449]
+[0000043656] fw-1: firmware 4194304 B (VARS 540672 + CODE 3653632) read through hype's own stack in 67ms, mapped 4194304 B @0x1c5600000 [#451]
+[0000043786] fw-1 M9-4: no \hype-state.txt on the boot volume -- the ABSENT case, not a failure: every VM starts [#177]
+[0000043893] fw-1: vm0 guest RAM 1024 MiB -- from hype.cfg (requested 1024, limits 128..3072) [#290]
+[0000043981] fw-1: vm0 os_hint=linux hyper-v-leaves=off (KVM identity) [#91]
+[0000044045] fw-1: vm0 vcpus 2 (= physical core(s); the guest sees this x threads/core) -- from hype.cfg (requested 2, max 8) [#185 #564]
+[0000044170] input: vm0 armed \input\vm0.txt (3002 bytes, 19 directive(s))
+[0000044232] fw-1 RAMPOOL: vm0 guest RAM carve 1024 MiB @0x1c5a00000 (24984 MiB left) [#449]
+[0000044312] usb-log: split diagnostics -- 1 of 1 per-VM log(s) open; hype's own output to \HYPE.LOG, each guest's serial to its own file; the combined stream lives on the serial port and is recoverable from the [offset] prefixes [#338 #558]
+[0000044541] host-fat: vm0 resolved \iso\test.iso on exFAT partition 2 of the usb device
+[0000044617] media-scan: vm0 dev 1 (usb) probed -- 33 reads
+[0000044664] host-fat: \iso\test.iso vol-LBA 35072 -> disk-LBA 8425728, 278921216 bytes, 1 extent(s)
+[0000044752] host-stream: vm0 CD001 verified streaming from a FILE on a host volume -- backing guest CD via streaming
