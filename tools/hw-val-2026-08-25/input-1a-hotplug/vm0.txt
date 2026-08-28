@@ -1,0 +1,59 @@
+# BOOT 8 -- USB hot-plug (#744 #745 #746) and a #750 soak, in one run.
+#
+# The guest's job here is only to stay alive and keep saying so. Everything being tested
+# lives on hype's side of the boundary and is logged by hype, not by the guest: port
+# change events, slot teardown, re-enumeration, the hub's status-change endpoint. The
+# operator drives it by physically unplugging things. See RUN-CARD.md for the sequence.
+#
+# The heartbeat is what makes this also a #750 run. #750 was an idle AP that stopped
+# taking interrupts because its STI shadow was never cleared, so nothing could ever be
+# injected. `vcpus = 2` is 2 physical cores and therefore 4 logical CPUs (#564), which is
+# the shape that reproduced it at about 1 in 3. Twenty idle minutes with a heartbeat is a
+# far harsher test of that than the boot-and-reboot the QEMU rig runs, because the bug
+# needs an AP to go idle and stay idle -- which is exactly what the guest does while the
+# operator is busy with the cables.
+#
+# `fail-if soft lockup` is the #750 detector. It fires on the kernel's own watchdog line,
+# so it does not depend on anything hype reports about itself.
+
+timeout 1500000
+fail-if soft lockup
+
+expect localhost login:
+send root\n
+expect ~#
+
+# Kernel ring buffer -> serial. setsid so it outlives the shell's process group. Boot 7's
+# script established this is the only way any kernel message reaches \RUN1A.LOG at all:
+# Alpine's live-ISO cmdline sends kernel output to tty0 and the serial prompts come from
+# inittab, so without this the log has never contained one.
+send setsid sh -c 'dmesg -w > /dev/ttyS0' &\n
+send dmesg -n 8\n
+send echo DMESG-STREAMING-NOW\n
+expect DMESG-STREAMING-NOW
+
+# Ten-second heartbeat, numbered from uptime so the log dates any gap. Slower than boot
+# 7's one-second tick on purpose: this run is twenty minutes long and a 1 Hz tick would
+# bury hype's hot-plug lines in ten thousand HB lines.
+send setsid sh -c 'while :; do echo HB-$(cut -d. -f1 /proc/uptime) > /dev/ttyS0; sleep 10; done' &\n
+send echo HEARTBEAT-STARTED\n
+expect HEARTBEAT-STARTED
+
+# Per-CPU idle proof. #750 stranded ONE AP while the others ran, so a whole-guest liveness
+# check would have missed it. This prints each CPU's idle jiffies once, and again at the
+# end; a CPU whose idle count does not advance across twenty minutes never ran at all.
+send echo CPUS-$(nproc); grep -c ^processor /proc/cpuinfo\n
+expect CPUS-
+send awk '/^cpu[0-9]/{print "IDLE-START-" $1 "-" $5}' /proc/stat\n
+expect IDLE-START-cpu0
+
+send echo OPERATOR-GO -- start the RUN-CARD sequence now\n
+expect OPERATOR-GO
+
+# Twenty minutes of nothing, while the operator unplugs and re-plugs. The guest must be
+# idle for this stretch, not busy: #750 needs an AP in HLT. Do not add work here.
+#
+# This expect will NOT match -- there is no second login prompt in this run. It is here
+# so the script blocks on the timeout rather than falling off the end and closing the
+# session while the operator is still working.
+expect THIS-MARKER-NEVER-ARRIVES

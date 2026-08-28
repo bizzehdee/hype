@@ -28,6 +28,13 @@
 #   ./stage.sh --check         verify the staged drive and change nothing
 set -u
 
+# Which input script and run card this staging is for. \input\vm0.txt was copied by hand
+# for the first seven stagings, which is why boot 7 went out with boot 6's card still on the
+# drive. The active script and the card that describes it must move together or the operator
+# is reading instructions for a different run.
+BOOT_INPUT=input-1a-hotplug
+RUN_CARD=RUN-CARD-2026-08-28.md
+
 BOOTLABEL=HYPEBOOT
 # The data partition has NO label. `EADE-CA36` is its exFAT volume UUID, which is what
 # udisks then names the mountpoint after -- which is why the README called it a label for
@@ -128,8 +135,15 @@ if [ "$CHECK" = 0 ]; then
   cp "$STAGEDIR/hype-avic.efi"    "$BOOTMP/EFI/hype/hype-avic.efi"    || die "copy avic"
   cp "$STAGEDIR/hype-default.efi" "$BOOTMP/EFI/BOOT/BOOTX64.EFI"      || die "copy active"
   cp $HERE/hype*.cfg "$BOOTMP/" || die "copy configs"
-  cp $HERE/RUN-CARD-2026-08-27.md "$BOOTMP/RUN-CARD.md" 2>/dev/null || true
-  cp docs/hw-validation-queue-2026-08-27.md "$BOOTMP/QUEUE-2026-08-27.md" 2>/dev/null || true
+  [ -f "$HERE/$RUN_CARD" ] || die "run card $RUN_CARD not found"
+  cp "$HERE/$RUN_CARD" "$BOOTMP/RUN-CARD.md" || die "copy run card"
+  # The active input script. Kept under its own name on the drive as well, so which run a
+  # log belongs to is recoverable from the drive alone after the fact.
+  [ -f "$HERE/$BOOT_INPUT/vm0.txt" ] || die "input script $BOOT_INPUT/vm0.txt not found"
+  mkdir -p "$BOOTMP/input" "$BOOTMP/$BOOT_INPUT"
+  cp "$HERE/$BOOT_INPUT/vm0.txt" "$BOOTMP/input/vm0.txt"      || die "copy input script"
+  cp "$HERE/$BOOT_INPUT/vm0.txt" "$BOOTMP/$BOOT_INPUT/vm0.txt" || die "copy input archive"
+  cp docs/hw-validation-queue-2026-08-28.md "$BOOTMP/QUEUE.md" 2>/dev/null || true
   # Logs cleared so the next boot starts from a clean rotation. Archive them FIRST --
   # this script does not, deliberately: losing a boot's evidence is worse than an
   # extra manual step, so it refuses if they are non-empty and unarchived.
@@ -163,6 +177,10 @@ fi
 for c in $HERE/hype*.cfg; do
   verify "$c" "$BOOTMP/$(basename "$c")" "$(basename "$c")"
 done
+if [ "$CHECK" = 0 ]; then
+  verify "$HERE/$BOOT_INPUT/vm0.txt" "$BOOTMP/input/vm0.txt" "input/vm0.txt"
+  verify "$HERE/$RUN_CARD" "$BOOTMP/RUN-CARD.md" "RUN-CARD.md"
+fi
 echo "scratch image on media:"
 ls -l "$DATAMP/hype/disks/" 2>/dev/null | tail -n +2 | sed 's/^/  /'
 
