@@ -54,6 +54,8 @@
 #define MAX_SCRATCH 64u
 #define DEVPOOL 8u
 #define SPIN 20000000u
+/* #759: one look at the event ring, for pollers rather than waiters. See int_in_poll. */
+#define XHCI_POLL_PEEK 1u
 /* #266: one second, chosen against the measured distribution (mean 493,692 spins,
  * worst observed ~36,000,000 spins). Generous by design -- being early is what
  * caused the bug. */
@@ -422,6 +424,18 @@ static int next_event_budget(xhci_hw_t *hw, volatile uint8_t *bar, uint32_t rtso
             if (((d3 >> 10) & 0x3Fu) == (uint32_t)HYPE_XHCI_TRB_PORT_STATUS) {
                 unsigned int pid = (out[0] >> 24) & 0xFFu;
                 hw->port_events++;
+                /*
+                 * #760: say so HERE, where it happens.
+                 *
+                 * Boot 9 could not answer "did the controller even raise an event when the
+                 * operator re-plugged", because the only place that number appeared was a
+                 * DIAG line behind a 30-second gate, and it printed once -- before the
+                 * operator touched anything. A hot-plug is a rare, operator-driven event;
+                 * one line each is not noise, and its ABSENCE is the finding.
+                 */
+                hype_debug_print("host-xhci: PORT EVENT port=%u (event #%llu on this "
+                                 "controller) [#760]\n", pid,
+                                 (unsigned long long)hw->port_events);
                 if (pid >= 1u && pid <= 31u) {
                     hw->port_changed |= (1u << pid);
                 }
@@ -1485,7 +1499,24 @@ int hype_xhci_int_in_poll(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int e
             return 1;
         }
     }
-    if (next_event_budget(hw, bar, c->rtsoff, evt, SPIN / 1024u, &spins) != 0) {
+    /*
+     * #759: a POLL asks "is there an event right now", and one read of the cycle bit
+     * answers it. This used to spend SPIN/1024 -- 19,531 iterations -- and when the
+     * endpoint has nothing to say, which is the overwhelmingly common case, it burned
+     * every one of them before returning idle.
+     *
+     * That was tolerable at two interrupt-IN endpoints. #746 arms one per hub, and the
+     * 5950X has five, so the desktop polls eight endpoints a tick and paid ~156,000
+     * uncached event-ring reads per tick to learn nothing. It showed up as visible
+     * hitching, and it throttled the 125 Hz input tick badly enough that the hot-plug
+     * sweep and the HID drain ran at a few hertz.
+     *
+     * Spinning is right when WAITING for a transfer known to be outstanding -- which is
+     * what cmd_submit_wait and next_event_timed do, and they are unchanged. It is wrong
+     * here: the transfer is asynchronous and its completion will still be there on the
+     * next poll, or waiting in the parked table.
+     */
+    if (next_event_budget(hw, bar, c->rtsoff, evt, XHCI_POLL_PEEK, &spins) != 0) {
         return 0; /* idle -- the common case, NOT an error */
     }
     if (hype_xhci_event_slot_id(evt) != slot || hype_xhci_event_ep_id(evt) != dci) {
