@@ -33,7 +33,7 @@ set -u
 # drive. The active script and the card that describes it must move together or the operator
 # is reading instructions for a different run.
 BOOT_INPUT=input-1a-hotplug
-RUN_CARD=RUN-CARD-2026-08-28-boot12.md
+RUN_CARD=RUN-CARD-2026-08-28-boot13.md
 
 BOOTLABEL=HYPEBOOT
 # The data partition has NO label. `EADE-CA36` is its exFAT volume UUID, which is what
@@ -144,6 +144,7 @@ if [ "$CHECK" = 0 ]; then
   cp "$HERE/$BOOT_INPUT/vm0.txt" "$BOOTMP/input/vm0.txt"      || die "copy input script"
   cp "$HERE/$BOOT_INPUT/vm0.txt" "$BOOTMP/$BOOT_INPUT/vm0.txt" || die "copy input archive"
   cp docs/hw-validation-queue-2026-08-28.md "$BOOTMP/QUEUE.md" 2>/dev/null || true
+  cp docs/qemu-vs-hardware.md "$BOOTMP/QEMU-VS-HARDWARE.md" 2>/dev/null || true
   # Logs cleared so the next boot starts from a clean rotation. Archive them FIRST --
   # this script does not, deliberately: losing a boot's evidence is worse than an
   # extra manual step, so it refuses if they are non-empty and unarchived.
