@@ -1,7 +1,11 @@
-# Boot 16 -- catch the keyboard dying, with the evidence attached
+# Boot 16 -- does your machine fail the same way mine does?
 
-This boot does not fix anything. Its whole job is to record what the ring looks like at the
-instant the keyboard stops, and what the dashboard freeze actually is.
+This is a correlation run. I have a reproduction in QEMU now, with a signature that repeats
+exactly. One question: does the 5950X produce the same signature, or a different one?
+
+Either answer is worth the boot. The same signature means one bug and I can chase it locally
+without spending any more of your time. A different one means the desk has something QEMU
+does not, and the difference itself is the lead.
 
 ## DO NOT UNPLUG THE HYPE DRIVE
 
@@ -9,68 +13,59 @@ instant the keyboard stops, and what the dashboard freeze actually is.
 
 ## What you need to do
 
-**Make the keyboard die, then stop.** Nothing else.
+**Make the keyboard die, then stop touching everything.**
 
-1. Boot. Wait for the guest to reach a login prompt.
-2. Press **Right-Ctrl + Right-Alt + D** a few times, so there is a healthy baseline in the log.
-3. Then use the keyboard **continuously** -- hold a key down, type steadily, whatever you
-   like -- until it stops responding. Last time that was a few seconds in, with a dashboard
-   freeze as it went.
-4. **The moment it stops: stop touching everything.** Do not hot-plug, do not re-cable. The
-   diagnostic is written when it happens, and the log needs a minute of hype running quietly
-   afterwards to flush it.
-5. Leave it for two minutes, then power off.
+1. Boot, wait for the guest login prompt.
+2. Press **Right-Ctrl + Right-Alt + D** a few times, for a healthy baseline.
+3. Use the keyboard steadily until it stops. Last time that was seconds in.
+4. **Stop.** No hot-plugging, no re-cabling, nothing.
+5. Leave it running quietly for two minutes so the log flushes, then power off.
 
-If the keyboard does **not** die this time, let the run go the full twenty minutes and say
-so -- that is also a result, and a more interesting one.
+Step 4 is the whole run. Every previous boot ended in hot-plug attempts -- entirely
+reasonable, you were trying to recover it -- but that buries the moment under hundreds of
+enumeration lines, and on boot 14 the backlog was itself enough to hide a real event.
 
-## Why "then stop" matters
+If the keyboard does not die, let it run twenty minutes and say so. Also a result.
 
-Every previous boot ended with a burst of hot-plugging after the failure, which is
-reasonable -- you were trying to get the keyboard back. But it buries the moment of failure
-under hundreds of enumeration lines, and on boot 14 that backlog was itself enough to hide a
-real event. This boot needs the seconds *after* the death to be quiet.
+## What I found in QEMU, so you know what this is testing
 
-## What the build now records
-
-Two things that were not in any previous boot:
-
-```
-host-xhci: #764 DIVERGED slot=N ep=M | controller deq=+0x.. hype trb=+0x.. enq=.. cyc=..
-                                     | reports=.. silent=.. rearms=..
-host-xhci: #764   claim[-1] trb=+0x.. cc=..      (the last eight completions hype claimed)
-```
-
-The controller's position against hype's, checked every 64 polls instead of every 4,000, so
-it is caught near the moment rather than half a minute later. Previous boots printed only a
-late summary whose numbers no longer described the failure.
-
-```
-host-xhci: #764 SLOW POLL slot=N ep=0x.. took NNN ms -- this is what a dashboard freeze is
-```
-
-Every keyboard poll is timed. A freeze is something blocking, and this says whether it is in
-the USB path at all and which device owns it.
-
-## Worth knowing before you run it
-
-**I reproduced this in QEMU while building the boot.** The new rig -- which now mirrors your
-machine: two controllers, four hub devices, a hub behind a hub, a composite keyboard+mouse
-like your Logitech receiver, and a device that will not enumerate -- caught one:
+The new rig -- your topology: two controllers, four hub devices, a hub behind a hub, a
+composite keyboard+mouse like your Logitech receiver, and a device that will not enumerate --
+reproduces a dead keyboard on **2 to 3 runs out of 4**, always like this:
 
 ```
 #764 DIVERGED slot=3 ep=3 | controller deq=+0x10 hype trb=+0x0 enq=1 cyc=1 armed=1
-                          | reports=0 silent=1471 rearms=0
+                          | reports=0 | handed=0 deliv=0 from_park=0 own=0 to_park=0
 ```
 
-A hot-plugged keyboard: the controller finished TRB 0 and moved on, hype is still waiting on
-TRB 0, and no report ever arrived. Enumerated, claimed, deaf -- your symptom.
+The controller has finished the transfer hype is waiting on and moved to the next one, and
+hype never saw the completion. The offset is **always exactly one TRB**, whether it happens
+on the first transfer or the sixth. Every counter for "where did the completion go" reads
+zero.
 
-So this boot may not be necessary. If you would rather I chase the QEMU reproduction first
-and save you the boot, say so; it is the cheaper path and I would default to it. The drive is
-staged either way, and a hardware capture would still tell us whether the desk fails the same
-way or differently.
+I had an explanation for this and it was wrong -- I built the fix, measured it, and it never
+fired once while the fault carried on. That is on the ticket (#772) rather than buried.
+
+## The one thing to read afterwards
+
+```
+host-xhci: #764 DIVERGED ...
+```
+
+Send me the line. What matters is:
+
+| field | what it tells us |
+|---|---|
+| `deq` vs `trb` | if the gap is exactly one TRB, your machine and mine have the same bug |
+| `handed` | if non-zero, the completion arrived and was filed and never picked up -- a different fault from mine |
+| `reports` | whether the endpoint ever worked, or was deaf from its first poll |
+| `#764 SLOW POLL` | whether the dashboard freeze is in the USB path at all, and which device owns it |
+
+A gap of exactly one, with every counter zero, means I can stop asking you for boots and
+work on it here.
 
 ## Afterwards
 
     cp \HYPE.LOG \RUN1A.LOG  tools/hw-val-2026-08-25/logs/boot-16/
+
+`\HYPE.LOG` needs `LC_ALL=C grep -a`.
