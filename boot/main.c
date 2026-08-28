@@ -2210,6 +2210,33 @@ static void fw_1_claim_boot_hid(hype_xhci_ctrl_t *xc, unsigned int ctrl_idx,
                                      "REFUSED -- reports may not be boot-format [#734]\n", what,
                                      (unsigned)d->vid, (unsigned)d->pid, hid.interface_num);
                 }
+                /*
+                 * #771: already polling this exact endpoint? Then this is the same claim
+                 * arriving twice, not a second device.
+                 *
+                 * Boot 14 ended with HID[0] and HID[2] both `046d:c547 slot5 ep=0x82` --
+                 * one device, one endpoint, two entries. They share an interrupt-IN block
+                 * (keyed on controller/slot/dci), so the two entries poll the same transfer
+                 * and each claims completions the other armed. A hot-plug elsewhere on the
+                 * controller re-runs the claim walk, which is when the duplicate appears.
+                 */
+                {
+                    unsigned int q;
+                    int dup = 0;
+                    for (q = 0; q < *count; q++) {
+                        if (out[q].xc.bar == xc->bar && out[q].slot == d->slot &&
+                            out[q].ep == hid.int_in_ep) {
+                            dup = 1;
+                            break;
+                        }
+                    }
+                    if (dup) {
+                        hi = hype_usb_inventory_next_iface(&g_usb_inv, HYPE_USB_CLASS_HID,
+                                                           HYPE_USB_SUBCLASS_BOOT,
+                                                           (uint8_t)protocol, hi);
+                        continue;
+                    }
+                }
                 if (*count >= cap) {
                     /* Past the cap. Counted and named rather than skipped in silence: the
                      * interrupt-IN pool is what bounds this, and an operator whose third
@@ -24728,8 +24755,9 @@ static void fw_1_arrival_failed(unsigned int ctrl_idx, unsigned int hub_slot,
     if (f->fails >= HYPE_ARRIVAL_FAIL_MAX && !f->reported) {
         f->reported = 1;
         hype_debug_print("host-usb: giving up on hub slot %u port %u after %u failed "
-                         "arrivals (%s) -- it will not be retried until the port reports "
-                         "empty [#763]\n", hub_slot, port, f->fails, why);
+                         "arrivals (%s) -- it will not be retried, and the hub will stop "
+                         "being asked about it, until the port reports empty [#763 #770]\n",
+                         hub_slot, port, f->fails, why);
     }
 }
 
@@ -25013,12 +25041,28 @@ static void fw_1_usb_hotplug_poll(void) {
                 }
                 hype_debug_print("host-usb: hub slot %u port %u changed -- %s [#746]\n",
                                  hslot, hport, hconn ? "something is attached" : "now empty");
+
                 if (hconn) {
+                    /*
+                     * #770: once hype has given up on this port, tell the HUB to stop
+                     * offering it. #763 stopped the enumeration retries but the reporting
+                     * carried on -- boot 14 logged one port 4,610 times, 68 bytes apart,
+                     * and it filled an 864 KB log. Each report still costs a
+                     * GET_PORT_STATUS and a ClearPortFeature from the dispatch loop.
+                     */
+                    if (fw_1_arrival_given_up(g_live_xc_idx[k], hslot, hport)) {
+                        hype_xhci_hub_ignore_port(xc, hslot, hport, 1);
+                        continue;
+                    }
                     if (!enumerated) {
                         enumerated = fw_1_usb_enumerate_behind_hub(xc, g_live_xc_idx[k],
                                                                    hslot, hport);
                     }
                 } else {
+                    /* Empty again: whatever could not be addressed has physically gone, so
+                     * the next thing plugged in here gets a fresh set of attempts. */
+                    fw_1_arrival_reset(g_live_xc_idx[k], hslot, hport);
+                    hype_xhci_hub_ignore_port(xc, hslot, hport, 0);
                     fw_1_usb_release_behind_hub(xc, hslot, hport);
                 }
             }

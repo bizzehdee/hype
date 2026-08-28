@@ -552,6 +552,17 @@ unsigned int hype_xhci_take_port_change(hype_xhci_ctrl_t *c);
  * Called from the hot-plug sweep for every live controller, so noticing a plug does not
  * depend on something else happening to be busy.
  */
+/*
+ * #770: stop reporting this hub port, or start again.
+ *
+ * Its change bits are still CLEARED on every poll -- leaving them set would make the hub
+ * report its whole bitmap forever -- but the port is not handed back to the caller. For a
+ * device hype has given up enumerating whose link keeps flapping, that is the difference
+ * between a bounded cost and 4,610 log lines from one port.
+ */
+void hype_xhci_hub_ignore_port(hype_xhci_ctrl_t *c, unsigned int hub_slot, unsigned int port,
+                               int ignore);
+
 unsigned int hype_xhci_pump_events(hype_xhci_ctrl_t *c, unsigned int budget);
 
 unsigned int hype_xhci_discard_port_changes(hype_xhci_ctrl_t *c);

@@ -1181,6 +1181,21 @@ typedef struct {
     hype_xhci_devpath_t path;
     unsigned int tier;
     int ss;                 /* a SuperSpeed hub: its downstream ports are all SS */
+    /*
+     * #770: ports hype has given up on, one bit per port (1-based, so bit 1 is port 1).
+     *
+     * A hub reports a port while any of its change bits is set, and a device whose link
+     * keeps flapping sets them again as fast as they are cleared. Boot 14 logged
+     * `hub slot 6 port 1 changed` 4,610 times -- 68 bytes apart, a tight loop -- and it
+     * dominated an 864 KB log.
+     *
+     * #763 caps the ENUMERATION retries, which stopped the Address Device storm, but the
+     * reporting itself carries on: take_change still spends a GET_PORT_STATUS and a
+     * ClearPortFeature per report, from the guest dispatch loop, forever. An ignored port
+     * still has its change bits cleared -- leaving them set would make the hub report the
+     * whole bitmap every time -- but it is not handed back to the caller.
+     */
+    uint32_t ignore_ports;
 } xhci_hub_reg_t;
 
 static xhci_hub_reg_t g_hubs[HYPE_XHCI_HUB_MAX];
@@ -1491,6 +1506,10 @@ int hype_xhci_hub_take_change(hype_xhci_ctrl_t *c, unsigned int i, unsigned int 
                 (void)hub_clear_port_feature(c, g_hubs[i].slot,
                                              HUB_FEAT_C_PORT_CONNECTION, port);
             }
+        }
+        /* #770: cleared above, but not reported -- hype has given up on this one. */
+        if (g_hubs[i].ignore_ports & (1u << (port & 31u))) {
+            continue;
         }
         *out_port = port;
         *out_connected = (st[0] & 0x01u) ? 1 : 0;
@@ -3065,6 +3084,19 @@ unsigned int hype_xhci_take_port_change(hype_xhci_ctrl_t *c) {
         }
     }
     return 0;
+}
+
+void hype_xhci_hub_ignore_port(hype_xhci_ctrl_t *c, unsigned int hub_slot, unsigned int port,
+                               int ignore) {
+    unsigned int i;
+    if (c == (hype_xhci_ctrl_t *)0 || port == 0u || port > 31u) return;
+    for (i = 0; i < HYPE_XHCI_HUB_MAX; i++) {
+        if (g_hubs[i].used && g_hubs[i].ctrl == c->hw_slot && g_hubs[i].slot == hub_slot) {
+            if (ignore) g_hubs[i].ignore_ports |= (1u << port);
+            else g_hubs[i].ignore_ports &= ~(1u << port);
+            return;
+        }
+    }
 }
 
 unsigned int hype_xhci_pump_events(hype_xhci_ctrl_t *c, unsigned int budget) {
