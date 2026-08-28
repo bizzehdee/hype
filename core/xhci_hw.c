@@ -60,6 +60,8 @@
 #define HYPE_INT_IN_SILENT_MAX 4000u
 /* #764 capture: how often to compare the controller's dequeue against ours while armed. */
 #define HYPE_INT_IN_CHECK_POLLS 64u
+/* #764: consecutive checks, all showing the same stuck pair, before it is reported. */
+#define HYPE_INT_IN_DIVERGE_RUNS 8u
 
 /* #266: one second, chosen against the measured distribution (mean 493,692 spins,
  * worst observed ~36,000,000 spins). Generous by design -- being early is what
@@ -250,6 +252,9 @@ typedef struct {
      * which no other counter can distinguish from one that never arrived at all.
      */
     unsigned long long handed;
+    /* #764: a divergence only counts if it PERSISTS. See the check in the poll. */
+    uint64_t last_deq;
+    unsigned int diverge_run;
 } xhci_int_in_hw_t;
 
 static xhci_int_in_hw_t g_iin_hw[HYPE_XHCI_INT_IN_MAX];
@@ -1150,6 +1155,7 @@ int hype_xhci_configure_int_in_endpoint(hype_xhci_ctrl_t *c, unsigned int slot,
     iin->silent_polls = 0; iin->rearms = 0;
     iin->claim_n = 0; iin->diverged = 0; iin->reports = 0;
     iin->deliv = 0; iin->from_park = 0; iin->own = 0; iin->to_park = 0; iin->handed = 0;
+    iin->last_deq = 0; iin->diverge_run = 0;
 
     zero(hw->input_ctx, XPAGE);
     hype_xhci_input_ctrl_ctx(ctx, HYPE_XHCI_ADD_SLOT | (1u << dci), 0);
@@ -1364,6 +1370,7 @@ int hype_xhci_configure_hub_int_in(hype_xhci_ctrl_t *c, unsigned int slot,
     iin->silent_polls = 0; iin->rearms = 0;
     iin->claim_n = 0; iin->diverged = 0; iin->reports = 0;
     iin->deliv = 0; iin->from_park = 0; iin->own = 0; iin->to_park = 0; iin->handed = 0;
+    iin->last_deq = 0; iin->diverge_run = 0;
 
     zero(hw->input_ctx, XPAGE);
     hype_xhci_input_ctrl_ctx(ctx, HYPE_XHCI_ADD_SLOT | (1u << dci), 0);
@@ -1819,8 +1826,31 @@ static int int_in_poll_body(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int
         uint64_t link = b + (uint64_t)(RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES;
         if (int_in_ctx_dequeue(c, slot, dci, &d) == 0 && d != 0ull && d != link &&
             d != iin->pending_trb) {
-            iin->diverged = 1;
-            int_in_report_divergence(iin, slot, dci, d, b);
+            /*
+             * #764: only report a divergence that PERSISTS.
+             *
+             * Boot 16 fired this twice on a keyboard that went on working perfectly --
+             * 1,326 reports afterwards. Both sightings were the ring wrap: the controller
+             * had consumed the last TRB and moved to index 0 while hype's cursor was still
+             * near the end, and the completion arrived a moment later. Every counter
+             * balanced (handed+own == reports), which is the tell.
+             *
+             * A transient resolves; a stuck endpoint does not. So require the SAME dequeue
+             * and the same outstanding TRB across several checks before saying anything.
+             * The QEMU reproduction sits there for thousands of polls and still trips it.
+             */
+            if (d == iin->last_deq) {
+                iin->diverge_run++;
+            } else {
+                iin->last_deq = d;
+                iin->diverge_run = 1;
+            }
+            if (iin->diverge_run >= HYPE_INT_IN_DIVERGE_RUNS) {
+                iin->diverged = 1;
+                int_in_report_divergence(iin, slot, dci, d, b);
+            }
+        } else {
+            iin->diverge_run = 0;
         }
     }
     if (iin->armed && ++iin->silent_polls >= HYPE_INT_IN_SILENT_MAX) {
