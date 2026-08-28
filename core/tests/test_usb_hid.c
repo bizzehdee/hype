@@ -517,6 +517,109 @@ static void test_mouse_report_rejects_bad_input(void) {
     CHECK_HEX("output too small", 0, (int)hype_usb_hid_mouse_report_to_ps2(rep, 3u, ps2, 2u));
 }
 
+
+/* ---------------------------------------------------------------- #774 typematic */
+
+static void test_typematic_waits_the_delay_then_repeats(void) {
+    hype_usb_hid_typematic_t t;
+    uint8_t r[8], out[8];
+
+    hype_usb_hid_typematic_init(&t);
+    mk_report(r, 0, 0x04, 0, 0); /* hold 'a' */
+    hype_usb_hid_typematic_note(&t, r, 1000);
+
+    /* Nothing before the delay: a key held briefly must not repeat at all. */
+    CHECK_HEX("repeated before the 500ms delay", 1, (hype_usb_hid_typematic_tick(&t, 1000 + 499, out, sizeof out) == 0) ? 1 : 0);
+    /* Then one make code, and one only, until the period elapses. */
+    CHECK_HEX("no repeat at the delay", 1, (hype_usb_hid_typematic_tick(&t, 1000 + 500, out, sizeof out) == 1) ? 1 : 0);
+    CHECK_HEX("repeat emitted the wrong make code for 'a'", 1, (out[0] == 0x1E) ? 1 : 0);
+    CHECK_HEX("repeated again immediately instead of waiting the period", 1, (hype_usb_hid_typematic_tick(&t, 1000 + 501, out, sizeof out) == 0) ? 1 : 0);
+    CHECK_HEX("no repeat after the period", 1, (hype_usb_hid_typematic_tick(&t, 1000 + 500 + 92, out, sizeof out) == 1) ? 1 : 0);
+}
+
+static void test_typematic_release_stops_it(void) {
+    hype_usb_hid_typematic_t t;
+    uint8_t r[8], out[8];
+
+    hype_usb_hid_typematic_init(&t);
+    mk_report(r, 0, 0x04, 0, 0);
+    hype_usb_hid_typematic_note(&t, r, 0);
+    CHECK_HEX("no first repeat", 1, (hype_usb_hid_typematic_tick(&t, 500, out, sizeof out) == 1) ? 1 : 0);
+
+    mk_report(r, 0, 0, 0, 0); /* released */
+    hype_usb_hid_typematic_note(&t, r, 600);
+    CHECK_HEX("kept repeating after the key was released", 1, (hype_usb_hid_typematic_tick(&t, 5000, out, sizeof out) == 0) ? 1 : 0);
+}
+
+static void test_typematic_only_the_last_key_repeats(void) {
+    hype_usb_hid_typematic_t t;
+    uint8_t r[8], out[8];
+
+    hype_usb_hid_typematic_init(&t);
+    mk_report(r, 0, 0x04, 0, 0);          /* 'a' down */
+    hype_usb_hid_typematic_note(&t, r, 0);
+    CHECK_HEX("no repeat for 'a'", 1, (hype_usb_hid_typematic_tick(&t, 500, out, sizeof out) == 1) ? 1 : 0);
+
+    mk_report(r, 0, 0x04, 0x05, 0);       /* 'b' pressed while 'a' still down */
+    hype_usb_hid_typematic_note(&t, r, 600);
+    /* The delay restarts for 'b', so nothing is due yet -- and when it is, it is 'b'. */
+    CHECK_HEX("did not restart the delay when a second key took over", 1, (hype_usb_hid_typematic_tick(&t, 700, out, sizeof out) == 0) ? 1 : 0);
+    CHECK_HEX("no repeat for 'b'", 1, (hype_usb_hid_typematic_tick(&t, 600 + 500, out, sizeof out) == 1) ? 1 : 0);
+    CHECK_HEX("repeated the wrong key -- PS/2 repeats the LAST one pressed", 1, (out[0] == 0x30) ? 1 : 0);
+}
+
+static void test_typematic_modifiers_alone_never_repeat(void) {
+    hype_usb_hid_typematic_t t;
+    uint8_t r[8], out[8];
+
+    hype_usb_hid_typematic_init(&t);
+    mk_report(r, 0x02 /* LShift */, 0, 0, 0);
+    hype_usb_hid_typematic_note(&t, r, 0);
+    CHECK_HEX("a held shift repeated -- a PS/2 keyboard does not do that", 1, (hype_usb_hid_typematic_tick(&t, 10000, out, sizeof out) == 0) ? 1 : 0);
+}
+
+static void test_typematic_extended_key_repeats_with_its_prefix(void) {
+    hype_usb_hid_typematic_t t;
+    uint8_t r[8], out[8];
+
+    hype_usb_hid_typematic_init(&t);
+    mk_report(r, 0, 0x50 /* Left Arrow */, 0, 0);
+    hype_usb_hid_typematic_note(&t, r, 0);
+    CHECK_HEX("an extended key must repeat as TWO bytes", 1, (hype_usb_hid_typematic_tick(&t, 500, out, sizeof out) == 2) ? 1 : 0);
+    CHECK_HEX("wrong extended repeat sequence", 1, (out[0] == 0xE0 && out[1] == 0x4B) ? 1 : 0);
+    /* And never a lone prefix when the buffer cannot hold both. */
+    CHECK_HEX("emitted a lone 0xE0 when there was room for only one byte", 1, (hype_usb_hid_typematic_tick(&t, 5000, out, 1) == 0) ? 1 : 0);
+}
+
+static void test_typematic_honours_the_guest_f3_setting(void) {
+    hype_usb_hid_typematic_t t;
+    uint8_t r[8], out[8];
+
+    hype_usb_hid_typematic_init(&t);
+    /* 0x00 = fastest: 250 ms delay, 30 per second. A guest that asks for this and silently
+     * gets the default feels broken in a way no log explains. */
+    hype_usb_hid_typematic_set_f3(&t, 0x00);
+    mk_report(r, 0, 0x04, 0, 0);
+    hype_usb_hid_typematic_note(&t, r, 0);
+    CHECK_HEX("ignored the 250ms delay", 1, (hype_usb_hid_typematic_tick(&t, 249, out, sizeof out) == 0) ? 1 : 0);
+    CHECK_HEX("no repeat at 250ms", 1, (hype_usb_hid_typematic_tick(&t, 250, out, sizeof out) == 1) ? 1 : 0);
+    /* 8 ticks * 4.17ms = 33ms */
+    CHECK_HEX("ignored the fast rate the guest asked for", 1, (hype_usb_hid_typematic_tick(&t, 250 + 33, out, sizeof out) == 1) ? 1 : 0);
+}
+
+static void test_typematic_null_safe(void) {
+    uint8_t out[8], r[8];
+    hype_usb_hid_typematic_t t;
+
+    hype_usb_hid_typematic_init(0);
+    hype_usb_hid_typematic_note(0, r, 0);
+    hype_usb_hid_typematic_init(&t);
+    hype_usb_hid_typematic_note(&t, 0, 0);
+    CHECK_HEX("tick(NULL) misbehaved", 1, (hype_usb_hid_typematic_tick(0, 0, out, sizeof out) == 0) ? 1 : 0);
+    CHECK_HEX("tick with no buffer misbehaved", 1, (hype_usb_hid_typematic_tick(&t, 0, 0, 8) == 0) ? 1 : 0);
+    hype_usb_hid_typematic_set_f3(0, 0);
+}
+
 int main(void) {
     test_find_mouse_picks_the_mouse_interface();
     test_find_mouse_refuses_a_non_boot_mouse();
@@ -542,6 +645,13 @@ int main(void) {
     test_find_keyboard_rejects_non_interrupt_endpoint();
     test_find_keyboard_short_descriptors();
     test_find_keyboard();
+    test_typematic_waits_the_delay_then_repeats();
+    test_typematic_release_stops_it();
+    test_typematic_only_the_last_key_repeats();
+    test_typematic_modifiers_alone_never_repeat();
+    test_typematic_extended_key_repeats_with_its_prefix();
+    test_typematic_honours_the_guest_f3_setting();
+    test_typematic_null_safe();
     test_find_keyboard_ignores_interrupt_out();
     test_find_keyboard_rejects_non_boot_and_malformed();
 

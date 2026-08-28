@@ -102,7 +102,19 @@ typedef struct {
                       * keyboard-controller system-reset pulse. Latched for the
                       * VMM to consume (it owns the VM lifecycle); the device
                       * model itself has nothing to reset. */
-    int awaiting_scancode_set_param; /* #436: 0xF0 consumes one parameter byte */
+    int awaiting_scancode_set_param;
+    /*
+     * #774: Set Typematic Rate/Delay (0xF3) and its parameter byte.
+     *
+     * The guest is entitled to choose its own repeat delay and rate, and a guest that asks
+     * for a fast repeat and silently gets the default feels broken in a way no log would
+     * explain. hype has no hardware keyboard to forward this to -- it synthesises the
+     * repeat itself from USB reports -- so the value is recorded here and the input path
+     * picks it up.
+     */
+    int awaiting_typematic_param;
+    uint8_t typematic_param;
+    int typematic_pending;   /* a new value the input path has not applied yet */ /* #436: 0xF0 consumes one parameter byte */
     uint8_t out_is_scancode[HYPE_PS2_KBD_FIFO_SIZE];
     unsigned int out_head;  /* index of the next byte to read */
     unsigned int out_count; /* bytes currently queued */
@@ -219,5 +231,13 @@ int hype_ps2_kbd_has_pending_irq(const hype_ps2_kbd_t *kbd);
 unsigned hype_ps2_kbd_trace_event(const hype_ps2_kbd_t *kbd, unsigned i, uint16_t *out);
 unsigned hype_ps2_kbd_trace_count(const hype_ps2_kbd_t *kbd);
 unsigned long long hype_ps2_kbd_trace_total(const hype_ps2_kbd_t *kbd);
+
+/*
+ * #774: take a typematic setting the guest has just written, if there is one.
+ *
+ * Returns 1 and fills `out` once per new value, 0 otherwise -- so the input path can call
+ * it every tick and act only when the guest actually changed something.
+ */
+int hype_ps2_kbd_take_typematic(hype_ps2_kbd_t *kbd, uint8_t *out);
 
 #endif /* HYPE_DEVICES_PS2_KEYBOARD_H */

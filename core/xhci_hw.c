@@ -1759,6 +1759,37 @@ int hype_xhci_int_in_poll(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int e
     return poll_rc;
 }
 
+/*
+ * #773: arm one transfer on this endpoint and ring its doorbell.
+ *
+ * Extracted so a claim can re-arm IMMEDIATELY instead of waiting for the next poll.
+ *
+ * An interrupt endpoint carries one transfer at a time, and hype used to leave it unarmed
+ * from the moment a report was claimed until the next tick came round -- up to 8 ms at
+ * 125 Hz. A HID boot report is a STATE SNAPSHOT, not an event log, so the device has
+ * nowhere to record what happened while nothing was armed: a key pressed and released
+ * inside that window is simply absent from the next report, and hype's diff never sees it.
+ *
+ * That is the operator's "the faster i typed, the more it missed". It is not the tick being
+ * slow -- the tick was measured at 122-136 Hz, which is what it asks for. It is the endpoint
+ * being deaf for most of each interval between ticks.
+ */
+static void int_in_arm(hype_xhci_ctrl_t *c, xhci_int_in_hw_t *iin, unsigned int slot,
+                       unsigned int dci, unsigned int len) {
+    volatile uint8_t *bar = (volatile uint8_t *)(uintptr_t)c->bar;
+    unsigned int xfer = (iin->mps != 0u && iin->mps <= sizeof(iin->report)) ? iin->mps : len;
+    uint64_t my_trb = phys(iin->ring) + (uint64_t)iin->enq * HYPE_XHCI_TRB_BYTES;
+    uint32_t t[4];
+    unsigned int i;
+
+    for (i = 0; i < sizeof(iin->report); i++) iin->report[i] = 0;
+    hype_xhci_trb_normal(t, phys(iin->report), xfer, (int)iin->cyc);
+    ring_enqueue(iin->ring, &iin->enq, &iin->cyc, t);
+    wr32(bar, hype_xhci_doorbell_offset(c->dboff, slot), dci);
+    iin->armed = 1;
+    iin->pending_trb = my_trb;
+}
+
 static int int_in_poll_body(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int ep_addr,
                             uint8_t *out, unsigned int len) {
     xhci_hw_t *hw = HW(c);
@@ -1895,13 +1926,7 @@ static int int_in_poll_body(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int
         }
     }
     if (!iin->armed) {
-        unsigned int xfer = (iin->mps != 0u && iin->mps <= sizeof(iin->report)) ? iin->mps : len;
-        for (i = 0; i < sizeof(iin->report); i++) iin->report[i] = 0;
-        hype_xhci_trb_normal(t, phys(iin->report), xfer, (int)iin->cyc);
-        ring_enqueue(iin->ring, &iin->enq, &iin->cyc, t);
-        wr32(bar, hype_xhci_doorbell_offset(c->dboff, slot), dci);
-        iin->armed = 1;
-        iin->pending_trb = my_trb;
+        int_in_arm(c, iin, slot, dci, len);
     }
     my_trb = iin->pending_trb;
 
@@ -1924,6 +1949,7 @@ static int int_in_poll_body(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int
         iin->deliv++;
         int_in_note_claim(iin, my_trb, cc);
         for (i = 0; i < len; i++) out[i] = iin->report[i];
+        int_in_arm(c, iin, slot, dci, len); /* #773: at once, not next tick */
         return 1;
     }
 
@@ -1946,6 +1972,7 @@ static int int_in_poll_body(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int
             iin->from_park++;
             int_in_note_claim(iin, my_trb, parked_cc);
             for (i = 0; i < len; i++) out[i] = iin->report[i];
+            int_in_arm(c, iin, slot, dci, len); /* #773 */
             return 1;
         }
     }
@@ -2000,6 +2027,7 @@ static int int_in_poll_body(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int
     iin->own++;
     int_in_note_claim(iin, hype_xhci_event_trb_ptr(evt), hype_xhci_event_cc(evt));
     for (i = 0; i < len; i++) out[i] = iin->report[i];
+    int_in_arm(c, iin, slot, dci, len); /* #773 */
     return 1;
 }
 
@@ -3356,6 +3384,34 @@ int hype_xhci_port_connected(hype_xhci_ctrl_t *c, unsigned int port, int *out_co
     }
     bar = (volatile uint8_t *)(uintptr_t)c->bar;
     sc = rd32(bar, c->op + hype_xhci_portsc_offset(port));
+    /*
+     * #758: read CCS twice and require agreement before believing it.
+     *
+     * A port that has just changed is still settling, and a single read can catch it
+     * mid-transition -- rig 744 failed about one run in four with "port N changed --
+     * something is attached" on an unplug, and because the change bits were ACKed in the
+     * same breath, no further event came and the departure was lost for good.
+     *
+     * The two reads are separated by a PORTSC read of the same register, which is a real
+     * MMIO round trip rather than a delay loop: enough for a transitioning line to settle,
+     * and nothing measurable in a sweep that runs from the guest dispatch loop.
+     */
+    {
+        uint32_t sc2 = rd32(bar, c->op + hype_xhci_portsc_offset(port));
+        if ((sc ^ sc2) & HYPE_XHCI_PORTSC_CCS) {
+            /*
+             * Still moving. Do NOT ACK -- leaving the change bits set is what keeps the
+             * controller willing to tell us again, and re-banking the port means the sweep
+             * reconsiders it next tick rather than committing to a reading it cannot
+             * justify. Refusing to classify is the safe answer here: a wrong "now empty"
+             * tears down a working device, and a wrong "attached" loses a departure.
+             */
+            xhci_hw_t *hw = HW(c);
+            if (port <= 31u) hw->port_changed |= (1u << port);
+            return -1;
+        }
+        sc = sc2;
+    }
     /*
      * #744: ACK the change bits while we are here, by writing them back. PORTSC's change
      * bits are write-1-to-clear and the controller will not raise another event for this

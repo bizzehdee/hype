@@ -395,6 +395,9 @@ typedef struct {
      * it. Per-device because the answer is a property of the keyboard, not of hype.
      */
     uint8_t mods_seen;
+    /* #774: this keyboard's auto-repeat state. Per keyboard, because two keyboards holding
+     * different keys must each repeat their own. */
+    hype_usb_hid_typematic_t typematic;
 } hype_host_kbd_t;
 
 static hype_host_kbd_t g_hid[HYPE_HOST_KBD_MAX];
@@ -2263,6 +2266,7 @@ static void fw_1_claim_boot_hid(hype_xhci_ctrl_t *xc, unsigned int ctrl_idx,
                      * `prev` report and diff the first real report against a stranger's. */
                     for (z = 0; z < HYPE_USB_HID_REPORT_LEN; z++) e->prev[z] = 0u;
                     e->have_prev = 0;
+                    hype_usb_hid_typematic_init(&e->typematic); /* #774 */
                     e->polls = 0; e->reports = 0; e->errs = 0; e->mods_seen = 0u;
                     (*count)++;
                     hype_usb_inventory_claim(&g_usb_inv, hi, HYPE_USB_OWNER_HYPE);
@@ -2516,7 +2520,49 @@ static volatile unsigned int g_bsp_phase;
  */
 static volatile unsigned long long g_bsp_phase_seq;
 
+/*
+ * #773: and how long each phase COSTS.
+ *
+ * The markers existed so a wedge could be located; they said which phase the BSP was in and
+ * nothing about the time spent there. Boot 16 measured the 125 Hz input tick actually running
+ * at 50.5 Hz -- 11,832 polls in 234 s -- which means the loop iteration takes about 20 ms and
+ * the tick can only fire when it comes round. USB HID reports STATE and hype diffs
+ * consecutive reports, so a 20 ms sampling window loses anything that happens inside it, and
+ * that is the operator's "the faster i typed, the more it missed".
+ *
+ * Raising the tick rate without knowing where the 20 ms goes would just move the problem, so
+ * each phase is accumulated and reported. Cost is one rdtsc per transition.
+ */
+/* #773: how many times the 125 Hz gate actually opened. The poll counts in the HID DIAG are
+ * per endpoint and can be confounded by an endpoint that errors or backs off; this is the
+ * tick itself. */
+static unsigned long long g_hid_gate_opens;
+
+/*
+ * #774: a monotonic millisecond clock for the input path.
+ *
+ * Typematic is the one part of keyboard handling that is about elapsed time rather than
+ * transitions, so it needs a clock. Derived from the TSC, which is already calibrated;
+ * returns 0 before calibration, which simply means no repeat until the clock exists.
+ */
+static uint64_t fw_1_now_ms(void) {
+    uint64_t hz = g_vms[0].host_tsc_hz;
+    return (hz != 0ull) ? (hype_rdtsc() / (hz / 1000ull)) : 0ull;
+}
+
+#define BSP_PHASE_MAX 16u
+static unsigned long long g_bsp_phase_tsc[BSP_PHASE_MAX];
+static unsigned long long g_bsp_phase_hits[BSP_PHASE_MAX];
+static uint64_t g_bsp_phase_at;
+
 static inline void bsp_phase(unsigned int p) {
+    uint64_t now = hype_rdtsc();
+    unsigned int was = g_bsp_phase;
+    if (g_bsp_phase_at != 0 && was < BSP_PHASE_MAX) {
+        g_bsp_phase_tsc[was] += now - g_bsp_phase_at;
+        g_bsp_phase_hits[was]++;
+    }
+    g_bsp_phase_at = now;
     g_bsp_phase = p;
     g_bsp_phase_seq++;
 }
@@ -8376,6 +8422,7 @@ static void fw_1_host_input_poll(void) {
             uint64_t now_h = hype_rdtsc();
             if (hid_last == 0 || now_h - hid_last >= hz / 125u) {
                 hid_last = now_h;
+                g_hid_gate_opens++; /* #773: measured, not inferred */
                 (void)usb_hid_drain();
                 fw_1_usb_hotplug_poll(); /* #744 */
             }
@@ -24551,10 +24598,44 @@ static unsigned int usb_hid_drain(void) {
      * sharing that state would make a key held on one board look released as soon as
      * another board reported.
      */
+    /*
+     * #774: has the guest asked for a different repeat rate? Applied to every host keyboard,
+     * because the guest sees one PS/2 keyboard however many are merged into it (#742) and a
+     * setting that took effect on only some of them would be worse than none.
+     */
+    {
+        uint8_t f3;
+        unsigned int fk;
+        if (g_vm_count != 0u && hype_ps2_kbd_take_typematic(&g_vms[0].ps2, &f3)) {
+            for (fk = 0; fk < g_hid_count && fk < HYPE_HOST_KBD_MAX; fk++) {
+                hype_usb_hid_typematic_set_f3(&g_hid[fk].typematic, f3);
+            }
+            hype_debug_print("host-hid: guest set typematic 0x%02x -> delay %ums rate period "
+                             "%ums, applied to %u keyboard(s) [#774]\n", (unsigned)f3,
+                             g_hid[0].typematic.delay_ms, g_hid[0].typematic.period_ms,
+                             g_hid_count);
+        }
+    }
+
     for (k = 0; k < g_hid_count && k < HYPE_HOST_KBD_MAX; k++) {
         hype_host_kbd_t *kb = &g_hid[k];
 
         kb->polls++;
+        /*
+         * #774: any repeat that has come due, BEFORE polling. A held key produces no new
+         * report -- that is the whole reason typematic has to be synthesised -- so this
+         * must run on every tick, not only on ticks where the device said something.
+         */
+        {
+            uint8_t rep[4];
+            unsigned int rn = hype_usb_hid_typematic_tick(&kb->typematic, fw_1_now_ms(),
+                                                          rep, (unsigned)sizeof(rep));
+            unsigned int ri;
+            for (ri = 0; ri < rn; ri++) {
+                hype_host_kbd_inject_scancode(rep[ri]);
+            }
+            injected += rn;
+        }
         r = hype_xhci_int_in_poll(&kb->xc, kb->slot, kb->ep, report, HYPE_USB_HID_REPORT_LEN);
         if (r < 0) {
             kb->errs++;
@@ -24579,6 +24660,7 @@ static unsigned int usb_hid_drain(void) {
                              "USB keyboard is live [#217 #742]\n",
                              (unsigned)kb->vid, (unsigned)kb->pid, kb->slot);
         }
+        hype_usb_hid_typematic_note(&kb->typematic, report, fw_1_now_ms()); /* #774 */
         n = hype_usb_hid_report_to_scancodes(kb->have_prev ? kb->prev : 0, report, codes,
                                              (unsigned)sizeof(codes));
         for (i = 0; i < HYPE_USB_HID_REPORT_LEN; i++) {
@@ -29191,6 +29273,60 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 }
             }
             bsp_phase(BSP_PHASE_KBDDIAG);
+            /*
+             * #773: where the BSP loop's time actually goes, every 10 s. Named phases so the
+             * answer is a place in the code rather than a number to theorise about.
+             */
+            {
+                static uint64_t bp_at;
+                uint64_t bp_hz = g_vms[0].host_tsc_hz;
+                if (bp_hz != 0 && (bp_at == 0 || hype_rdtsc() - bp_at >= 10ull * bp_hz)) {
+                    static const char *const nm[BSP_PHASE_MAX] = {
+                        "idle", "render", "input", "kbddiag", "flush", "fbprobe", "fbcli",
+                        "fbreport", "inval", "band", "gopflush", "dash", "?12", "?13",
+                        "?14", "?15"
+                    };
+                    unsigned int q;
+                    unsigned long long tot = 0;
+                    bp_at = hype_rdtsc();
+                    for (q = 0; q < BSP_PHASE_MAX; q++) tot += g_bsp_phase_tsc[q];
+                    if (tot != 0ull) {
+                        for (q = 0; q < BSP_PHASE_MAX; q++) {
+                            if (g_bsp_phase_hits[q] == 0ull) continue;
+                            hype_debug_print("fw-1 BSPCOST %s %llu%% total=%llums "
+                                             "hits=%llu mean=%lluus [#773]\n",
+                                             nm[q],
+                                             (g_bsp_phase_tsc[q] * 100ull) / tot,
+                                             (g_bsp_phase_tsc[q] * 1000ull) / bp_hz,
+                                             g_bsp_phase_hits[q],
+                                             (g_bsp_phase_tsc[q] * 1000000ull) / bp_hz /
+                                                 g_bsp_phase_hits[q]);
+                        }
+                        hype_debug_print("fw-1 BSPCOST loop iterations=%llu hz=%llu "
+                                         "gate=hz/125=%llu cycles -- the input tick fires "
+                                         "when this many cycles have passed [#773]\n",
+                                         (unsigned long long)g_bsp_ticks,
+                                         (unsigned long long)bp_hz,
+                                         (unsigned long long)(bp_hz / 125ull));
+                        {
+                            static unsigned long long last_opens;
+                            static uint64_t last_at;
+                            uint64_t now = hype_rdtsc();
+                            if (last_at != 0) {
+                                unsigned long long d = g_hid_gate_opens - last_opens;
+                                unsigned long long secs = (now - last_at) / bp_hz;
+                                if (secs != 0ull) {
+                                    hype_debug_print("fw-1 BSPCOST input tick fired %llu times "
+                                                     "in %llus = %llu Hz (want 125) [#773]\n",
+                                                     d, secs, d / secs);
+                                }
+                            }
+                            last_opens = g_hid_gate_opens;
+                            last_at = now;
+                        }
+                    }
+                }
+            }
             {
                 /*
                  * #363: report keyboard-interrupt liveness FROM THE BSP, on its own cadence.

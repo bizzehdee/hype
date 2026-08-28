@@ -315,3 +315,83 @@ unsigned int hype_usb_hid_mouse_report_to_ps2(const uint8_t *report, unsigned in
     out[2] = (uint8_t)dy;
     return HYPE_USB_HID_PS2_PACKET_LEN;
 }
+
+/* ---------------------------------------------------------------- #774 typematic */
+
+void hype_usb_hid_typematic_init(hype_usb_hid_typematic_t *t) {
+    if (t == 0) return;
+    t->usage = 0;
+    t->code = 0;
+    t->ext = 0;
+    t->next_at_ms = 0;
+    t->delay_ms = HYPE_USB_HID_TYPEMATIC_DELAY_MS;
+    t->period_ms = HYPE_USB_HID_TYPEMATIC_PERIOD_MS;
+    t->started = 0;
+}
+
+void hype_usb_hid_typematic_note(hype_usb_hid_typematic_t *t, const uint8_t report[8],
+                                 uint64_t now_ms) {
+    unsigned int i;
+    uint8_t hold = 0;
+
+    if (t == 0 || report == 0) return;
+
+    /*
+     * The LAST ordinary key in the report is the one that repeats. A HID boot report lists
+     * held keys in bytes 2..7 in the order they were pressed, so the last non-zero entry is
+     * the most recent -- which is the key a PS/2 keyboard would be repeating.
+     */
+    for (i = 2u; i < HYPE_USB_HID_REPORT_LEN; i++) {
+        if (report[i] != 0u && report[i] != 0x01u /* ErrorRollOver */) {
+            hold = report[i];
+        }
+    }
+
+    if (hold == 0u) {
+        t->usage = 0; /* modifiers alone do not repeat */
+        t->started = 0;
+        return;
+    }
+    if (hold == t->usage) {
+        return; /* same key still down -- leave the schedule alone */
+    }
+    /* A different key took over: restart from the delay, as a PS/2 keyboard does. */
+    t->usage = hold;
+    t->code = g_usage_to_set1[hold];
+    t->ext = g_usage_is_ext[hold] ? 1 : 0;
+    t->started = 0;
+    t->next_at_ms = now_ms + (uint64_t)t->delay_ms;
+}
+
+unsigned int hype_usb_hid_typematic_tick(hype_usb_hid_typematic_t *t, uint64_t now_ms,
+                                         uint8_t *out, unsigned int out_cap) {
+    unsigned int n = 0;
+
+    if (t == 0 || out == 0 || t->usage == 0u || t->code == 0u) return 0;
+    if (now_ms < t->next_at_ms) return 0;
+
+    n = emit_code(out, 0u, out_cap, t->code, t->ext, 0 /* make */);
+    if (n == 0u) return 0; /* no room for the whole sequence -- emit nothing, never a lone 0xE0 */
+    t->started = 1;
+    t->next_at_ms = now_ms + (uint64_t)t->period_ms;
+    return n;
+}
+
+void hype_usb_hid_typematic_set_f3(hype_usb_hid_typematic_t *t, uint8_t param) {
+    /*
+     * 8042 Set Typematic Rate/Delay. Bits 6:5 select the delay and bits 4:0 the rate.
+     *
+     * The rate is not linear: it is (8 + B) * 2^A periods of 4.17 ms, where A is bits 4:3 and
+     * B is bits 2:0. Computed rather than tabulated, so an unusual value a guest picks is
+     * honoured instead of falling back to the default.
+     */
+    unsigned int a, b, ticks;
+
+    if (t == 0) return;
+    t->delay_ms = 250u * (unsigned int)(((param >> 5) & 0x3u) + 1u);
+    a = ((unsigned int)param >> 3) & 0x3u;
+    b = (unsigned int)param & 0x7u;
+    ticks = (8u + b) << a;              /* in units of 4.17 ms */
+    t->period_ms = (ticks * 417u) / 100u;
+    if (t->period_ms == 0u) t->period_ms = 1u;
+}

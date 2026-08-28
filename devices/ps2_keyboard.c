@@ -198,6 +198,13 @@ int hype_ps2_kbd_io_write(hype_ps2_kbd_t *kbd, uint16_t port, uint8_t value) {
              * byte -- the bulk of FW-1's PS/2 init spin. */
             stage_response(kbd, HYPE_PS2_KBD_ACK);
             stage_response(kbd, HYPE_PS2_KBD_BAT_OK);
+        } else if (kbd->awaiting_typematic_param) {
+            /* #774: the parameter to 0xF3. Recorded for the input path to apply; the guest
+             * only needs the ACK. */
+            kbd->awaiting_typematic_param = 0;
+            kbd->typematic_param = value;
+            kbd->typematic_pending = 1;
+            stage_response(kbd, HYPE_PS2_KBD_ACK);
         } else if (kbd->awaiting_scancode_set_param) {
             /* #436: 0xF0 parameter. 0 = query -> ACK + current set (2);
              * 1/2/3 = select -> ACK alone. */
@@ -214,6 +221,10 @@ int hype_ps2_kbd_io_write(hype_ps2_kbd_t *kbd, uint16_t port, uint8_t value) {
             stage_response(kbd, HYPE_PS2_KBD_ACK);
             stage_response(kbd, 0xABu);
             stage_response(kbd, 0x83u);
+        } else if (value == 0xF3u) {
+            /* #774: Set Typematic Rate/Delay -- one parameter byte follows. */
+            kbd->awaiting_typematic_param = 1;
+            stage_response(kbd, HYPE_PS2_KBD_ACK);
         } else if (value == 0xF0u) {
             kbd->awaiting_scancode_set_param = 1;
             stage_response(kbd, HYPE_PS2_KBD_ACK);
@@ -284,4 +295,13 @@ unsigned hype_ps2_kbd_trace_count(const hype_ps2_kbd_t *kbd) { return kbd->trace
 
 unsigned long long hype_ps2_kbd_trace_total(const hype_ps2_kbd_t *kbd) {
     return kbd->trace_total;
+}
+
+int hype_ps2_kbd_take_typematic(hype_ps2_kbd_t *kbd, uint8_t *out) {
+    if (kbd == 0 || out == 0 || !kbd->typematic_pending) {
+        return 0;
+    }
+    kbd->typematic_pending = 0;
+    *out = kbd->typematic_param;
+    return 1;
 }

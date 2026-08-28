@@ -196,6 +196,10 @@ struct hype_vcpu_ctx {
     hype_cpuid_topology_t cpuid_topo;
 };
 
+/* #753: forward -- retires a pending vector and its deferral stamp together. Defined below,
+ * beside the deferral bookkeeping it belongs to. */
+static void svm_retire_pending(struct hype_vcpu_ctx *real, uint8_t v);
+
 /* M8-0b-ii: per-vCPU state pool. Was a single g_vmcb/g_ctx (M2's one-vCPU
  * scope); now one slot per concurrent vCPU so a second guest can run on the AP
  * (VM0 on the BSP = slot 0, VM1 on the AP = slot 1). VMCB is architecturally
@@ -871,7 +875,7 @@ static int svm_ioio_pic_pit_write_byte(struct hype_vcpu_ctx *real, hype_pic_emu_
             uint8_t old_offset = (port == 0x20u) ? pic->master.irq_offset : pic->slave.irq_offset;
             unsigned i;
             for (i = 0; i < 8u; i++) {
-                hype_svm_irr_clear(real->pending_irr, (uint8_t)(old_offset + i));
+                svm_retire_pending(real, (uint8_t)(old_offset + i));
                 hype_svm_irr_clear(real->pending_pic, (uint8_t)(old_offset + i)); /* #512 */
             }
         }
@@ -1689,6 +1693,27 @@ trace_done:
     real->int_defer++;
 }
 
+/*
+ * #753: retire a pending vector -- clear the IRR bit AND the deferral stamp together.
+ *
+ * `int_defer_tsc[]` is indexed by VECTOR, so one slot has to stand for every instance of
+ * that vector for the life of the VM. It was stamped on the first deferral and cleared only
+ * on the VINTR-window drain, so a vector that stopped being pending any other way -- the
+ * fast-path injection, the guest clearing it, a reset -- left its stamp behind. The next
+ * time that vector drained, the "wait" measured was the age of the stale stamp.
+ *
+ * A periodic vector reuses one slot thousands of times, so a single missed clear made the
+ * metric report the whole run. It read 283,970 ms during #750 and looked like the smoking
+ * gun; it still read 204 s after #750 was fixed, on runs with no fault at all.
+ *
+ * The stamp now dies with the pending entry, because both are cleared here and nowhere
+ * else clears the IRR without coming through this.
+ */
+static void svm_retire_pending(struct hype_vcpu_ctx *real, uint8_t v) {
+    hype_svm_irr_clear(real->pending_irr, v);
+    real->int_defer_tsc[v] = 0ull;
+}
+
 /* GLADDER-6c DIAG: reinject a guest exception that hype intercepted purely to
  * observe it -- staged in EVENTINJ so the guest takes it through its own IDT on
  * the next VMRUN, exactly as if hype had never intercepted the vector. Type =
@@ -1727,7 +1752,7 @@ void hype_svm_vcpu_inject_nmi(hype_vcpu_ctx_t *ctx) {
 
 void hype_svm_vcpu_cancel_pending_vector(hype_vcpu_ctx_t *ctx, uint8_t vector) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
-    hype_svm_irr_clear(real->pending_irr, vector);
+    svm_retire_pending(real, vector);
     hype_svm_irr_clear(real->pending_pic, vector); /* #512 */
 }
 
@@ -1745,7 +1770,7 @@ void hype_svm_vcpu_note_pic_pending(hype_vcpu_ctx_t *ctx, uint8_t vector) {
 void hype_svm_vcpu_cancel_pic_pending(hype_vcpu_ctx_t *ctx, uint8_t vector) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     if ((real->pending_pic[vector >> 5] & ((uint32_t)1u << (vector & 31u))) != 0u) {
-        hype_svm_irr_clear(real->pending_irr, vector);
+        svm_retire_pending(real, vector);
         hype_svm_irr_clear(real->pending_pic, vector);
         hype_svm_sync_vintr(real);
     }
@@ -1761,16 +1786,17 @@ void hype_svm_vcpu_handle_vintr_window(hype_vcpu_ctx_t *ctx) {
     if (hype_svm_irr_any(real->pending_irr) &&
         (real->vmcb->control.eventinj & HYPE_SVM_EVENTINJ_V) == 0) {
         int v = hype_svm_irr_highest(real->pending_irr);
-        hype_svm_irr_clear(real->pending_irr, (uint8_t)v);
+        /* #750/#753: how long THIS deferral waited -- read before retiring it, because
+         * retiring is what clears the stamp. */
+        uint64_t stamp = real->int_defer_tsc[(uint8_t)v];
+        svm_retire_pending(real, (uint8_t)v);
         hype_svm_irr_clear(real->pending_pic, (uint8_t)v); /* #512 */
         real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr((uint8_t)v);
         real->int_inj_by_vec[(uint8_t)v]++;
         svm_note_injected(real, (uint8_t)v); /* #456 */
         real->int_window++;
-        /* #750: and how long it waited. */
-        if (real->int_defer_tsc[(uint8_t)v] != 0ull) {
-            uint64_t waited = real_rdtsc() - real->int_defer_tsc[(uint8_t)v];
-            real->int_defer_tsc[(uint8_t)v] = 0ull;
+        if (stamp != 0ull) {
+            uint64_t waited = real_rdtsc() - stamp;
             if (waited > real->int_defer_wait_max) {
                 real->int_defer_wait_max = waited;
                 real->int_defer_wait_vec = (uint8_t)v;
@@ -1873,7 +1899,7 @@ int hype_svm_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx) {
         if (!hype_svm_vintr_priority_allows(real->vmcb->control.vintr, (uint8_t)v)) {
             return 0;
         }
-        hype_svm_irr_clear(real->pending_irr, (uint8_t)v);
+        svm_retire_pending(real, (uint8_t)v);
         hype_svm_irr_clear(real->pending_pic, (uint8_t)v); /* #512 */
         real->vmcb->control.eventinj = hype_svm_encode_eventinj_intr((uint8_t)v);
         real->int_inj_by_vec[(uint8_t)v]++;

@@ -39,6 +39,65 @@
  * tail. */
 #define HYPE_USB_HID_MAX_SCANCODES 48u
 
+/*
+ * #774: typematic -- auto-repeat for a held key.
+ *
+ * A PS/2 keyboard repeats in HARDWARE, and a guest driving one expects that. A USB HID
+ * keyboard does not: it reports one state when a key goes down and another when it comes up,
+ * and holding the key changes nothing in between. hype presents PS/2 Set-1 scancodes to the
+ * guest while being fed by USB, so the repeat has to be synthesised here or the guest sees a
+ * single keypress no matter how long the key is held -- which breaks holding backspace, an
+ * arrow key, or any character in an editor.
+ *
+ * Only the LAST key pressed repeats, and pressing another key takes the repeat over. That is
+ * the PS/2 behaviour a guest is written against, not an approximation of it.
+ *
+ * Defaults are the PS/2 power-on values: 500 ms before the first repeat, then 10.9 per
+ * second. A guest can change both with Set Typematic Rate/Delay (0xF3), so they are settable
+ * rather than baked in -- see hype_usb_hid_typematic_set_f3().
+ */
+#define HYPE_USB_HID_TYPEMATIC_DELAY_MS 500u
+#define HYPE_USB_HID_TYPEMATIC_PERIOD_MS 92u /* ~10.9/s, the PS/2 default rate */
+
+typedef struct {
+    uint8_t usage;        /* the HID usage repeating, 0 = nothing held */
+    uint8_t code;         /* its Set-1 make code */
+    int ext;              /* whether that code needs the 0xE0 prefix */
+    uint64_t next_at_ms;  /* when the next repeat is due */
+    unsigned int delay_ms;
+    unsigned int period_ms;
+    int started;          /* past the initial delay, so the period applies */
+} hype_usb_hid_typematic_t;
+
+/* Power-on defaults. Call once per keyboard before the first report. */
+void hype_usb_hid_typematic_init(hype_usb_hid_typematic_t *t);
+
+/*
+ * Note what the current report holds. Call once per report, before or after
+ * hype_usb_hid_report_to_scancodes(); `now_ms` is any monotonic millisecond clock.
+ *
+ * Picks the last non-modifier key in the report as the repeating one, and restarts the delay
+ * whenever that changes. A report with no ordinary key held stops the repeat -- modifiers
+ * alone never repeat, which is also what a PS/2 keyboard does.
+ */
+void hype_usb_hid_typematic_note(hype_usb_hid_typematic_t *t, const uint8_t report[8],
+                                 uint64_t now_ms);
+
+/*
+ * Emit any repeats now due. Returns how many bytes were written to `out`, 0 when nothing is
+ * due -- which is the common case, so this is cheap to call every tick.
+ */
+unsigned int hype_usb_hid_typematic_tick(hype_usb_hid_typematic_t *t, uint64_t now_ms,
+                                         uint8_t *out, unsigned int out_cap);
+
+/*
+ * Apply a guest's Set Typematic Rate/Delay byte (the parameter to PS/2 command 0xF3).
+ * Bits 6:5 are the delay (250/500/750/1000 ms) and bits 4:0 the rate, per the 8042 spec.
+ * Honouring it matters: a guest that asks for a fast repeat and silently gets the default
+ * feels broken in a way no log would explain.
+ */
+void hype_usb_hid_typematic_set_f3(hype_usb_hid_typematic_t *t, uint8_t param);
+
 /* The interrupt-IN endpoint a boot keyboard delivers its reports on. */
 typedef struct {
     int found;
