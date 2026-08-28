@@ -1,0 +1,255 @@
+--- hw/usb/dev-hid.c.orig	2026-08-28 15:03:26.706971069 +0100
++++ hw/usb/dev-hid.c	2026-08-28 15:49:41.058038904 +0100
+@@ -40,6 +40,12 @@
+     USBDevice dev;
+     USBEndpoint *intr;
+     HIDState hid;
++    /* hype #767: the composite usb-kbd-mouse presents TWO boot HID interfaces on one
++     * device, like a Logitech unifying receiver (046d:c547). `hid` serves the mouse on
++     * endpoint 1; this serves the keyboard on endpoint 2. */
++    HIDState hid2;
++    USBEndpoint *intr2;
++    bool composite;
+     uint32_t usb_version;
+     char *display;
+     uint32_t head;
+@@ -168,6 +174,86 @@
+     },
+ };
+ 
++/* hype #767: composite -- interface 0 boot mouse (ep 0x81), interface 1 boot keyboard
++ * (ep 0x82). Mirrors the receiver on the 5950X, which hype claims TWICE on one slot. */
++static const USBDescIface desc_ifaces_combo[] = {
++    {
++        .bInterfaceNumber              = 0,
++        .bNumEndpoints                 = 1,
++        .bInterfaceClass               = USB_CLASS_HID,
++        .bInterfaceSubClass            = 0x01, /* boot */
++        .bInterfaceProtocol            = 0x02, /* mouse */
++        .ndesc                         = 1,
++        .descs = (USBDescOther[]) {
++            {
++                .data = (uint8_t[]) {
++                    0x09, USB_DT_HID, 0x01, 0x00, 0x00, 0x01, USB_DT_REPORT, 52, 0,
++                },
++            },
++        },
++        .eps = (USBDescEndpoint[]) {
++            {
++                .bEndpointAddress      = USB_DIR_IN | 0x01,
++                .bmAttributes          = USB_ENDPOINT_XFER_INT,
++                .wMaxPacketSize        = 4,
++                .bInterval             = 0x0a,
++            },
++        },
++    },
++    {
++        .bInterfaceNumber              = 1,
++        .bNumEndpoints                 = 1,
++        .bInterfaceClass               = USB_CLASS_HID,
++        .bInterfaceSubClass            = 0x01, /* boot */
++        .bInterfaceProtocol            = 0x01, /* keyboard */
++        .ndesc                         = 1,
++        .descs = (USBDescOther[]) {
++            {
++                .data = (uint8_t[]) {
++                    0x09, USB_DT_HID, 0x11, 0x01, 0x00, 0x01, USB_DT_REPORT, 0x3f, 0,
++                },
++            },
++        },
++        .eps = (USBDescEndpoint[]) {
++            {
++                .bEndpointAddress      = USB_DIR_IN | 0x02,
++                .bmAttributes          = USB_ENDPOINT_XFER_INT,
++                .wMaxPacketSize        = 8,
++                .bInterval             = 0x0a,
++            },
++        },
++    },
++};
++
++static const USBDescDevice desc_device_combo = {
++    .bcdUSB                        = 0x0200,
++    .bMaxPacketSize0               = 8,
++    .bNumConfigurations            = 1,
++    .confs = (USBDescConfig[]) {
++        {
++            .bNumInterfaces        = 2,
++            .bConfigurationValue   = 1,
++            .bmAttributes          = USB_CFG_ATT_ONE | USB_CFG_ATT_WAKEUP,
++            .nif = 2,
++            .ifs = desc_ifaces_combo,
++        },
++    },
++};
++
++static const USBDesc desc_combo = {
++    .id = {
++        .idVendor          = 0x046d,
++        .idProduct         = 0xc547,
++        .bcdDevice         = 0,
++        .iManufacturer     = STR_MANUFACTURER,
++        .iProduct          = STR_PRODUCT_KEYBOARD,
++        .iSerialNumber     = STR_SERIAL_KEYBOARD,
++    },
++    .full = &desc_device_combo,
++    .high = &desc_device_combo,
++    .str  = desc_strings,
++};
++
+ static const USBDescIface desc_iface_tablet2 = {
+     .bInterfaceNumber              = 0,
+     .bNumEndpoints                 = 1,
+@@ -565,6 +651,20 @@
+     usb_wakeup(us->intr, 0);
+ }
+ 
++/*
++ * hype #767: the composite's SECOND interface.
++ *
++ * container_of() above resolves against the `hid` member, so calling it with &us->hid2
++ * yields a pointer short of the real object -- a wild `us->intr` and undefined behaviour.
++ * The second interface needs its own callback and its own endpoint.
++ */
++static void usb_hid2_changed(HIDState *hs)
++{
++    USBHIDState *us = container_of(hs, USBHIDState, hid2);
++
++    usb_wakeup(us->intr2, 0);
++}
++
+ static void usb_hid_handle_reset(USBDevice *dev)
+ {
+     USBHIDState *us = USB_HID(dev);
+@@ -659,9 +759,14 @@
+     g_autofree uint8_t *buf = g_malloc(p->iov.size);
+     int len = 0;
+ 
++    /* hype #767: on the composite, endpoint 2 is the keyboard interface. */
++    if (us->composite && p->ep->nr == 2) {
++        hs = &us->hid2;
++    }
++
+     switch (p->pid) {
+     case USB_TOKEN_IN:
+-        if (p->ep->nr == 1) {
++        if (p->ep->nr == 1 || (us->composite && p->ep->nr == 2)) {
+             if (hs->kind == HID_MOUSE || hs->kind == HID_TABLET) {
+                 hid_pointer_activate(hs);
+             }
+@@ -741,6 +846,31 @@
+     usb_hid_initfn(dev, HID_KEYBOARD, &desc_keyboard, &desc_keyboard2, errp);
+ }
+ 
++/*
++ * hype #767: a composite boot-HID device -- one USB device presenting a boot MOUSE
++ * interface on endpoint 1 and a boot KEYBOARD interface on endpoint 2.
++ *
++ * Every stock QEMU HID is single-interface, so a host that claims a device twice on one
++ * slot -- once per interface -- has nothing to exercise it against. That is ordinary
++ * hardware: a wireless receiver is exactly this shape. hype's #755 (a second Configure
++ * Endpoint lowering Context Entries and invalidating the first) and #771 (two claims
++ * sharing one transfer ring) both live on that path and both reached real hardware
++ * unreproduced.
++ */
++static void usb_kbd_mouse_realize(USBDevice *dev, Error **errp)
++{
++    USBHIDState *us = USB_HID(dev);
++
++    us->composite = true;
++    dev->usb_desc = &desc_combo;
++    usb_desc_create_serial(dev);
++    usb_desc_init(dev);
++    us->intr = usb_ep_get(dev, USB_TOKEN_IN, 1);
++    us->intr2 = usb_ep_get(dev, USB_TOKEN_IN, 2);
++    hid_init(&us->hid, HID_MOUSE, usb_hid_changed);
++    hid_init(&us->hid2, HID_KEYBOARD, usb_hid2_changed);
++}
++
+ static int usb_ptr_post_load(void *opaque, int version_id)
+ {
+     USBHIDState *s = opaque;
+@@ -862,6 +992,74 @@
+     .class_init    = usb_keyboard_class_initfn,
+ };
+ 
++/*
++ * hype #767: a device that cannot be addressed.
++ *
++ * Real hardware has these -- a SuperSpeed hub below another hub on the 5950X answers
++ * Address Device with cc=4 (Transaction Error) every time, and its link keeps flapping so
++ * the parent hub re-reports the port forever. That drove #763 (retries without bound) and
++ * #770 (a hub reporting one port 4,610 times), both of which reached hardware unreproduced
++ * because nothing in QEMU refuses to be addressed.
++ *
++ * Every control transfer stalls, so SET_ADDRESS never completes and the host sees exactly
++ * the failure the real device produces.
++ */
++static void usb_badaddr_handle_control(USBDevice *dev, USBPacket *p, int request,
++                                       int value, int index, int length, uint8_t *data)
++{
++    p->status = USB_RET_STALL;
++}
++
++static void usb_badaddr_handle_data(USBDevice *dev, USBPacket *p)
++{
++    p->status = USB_RET_STALL;
++}
++
++static void usb_badaddr_realize(USBDevice *dev, Error **errp)
++{
++    USBHIDState *us = USB_HID(dev);
++
++    dev->usb_desc = &desc_keyboard;
++    usb_desc_create_serial(dev);
++    usb_desc_init(dev);
++    us->intr = usb_ep_get(dev, USB_TOKEN_IN, 1);
++}
++
++static void usb_badaddr_class_initfn(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    USBDeviceClass *uc = USB_DEVICE_CLASS(klass);
++
++    uc->realize        = usb_badaddr_realize;
++    uc->handle_control = usb_badaddr_handle_control;
++    uc->handle_data    = usb_badaddr_handle_data;
++    uc->product_desc   = "QEMU USB device that refuses to be addressed";
++    set_bit(DEVICE_CATEGORY_INPUT, dc->categories);
++}
++
++static const TypeInfo usb_badaddr_info = {
++    .name          = "usb-badaddr",
++    .parent        = TYPE_USB_HID,
++    .class_init    = usb_badaddr_class_initfn,
++};
++
++/* hype #767: the composite. No vmsd -- this exists for host-driver testing, not migration. */
++static void usb_kbd_mouse_class_initfn(ObjectClass *klass, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(klass);
++    USBDeviceClass *uc = USB_DEVICE_CLASS(klass);
++
++    uc->realize        = usb_kbd_mouse_realize;
++    uc->product_desc   = "QEMU USB composite keyboard+mouse";
++    set_bit(DEVICE_CATEGORY_INPUT, dc->categories);
++}
++
++static const TypeInfo usb_kbd_mouse_info = {
++    .name          = "usb-kbd-mouse",
++    .parent        = TYPE_USB_HID,
++    .class_init    = usb_kbd_mouse_class_initfn,
++};
++
+ static void usb_hid_register_types(void)
+ {
+     type_register_static(&usb_hid_type_info);
+@@ -870,6 +1068,8 @@
+     type_register_static(&usb_mouse_info);
+     usb_legacy_register("usb-mouse", "mouse", NULL);
+     type_register_static(&usb_keyboard_info);
++    type_register_static(&usb_kbd_mouse_info);
++    type_register_static(&usb_badaddr_info);
+     usb_legacy_register("usb-kbd", "keyboard", NULL);
+ }
+ 
