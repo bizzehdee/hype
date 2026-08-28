@@ -50,7 +50,13 @@ Short list, and none of them is why this series went the way it did.
 3. **xHCI BAR placement** (#240, earlier). QEMU puts it at 0x380000000000; this firmware
    uses a low BAR, and an off-by-8x guard left [64 GiB, 512 GiB) unmapped. The QEMU value
    was on the safe side of the bug.
-4. **Transfer-event ordering.** Real controllers deliver command and transfer events later
+4. **The TR Dequeue Pointer in a Running endpoint context.** QEMU keeps it updated during
+   normal operation; real hardware need not, and this one does not -- xHCI 4.12.2 only
+   requires it to be valid on a Stopped or Halted endpoint. A #764 diagnostic built on
+   reading it looked sound in QEMU and produced nothing but false positives on the desk,
+   five across two boots, on endpoints that were working. Withdrawn.
+
+5. **Transfer-event ordering.** Real controllers deliver command and transfer events later
    and more out-of-order than QEMU (#254, #266). Both needed leniency QEMU never demanded.
 
 ## What I wrongly blamed on QEMU

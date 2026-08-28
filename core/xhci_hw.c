@@ -778,27 +778,6 @@ static void int_in_note_claim(xhci_int_in_hw_t *iin, uint64_t trb, uint32_t cc) 
  * where each side thinks it is, how hype's enqueue cursor sits, and the last completions
  * hype claimed -- so a claim from a TRB that was never armed is visible rather than inferred.
  */
-static void int_in_report_divergence(xhci_int_in_hw_t *iin, unsigned int slot, unsigned int dci,
-                                     uint64_t deq, uint64_t base) {
-    unsigned int i, n = (iin->claim_n < 8u) ? iin->claim_n : 8u;
-
-    hype_debug_print("host-xhci: #764 DIVERGED slot=%u ep=%u | controller deq=+0x%llx "
-                     "hype trb=+0x%llx enq=%u cyc=%u armed=%d | reports=%llu silent=%u "
-                     "rearms=%llu | handed=%llu deliv=%llu from_park=%llu own=%llu to_park=%llu\n",
-                     slot, dci,
-                     (unsigned long long)(deq - base),
-                     (unsigned long long)(iin->pending_trb - base),
-                     iin->enq, iin->cyc, iin->armed, iin->reports, iin->silent_polls,
-                     iin->rearms, iin->handed, iin->deliv, iin->from_park, iin->own,
-                     iin->to_park);
-    for (i = 0; i < n; i++) {
-        unsigned int k = (iin->claim_n >= 8u) ? ((iin->claim_n + i) % 8u) : i;
-        hype_debug_print("host-xhci: #764   claim[-%u] trb=+0x%llx cc=%u\n", n - i,
-                         (unsigned long long)(iin->claim_trb[k] - base),
-                         (unsigned)iin->claim_cc[k]);
-    }
-}
-
 static unsigned int out_ctx_entries(hype_xhci_ctrl_t *c, unsigned int slot) {
     xhci_hw_t *hw = HW(c);
     int di = dev_index(hw, slot);
@@ -1868,85 +1847,43 @@ static int int_in_poll_body(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int
      * NOT ACTED ON yet -- see the body. It reports; it does not re-arm.
      */
     /*
-     * #764 capture: look for divergence every HYPE_INT_IN_CHECK_POLLS, not only after
-     * HYPE_INT_IN_SILENT_MAX. At 125 Hz the long threshold is half a minute after the
-     * event, by which time the ring state printed is no longer the state that failed. This
-     * catches the FIRST disagreement, reports it once, and says nothing further.
+     * #764 WITHDRAWN: hype cannot compare against the controller's dequeue pointer here.
+     *
+     * The TR Dequeue Pointer in the OUTPUT Endpoint Context is only architecturally valid
+     * when the endpoint is Stopped or Halted (xHCI 4.12.2). While it is Running the
+     * controller caches it and need not write it back, so a read returns whatever was there
+     * last -- in practice the ring base written by Configure Endpoint.
+     *
+     * Every divergence this reported on real hardware read deq=+0x0, on endpoints that went
+     * on working: two in boot 16 (the keyboard reported 1,326 times afterwards) and three in
+     * boot 17. It was comparing a stale field against a live cursor and calling the
+     * difference a fault.
+     *
+     * It was also expensive in the worst place. The report is nine debug lines printed from
+     * inside the poll, and boot 17 measured that as 26 ms and 45 ms stalls in the input
+     * path -- the diagnostic was causing the hitching it existed to explain.
+     *
+     * The routing counters below (handed/deliv/own/to_park) are kept: they cost nothing, and
+     * they are what actually distinguished a lost completion from one that never happened.
      */
-    if (iin->armed && !iin->diverged &&
-        (iin->silent_polls % HYPE_INT_IN_CHECK_POLLS) == (HYPE_INT_IN_CHECK_POLLS - 1u)) {
-        uint64_t d = 0, b = phys(iin->ring);
-        uint64_t link = b + (uint64_t)(RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES;
-        if (int_in_ctx_dequeue(c, slot, dci, &d) == 0 && d != 0ull && d != link &&
-            d != iin->pending_trb) {
-            /*
-             * #764: only report a divergence that PERSISTS.
-             *
-             * Boot 16 fired this twice on a keyboard that went on working perfectly --
-             * 1,326 reports afterwards. Both sightings were the ring wrap: the controller
-             * had consumed the last TRB and moved to index 0 while hype's cursor was still
-             * near the end, and the completion arrived a moment later. Every counter
-             * balanced (handed+own == reports), which is the tell.
-             *
-             * A transient resolves; a stuck endpoint does not. So require the SAME dequeue
-             * and the same outstanding TRB across several checks before saying anything.
-             * The QEMU reproduction sits there for thousands of polls and still trips it.
-             */
-            if (d == iin->last_deq) {
-                iin->diverge_run++;
-            } else {
-                iin->last_deq = d;
-                iin->diverge_run = 1;
-            }
-            if (iin->diverge_run >= HYPE_INT_IN_DIVERGE_RUNS) {
-                iin->diverged = 1;
-                int_in_report_divergence(iin, slot, dci, d, b);
-            }
-        } else {
-            iin->diverge_run = 0;
-        }
-    }
-    if (iin->armed && ++iin->silent_polls >= HYPE_INT_IN_SILENT_MAX) {
-        uint64_t deq = 0;
-        iin->silent_polls = 0;
-        /*
-         * #764: the LINK TRB is not drift. The ring is RING_TRBS entries with a link in the
-         * last slot, so a dequeue pointer sitting there means the controller is about to
-         * wrap to index 0 -- which is exactly where hype will have armed. Comparing raw
-         * pointers flagged that as a lost completion 5-6 times per rig run, and it was the
-         * unexplained residue that kept this check from being trusted.
-         */
-        uint64_t link_trb = phys(iin->ring) + (uint64_t)(RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES;
-        if (int_in_ctx_dequeue(c, slot, dci, &deq) == 0 && deq != 0ull &&
-            deq != link_trb && deq != iin->pending_trb) {
-            /*
-             * REPORT ONLY -- deliberately does not re-arm.
-             *
-             * The reasoning was: dequeue past our TRB means the controller consumed it, so
-             * a completion happened and hype missed it. Re-arming would then rescue an
-             * endpoint that `armed` has latched deaf.
-             *
-             * It fires 31-46 times per QEMU rig run on endpoints that are working
-             * normally -- rig 734 still counts its usual 120 reports -- so the comparison
-             * is catching something ordinary that this reasoning does not explain, and
-             * acting on it would queue a second TRB each time. That is #217's bug (a ring
-             * filled by over-enqueuing, and the device goes silent) reached slowly.
-             *
-             * So it counts and says so, and nothing more, until the discriminator is
-             * understood. #761 fixed the KNOWN way to lose a completion -- three event
-             * waits that dropped foreign transfer events -- and that one is proven.
-             */
-            iin->rearms++;
-            if (iin->rearms <= 4ull || (iin->rearms % 64ull) == 0ull) {
-                hype_debug_print("host-xhci: interrupt-IN slot=%u ep=%u dequeue 0x%llx is "
-                                 "past our TRB 0x%llx after %u silent polls -- NOT re-armed, "
-                                 "counting only (%llu so far) [#764]\n", slot, dci,
-                                 (unsigned long long)deq,
-                                 (unsigned long long)iin->pending_trb,
-                                 (unsigned)HYPE_INT_IN_SILENT_MAX, iin->rearms);
-            }
-        }
-    }
+    /*
+     * #764: the silence watchdog is withdrawn with the check it depended on.
+     *
+     * It compared the controller's dequeue pointer against ours, and that field is only
+     * architecturally valid on a Stopped or Halted endpoint (xHCI 4.12.2) -- on a Running
+     * one it reads back whatever Configure Endpoint left, which is the ring base. Every
+     * report it produced on hardware said deq=+0x0, on endpoints that carried on working.
+     *
+     * Silence on its own cannot stand in for it either: an interrupt IN transfer stays
+     * outstanding while the device NAKs, so "armed and quiet" is exactly a keyboard nobody
+     * is typing on. Re-arming on a timer would queue a second TRB each time and refill the
+     * ring, which is #217 arrived at slowly.
+     *
+     * A real deaf endpoint is now far less likely anyway -- #761 stopped foreign transfer
+     * events being dropped, #766 restored strict TRB attribution, and #773 closed the
+     * unarmed window. If one recurs, the honest recovery is Stop Endpoint (which makes the
+     * dequeue pointer valid to read) followed by Set TR Dequeue, not a guess from here.
+     */
     if (!iin->armed) {
         int_in_arm(c, iin, slot, dci, len);
     }
