@@ -1,0 +1,23 @@
+[0000106112] ttyS0| BdsDxe: loading Boot0002 "UEFI HYPE VIRTUAL CD-ROM HYPE0000000000000001" from PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)
+[0000106253] ttyS1| BdsDxe: loading Boot0002 "UEFI HYPE VIRTUAL CD-ROM HYPE0000000000000001" from PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)
+[0000106394] ttyS0| BdsDxe: starting Boot0002 "UEFI HYPE VIRTUAL CD-ROM HYPE0000000000000001" from PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)
+[0000106536] ttyS1| BdsDxe: starting Boot0002 "UEFI HYPE VIRTUAL CD-ROM HYPE0000000000000001" from PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)
+[0000106678] ttyS0| GNU GRUB  version 2.12
+[0000106717] ttyS1| GNU GRUB  version 2.12
+[0000106756] ttyS0| 
+[0000106773] ttyS1| 
+[0000106790] ttyS0|      Use the  and  keys to select which entry is highlighted.                              
+[0000106898] ttyS1|      Use the  and  keys to select which entry is highlighted.                              
+[0000107006] ttyS0|       Press enter to boot the selected OS, `e' to edit the commands before booting or `c' for 
+[0000107117] ttyS1|       Press enter to boot the selected OS, `e' to edit the commands before booting or `c' for 
+[0000107228] ttyS0|       a command-line.                                                                          *Linux lts                                                                                                                                                      
+[0000107500] ttyS1|       a command-line.                                                                          *Linux lts                                                                                                                                                      
+[0000107889] ttyS0|                                                                                                                                                                                                                                                                
+[0000108270] ttyS1|                                                                                                                                                                                                                                                                
+[0000108652] ttyS0|                                                                                                                                                                                                                                                                
+[0000109082] ttyS1|                                                                                                                                                                                                                                                                
+[0000109511] ttyS0|                                                                                                                                                                                                                                                                
+[0000109942] ttyS1|                                                                                                                                                                                                                                                                
+[0000110214] ttyS0|                                                                                                                                                                                                                                                                
+[0000110486] ttyS1|                                                                                                                                                                                                                                                                
+[0000110758] ttyS0|                                                                                                                                                                                                                                                                
