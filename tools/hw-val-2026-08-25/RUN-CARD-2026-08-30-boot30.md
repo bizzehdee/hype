@@ -41,6 +41,15 @@ button, so this build gives hype two ways to warm-reboot itself:
   after it had worked, and only after a revive was attempted -- a person walking away from
   an ordinary keyboard cannot fire it.
 
+## The guests failing to read the ISO is probably the same fault
+
+You saw guests failing to read the ISO on boot 29. Guest ISO streaming, the log flush, and
+nothing else all share one path: the USB block route to the boot stick (one transfer lock,
+one JMicron bridge). If that path dies mid-run, the log freezes and the guests lose their
+disc at the same moment -- two symptoms, one fault. The salvage file will show the guests'
+media errors with timestamps, so we can check whether they line up with the log's death.
+The HID deafness is on the other controller and stays a separate question.
+
 ## What the salvage file should settle
 
 - Whether the flush was failing (`FLUSH FAILED` / streak lines) -- pointing at the stick's

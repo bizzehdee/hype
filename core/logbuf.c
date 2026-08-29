@@ -9,19 +9,53 @@
  * before any logging -- see efi_main. */
 static hype_logbuf_t g_logbuf __attribute__((aligned(HYPE_LOGBUF_SCAN_ALIGN)));
 
+/*
+ * RT-1b (fix): every access goes through this pointer, because a buffer INSIDE the image can
+ * never survive a reboot -- the PE loader zero-fills .bss on every load, so the next boot
+ * destroyed the previous boot's log before the RT-1b scanner ever ran, warm reset or not.
+ * That is why RT-1b never once found anything on real hardware. efi_main attaches a region
+ * allocated OUTSIDE the image (hype_logbuf_attach below); the static buffer remains the
+ * default so hosted tests and any pre-attach logging keep working unchanged.
+ */
+static hype_logbuf_t *g_lb = &g_logbuf;
+
+void hype_logbuf_attach(void *region) {
+    hype_logbuf_t *nb = (hype_logbuf_t *)region;
+    hype_logbuf_t *old = g_lb;
+    if (nb == 0 || nb == old) {
+        return;
+    }
+    /* Carry anything captured before the attach. The old buffer is only trustworthy once
+     * reset() has stamped it; unstamped means nothing was logged yet. */
+    if (old->magic == HYPE_LOGBUF_MAGIC && old->len != 0u && old->len <= HYPE_LOGBUF_CAPACITY) {
+        unsigned int i;
+        nb->magic = old->magic;
+        nb->version = old->version;
+        nb->truncated = old->truncated;
+        nb->checksum = old->checksum;
+        nb->reclaimed = old->reclaimed;
+        for (i = 0; i < old->len; i++) {
+            nb->data[i] = old->data[i];
+        }
+        nb->len = old->len;
+        old->magic = 0; /* the abandoned copy must never win a later scan */
+    }
+    g_lb = nb;
+}
+
 void hype_logbuf_reset(void) {
-    g_logbuf.magic = HYPE_LOGBUF_MAGIC;
-    g_logbuf.version = HYPE_LOGBUF_VERSION;
-    g_logbuf.len = 0;
-    g_logbuf.truncated = 0;
-    g_logbuf.checksum = 0;
-    g_logbuf.reclaimed = 0;
+    g_lb->magic = HYPE_LOGBUF_MAGIC;
+    g_lb->version = HYPE_LOGBUF_VERSION;
+    g_lb->len = 0;
+    g_lb->truncated = 0;
+    g_lb->checksum = 0;
+    g_lb->reclaimed = 0;
 }
 
 /*
  * #338: the append lock.
  *
- * g_logbuf.len was advanced with no synchronisation, so two cores appending at once did not merely
+ * g_lb->len was advanced with no synchronisation, so two cores appending at once did not merely
  * interleave -- they LOST BYTES: both read the same len, both wrote there, one won. That silently
  * corrupts \HYPE.LOG and the per-VM USB logs, which are the persistent artefacts
  * that exist precisely for serial-less real-hardware debugging, where there is no second copy.
@@ -54,12 +88,12 @@ void hype_logbuf_append_unlocked(const char *s) {
         return;
     }
     while (*s != '\0') {
-        if (g_logbuf.len >= HYPE_LOGBUF_CAPACITY) {
-            g_logbuf.truncated = 1;
+        if (g_lb->len >= HYPE_LOGBUF_CAPACITY) {
+            g_lb->truncated = 1;
             return;
         }
-        g_logbuf.data[g_logbuf.len++] = *s;
-        g_logbuf.checksum += (unsigned char)*s;
+        g_lb->data[g_lb->len++] = *s;
+        g_lb->checksum += (unsigned char)*s;
         s++;
     }
 }
@@ -83,15 +117,15 @@ void hype_logbuf_append(const char *s) {
 }
 
 const char *hype_logbuf_data(void) {
-    return g_logbuf.data;
+    return g_lb->data;
 }
 
 unsigned int hype_logbuf_len(void) {
-    return g_logbuf.len;
+    return g_lb->len;
 }
 
 int hype_logbuf_truncated(void) {
-    return g_logbuf.truncated;
+    return g_lb->truncated;
 }
 
 /*
@@ -109,31 +143,31 @@ int hype_logbuf_truncated(void) {
 unsigned int hype_logbuf_reclaim_unlocked(unsigned int upto) {
     unsigned int i;
 
-    if (upto > g_logbuf.len) {
-        upto = g_logbuf.len;
+    if (upto > g_lb->len) {
+        upto = g_lb->len;
     }
     if (upto == 0u) {
         return 0u;
     }
     for (i = 0; i < upto; i++) {
-        g_logbuf.checksum -= (unsigned char)g_logbuf.data[i];
+        g_lb->checksum -= (unsigned char)g_lb->data[i];
     }
     /* Forward copy is correct for a downward move even when the ranges overlap: the destination
      * index is always below the source, so a byte is read before anything writes over it. */
-    for (i = upto; i < g_logbuf.len; i++) {
-        g_logbuf.data[i - upto] = g_logbuf.data[i];
+    for (i = upto; i < g_lb->len; i++) {
+        g_lb->data[i - upto] = g_lb->data[i];
     }
-    g_logbuf.len -= upto;
-    g_logbuf.reclaimed += (uint64_t)upto;
+    g_lb->len -= upto;
+    g_lb->reclaimed += (uint64_t)upto;
     return upto;
 }
 
 uint64_t hype_logbuf_reclaimed(void) {
-    return g_logbuf.reclaimed;
+    return g_lb->reclaimed;
 }
 
 const hype_logbuf_t *hype_logbuf_get(void) {
-    return &g_logbuf;
+    return g_lb;
 }
 
 int hype_logbuf_validate(const hype_logbuf_t *hdr) {

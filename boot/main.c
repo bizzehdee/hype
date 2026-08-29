@@ -329,6 +329,7 @@ static int g_209_reads_passed;
 /* #230: USB debug-log sink helpers (defined just above efi_main); forward-
  * declared here because the post-EBS run loop appears above the definition. */
 static void usb_log_flush(void);
+static void usb_log_fatal_flush(void);
 static void usb_log_fatal_flush(void); /* #513: registered as the panic flush hook */
 /* USB-5 (#217): defined with the other USB globals, used by the FW-1 dispatch loop and
  * the #233 confirm gate, both of which appear earlier in this file. */
@@ -2744,6 +2745,10 @@ static inline void host_reset_outb(uint16_t port, uint8_t val) {
 static void fw_1_host_power_act(unsigned action) {
     hype_debug_print("fw-1 HOST: all guests down -- %s the host [#175]\n",
                      (action == HYPE_HOST_ACTION_OFF) ? "powering off" : "rebooting");
+    /* Last-gasp flush, same as a panic: this line and everything behind it is the run's
+     * tail, and if the sink died transiently this is the one write that can still save it.
+     * A sink that is genuinely gone just fails again, which costs nothing. */
+    usb_log_fatal_flush();
     if (g_runtime_services != 0 && g_runtime_services->ResetSystem != 0) {
         /*
          * WARM first for a reboot, cold as the fallback. RT-1b's next-boot salvage of the
@@ -7973,6 +7978,9 @@ static void fw_1_dump_prev_log(EFI_HANDLE image_handle, EFI_BOOT_SERVICES *bs,
     const hype_logbuf_t *found = 0;
     UINTN i;
 
+    if (g_prev_log_len != 0u) {
+        return; /* efi_main already recovered it at the reallocated region's own address */
+    }
     if (map == 0 || count == 0) {
         return;
     }
@@ -26805,11 +26813,78 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * ops/kind must outlive the pre-EBS setup block that computes them. */
     hype_test_guest_args_t args;
 
+    /*
+     * RT-1b (fix): move the capture buffer OUT of the image before anything logs.
+     *
+     * It lived in .bss, and the PE loader zero-fills .bss on every load -- so the next boot
+     * destroyed the previous boot's log before the RT-1b scanner ran, warm reset or not.
+     * Proven in QEMU (rig/i452-salvage): two boots, boot 2 found nothing. RT-1b has therefore
+     * never recovered anything, which is exactly the operator's memory of it.
+     *
+     * Allocated pages are not part of the image, so a reload cannot touch them. And because
+     * an identical boot makes identical allocations, the firmware usually hands back the SAME
+     * pages -- so the previous boot's log is often sitting at this exact address: capture it
+     * BEFORE attach/reset stamps this boot's header over it. The full RAM scan later
+     * (fw_1_dump_prev_log) remains the fallback for when the address moved.
+     */
+    {
+        /*
+         * A FIXED physical address, in the middle of RAM, and the same one every boot.
+         *
+         * AllocateAnyPages was tried first and measured useless: EDK2 allocates top-down, so
+         * the previous boot's buffer landed at the top of RAM -- exactly where the NEXT
+         * boot's firmware puts its own DXE heap, which clobbered it before hype ever ran
+         * (proven in rig/i452-salvage: boot 2 found nothing). And it must sit near the BOTTOM
+         * of the big conventional region, not the middle: a mid-region carve bisects it, and
+         * the #449 pool reservation -- which needs the largest CONTIGUOUS run -- shrank from
+         * 1.7 GiB to 768 MiB and refused vm0 admission (measured in rig/i767 at 1 GiB).
+         * 48 MiB costs the pool only the ~47 MiB below it, and clears OVMF's low-memory
+         * working set (~<32 MiB). If THIS boot's firmware is using it, AllocateAddress fails
+         * cleanly and hype falls back to AnyPages -- losing next-boot salvage, not the run.
+         */
+        const EFI_PHYSICAL_ADDRESS lb_fixed = 0x03000000ull;
+        EFI_PHYSICAL_ADDRESS lb_phys = lb_fixed;
+        UINTN lb_pages = (sizeof(hype_logbuf_t) + 4095u) / 4096u;
+        const hype_logbuf_t *prior = (const hype_logbuf_t *)(UINTN)lb_fixed;
+        /* Salvage BEFORE allocating: the read needs no ownership, and the attach+reset below
+         * stamps this boot's header over exactly these bytes. */
+        if (hype_logbuf_validate(prior) && prior->len != 0u) {
+            void *copy = 0;
+            if (SystemTable->BootServices->AllocatePool(EfiLoaderData, prior->len, &copy) ==
+                    EFI_SUCCESS &&
+                copy != 0) {
+                const char *src = prior->data;
+                char *dst = (char *)copy;
+                unsigned int ci;
+                for (ci = 0; ci < prior->len; ci++) {
+                    dst[ci] = src[ci];
+                }
+                g_prev_log_data = (const char *)copy;
+                g_prev_log_len = prior->len;
+                g_prev_log_truncated = prior->truncated ? 1 : 0;
+            }
+        }
+        if (SystemTable->BootServices->AllocatePages(AllocateAddress, EfiLoaderData, lb_pages,
+                                                     &lb_phys) != EFI_SUCCESS) {
+            lb_phys = 0;
+            if (SystemTable->BootServices->AllocatePages(AllocateAnyPages, EfiLoaderData,
+                                                         lb_pages, &lb_phys) != EFI_SUCCESS) {
+                lb_phys = 0; /* stay on the in-image buffer: capture works, salvage will not */
+            }
+        }
+        if (lb_phys != 0) {
+            hype_logbuf_attach((void *)(UINTN)lb_phys);
+        }
+    }
     /* RT-1a: stamp the log-capture region's magic header before anything
      * logs into it, so it is self-describing (findable + validatable by a
-     * later boot's scanner, RT-1b) from the very first byte. The buffer is
-     * in BSS (zero at load), so this must run explicitly. */
+     * later boot's scanner, RT-1b) from the very first byte. */
     hype_logbuf_reset();
+    if (g_prev_log_len != 0u) {
+        hype_debug_print("RT-1b: the previous boot's capture buffer (%u bytes%s) survived the "
+                         "reboot at the same address -- written in Phase 1 [#452]\n",
+                         g_prev_log_len, g_prev_log_truncated ? ", truncated" : "");
+    }
 
     /* First thing in every log: which build this is. Captures from a
      * serial-less machine otherwise all start with identical boilerplate. */

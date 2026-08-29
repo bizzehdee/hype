@@ -127,6 +127,15 @@ typedef struct {
  * self-describing from the first byte; also used by tests. */
 void hype_logbuf_reset(void);
 
+/*
+ * RT-1b (fix): point the capture machinery at a region allocated OUTSIDE the image, so the
+ * next boot's PE load (which zero-fills .bss) cannot destroy this boot's log. Must be at
+ * least sizeof(hype_logbuf_t) and HYPE_LOGBUF_SCAN_ALIGN-aligned. Anything already captured
+ * in the default buffer is carried over; call before or immediately followed by
+ * hype_logbuf_reset(). Without an attach the static in-image buffer is used (tests).
+ */
+void hype_logbuf_attach(void *region);
+
 /* Append a NUL-terminated string. Drops any bytes past capacity and
  * latches hype_logbuf_truncated(); maintains len + checksum. */
 void hype_logbuf_append(const char *s);
