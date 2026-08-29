@@ -1610,10 +1610,26 @@ int hype_xhci_hub_child_path(hype_xhci_ctrl_t *c, unsigned int hub_slot, unsigne
         return -1;
     }
     if (hub_set_port_feature(c, hub_slot, HUB_FEAT_PORT_RESET, port) != 0) return -1;
+    /*
+     * Wait for the reset in REAL MILLISECONDS, not in spins.
+     *
+     * This used to be 20 iterations of short_delay() -- a 200,000-step volatile decrement,
+     * roughly 120 us -- plus one control transfer each, so about 13 ms of budget in total.
+     * USB 2.0 11.5.1.5 has a hub drive reset for 10 ms MINIMUM and allows longer, so 13 ms
+     * is not a timeout, it is a coin flip.
+     *
+     * Boot 21 measured the losing side: 159 failed resets on one hub port, every one of them
+     * reporting status 0x0511 -- PORT_RESET still SET, so the hub had not finished. hype was
+     * declaring failure on a port that was still resetting normally.
+     *
+     * 200 ms in 10 ms steps, which is what the port is actually allowed to take. It exits as
+     * soon as C_PORT_RESET appears, so a healthy port still costs one step.
+     */
     for (guard = 0; guard < 20u; guard++) {
-        short_delay();
+        delay_ms(10);
         if (hub_get_port_status(c, hub_slot, port, st) != 0) break;
         if (st[2] & 0x10u) break; /* C_PORT_RESET */
+        if (!(st[0] & 0x10u)) break; /* PORT_RESET cleared without the change bit */
     }
     hub_clear_port_feature(c, hub_slot, HUB_FEAT_C_PORT_RESET, port);
     hub_clear_port_feature(c, hub_slot, HUB_FEAT_C_PORT_CONNECTION, port);

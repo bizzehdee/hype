@@ -24957,6 +24957,15 @@ static int fw_1_usb_enumerate_behind_hub(hype_xhci_ctrl_t *xc, unsigned int ctrl
     if (hype_xhci_hub_child_path(xc, hub_slot, port, &hpath, &cp, &child_speed) != 0) {
         hype_debug_print("host-usb: hub slot %u port %u -- could not work out the child's "
                          "topology, not enumerating [#746]\n", hub_slot, port);
+        /*
+         * COUNT IT. This was the one arrival failure that did not feed the #763 cap, so a
+         * port that could never be reset was retried for ever -- boot 21 measured 159
+         * attempts on a single port, each costing a 100 ms connect debounce plus the reset
+         * wait, all of it blocking the BSP input tick. That is the delay the operator feels
+         * between pressing a key and seeing it, and every other failure path here already
+         * bounds itself this way.
+         */
+        fw_1_arrival_failed(ctrl_idx, hub_slot, port, "port reset");
         return 1;
     }
     if (hype_xhci_enable_slot(xc, &slot) != 0 || slot == 0u) {
