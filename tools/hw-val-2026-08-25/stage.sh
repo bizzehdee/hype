@@ -33,7 +33,7 @@ set -u
 # drive. The active script and the card that describes it must move together or the operator
 # is reading instructions for a different run.
 BOOT_INPUT=input-1a-hotplug
-RUN_CARD=RUN-CARD-2026-08-29-boot21.md
+RUN_CARD=RUN-CARD-2026-08-29-boot22.md
 
 BOOTLABEL=HYPEBOOT
 # The data partition has NO label. `EADE-CA36` is its exFAT volume UUID, which is what
