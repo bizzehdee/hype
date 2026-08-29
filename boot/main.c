@@ -2730,6 +2730,7 @@ static EFI_RUNTIME_SERVICES *g_runtime_services;
 typedef void(EFIAPI *hype_efi_reset_system_t)(unsigned reset_type, EFI_STATUS reset_status,
                                               UINTN data_size, void *reset_data);
 #define HYPE_EFI_RESET_COLD 0u
+#define HYPE_EFI_RESET_WARM 1u
 #define HYPE_EFI_RESET_SHUTDOWN 2u
 
 static inline void host_reset_outb(uint16_t port, uint8_t val) {
@@ -2744,6 +2745,16 @@ static void fw_1_host_power_act(unsigned action) {
     hype_debug_print("fw-1 HOST: all guests down -- %s the host [#175]\n",
                      (action == HYPE_HOST_ACTION_OFF) ? "powering off" : "rebooting");
     if (g_runtime_services != 0 && g_runtime_services->ResetSystem != 0) {
+        /*
+         * WARM first for a reboot, cold as the fallback. RT-1b's next-boot salvage of the
+         * capture buffer depends on RAM contents surviving the reset, and warm is the reset
+         * type defined to preserve them; a cold reset may retrain and scrub memory. The
+         * operator's machine has no reset button, so this path IS the salvage trigger.
+         */
+        if (action != HYPE_HOST_ACTION_OFF) {
+            ((hype_efi_reset_system_t)g_runtime_services->ResetSystem)(HYPE_EFI_RESET_WARM, 0,
+                                                                       0, 0);
+        }
         ((hype_efi_reset_system_t)g_runtime_services->ResetSystem)(
             (action == HYPE_HOST_ACTION_OFF) ? HYPE_EFI_RESET_SHUTDOWN : HYPE_EFI_RESET_COLD,
             0, 0, 0);
@@ -8439,11 +8450,27 @@ static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_t
  * become a cost of its own.
  */
 #define FW1_HID_QUIET_TICKS 500u /* ~4 s at 125 Hz -- longer than any gap in real typing */
+/*
+ * The dead-man trigger for the RT-1b post-mortem. The Pico tag keyboard (cafe:4b44) types
+ * every 10 seconds once armed, so five minutes of silence from an endpoint that HAS
+ * delivered reports, on a machine with no reset button and (by then, usually) no working
+ * keyboard, is the terminal deaf state this whole investigation is about -- and the only
+ * way to read the capture buffer's account of it is a WARM reboot while it is still in RAM.
+ * Ordinary keyboards are exempt: a human five minutes away from the desk is not a fault.
+ */
+#define FW1_HID_DEAD_TICKS (125u * 300u) /* 5 minutes at the 125 Hz input tick */
+#define FW1_PICO_VID 0xcafeu
+#define FW1_PICO_PID 0x4b44u
 #define FW1_HID_PROBE_MAX    64u /* an overnight run must not fill the log with these */
 
 /* Defined further down with the log sink and the mouse counters; declared here because the
  * input tick reports their health and sits above both. */
 #define HYPE_USBLOG_FAIL_STREAK_MAX 64u
+/* Bytes the log buffer is ahead of the file. A growing gap is the sink dying WITHOUT
+ * reporting a failure, which is how boot 29 produced four seconds of log in a three-minute
+ * run while every failure counter stayed at zero. */
+#define HYPE_USBLOG_BEHIND_ALERT 65536u
+static unsigned int g_usb_log_behind_bytes;
 static unsigned int g_usb_log_flush_fail_streak;
 static unsigned long long g_hid_lock_missed;
 
@@ -8492,6 +8519,16 @@ static void fw_1_hid_watch(uint64_t now_h, uint64_t hz) {
         }
         if (kb->reports == 0ull) continue; /* never worked: nothing to have stopped */
         if (++quiet[k] == FW1_HID_QUIET_TICKS) fw_1_hid_probe_port(k, kb);
+        if (kb->vid == FW1_PICO_VID && kb->pid == FW1_PICO_PID &&
+            quiet[k] == FW1_HID_DEAD_TICKS && g_host_action == HYPE_HOST_ACTION_NONE &&
+            hype_xhci_int_in_revives((hype_xhci_ctrl_t *)&kb->xc, kb->slot, kb->ep) != 0ull) {
+            hype_debug_print("fw-1 DEADMAN: the tag keyboard (%04x:%04x slot%u) delivered "
+                             "reports, then nothing for 5 minutes despite a revive -- the "
+                             "input path is dead. WARM-REBOOTING to salvage the capture "
+                             "buffer; read \\hype-log-prev.txt after the next boot [#175 #452]\n",
+                             (unsigned)kb->vid, (unsigned)kb->pid, kb->slot);
+            (void)fw_1_host_action_begin(HYPE_HOST_ACTION_REBOOT);
+        }
     }
 
     if (hz == 0ull || (watch_last != 0ull && now_h - watch_last < hz * 2ull)) return;
@@ -8506,11 +8543,12 @@ static void fw_1_hid_watch(uint64_t now_h, uint64_t hz) {
      * them to discover an empty log afterwards. Zero is the normal case and costs one line
      * every two seconds.
      */
-    if (g_usb_log_flush_fail_streak != 0u || g_hid_lock_missed != 0ull) {
-        hype_debug_print("fw-1 LOGHEALTH: flush_fail_streak=%u (gives up at %u) | "
-                         "input ticks skipped for the USB lock=%llu [#596 #775]\n",
+    if (g_usb_log_flush_fail_streak != 0u || g_hid_lock_missed != 0ull ||
+        g_usb_log_behind_bytes > 4096u) {
+        hype_debug_print("fw-1 LOGHEALTH: flush_fail_streak=%u (gives up at %u) | behind=%u B "
+                         "| input ticks skipped for the USB lock=%llu [#596 #338 #775]\n",
                          g_usb_log_flush_fail_streak, (unsigned)HYPE_USBLOG_FAIL_STREAK_MAX,
-                         g_hid_lock_missed);
+                         g_usb_log_behind_bytes, g_hid_lock_missed);
     }
     for (k = 0; k < g_hid_count && k < HYPE_HOST_KBD_MAX; k++) {
         const hype_host_kbd_t *kb = &g_hid[k];
@@ -9262,6 +9300,17 @@ static void fw_1_render_console(void) {
                                   "** %u CORE PANIC(S) -- apic=%u halted; see the log for the "
                                   "fault [#461] **",
                                   panics, hype_fatal_core_panic_apic());
+                    alert = alert_line;
+                } else if (g_usb_log_behind_bytes > HYPE_USBLOG_BEHIND_ALERT) {
+                    /*
+                     * The sink is alive and not keeping up -- or has quietly stopped. Either
+                     * way the run is no longer being recorded, which is what the operator
+                     * needs to know, and it is NOT covered by the failure streak below.
+                     */
+                    hype_snprintf(alert_line, sizeof(alert_line),
+                                  "** LOG %u KB BEHIND -- \\HYPE.LOG is not keeping up with "
+                                  "this run [#338] **",
+                                  g_usb_log_behind_bytes / 1024u);
                     alert = alert_line;
                 } else if (g_usb_log_flush_fail_streak != 0u) {
                     /*
@@ -30080,6 +30129,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                     if (have > wrote_now && (have - wrote_now) > g_usb_log_max_lag) {
                         g_usb_log_max_lag = have - wrote_now;
                     }
+                    /*
+                     * Published for the dashboard alert on EVERY pass, not only when a drain
+                     * slice is due. If the drain gate itself stops firing, a behind value
+                     * computed inside that gate freezes at its last healthy reading and the
+                     * alert stays silent -- the exact class of miss boot 29 already cost.
+                     */
+                    g_usb_log_behind_bytes = (have > wrote_now) ? (have - wrote_now) : 0u;
                 }
                 if (hype_log_drain_due(&log_drain, now_d, have)) {
                     unsigned int before = usb_log_flushed_total();
