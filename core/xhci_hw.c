@@ -2106,6 +2106,19 @@ static int int_in_poll_body(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int
     }
     bar = (volatile uint8_t *)(uintptr_t)c->bar;
     my_trb = phys(iin->ring) + (uint64_t)iin->enq * HYPE_XHCI_TRB_BYTES;
+    /*
+     * Count silence per POLL OF THIS ENDPOINT, not per poll that found the ring empty.
+     *
+     * The first version incremented inside the idle branch, which is only reached when the
+     * whole shared event ring had nothing on it. With eight interrupt-IN endpoints and hub
+     * status endpoints reporting periodically, the ring is frequently NOT empty, so a deaf
+     * endpoint's counter advanced far slower than its poll count. Boot 27 measured the
+     * consequence: the Pico sat silent for 28,632 polls, needing 8,000, and was revived
+     * exactly once -- the trigger it needed never came round again.
+     *
+     * A report resets this, wherever the completion was routed from.
+     */
+    iin->silent_polls++;
 
     /* Arm exactly one transfer on THIS endpoint, and only when none is outstanding.
      *
@@ -2231,7 +2244,7 @@ static int int_in_poll_body(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int
          * boot 25 established that the second case is real: attached, awake, armed, and
          * permanently silent. Rebuild it rather than wait for a hand on the cable.
          */
-        if (iin->q.inflight != 0u && ++iin->silent_polls >= iin->revive_after) {
+        if (iin->q.inflight != 0u && iin->silent_polls >= iin->revive_after) {
             unsigned int after = iin->revive_after;
             iin->silent_polls = 0;
             if (int_in_revive(c, slot, dci, iin) == 0) {
