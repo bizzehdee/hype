@@ -174,6 +174,25 @@ static void usb_xfer_unlock(void) {
 }
 
 /*
+ * The same ticket lock the mass-storage datapath uses, exported for the HID input path.
+ *
+ * The interrupt-IN poll has always driven the host controller WITHOUT taking this, while
+ * guest media reads take it from their own AP cores -- so the BSP's input tick and an AP's
+ * bulk transfer have been touching one controller unserialised. That was survivable while
+ * the poll only read the event ring. It stopped being survivable when the poll gained
+ * int_in_revive(), which submits Stop Endpoint and Set TR Dequeue on the shared COMMAND
+ * ring: two producers on one ring with no lock corrupts it, and #596 is the precedent for
+ * what that does to the log written through the same path.
+ *
+ * Bounded on the BSP for the same reason usb_xfer_lock_or_fail() is: the input tick must
+ * never block for ever behind a wedged AP transfer, because that would take the keyboard
+ * down with it -- the exact failure #363 moved input to the BSP to avoid.
+ */
+int hype_blk_usb_try_lock(void) { return usb_xfer_lock_or_fail(); }
+void hype_blk_usb_unlock(void) { usb_xfer_unlock(); }
+
+
+/*
  * #368: the live queue, not the run totals.
  *
  * The existing counters are cumulative, so they say the USB path is heavily contended over a

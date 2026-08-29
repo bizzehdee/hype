@@ -83,4 +83,13 @@ void hype_blk_usb_queue_stats(unsigned int *waiters, unsigned int *holder_apic);
  */
 void hype_blk_usb_lock_wait(unsigned long long *total_tsc, unsigned long long *max_tsc);
 
+/*
+ * Serialise host-controller access against the mass-storage datapath. Returns 0 when the
+ * lock is held and the caller must release it; non-zero when it could not be taken and the
+ * caller must NOT touch the controller. See the implementation for why the input path needs
+ * this now.
+ */
+int hype_blk_usb_try_lock(void);
+void hype_blk_usb_unlock(void);
+
 #endif /* HYPE_CORE_BLK_USB_H */

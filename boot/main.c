@@ -415,6 +415,9 @@ static int g_mouse_ready;
 static unsigned int g_mouse_slot;
 static unsigned int g_mouse_ep;
 static unsigned int g_mouse_mps;
+/* #596-shaped: input ticks skipped because the storage datapath held the controller. A
+ * healthy run should see few; a large number means the input path is being starved by guest
+ * media and the tick rate is not what it claims. */
 static unsigned long long g_mouse_polls;
 static unsigned long long g_mouse_reports;
 static unsigned long long g_mouse_poll_errs;
@@ -8438,6 +8441,12 @@ static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_t
 #define FW1_HID_QUIET_TICKS 500u /* ~4 s at 125 Hz -- longer than any gap in real typing */
 #define FW1_HID_PROBE_MAX    64u /* an overnight run must not fill the log with these */
 
+/* Defined further down with the log sink and the mouse counters; declared here because the
+ * input tick reports their health and sits above both. */
+#define HYPE_USBLOG_FAIL_STREAK_MAX 64u
+static unsigned int g_usb_log_flush_fail_streak;
+static unsigned long long g_hid_lock_missed;
+
 static void fw_1_hid_probe_port(unsigned int k, const hype_host_kbd_t *kb) {
     static unsigned int probes;
     uint8_t st[4];
@@ -8487,6 +8496,22 @@ static void fw_1_hid_watch(uint64_t now_h, uint64_t hz) {
 
     if (hz == 0ull || (watch_last != 0ull && now_h - watch_last < hz * 2ull)) return;
     watch_last = now_h;
+    /*
+     * Log health, on the same two-second beat.
+     *
+     * Boot 26 ran for forty-five minutes with working input and produced fifteen seconds of
+     * log: flushing stopped and nothing said so, because the only place that says so is the
+     * log. hype_debug_print reaches the live display as well, so printing the streak here
+     * puts it on the operator's screen at the moment it starts failing rather than leaving
+     * them to discover an empty log afterwards. Zero is the normal case and costs one line
+     * every two seconds.
+     */
+    if (g_usb_log_flush_fail_streak != 0u || g_hid_lock_missed != 0ull) {
+        hype_debug_print("fw-1 LOGHEALTH: flush_fail_streak=%u (gives up at %u) | "
+                         "input ticks skipped for the USB lock=%llu [#596 #775]\n",
+                         g_usb_log_flush_fail_streak, (unsigned)HYPE_USBLOG_FAIL_STREAK_MAX,
+                         g_hid_lock_missed);
+    }
     for (k = 0; k < g_hid_count && k < HYPE_HOST_KBD_MAX; k++) {
         const hype_host_kbd_t *kb = &g_hid[k];
         unsigned long long lost = 0, skipped = 0, hce = 0, rfull = 0, evict = 0;
@@ -9237,6 +9262,27 @@ static void fw_1_render_console(void) {
                                   "** %u CORE PANIC(S) -- apic=%u halted; see the log for the "
                                   "fault [#461] **",
                                   panics, hype_fatal_core_panic_apic());
+                    alert = alert_line;
+                } else if (g_usb_log_flush_fail_streak != 0u) {
+                    /*
+                     * #596: the log cannot report its own death.
+                     *
+                     * Boot 26 ran for forty-five minutes and produced fifteen seconds of log.
+                     * Flushing had stopped, and the only place that says so is \HYPE.LOG --
+                     * so the operator had no way to know until they read an empty file
+                     * afterwards. The dashboard is the one surface that survives it, and this
+                     * is the same reasoning #461 used for a core panic: say it where a
+                     * serial-less machine can be read.
+                     *
+                     * Shown from the FIRST failed flush, not at the give-up threshold. By the
+                     * time 64 have failed the run is already wasted, and the operator's
+                     * decision -- restart now, or keep going -- needs the warning early.
+                     */
+                    hype_snprintf(alert_line, sizeof(alert_line),
+                                  "** LOG FLUSH FAILING: %u in a row (stops at %u) -- "
+                                  "\\HYPE.LOG is not recording this run [#596] **",
+                                  g_usb_log_flush_fail_streak,
+                                  (unsigned)HYPE_USBLOG_FAIL_STREAK_MAX);
                     alert = alert_line;
                 }
             }
@@ -23281,7 +23327,6 @@ static int g_usb_log_flush_failed; /* emitted once, not every interval */
  * ticket exists for) had nowhere to go. Retry each interval; give up only when the failure is
  * persistent.
  */
-static unsigned int g_usb_log_flush_fail_streak;
 #define HYPE_USBLOG_FAIL_STREAK_MAX 64u
 static usblog_ctx_t g_usb_log_ctx;
 /* #374: live BSP-slice evidence. Source bytes count capture-buffer progress
@@ -24765,7 +24810,25 @@ static unsigned int usb_hid_drain(void) {
             }
             injected += rn;
         }
+        /*
+         * SERIALISED against the mass-storage datapath. This poll drives the host controller
+         * from the BSP while guest media reads drive the same controller from AP cores, and
+         * until now only the storage side took the lock. Harmless while the poll merely read
+         * the event ring; not harmless once it can submit Stop Endpoint and Set TR Dequeue on
+         * the shared command ring. Boot 26's log stopped fifteen seconds in with no panic --
+         * the log is written through that same storage path -- and #596 is the precedent for
+         * what unserialised access does to it.
+         *
+         * try, not block: a wedged AP transfer must never take the keyboard down with it,
+         * which is the whole reason #363 moved input to the BSP. A missed tick costs one
+         * poll; the next one is 8 ms away.
+         */
+        if (hype_blk_usb_try_lock() != 0) {
+            g_hid_lock_missed++;
+            continue;
+        }
         r = hype_xhci_int_in_poll(&kb->xc, kb->slot, kb->ep, report, HYPE_USB_HID_REPORT_LEN);
+        hype_blk_usb_unlock();
         if (r < 0) {
             kb->errs++;
         }
@@ -25343,8 +25406,13 @@ static int usb_mouse_drain(hype_ps2_mouse_t *dst) {
         }
     }
     g_mouse_polls++;
+    if (hype_blk_usb_try_lock() != 0) {
+        g_hid_lock_missed++;
+        return 0; /* see usb_hid_drain: a missed tick is cheaper than a stalled input path */
+    }
     r = hype_xhci_int_in_poll(&g_mouse_xc, g_mouse_slot, g_mouse_ep, report,
                               (unsigned)sizeof(report));
+    hype_blk_usb_unlock(); /* released before every return below, so no path leaks it */
     if (r < 0) {
         g_mouse_poll_errs++;
     }
