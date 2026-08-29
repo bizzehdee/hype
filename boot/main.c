@@ -8394,6 +8394,47 @@ static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_t
  * core consumes, and x86 TSO plus the compiler barrier in hype_guest_uart_rx_enqueue() is enough.
  * No lock, and no device state touched from two cores -- deliberately, given #343.
  */
+/*
+ * A HID line every two seconds.
+ *
+ * Boot 20 classified the failure correctly -- every loss counter zero, so no completion was
+ * ever generated -- but it could not show the TRANSITION. The big periodic DIAG block ran
+ * twice in fifty-five seconds; the keyboard died at twenty-four and the nearest sample was
+ * at thirty-one. Aftermath, not the moment. At two seconds the moment is bracketed.
+ *
+ * Deliberately NOT part of that block: this rides the input tick that already exists, costs
+ * a TSC compare per tick, and prints one short line per keyboard. #764 printed nine lines
+ * from INSIDE the poll and was measured causing the 26 ms and 45 ms stalls it existed to
+ * explain, so this stays outside the poll and stays one line.
+ *
+ * And deliberately NOT a "went deaf" detector. The first cut of this had one, firing when an
+ * endpoint that had reported went four seconds armed and silent -- and the rig fired it four
+ * times on a keyboard nobody was typing on. Silence cannot distinguish a deaf endpoint from
+ * an idle one; that is precisely why #764 was withdrawn, and a detector that calls normal
+ * behaviour a fault is worse than no detector. A timestamped sample every two seconds says
+ * when reports stopped without having to guess what stopping means.
+ */
+static void fw_1_hid_watch(uint64_t now_h, uint64_t hz) {
+    static uint64_t watch_last;
+    unsigned int k;
+
+    if (hz == 0ull || (watch_last != 0ull && now_h - watch_last < hz * 2ull)) return;
+    watch_last = now_h;
+    for (k = 0; k < g_hid_count && k < HYPE_HOST_KBD_MAX; k++) {
+        const hype_host_kbd_t *kb = &g_hid[k];
+        unsigned long long lost = 0, skipped = 0, hce = 0, rfull = 0, evict = 0;
+        hype_xhci_int_in_losses((hype_xhci_ctrl_t *)&kb->xc, kb->slot, kb->ep, &lost, &skipped);
+        hype_xhci_event_health((hype_xhci_ctrl_t *)&kb->xc, &hce, &rfull, &evict);
+        hype_debug_print("fw-1 HIDTICK[%u]: %04x:%04x slot%u ep=0x%02x polls=%llu reports=%llu "
+                         "arms=%llu lost=%llu skipped=%llu hcevt=%llu ringfull=%llu evict=%llu "
+                         "| mouse polls=%llu reports=%llu [#775]\n",
+                         k, (unsigned)kb->vid, (unsigned)kb->pid, kb->slot, kb->ep,
+                         kb->polls, kb->reports,
+                         hype_xhci_int_in_arms((hype_xhci_ctrl_t *)&kb->xc, kb->slot, kb->ep),
+                         lost, skipped, hce, rfull, evict, g_mouse_polls, g_mouse_reports);
+    }
+}
+
 static void fw_1_host_input_poll(void) {
     uint8_t sc;
     /*
@@ -8425,6 +8466,7 @@ static void fw_1_host_input_poll(void) {
                 g_hid_gate_opens++; /* #773: measured, not inferred */
                 (void)usb_hid_drain();
                 fw_1_usb_hotplug_poll(); /* #744 */
+                fw_1_hid_watch(now_h, hz);
             }
         }
     }
@@ -25192,6 +25234,35 @@ static int usb_mouse_drain(hype_ps2_mouse_t *dst) {
 
     if (!g_mouse_ready || dst == 0) {
         return 0;
+    }
+    /*
+     * RATE-LIMIT, to the same 125 Hz the keyboards use.
+     *
+     * This runs from the GUEST DISPATCH LOOP, not from fw_1_host_input_poll's gate, so it
+     * used to poll on every iteration of a tight `pause` spin. Boot 20 measured what that
+     * costs: 354,529 mouse polls against 1,851 keyboard polls in the same 31 seconds -- the
+     * mouse endpoint ran 191x more often than the keyboards and became the dominant consumer
+     * of the controller's event ring, peeking it at roughly 11 kHz on the guest's core.
+     *
+     * That inverts the design. Interrupt-IN polling is supposed to be a 125 Hz activity;
+     * #365 measured a USB transfer at ~551 us of bus scheduling, and #363 moved input off
+     * the guest core precisely so a guest could not be charged for it. A USB HID mouse
+     * reports at 125 Hz natively, so nothing is lost by asking at that rate.
+     *
+     * The gate is global rather than per-VM because there is ONE mouse: g_mouse_slot and
+     * g_mouse_xc are file-globals, so a per-VM counter here would poll the same endpoint
+     * once per VM per tick.
+     */
+    {
+        static uint64_t mouse_last;
+        uint64_t hz = g_vms[0].host_tsc_hz; /* not g_fw_1_host_tsc_hz: that macro needs `vm` */
+        if (hz != 0ull) {
+            uint64_t now = hype_rdtsc();
+            if (mouse_last != 0ull && now - mouse_last < hz / 125ull) {
+                return 0;
+            }
+            mouse_last = now;
+        }
     }
     g_mouse_polls++;
     r = hype_xhci_int_in_poll(&g_mouse_xc, g_mouse_slot, g_mouse_ep, report,
