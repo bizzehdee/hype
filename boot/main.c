@@ -16444,11 +16444,28 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     unsigned int kq;
                     for (kq = 0; kq < g_hid_count && kq < HYPE_HOST_KBD_MAX; kq++) {
                         const hype_host_kbd_t *kb = &g_hid[kq];
-                        hype_debug_print("fw-1 DIAG: HID[%u/%u] %04x:%04x polls=%llu reports=%llu arms=%llu "
-                                         "errors=%llu (slot%u ep=0x%02x) [#217 #742]\n",
-                                         kq, g_hid_count, (unsigned)kb->vid, (unsigned)kb->pid,
-                                         kb->polls, kb->reports,
-                                         hype_xhci_int_in_arms(&kb->xc, kb->slot, kb->ep), kb->errs, kb->slot, kb->ep);
+                        {
+                            /* #775: and where the completions went. QEMU has been seen to
+                             * start 299 transfers on an endpoint hype scored at zero
+                             * reports; these four say which route lost them. */
+                            unsigned long long rh = 0, rd = 0, ro = 0, rp = 0;
+                            unsigned long long lost = 0, skipped = 0;
+                            unsigned long long hce = 0, rfull = 0, evict = 0;
+                            hype_xhci_int_in_routes(&kb->xc, kb->slot, kb->ep, &rh, &rd, &ro, &rp);
+                            hype_xhci_int_in_losses(&kb->xc, kb->slot, kb->ep, &lost, &skipped);
+                            hype_xhci_event_health(&kb->xc, &hce, &rfull, &evict);
+                            hype_debug_print("fw-1 DIAG: HID[%u/%u] %04x:%04x polls=%llu "
+                                             "reports=%llu arms=%llu errors=%llu "
+                                             "handed=%llu deliv=%llu own=%llu topark=%llu "
+                                             "lost=%llu skipped=%llu | ctrl hcevt=%llu "
+                                             "ringfull=%llu evict=%llu "
+                                             "(slot%u ep=0x%02x) [#217 #742 #775]\n",
+                                             kq, g_hid_count, (unsigned)kb->vid,
+                                             (unsigned)kb->pid, kb->polls, kb->reports,
+                                             hype_xhci_int_in_arms(&kb->xc, kb->slot, kb->ep),
+                                             kb->errs, rh, rd, ro, rp, lost, skipped,
+                                             hce, rfull, evict, kb->slot, kb->ep);
+                        }
                         /* #734: name the modifier bits seen, and say outright whether the two
                          * the chord needs have ever arrived. Per keyboard, because whether a
                          * board's right-hand Alt reports as usage 0xE6 is a property of that
@@ -25033,7 +25050,13 @@ static void fw_1_usb_hotplug_poll(void) {
          * interrupt-IN endpoint -- so its root ports could never hot-plug. Bounded, because
          * this runs from the guest dispatch loop.
          */
-        (void)hype_xhci_pump_events(xc, 16u);
+        /*
+         * Drain to empty, not to a token budget. The Event Ring is not a 125 Hz object:
+         * xHCI 4.9.4 stops the controller when it fills, so anything left on it between
+         * ticks is backpressure hype is applying to itself. The bound is a watchdog against
+         * a wedged ring, not a rationing policy -- one full ring's worth per pass.
+         */
+        (void)hype_xhci_pump_events(xc, HYPE_XHCI_PUMP_BUDGET);
 
         while ((port = hype_xhci_take_port_change(xc)) != 0u) {
             int connected = 0;

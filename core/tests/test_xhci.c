@@ -372,6 +372,42 @@ static void test_parked_events(void) {
               hype_xhci_parked_take(&p, 1, 3, 0x140425000ull, &cc, &residue));
 }
 
+/*
+ * The eviction is the fatal event, and until now nothing counted it. A dropped interrupt-IN
+ * completion does not lose a report, it loses the ENDPOINT: `armed` clears only on a claim,
+ * so the transfer stays outstanding for ever and the endpoint is never re-armed. A boot that
+ * ends with a deaf keyboard and evictions=0 means something else went wrong.
+ */
+static void test_parked_evictions_counted(void) {
+    hype_xhci_parked_t p;
+    unsigned i;
+
+    hype_xhci_parked_reset(&p);
+    CHECK_HEX("a fresh table has evicted nothing", 0,
+              (int)hype_xhci_parked_evictions(&p));
+
+    /* Fill it exactly. HYPE_XHCI_PARKED_MAX distinct transfers fit without evicting. */
+    for (i = 0; i < HYPE_XHCI_PARKED_MAX; i++) {
+        hype_xhci_parked_put(&p, 1, 3, 0x1000ull + i * 0x10ull, 1, 0);
+    }
+    CHECK_HEX("a table filled to capacity has evicted nothing", 0,
+              (int)hype_xhci_parked_evictions(&p));
+
+    /* One more must displace an existing entry, and say so. */
+    hype_xhci_parked_put(&p, 1, 3, 0x9000ull, 1, 0);
+    CHECK_HEX("the entry past capacity is counted as an eviction", 1,
+              (int)hype_xhci_parked_evictions(&p));
+
+    /* Re-parking a transfer already held replaces it in place: not an eviction. */
+    hype_xhci_parked_put(&p, 1, 3, 0x9000ull, 1, 0);
+    CHECK_HEX("re-parking the same transfer is not an eviction", 1,
+              (int)hype_xhci_parked_evictions(&p));
+
+    hype_xhci_parked_reset(&p);
+    CHECK_HEX("reset clears the eviction count", 0,
+              (int)hype_xhci_parked_evictions(&p));
+}
+
 static void test_parked_drop_exact(void) {
     hype_xhci_parked_t p;
     uint32_t cc = 0;
@@ -1182,6 +1218,7 @@ int main(void) {
 
     test_parked_events();
     test_parked_drop_exact();
+    test_parked_evictions_counted();
     test_exact_transfer_result();
     test_parked_no_duplicates();
     test_parked_overflow_keeps_newest();

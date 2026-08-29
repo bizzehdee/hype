@@ -1,7 +1,13 @@
 # USB HID interrupt-IN endpoints go permanently silent on real hardware
 
-**Status:** unresolved. Written as a hand-off for someone with deep xHCI experience.
-**Date:** 2026-08-29. **Tree:** `hype` @ `86fd3a8`.
+**Status:** root cause identified and fixed in software; awaiting a hardware run to confirm.
+**Date:** 2026-08-29. **Tree:** `hype` @ `86fd3a8` (analysis), fix on top.
+
+> **Update after expert review.** Two independent xHCI reviewers read this brief. Both
+> converged on the hypothesis in §4 — a lossy completion path, not a controller fault — and
+> both ranked it above the TT and hardware theories. The fix is described in §10, and §11
+> records which of the reviewers' specific claims did not survive checking against the
+> source, so nobody re-litigates them.
 
 ---
 
@@ -300,3 +306,81 @@ slot id with cc=4; QEMU delivers events far more promptly and in order.
 | Host `lsusb -v` | `/home/darren/lsusbv.txt` |
 
 Logs contain invalid UTF-8; read them with `LC_ALL=C grep -a`.
+
+
+---
+
+## 10. The fix
+
+Landed together, because the first is meaningless without the second.
+
+### 10.1 Retire where the event is routed, into a per-endpoint lossless queue
+
+This is the actual defect. hype retired the head at **poll** time, so between routing TRB0's
+completion and that endpoint's next poll the head still read TRB0 — and TRB1's completion,
+arriving in the same drain pass, could not match it. It went to the shared 8-entry parked
+table, which evicts round-robin under seven endpoints, and an evicted interrupt-IN
+completion is unrecoverable because `armed` clears only on a claim.
+
+`int_in_deliver()` now retires at the moment a completion is routed, wherever it was
+dequeued, and queues the completion code and report buffer on a per-endpoint FIFO of
+`HYPE_INT_IN_DEPTH` entries — exactly enough, since at most that many transfers can be
+outstanding. `have_completion`/`comp_cc` (a queue of depth one) and the interrupt-IN use of
+the parked table are both gone. Matching is against the whole outstanding set rather than
+the head alone, which keeps the strict TRB attribution of #766 while surviving a completion
+observed after the one behind it; an in-order match at index *k* retires 0..*k* and delivers
+their reports rather than discarding them.
+
+### 10.2 Rings sized to the page that was already allocated
+
+`RING_TRBS` 16 → 256. Every ring already lived in its own 4 KiB page; only 16 TRBs of it
+were used. On the **event** ring this removes the overflow risk outright: the worst case
+between drains is `HYPE_INT_IN_DEPTH × interrupt-IN endpoints` = 28 on this desktop, because
+an endpoint with its queue full cannot produce another event until hype retires one. 28
+against 16 slots was a real hazard; against 256 it is not, which is why the 125 Hz drain
+cadence is left alone. On the **transfer** rings it lengthens physical TRB-address reuse
+from every 15 submissions to every 255, so stale and current completions alias far less.
+
+### 10.3 The instrumentation that was missing
+
+- `parked.evictions` — the fatal event had no counter at all. Unit-tested.
+- Per-endpoint `lost` (a completion naming a TRB not outstanding — stale, correctly refused)
+  and `skipped` (a transfer retired because a later one completed). Both should stay zero.
+- **Host Controller Event** detection at the one point events leave the ring, naming
+  `Event Ring Full Error` (CC 21) explicitly. A non-zero count is the controller saying it
+  stopped, which no counter could previously distinguish from software losing completions.
+
+The HID diagnostic line now carries `lost`, `skipped`, `hcevt`, `ringfull` and `evict`
+alongside the routing counters.
+
+### 10.4 Deliberately not done yet
+
+Automatic `Stop Endpoint` → `Set TR Dequeue Pointer` → re-arm recovery. Both reviewers
+described it correctly, and one added the caveat that matters: if the Event Ring is full the
+controller has stopped processing the Command Ring, so the recovery command itself will not
+execute. Recovery must therefore come after the event-ring state is diagnosed, not before —
+and the counters in §10.3 are what will say whether it is needed at all.
+
+TT and split-transaction scheduling are untouched. Both reviewers ranked them last, and the
+signature (15 clean reports, then nothing, `errors=0`) does not match a split failure, which
+presents as transaction or split completion codes.
+
+---
+
+## 11. Reviewer claims that did not survive checking
+
+Recorded so they are not re-litigated. All five were checked against the source.
+
+| Claim | Verdict |
+|---|---|
+| “7 endpoints at `bInterval` 1 generate 7 events/ms, so 56 land in an 8 ms window” | **Wrong.** An interrupt IN endpoint with no data NAKs, and a NAK posts no Transfer Event — an idle keyboard produces nothing. The real bound is queue depth, not poll rate: `DEPTH × endpoints` = 28. Still exceeds 16, so the conclusion (ring undersized) holds; the arithmetic does not. |
+| “`Interval` must be `log2(bInterval) + 3` for Full Speed; programming 0 or 1 breaks AMD split scheduling” | **Already correct.** `hype_xhci_interval_encode()` (`core/xhci.c:633`) does exactly this for FS/LS, clamped to 3..10. `bInterval` 1 encodes as 3. |
+| “The Genesys hubs report Multi-TT; hype sets `MTT = 0`, so AMD fails to allocate split schedules” | **Wrong on this topology.** The keyboard's parent is `05e3:0610`, enumerated by hype as class `09/00/01` — `bDeviceProtocol` 1, **single TT**. The MTT-capable hub (`0bda:5411`, protocol 02) carries neither failing device. A hub only operates MTT if the host selects alternate interface setting 1, which hype never does, so `MTT = 0` is the correct programming. |
+| “`TT Hub Slot ID` must point at the HS parent, not an intermediate hub” | **Already correct.** `core/xhci_hw.c:1567` and `:3205` select the closest HS hub when `hype_xhci_tt_required()`, and otherwise inherit the parent's TT. |
+| Suggested `int_in_match_and_retire()` | **Not usable as written.** It decrements `pending_count` and `armed` as separate quantities; in hype `armed` *is* the count. It also retires without delivering the report data — for a HID keyboard, whose boot report is a state snapshot rather than an event log, silently dropping intermediate reports loses keystrokes. |
+
+One correction to the second review as well: it attributes the head-match failure to software
+observing completions out of sequence. The precise cause is narrower — retirement was
+deferred to poll time, so the head was stale by construction. Retiring at routing time fixes
+it without needing any out-of-order tolerance; matching the whole outstanding set is kept as
+cheap insurance, not as the mechanism.

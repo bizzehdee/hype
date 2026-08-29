@@ -50,7 +50,34 @@
  * between guests. That is deliberate given #343.
  */
 #define XDATA 65536u
-#define RING_TRBS 16u
+/*
+ * Every ring -- command, event, transfer -- lives in its own 4 KiB page, which is 256 TRBs.
+ * Only 16 of them were ever used.
+ *
+ * That mattered most on the EVENT ring. xHCI 4.9.4: when the Event Ring fills, the xHC posts
+ * an Event Ring Full Error and STOPS Command and Transfer Ring processing until software
+ * advances ERDP. hype drains at the 125 Hz input tick, so the window between drains is 8 ms,
+ * and with HYPE_INT_IN_DEPTH transfers outstanding on each of the seven interrupt-IN
+ * endpoints the desktop polls, up to 28 completions can land in one window -- against 16
+ * slots. (Not the 56 an events-per-millisecond estimate gives: an interrupt IN endpoint with
+ * no data NAKs, and a NAK posts no event, so an idle keyboard produces nothing. The bound is
+ * the queue depth, not the poll rate. 28 still exceeds 16.)
+ *
+ * At 256 the ring can no longer fill between drains, and that is a bound rather than a
+ * hope: an endpoint with HYPE_INT_IN_DEPTH TRBs outstanding cannot produce a further event
+ * until hype retires one and re-arms, so the whole controller can post at most
+ * DEPTH * (interrupt-IN endpoints) transfer events per window -- 28 on the desktop -- plus
+ * a port-status event per port and whatever synchronous command hype is waiting on. That
+ * is why the 125 Hz drain cadence is left alone: it was only ever unsafe against 16.
+ *
+ * It also mattered on the TRANSFER rings, where a 16-TRB ring reuses each physical TRB
+ * address every 15 submissions. TRB address is the only identity a completion carries, so a
+ * short ring makes stale and current completions alias each other -- which is the ambiguity
+ * bulk_xfer's parked_drop_exact exists to paper over. 256 pushes the reuse distance to 255.
+ *
+ * The memory was already allocated. This costs nothing.
+ */
+#define RING_TRBS 256u
 #define MAX_SCRATCH 64u
 #define DEVPOOL 8u
 #define SPIN 20000000u
@@ -93,6 +120,14 @@ typedef struct {
     unsigned int cmd_cyc; /* command-ring producer cycle bit */
     unsigned int evt_deq; /* event-ring dequeue index */
     unsigned int evt_cyc; /* event-ring consumer cycle bit */
+    /*
+     * Host Controller Events, and how many of those said Event Ring Full. Non-zero
+     * ring_full_events is direct proof the controller stopped rather than software losing
+     * completions -- the one question no counter could previously answer.
+     */
+    unsigned long long hc_events;
+    unsigned long long ring_full_events;
+    uint32_t opreg; /* operational-register base, so USBSTS is readable where events are drained */
 
     /* #734: the interrupt-IN rings moved to the per-ENDPOINT pool below (g_iin_hw). One
      * set per controller could not carry a keyboard and a mouse at once -- see
@@ -221,8 +256,20 @@ typedef struct {
     unsigned int armed;                          /* how many are outstanding, 0..DEPTH */
     uint64_t pending_trb[HYPE_INT_IN_DEPTH];
     unsigned int pending_buf[HYPE_INT_IN_DEPTH];
-    unsigned int next_buf;                       /* round-robin over the report buffers */
-    unsigned int last_buf;                       /* the buffer the just-retired head owned */
+    /*
+     * Which report buffer each outstanding transfer owns, and which each queued completion
+     * still holds. There are exactly HYPE_INT_IN_DEPTH buffers, and a buffer is busy from
+     * the moment it is armed until the poll that copies its report out -- so it is NOT free
+     * merely because its transfer retired. Round-robin allocation missed that: retiring the
+     * head freed a queue slot but not the buffer, and the next arm handed the controller the
+     * same buffer a queued completion was still holding, zeroing it and DMA'ing over it. The
+     * report delivered would have been whatever the device wrote next, or zeros.
+     *
+     * int_in_free_buf() therefore asks the two owners directly. armed + done_n <= DEPTH
+     * always holds (an arm takes a buffer, a retire moves it, a poll frees it), so a buffer
+     * is available exactly when armed + done_n < DEPTH.
+     */
+    unsigned int requested[HYPE_INT_IN_DEPTH]; /* TRB length armed, to turn residue into a length */
     /*
      * #761: a completion for THIS endpoint that some other endpoint's poll dequeued.
      *
@@ -235,8 +282,42 @@ typedef struct {
      *
      * The DMA has already written this block's own `report`, so nothing is copied here.
      */
-    int have_completion;
-    uint32_t comp_cc;
+    /*
+     * A LOSSLESS per-endpoint completion queue, replacing the single `have_completion` slot.
+     *
+     * The single slot was the bug. hype retired the head at POLL time, not at the moment a
+     * completion was routed, so between routing TRB0's event and this endpoint's next poll
+     * the head still read TRB0 -- and TRB1's event, arriving in the same drain pass, could
+     * not match it. It went to the shared 8-entry parked table instead, which evicts
+     * round-robin under seven endpoints, and an evicted interrupt-IN completion is
+     * unrecoverable: `armed` clears only on a claim, so the transfer stays outstanding for
+     * ever and the endpoint is never re-armed again.
+     *
+     * Retirement now happens where the event is routed (int_in_deliver), so the head is
+     * always current, and each retired transfer's completion code and report buffer are
+     * queued here. DEPTH entries is exactly enough: at most DEPTH transfers can be
+     * outstanding, so at most DEPTH can be waiting to be read.
+     */
+    struct {
+        uint32_t cc;
+        unsigned int buf;
+        unsigned int xlen; /* bytes the device actually sent: requested - residue */
+    } done[HYPE_INT_IN_DEPTH];
+    unsigned int done_n;
+    /*
+     * Completions seen for this endpoint that matched NO outstanding TRB. Before this
+     * change they were parked and could be evicted; they are now counted here and dropped
+     * deliberately, because a completion naming a TRB this endpoint does not have
+     * outstanding is a stale or duplicate one and must not retire anything (#766).
+     */
+    unsigned long long lost;
+    /*
+     * Transfers retired because a LATER one completed. xHCI completes an interrupt ring in
+     * order, so a match at index k proves 0..k-1 completed too; if their events were never
+     * seen, their reports are delivered anyway rather than dropped -- a HID boot report is a
+     * state snapshot, so dropping one loses keystrokes. Expected to stay at zero.
+     */
+    unsigned long long skipped;
     /*
      * #764: polls this endpoint has been armed without a completion.
      *
@@ -269,13 +350,12 @@ typedef struct {
      * #764: where this endpoint's completions went. A completion can reach its owner three
      * ways and be lost one, and only counting them apart says which happened:
      *   deliv      handed straight to this block by another poll (#761)
-     *   from_park  claimed out of the shared parked table
      *   own        dequeued by this endpoint's own poll
      *   to_park    seen for this endpoint but NOT matching its outstanding TRB, so parked --
      *              and the parked table holds 8 entries and evicts round-robin, so this is
      *              the count that can turn into a permanently deaf endpoint
      */
-    unsigned long long deliv, from_park, own, to_park;
+    unsigned long long deliv, own, to_park;
     /*
      * #764: handed INTO this block by another poll, counted at the moment of handover.
      * `deliv` counts handovers the owner went on to CLAIM. The difference between the two
@@ -524,6 +604,29 @@ static int next_event_budget(xhci_hw_t *hw, volatile uint8_t *bar, uint32_t rtso
             wr64(bar, hype_xhci_ir0_offset(rtsoff, HYPE_XHCI_IR_ERDP),
                  (phys(hw->evt_ring) + (uint64_t)hw->evt_deq * HYPE_XHCI_TRB_BYTES) | (1u << 3));
             /*
+             * A Host Controller Event is the controller telling software it has stopped.
+             * xHCI 4.9.4: when the Event Ring fills, the xHC posts Event Ring Full Error
+             * and halts Command and Transfer Ring processing until ERDP advances -- so
+             * every endpoint goes silent at once, with no error on any transfer, which is
+             * indistinguishable from the software-side loss this release fixes unless it
+             * is named. hype had no handler and no counter for it.
+             */
+            if (hype_xhci_trb_type(out) == HYPE_XHCI_TRB_HOST_CONTROLLER) {
+                unsigned int hc_cc = hype_xhci_event_cc(out);
+                hw->hc_events++;
+                if (hc_cc == HYPE_XHCI_CC_EVENT_RING_FULL) hw->ring_full_events++;
+                if (hw->hc_events <= 8ull) {
+                    hype_debug_print("host-xhci: HOST CONTROLLER EVENT cc=%u%s -- deq=%u "
+                                     "cyc=%u usbsts=0x%08x. The controller stopped; this is "
+                                     "not a transfer failure\n",
+                                     hc_cc,
+                                     (hc_cc == HYPE_XHCI_CC_EVENT_RING_FULL)
+                                         ? " (EVENT RING FULL)" : "",
+                                     hw->evt_deq, hw->evt_cyc,
+                                     rd32(bar, hw->opreg + HYPE_XHCI_OP_USBSTS));
+                }
+            }
+            /*
              * #744: a Port Status Change Event is recorded HERE and not handed back.
              *
              * This is the only place an event leaves the ring, so recording it here is the
@@ -628,7 +731,8 @@ static int next_event(xhci_hw_t *hw, volatile uint8_t *bar, uint32_t rtsoff, uin
  * int-in completion leaves the endpoint armed forever, never re-armed, and permanently
  * deaf. One lost event is not one lost report.
  */
-static int int_in_head_matches(const xhci_int_in_hw_t *iin, uint64_t trb);
+static int int_in_deliver(xhci_int_in_hw_t *iin, uint64_t trb, uint32_t cc,
+                          unsigned int residue);
 
 static void route_foreign_event(hype_xhci_ctrl_t *c, xhci_hw_t *hw, const uint32_t evt[4]) {
     unsigned int oslot = hype_xhci_event_slot_id(evt);
@@ -655,19 +759,28 @@ static void route_foreign_event(hype_xhci_ctrl_t *c, xhci_hw_t *hw, const uint32
      * endpoint on that controller went deaf at once, which is why re-plugging the keyboard
      * three times changed nothing: hype could not see the unplug either.
      */
-    if (other != (xhci_int_in_hw_t *)0 &&
-        int_in_head_matches(other, hype_xhci_event_trb_ptr(evt))) {
-        other->comp_cc = hype_xhci_event_cc(evt);
-        other->have_completion = 1;
-        other->handed++;
-        return;
-    }
     if (other != (xhci_int_in_hw_t *)0) {
-        /* #764: an int-in endpoint's completion that did NOT match its outstanding TRB.
-         * It goes to the parked table, which evicts, so this is the one route by which a
-         * completion can be lost outright. Counted so the DIVERGED report can say whether
-         * that is what happened. */
+        /*
+         * Retire against it HERE. An interrupt-IN endpoint owns its completions outright,
+         * so none of them has any business in the shared parked table -- that table evicts
+         * round-robin, and an evicted int-in completion leaves the endpoint armed for ever
+         * and permanently deaf. int_in_deliver retires the matching transfer immediately
+         * and queues its report, so the head is never stale when the next event arrives.
+         */
+        if (int_in_deliver(other, hype_xhci_event_trb_ptr(evt), hype_xhci_event_cc(evt),
+                           hype_xhci_event_xfer_residue(evt))) {
+            other->handed++;
+            return;
+        }
+        /*
+         * Matched nothing this endpoint holds outstanding: a stale or duplicate event for a
+         * TRB address the ring has since reused. Dropping it is correct (#766 -- letting it
+         * stand in for the current transfer is what drove the enqueue pointer ten TRBs past
+         * the controller's dequeue), and it is counted in `lost` by int_in_deliver.
+         * Parking it would only expose the MSC datapath's table to eviction for nothing.
+         */
         other->to_park++;
+        return;
     }
     hype_xhci_parked_put(&hw->parked, oslot, odci, hype_xhci_event_trb_ptr(evt),
                          hype_xhci_event_cc(evt), hype_xhci_event_xfer_residue(evt));
@@ -815,19 +928,109 @@ static int int_in_poll_body(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int
  * pointer against it keeps #766's strictness -- a stale or duplicate event still cannot be
  * claimed as something it is not -- while allowing several to be in flight.
  */
-static int int_in_head_matches(const xhci_int_in_hw_t *iin, uint64_t trb) {
-    return iin->armed != 0u && iin->pending_trb[0] == trb;
-}
-
 /* Retire the head, returning the buffer it owned so the caller can read it. */
 static unsigned int int_in_retire_head(xhci_int_in_hw_t *iin) {
     unsigned int buf = iin->pending_buf[0], i;
     for (i = 1; i < iin->armed; i++) {
         iin->pending_trb[i - 1u] = iin->pending_trb[i];
         iin->pending_buf[i - 1u] = iin->pending_buf[i];
+        iin->requested[i - 1u] = iin->requested[i];
     }
     if (iin->armed != 0u) iin->armed--;
     return buf;
+}
+
+/*
+ * Take a completion for THIS endpoint, wherever it was dequeued, and retire against it NOW.
+ *
+ * This is the fix for the permanent deafness. Retirement used to happen at poll time, so
+ * between one completion being routed and the endpoint's next poll the head was stale, and
+ * any further completion for the same endpoint could not match it -- it went to the shared
+ * parked table, which evicts, and an evicted interrupt-IN completion never comes back.
+ *
+ * Matching is against the whole outstanding set rather than the head alone, which keeps
+ * #766's strictness (a TRB this endpoint does not hold outstanding still retires nothing)
+ * while surviving a completion observed later than the one behind it. An interrupt ring
+ * completes in order, so a match at index k means 0..k-1 completed too and they are retired
+ * with it, their reports queued rather than discarded.
+ *
+ * Returns 1 if the completion belonged here and was queued, 0 if it matched nothing.
+ */
+/*
+ * A report buffer no outstanding transfer and no queued completion is holding.
+ *
+ * Returns HYPE_INT_IN_DEPTH when none is free, which the caller treats as "do not arm".
+ * That is a real state: with DEPTH buffers and DEPTH queue slots, an endpoint whose
+ * completions have not been read yet runs at reduced depth until the poll drains them,
+ * and recovers on its own.
+ */
+static unsigned int int_in_free_buf(const xhci_int_in_hw_t *iin) {
+    unsigned int b, i;
+
+    for (b = 0; b < HYPE_INT_IN_DEPTH; b++) {
+        int busy = 0;
+        for (i = 0; i < iin->armed; i++) {
+            if (iin->pending_buf[i] == b) { busy = 1; break; }
+        }
+        for (i = 0; !busy && i < iin->done_n; i++) {
+            if (iin->done[i].buf == b) { busy = 1; break; }
+        }
+        if (!busy) return b;
+    }
+    return HYPE_INT_IN_DEPTH;
+}
+
+static int int_in_deliver(xhci_int_in_hw_t *iin, uint64_t trb, uint32_t cc,
+                          unsigned int residue) {
+    unsigned int k;
+
+    for (k = 0; k < iin->armed; k++) {
+        if (iin->pending_trb[k] == trb) break;
+    }
+    if (k >= iin->armed) {
+        iin->lost++;
+        return 0;
+    }
+    while (k-- != 0u) {
+        /* An earlier transfer whose event was never seen. Its buffer holds real DMA'd
+         * data, so deliver it rather than drop it, and say so. */
+        if (iin->done_n < HYPE_INT_IN_DEPTH) {
+            iin->done[iin->done_n].cc = HYPE_XHCI_CC_SUCCESS;
+            iin->done[iin->done_n].xlen = iin->requested[0];
+            iin->done[iin->done_n].buf = int_in_retire_head(iin);
+            iin->done_n++;
+        } else {
+            (void)int_in_retire_head(iin);
+        }
+        iin->skipped++;
+    }
+    if (iin->done_n < HYPE_INT_IN_DEPTH) {
+        /* xHCI 6.4.2.1: on an IN transfer the event's TRB Transfer Length is the RESIDUE --
+         * what the device did NOT send. The report is that much shorter than the TRB asked
+         * for, which for a HID boot report is how a short packet arrives. */
+        unsigned int req = iin->requested[0];
+        iin->done[iin->done_n].cc = cc;
+        iin->done[iin->done_n].xlen = (residue <= req) ? (req - residue) : req;
+        iin->done[iin->done_n].buf = int_in_retire_head(iin);
+        iin->done_n++;
+    } else {
+        (void)int_in_retire_head(iin); /* cannot happen: done_n <= armed <= DEPTH */
+    }
+    iin->silent_polls = 0;
+    return 1;
+}
+
+/* Pop the oldest queued completion. Returns 1 and fills cc and buf, or 0 when empty. */
+static int int_in_take_done(xhci_int_in_hw_t *iin, uint32_t *cc, unsigned int *buf,
+                            unsigned int *xlen) {
+    unsigned int i;
+    if (iin->done_n == 0u) return 0;
+    *cc = iin->done[0].cc;
+    *buf = iin->done[0].buf;
+    *xlen = iin->done[0].xlen;
+    for (i = 1; i < iin->done_n; i++) iin->done[i - 1u] = iin->done[i];
+    iin->done_n--;
+    return 1;
 }
 
 /* #764 capture: note a completion this endpoint actually claimed. */
@@ -1197,12 +1400,12 @@ int hype_xhci_configure_int_in_endpoint(hype_xhci_ctrl_t *c, unsigned int slot,
 
     zero(iin->ring, XPAGE);
     ring_init_link(iin->ring);
-    iin->enq = 0; iin->cyc = 1; iin->armed = 0; iin->next_buf = 0;
+    iin->enq = 0; iin->cyc = 1; iin->armed = 0; iin->done_n = 0;
     iin->mps = mps; iin->recoveries = 0; iin->backoff = 0;
-    iin->have_completion = 0; iin->comp_cc = 0;
+    iin->done_n = 0; iin->lost = 0; iin->skipped = 0;
     iin->silent_polls = 0; iin->rearms = 0;
     iin->claim_n = 0; iin->diverged = 0; iin->reports = 0;
-    iin->deliv = 0; iin->from_park = 0; iin->own = 0; iin->to_park = 0; iin->handed = 0;
+    iin->deliv = 0; iin->own = 0; iin->to_park = 0; iin->handed = 0;
     iin->last_deq = 0; iin->diverge_run = 0;
     iin->arms = 0; iin->never_recovered = 0;
 
@@ -1250,7 +1453,7 @@ int hype_xhci_configure_int_in_endpoint(hype_xhci_ctrl_t *c, unsigned int slot,
      * every routing counter reads zero when it is caught:
      *
      *   #764 DIVERGED slot=3 ep=3 | controller deq=+0x10 hype trb=+0x0 enq=1 cyc=1 armed=1
-     *                             | reports=0 | deliv=0 from_park=0 own=0 to_park=0
+     *                             | reports=0 | deliv=0 own=0 to_park=0
      *
      * Reproduced in the #767 rig on a hot-plugged keyboard: enumerated, claimed, and deaf
      * from its first poll.
@@ -1413,12 +1616,12 @@ int hype_xhci_configure_hub_int_in(hype_xhci_ctrl_t *c, unsigned int slot,
 
     zero(iin->ring, XPAGE);
     ring_init_link(iin->ring);
-    iin->enq = 0; iin->cyc = 1; iin->armed = 0; iin->next_buf = 0;
+    iin->enq = 0; iin->cyc = 1; iin->armed = 0; iin->done_n = 0;
     iin->mps = mps; iin->recoveries = 0; iin->backoff = 0;
-    iin->have_completion = 0; iin->comp_cc = 0;
+    iin->done_n = 0; iin->lost = 0; iin->skipped = 0;
     iin->silent_polls = 0; iin->rearms = 0;
     iin->claim_n = 0; iin->diverged = 0; iin->reports = 0;
-    iin->deliv = 0; iin->from_park = 0; iin->own = 0; iin->to_park = 0; iin->handed = 0;
+    iin->deliv = 0; iin->own = 0; iin->to_park = 0; iin->handed = 0;
     iin->last_deq = 0; iin->diverge_run = 0;
     iin->arms = 0; iin->never_recovered = 0;
 
@@ -1785,7 +1988,6 @@ static void int_in_recover(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int 
     static unsigned int recover_reported = 0;
 
     iin->armed = 0;
-    iin->next_buf = 0;
     iin->silent_polls = 0;
     if (iin->recoveries >= INT_IN_MAX_RECOVERIES) {
         iin->backoff = INT_IN_BACKOFF_POLLS;
@@ -1851,20 +2053,29 @@ static void int_in_arm(hype_xhci_ctrl_t *c, xhci_int_in_hw_t *iin, unsigned int 
     volatile uint8_t *bar = (volatile uint8_t *)(uintptr_t)c->bar;
     unsigned int xfer = (iin->mps != 0u && iin->mps <= sizeof(iin->report[0])) ? iin->mps : len;
     uint64_t my_trb = phys(iin->ring) + (uint64_t)iin->enq * HYPE_XHCI_TRB_BYTES;
-    unsigned int buf = iin->next_buf;
+    unsigned int buf;
     uint32_t t[4];
     unsigned int i;
 
     if (iin->armed >= HYPE_INT_IN_DEPTH) {
         return; /* the queue is full -- nothing to do until one completes */
     }
-    iin->next_buf = (iin->next_buf + 1u) % HYPE_INT_IN_DEPTH;
+    /*
+     * Take a buffer nothing still owns. A completion sitting in the done FIFO is still
+     * holding the buffer its report was DMA'd into, and handing that buffer to the
+     * controller here would zero it and overwrite the report before the poll copied it out.
+     */
+    buf = int_in_free_buf(iin);
+    if (buf >= HYPE_INT_IN_DEPTH) {
+        return; /* every buffer is spoken for -- arm again once a report has been read */
+    }
     for (i = 0; i < sizeof(iin->report[0]); i++) iin->report[buf][i] = 0;
     hype_xhci_trb_normal(t, phys(iin->report[buf]), xfer, (int)iin->cyc);
     ring_enqueue(iin->ring, &iin->enq, &iin->cyc, t);
     wr32(bar, hype_xhci_doorbell_offset(c->dboff, slot), dci);
     iin->pending_trb[iin->armed] = my_trb;
     iin->pending_buf[iin->armed] = buf;
+    iin->requested[iin->armed] = xfer;
     iin->armed++;
     iin->arms++;
 }
@@ -1977,52 +2188,34 @@ static int int_in_poll_body(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int
     my_trb = (iin->armed != 0u) ? iin->pending_trb[0] : 0ull;
 
     /*
-     * #761: a completion another endpoint's poll handed us directly. Checked first: it is
-     * the same event the parked table used to carry, minus the eviction.
+     * A completion already retired and queued for this endpoint -- by another endpoint's
+     * poll, by the global pump, or by this endpoint's own previous pass. Checked first, and
+     * it is now a QUEUE: the single slot it replaces could hold one completion, so a second
+     * arriving before this endpoint was polled had nowhere to go but the evicting parked
+     * table, which is how an endpoint went permanently deaf.
      */
-    if (iin->have_completion) {
-        uint32_t cc = iin->comp_cc;
-        unsigned int buf;
-        iin->have_completion = 0;
-        iin->silent_polls = 0;
-        buf = int_in_retire_head(iin);
-        if (cc != HYPE_XHCI_CC_SUCCESS && cc != HYPE_XHCI_CC_SHORT_PACKET) {
-            int_in_report_error(slot, dci, my_trb, cc);
-            int_in_recover(c, slot, dci, iin);
-            return -1;
-        }
-        iin->recoveries = 0;
-        iin->backoff = 0;
-        iin->deliv++;
-        int_in_note_claim(iin, my_trb, cc);
-        for (i = 0; i < len; i++) out[i] = iin->report[buf][i];
-        int_in_fill(c, iin, slot, dci, len); /* #773/#775: top up at once */
-        return 1;
-    }
-
-    /* #266: a completion for this armed transfer may already be parked from a previous
-     * poll -- claim it before spinning. */
     {
-        uint32_t parked_cc = 0;
-        uint32_t parked_residue = 0;
-        if (hype_xhci_parked_take(&hw->parked, slot, dci, my_trb, &parked_cc,
-                                  &parked_residue)) {
-            unsigned int buf = int_in_retire_head(iin);
-            iin->silent_polls = 0;
-            if (parked_cc != HYPE_XHCI_CC_SUCCESS && parked_cc != HYPE_XHCI_CC_SHORT_PACKET) {
-                int_in_report_error(slot, dci, my_trb, parked_cc);
+        uint32_t cc;
+        unsigned int buf, xlen;
+        if (int_in_take_done(iin, &cc, &buf, &xlen)) {
+            if (cc != HYPE_XHCI_CC_SUCCESS && cc != HYPE_XHCI_CC_SHORT_PACKET) {
+                int_in_report_error(slot, dci, my_trb, cc);
                 int_in_recover(c, slot, dci, iin);
                 return -1;
             }
             iin->recoveries = 0;
             iin->backoff = 0;
-            iin->from_park++;
-            int_in_note_claim(iin, my_trb, parked_cc);
-            for (i = 0; i < len; i++) out[i] = iin->report[buf][i];
-            int_in_fill(c, iin, slot, dci, len); /* #773/#775 */
+            iin->deliv++;
+            int_in_note_claim(iin, my_trb, cc);
+            /* Copy BEFORE re-arming: int_in_fill may hand this buffer straight back to the
+             * controller once the FIFO no longer holds it. Bytes past what the device
+             * actually sent stay zero, because the buffer is zeroed at arm time. */
+            for (i = 0; i < len; i++) out[i] = (i < xlen) ? iin->report[buf][i] : 0u;
+            int_in_fill(c, iin, slot, dci, len); /* #773/#775: top up at once */
             return 1;
         }
     }
+
     /*
      * #759: a POLL asks "is there an event right now", and one read of the cycle bit
      * answers it. This used to spend SPIN/1024 -- 19,531 iterations -- and when the
@@ -2059,24 +2252,34 @@ static int int_in_poll_body(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int
         route_foreign_event(c, hw, evt);
         return 0;
     }
+    /*
+     * This endpoint's own event. It goes through the same retire-and-queue path as a routed
+     * one, so there is exactly one place where an interrupt-IN transfer is retired.
+     */
+    if (!int_in_deliver(iin, hype_xhci_event_trb_ptr(evt), hype_xhci_event_cc(evt),
+                        hype_xhci_event_xfer_residue(evt))) {
+        return 0; /* stale or duplicate: counted in `lost`, retires nothing */
+    }
     {
-        unsigned int hb = int_in_retire_head(iin);
-        iin->silent_polls = 0;
-        iin->last_buf = hb;
+        uint32_t cc;
+        unsigned int buf, xlen;
+        if (!int_in_take_done(iin, &cc, &buf, &xlen)) {
+            return 0; /* cannot happen: deliver queued one */
+        }
+        if (cc != HYPE_XHCI_CC_SUCCESS && cc != HYPE_XHCI_CC_SHORT_PACKET) {
+            int_in_report_error(slot, dci, my_trb, cc);
+            int_in_recover(c, slot, dci, iin);
+            return -1;
+        }
+        iin->recoveries = 0;
+        iin->backoff = 0;
+        /* #764 capture: the event carries the TRB it completed, so record THAT rather than
+         * what hype thought was outstanding -- a claim from a TRB never armed is the thing
+         * to see. */
+        iin->own++;
+        int_in_note_claim(iin, hype_xhci_event_trb_ptr(evt), cc);
+        for (i = 0; i < len; i++) out[i] = (i < xlen) ? iin->report[buf][i] : 0u;
     }
-    if (hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS &&
-        hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SHORT_PACKET) {
-        int_in_report_error(slot, dci, my_trb, hype_xhci_event_cc(evt));
-        int_in_recover(c, slot, dci, iin);
-        return -1;
-    }
-    iin->recoveries = 0;
-    iin->backoff = 0;
-    /* #764 capture: the event carries the TRB it completed, so record THAT rather than what
-     * hype thought was outstanding -- a claim from a TRB never armed is the thing to see. */
-    iin->own++;
-    int_in_note_claim(iin, hype_xhci_event_trb_ptr(evt), hype_xhci_event_cc(evt));
-    for (i = 0; i < len; i++) out[i] = iin->report[iin->last_buf][i];
     int_in_fill(c, iin, slot, dci, len); /* #773/#775 */
     return 1;
 }
@@ -2826,6 +3029,7 @@ int hype_xhci_host_init(uint64_t bar_phys, hype_xhci_ctrl_t *out) {
 
     out->bar = bar_phys;
     out->op = op;
+    hw->opreg = op;
     out->dboff = rd32(bar, HYPE_XHCI_CAP_DBOFF);
     out->rtsoff = rd32(bar, HYPE_XHCI_CAP_RTSOFF);
     out->max_slots = max_slots;
@@ -3404,12 +3608,65 @@ unsigned int hype_xhci_pump_events(hype_xhci_ctrl_t *c, unsigned int budget) {
     return n;
 }
 
+void hype_xhci_int_in_routes(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int ep_addr,
+                             unsigned long long *handed, unsigned long long *deliv,
+                             unsigned long long *own, unsigned long long *to_park) {
+    xhci_int_in_hw_t *iin;
+    if (handed) *handed = 0; if (deliv) *deliv = 0;
+    if (own) *own = 0; if (to_park) *to_park = 0;
+    if (c == (hype_xhci_ctrl_t *)0 || !c->inited) return;
+    iin = iin_hw_for(c, slot, hype_xhci_ep_dci(ep_addr), 0);
+    if (iin == (xhci_int_in_hw_t *)0) return;
+    if (handed) *handed = iin->handed;
+    if (deliv) *deliv = iin->deliv;
+    if (own) *own = iin->own;
+    if (to_park) *to_park = iin->to_park;
+}
+
 unsigned long long hype_xhci_int_in_arms(hype_xhci_ctrl_t *c, unsigned int slot,
                                          unsigned int ep_addr) {
     xhci_int_in_hw_t *iin;
     if (c == (hype_xhci_ctrl_t *)0 || !c->inited) return 0ull;
     iin = iin_hw_for(c, slot, hype_xhci_ep_dci(ep_addr), 0);
     return (iin != (xhci_int_in_hw_t *)0) ? iin->arms : 0ull;
+}
+
+/*
+ * The two numbers that tell a lost completion apart from a stopped controller.
+ *
+ * `lost` counts completions that named a TRB this endpoint did not hold outstanding --
+ * stale or duplicate, correctly refused. `skipped` counts transfers retired because a
+ * LATER one completed, which means their own events were never seen. Both should stay at
+ * zero; either one moving says where to look next.
+ */
+void hype_xhci_int_in_losses(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int ep_addr,
+                             unsigned long long *lost, unsigned long long *skipped) {
+    xhci_int_in_hw_t *iin;
+    if (lost) *lost = 0;
+    if (skipped) *skipped = 0;
+    if (c == (hype_xhci_ctrl_t *)0 || !c->inited) return;
+    iin = iin_hw_for(c, slot, hype_xhci_ep_dci(ep_addr), 0);
+    if (iin == (xhci_int_in_hw_t *)0) return;
+    if (lost) *lost = iin->lost;
+    if (skipped) *skipped = iin->skipped;
+}
+
+/*
+ * Controller-wide event health. `ring_full` non-zero is the controller saying it stopped
+ * (xHCI 4.9.4); `evictions` non-zero is the shared parked table dropping a completion,
+ * which no longer happens for interrupt-IN endpoints and so now points at the MSC path.
+ */
+void hype_xhci_event_health(hype_xhci_ctrl_t *c, unsigned long long *hc_events,
+                            unsigned long long *ring_full, unsigned long long *evictions) {
+    xhci_hw_t *hw;
+    if (hc_events) *hc_events = 0;
+    if (ring_full) *ring_full = 0;
+    if (evictions) *evictions = 0;
+    if (c == (hype_xhci_ctrl_t *)0 || !c->inited) return;
+    hw = HW(c);
+    if (hc_events) *hc_events = hw->hc_events;
+    if (ring_full) *ring_full = hw->ring_full_events;
+    if (evictions) *evictions = hype_xhci_parked_evictions(&hw->parked);
 }
 
 unsigned int hype_xhci_discard_port_changes(hype_xhci_ctrl_t *c) {

@@ -92,12 +92,20 @@ typedef enum {
     HYPE_XHCI_TRB_NOOP_CMD        = 23,
     HYPE_XHCI_TRB_TRANSFER_EVENT  = 32,
     HYPE_XHCI_TRB_CMD_COMPLETION  = 33,
-    HYPE_XHCI_TRB_PORT_STATUS     = 34
+    HYPE_XHCI_TRB_PORT_STATUS     = 34,
+    HYPE_XHCI_TRB_HOST_CONTROLLER = 37
 } hype_xhci_trb_type_t;
 
 /* Completion codes (event TRB status bits 31:24), xHCI 6.4.5. */
 #define HYPE_XHCI_CC_SUCCESS      1u
 #define HYPE_XHCI_CC_SHORT_PACKET 13u
+/*
+ * xHCI 6.4.5 table 6-90. The xHC posts this in a Host Controller Event when it has run out
+ * of room on the Event Ring, and stops Command and Transfer Ring processing until software
+ * advances ERDP. It is the one completion code that says "the controller stopped", as
+ * opposed to "a transfer failed", and hype had no name for it.
+ */
+#define HYPE_XHCI_CC_EVENT_RING_FULL 21u
 
 /* Control-transfer TRT (Setup Stage control dword bits 17:16), xHCI 6.4.1.2.1. */
 #define HYPE_XHCI_TRT_NO_DATA     0u
@@ -563,13 +571,33 @@ unsigned int hype_xhci_take_port_change(hype_xhci_ctrl_t *c);
 void hype_xhci_hub_ignore_port(hype_xhci_ctrl_t *c, unsigned int hub_slot, unsigned int port,
                                int ignore);
 
+/* One full Event Ring per pass: enough to empty it, bounded so a wedged ring cannot spin. */
+#define HYPE_XHCI_PUMP_BUDGET 256u
 unsigned int hype_xhci_pump_events(hype_xhci_ctrl_t *c, unsigned int budget);
 
 /* #775: how many times this interrupt-IN endpoint has been armed. With the report count
  * beside it, "armed once and never answered" is distinguishable from "armed repeatedly and
  * answering", which no other pair of numbers says. */
+/* Per-endpoint loss counters; see the implementation for what each one means. */
+void hype_xhci_int_in_losses(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int ep_addr,
+                             unsigned long long *lost, unsigned long long *skipped);
+
+/* Controller-wide event health: Host Controller Events, Event Ring Full, parked evictions. */
+void hype_xhci_event_health(hype_xhci_ctrl_t *c, unsigned long long *hc_events,
+                            unsigned long long *ring_full, unsigned long long *evictions);
+
 unsigned long long hype_xhci_int_in_arms(hype_xhci_ctrl_t *c, unsigned int slot,
                                          unsigned int ep_addr);
+
+/*
+ * #775: where this endpoint's completions went. A completion reaches its owner three ways --
+ * handed over by another poll, taken from the parked table, or dequeued by its own poll --
+ * and is lost one way, by being parked and evicted. With QEMU reporting 299 transfers
+ * started on an endpoint hype scored at zero reports, these four are what say which.
+ */
+void hype_xhci_int_in_routes(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int ep_addr,
+                             unsigned long long *handed, unsigned long long *deliv,
+                             unsigned long long *own, unsigned long long *to_park);
 
 unsigned int hype_xhci_discard_port_changes(hype_xhci_ctrl_t *c);
 
@@ -842,7 +870,19 @@ typedef struct {
 typedef struct {
     hype_xhci_parked_evt_t e[HYPE_XHCI_PARKED_MAX];
     uint32_t next; /* round-robin victim when full */
+    /*
+     * Evictions, counted. This table drops the oldest entry when full, and for an
+     * interrupt-IN endpoint a dropped completion is not a dropped report -- the transfer
+     * stays counted as outstanding for ever and the endpoint is never re-armed. That is
+     * the failure the operator sees as a keyboard going deaf mid-boot, and nothing
+     * counted it.
+     */
+    unsigned long long evictions;
 } hype_xhci_parked_t;
+
+/* Evictions this table has performed. See the struct comment: each one is potentially a
+ * permanently deaf endpoint. */
+unsigned long long hype_xhci_parked_evictions(const hype_xhci_parked_t *p);
 
 void hype_xhci_parked_reset(hype_xhci_parked_t *p);
 

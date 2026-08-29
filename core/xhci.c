@@ -281,6 +281,11 @@ void hype_xhci_parked_reset(hype_xhci_parked_t *p) {
         p->e[i].residue = 0;
     }
     p->next = 0;
+    p->evictions = 0;
+}
+
+unsigned long long hype_xhci_parked_evictions(const hype_xhci_parked_t *p) {
+    return (p == (const hype_xhci_parked_t *)0) ? 0ull : p->evictions;
 }
 
 void hype_xhci_parked_put(hype_xhci_parked_t *p, uint32_t slot, uint32_t dci, uint64_t trb,
@@ -308,7 +313,15 @@ void hype_xhci_parked_put(hype_xhci_parked_t *p, uint32_t slot, uint32_t dci, ui
         }
     }
     /* Full: evict round-robin. A stale parked event is worth less than a fresh one, and
-     * silently refusing to record the newest would recreate the discard bug. */
+     * silently refusing to record the newest would recreate the discard bug.
+     *
+     * COUNTED, because for an interrupt-IN endpoint this is not a lost report but a lost
+     * endpoint: `armed` clears only on a claimed completion, so the evicted transfer stays
+     * outstanding for ever. Interrupt-IN completions no longer take this path at all
+     * (int_in_deliver retires them where they are routed), so a non-zero count here is now
+     * either MSC traffic or a genuine attribution failure -- and the two are told apart by
+     * whether any endpoint's `lost` counter moved. */
+    p->evictions++;
     i = p->next % HYPE_XHCI_PARKED_MAX;
     p->next = (p->next + 1u) % HYPE_XHCI_PARKED_MAX;
     p->e[i].used = 1;
