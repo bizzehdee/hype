@@ -1,0 +1,2054 @@
+[0000000000] hype: build 85501d2-dirty
+[0000000026] hype: version 2026.8.29-alpha (#85501d2-dirty)
+[0000000073] hype: CR4.SMEP enabled on the BSP [#604]
+[0000000114] hype: EFER.NXE enabled on the BSP [#604]
+[0000000155] hype: own image base=0x140000000 size=0x1cde000 [#604]
+[0000000210] rtc: host clock 2026-08-29 10:30:17
+[0000000246] memory map: 351 entries
+[0000000270]   [0] Conventional phys=0x0 pages=159
+[0000000308]   [1] BootServicesData phys=0x9f000 pages=1
+[0000000352]   [2] Conventional phys=0x100000 pages=3840
+[0000000396]   [3] BootServicesData phys=0x1000000 pages=128
+[0000000444]   [4] Conventional phys=0x1080000 pages=36226
+[0000000490]   [5] Reserved phys=0x9e02000 pages=510
+[0000000530]   [6] Conventional phys=0xa000000 pages=512
+[0000000574]   [7] ACPIMemoryNVS phys=0xa200000 pages=14
+[0000000618]   [8] Conventional phys=0xa20e000 pages=3570
+[0000000663]   [9] Reserved phys=0xb000000 pages=32
+[0000000702]   [10] Conventional phys=0xb020000 pages=20448
+[0000000749]   [11] BootServicesCode phys=0x10000000 pages=11
+[0000000798]   [12] Conventional phys=0x1000b000 pages=800207
+[0000000847]   [13] BootServicesData phys=0xd35da000 pages=913
+[0000000897]   [14] Conventional phys=0xd396b000 pages=15
+[0000000942]   [15] BootServicesData phys=0xd397a000 pages=4
+[0000000990]   [16] LoaderData phys=0xd397e000 pages=1
+[0000001032]   [17] BootServicesData phys=0xd397f000 pages=492
+[0000001082]   [18] Conventional phys=0xd3b6b000 pages=1
+[0000001126]   [19] BootServicesData phys=0xd3b6c000 pages=11142
+[0000001178]   [20] Conventional phys=0xd66f2000 pages=2
+[0000001222]   [21] BootServicesData phys=0xd66f4000 pages=788
+[0000001272]   [22] LoaderData phys=0xd6a08000 pages=7
+[0000001314]   [23] BootServicesData phys=0xd6a0f000 pages=18
+[0000001363]   [24] LoaderData phys=0xd6a21000 pages=8
+[0000001405]   [25] BootServicesData phys=0xd6a29000 pages=101
+[0000001455]   [26] BootServicesCode phys=0xd6a8e000 pages=13
+[0000001504]   [27] BootServicesData phys=0xd6a9b000 pages=13
+[0000001553]   [28] BootServicesCode phys=0xd6aa8000 pages=7
+[0000001601]   [29] BootServicesData phys=0xd6aaf000 pages=7
+[0000001649]   [30] BootServicesCode phys=0xd6ab6000 pages=5
+[0000001697]   [31] BootServicesData phys=0xd6abb000 pages=45
+[0000001746]   [32] BootServicesCode phys=0xd6ae8000 pages=65
+[0000001795]   [33] BootServicesData phys=0xd6b29000 pages=7
+[0000001843]   [34] Conventional phys=0xd6b30000 pages=3
+[0000001887]   [35] BootServicesData phys=0xd6b33000 pages=55
+[0000001936]   [36] Conventional phys=0xd6b6a000 pages=1
+[0000001980]   [37] LoaderData phys=0xd6b6b000 pages=5
+[0000002022]   [38] BootServicesData phys=0xd6b70000 pages=61
+[0000002071]   [39] BootServicesCode phys=0xd6bad000 pages=335
+[0000002121]   [40] BootServicesData phys=0xd6cfc000 pages=83
+[0000002170]   [41] Conventional phys=0xd6d4f000 pages=2
+[0000002214]   [42] BootServicesData phys=0xd6d51000 pages=37
+[0000002263]   [43] BootServicesCode phys=0xd6d76000 pages=14
+[0000002312]   [44] BootServicesData phys=0xd6d84000 pages=2
+[0000002360]   [45] BootServicesCode phys=0xd6d86000 pages=2
+[0000002408]   [46] BootServicesData phys=0xd6d88000 pages=63
+[0000002457]   [47] BootServicesCode phys=0xd6dc7000 pages=1
+[0000002505]   [48] BootServicesData phys=0xd6dc8000 pages=28
+[0000002554]   [49] BootServicesCode phys=0xd6de4000 pages=1
+[0000002602]   [50] BootServicesData phys=0xd6de5000 pages=123
+[0000002652]   [51] BootServicesCode phys=0xd6e60000 pages=15
+[0000002701]   [52] BootServicesData phys=0xd6e6f000 pages=8
+[0000002749]   [53] BootServicesCode phys=0xd6e77000 pages=1
+[0000002797]   [54] BootServicesData phys=0xd6e78000 pages=3011
+[0000002848]   [55] BootServicesCode phys=0xd7a3b000 pages=2164
+[0000002899]   [56] BootServicesData phys=0xd82af000 pages=478
+[0000002949]   [57] BootServicesCode phys=0xd848d000 pages=14
+[0000002998]   [58] BootServicesData phys=0xd849b000 pages=134
+[0000003048]   [59] BootServicesCode phys=0xd8521000 pages=43
+[0000003097]   [60] BootServicesData phys=0xd854c000 pages=43
+[0000003146]   [61] BootServicesCode phys=0xd8577000 pages=33
+[0000003195]   [62] BootServicesData phys=0xd8598000 pages=9
+[0000003243]   [63] BootServicesCode phys=0xd85a1000 pages=87
+[0000003292]   [64] BootServicesData phys=0xd85f8000 pages=1
+[0000003340]   [65] BootServicesCode phys=0xd85f9000 pages=8
+[0000003388]   [66] BootServicesData phys=0xd8601000 pages=8
+[0000003436]   [67] BootServicesCode phys=0xd8609000 pages=13
+[0000003485]   [68] BootServicesData phys=0xd8616000 pages=1197
+[0000003536]   [69] BootServicesCode phys=0xd8ac3000 pages=6
+[0000003584]   [70] BootServicesData phys=0xd8ac9000 pages=6
+[0000003632]   [71] BootServicesCode phys=0xd8acf000 pages=14
+[0000003681]   [72] BootServicesData phys=0xd8add000 pages=21
+[0000003730]   [73] BootServicesCode phys=0xd8af2000 pages=4
+[0000003778]   [74] BootServicesData phys=0xd8af6000 pages=45
+[0000003827]   [75] BootServicesCode phys=0xd8b23000 pages=10
+[0000003876]   [76] BootServicesData phys=0xd8b2d000 pages=10
+[0000003925]   [77] BootServicesCode phys=0xd8b37000 pages=15
+[0000003974]   [78] BootServicesData phys=0xd8b46000 pages=5
+[0000004022]   [79] BootServicesCode phys=0xd8b4b000 pages=37
+[0000004071]   [80] BootServicesData phys=0xd8b70000 pages=2
+[0000004119]   [81] BootServicesCode phys=0xd8b72000 pages=4
+[0000004167]   [82] BootServicesData phys=0xd8b76000 pages=2
+[0000004215]   [83] BootServicesCode phys=0xd8b78000 pages=20
+[0000004264]   [84] BootServicesData phys=0xd8b8c000 pages=18
+[0000004313]   [85] BootServicesCode phys=0xd8b9e000 pages=1
+[0000004361]   [86] BootServicesData phys=0xd8b9f000 pages=2
+[0000004409]   [87] BootServicesCode phys=0xd8ba1000 pages=3
+[0000004457]   [88] BootServicesData phys=0xd8ba4000 pages=2
+[0000004505]   [89] BootServicesCode phys=0xd8ba6000 pages=13
+[0000004554]   [90] BootServicesData phys=0xd8bb3000 pages=2
+[0000004602]   [91] BootServicesCode phys=0xd8bb5000 pages=2
+[0000004650]   [92] BootServicesData phys=0xd8bb7000 pages=2
+[0000004698]   [93] BootServicesCode phys=0xd8bb9000 pages=9
+[0000004746]   [94] BootServicesData phys=0xd8bc2000 pages=18
+[0000004795]   [95] BootServicesCode phys=0xd8bd4000 pages=18
+[0000004844]   [96] BootServicesData phys=0xd8be6000 pages=3
+[0000004892]   [97] BootServicesCode phys=0xd8be9000 pages=9
+[0000004940]   [98] BootServicesData phys=0xd8bf2000 pages=2
+[0000004988]   [99] BootServicesCode phys=0xd8bf4000 pages=21
+[0000005037]   [100] BootServicesData phys=0xd8c09000 pages=1
+[0000005086]   [101] BootServicesCode phys=0xd8c0a000 pages=7
+[0000005135]   [102] BootServicesData phys=0xd8c11000 pages=1
+[0000005184]   [103] BootServicesCode phys=0xd8c12000 pages=2
+[0000005233]   [104] BootServicesData phys=0xd8c14000 pages=4
+[0000005282]   [105] BootServicesCode phys=0xd8c18000 pages=40
+[0000005332]   [106] BootServicesData phys=0xd8c40000 pages=9
+[0000005381]   [107] BootServicesCode phys=0xd8c49000 pages=20
+[0000005431]   [108] BootServicesData phys=0xd8c5d000 pages=9
+[0000005480]   [109] BootServicesCode phys=0xd8c66000 pages=27
+[0000005530]   [110] BootServicesData phys=0xd8c81000 pages=110
+[0000005581]   [111] BootServicesCode phys=0xd8cef000 pages=2
+[0000005630]   [112] BootServicesData phys=0xd8cf1000 pages=438
+[0000005681]   [113] BootServicesCode phys=0xd8ea7000 pages=8
+[0000005730]   [114] BootServicesData phys=0xd8eaf000 pages=8
+[0000005779]   [115] BootServicesCode phys=0xd8eb7000 pages=5
+[0000005828]   [116] BootServicesData phys=0xd8ebc000 pages=5
+[0000005877]   [117] BootServicesCode phys=0xd8ec1000 pages=25
+[0000005927]   [118] BootServicesData phys=0xd8eda000 pages=1
+[0000005976]   [119] BootServicesCode phys=0xd8edb000 pages=2
+[0000006025]   [120] BootServicesData phys=0xd8edd000 pages=2
+[0000006074]   [121] BootServicesCode phys=0xd8edf000 pages=18
+[0000006124]   [122] BootServicesData phys=0xd8ef1000 pages=1
+[0000006173]   [123] BootServicesCode phys=0xd8ef2000 pages=1
+[0000006222]   [124] BootServicesData phys=0xd8ef3000 pages=2
+[0000006271]   [125] BootServicesCode phys=0xd8ef5000 pages=1
+[0000006320]   [126] BootServicesData phys=0xd8ef6000 pages=1
+[0000006369]   [127] BootServicesCode phys=0xd8ef7000 pages=1
+[0000006418]   [128] BootServicesData phys=0xd8ef8000 pages=1
+[0000006467]   [129] BootServicesCode phys=0xd8ef9000 pages=3
+[0000006516]   [130] BootServicesData phys=0xd8efc000 pages=773
+[0000006567]   [131] BootServicesCode phys=0xd9201000 pages=21
+[0000006617]   [132] BootServicesData phys=0xd9216000 pages=5
+[0000006666]   [133] BootServicesCode phys=0xd921b000 pages=2
+[0000006715]   [134] BootServicesData phys=0xd921d000 pages=3
+[0000006764]   [135] BootServicesCode phys=0xd9220000 pages=15
+[0000006814]   [136] BootServicesData phys=0xd922f000 pages=4
+[0000006863]   [137] BootServicesCode phys=0xd9233000 pages=4
+[0000006912]   [138] BootServicesData phys=0xd9237000 pages=32
+[0000006962]   [139] BootServicesCode phys=0xd9257000 pages=17
+[0000007012]   [140] BootServicesData phys=0xd9268000 pages=1
+[0000007061]   [141] BootServicesCode phys=0xd9269000 pages=2
+[0000007110]   [142] BootServicesData phys=0xd926b000 pages=3
+[0000007159]   [143] BootServicesCode phys=0xd926e000 pages=7
+[0000007208]   [144] BootServicesData phys=0xd9275000 pages=3
+[0000007257]   [145] BootServicesCode phys=0xd9278000 pages=22
+[0000007307]   [146] BootServicesData phys=0xd928e000 pages=2
+[0000007356]   [147] BootServicesCode phys=0xd9290000 pages=7
+[0000007405]   [148] BootServicesData phys=0xd9297000 pages=1
+[0000007454]   [149] BootServicesCode phys=0xd9298000 pages=1
+[0000007503]   [150] BootServicesData phys=0xd9299000 pages=10
+[0000007553]   [151] BootServicesCode phys=0xd92a3000 pages=11
+[0000007603]   [152] BootServicesData phys=0xd92ae000 pages=9
+[0000007652]   [153] BootServicesCode phys=0xd92b7000 pages=1
+[0000007701]   [154] BootServicesData phys=0xd92b8000 pages=1
+[0000007750]   [155] BootServicesCode phys=0xd92b9000 pages=308
+[0000007801]   [156] BootServicesData phys=0xd93ed000 pages=1
+[0000007850]   [157] BootServicesCode phys=0xd93ee000 pages=1
+[0000007899]   [158] BootServicesData phys=0xd93ef000 pages=6
+[0000007948]   [159] BootServicesCode phys=0xd93f5000 pages=10
+[0000007998]   [160] BootServicesData phys=0xd93ff000 pages=4
+[0000008047]   [161] BootServicesCode phys=0xd9403000 pages=17
+[0000008097]   [162] BootServicesData phys=0xd9414000 pages=64
+[0000008147]   [163] BootServicesCode phys=0xd9454000 pages=15
+[0000008197]   [164] BootServicesData phys=0xd9463000 pages=8
+[0000008246]   [165] BootServicesCode phys=0xd946b000 pages=2
+[0000008295]   [166] BootServicesData phys=0xd946d000 pages=3
+[0000008344]   [167] BootServicesCode phys=0xd9470000 pages=12
+[0000008394]   [168] BootServicesData phys=0xd947c000 pages=4
+[0000008443]   [169] BootServicesCode phys=0xd9480000 pages=7
+[0000008492]   [170] BootServicesData phys=0xd9487000 pages=1
+[0000008541]   [171] BootServicesCode phys=0xd9488000 pages=11
+[0000008591]   [172] BootServicesData phys=0xd9493000 pages=11
+[0000008641]   [173] BootServicesCode phys=0xd949e000 pages=94
+[0000008691]   [174] BootServicesData phys=0xd94fc000 pages=12
+[0000008741]   [175] BootServicesCode phys=0xd9508000 pages=1
+[0000008790]   [176] BootServicesData phys=0xd9509000 pages=1
+[0000008839]   [177] BootServicesCode phys=0xd950a000 pages=3
+[0000008888]   [178] BootServicesData phys=0xd950d000 pages=1
+[0000008937]   [179] BootServicesCode phys=0xd950e000 pages=2
+[0000008986]   [180] BootServicesData phys=0xd9510000 pages=2
+[0000009035]   [181] BootServicesCode phys=0xd9512000 pages=4
+[0000009084]   [182] BootServicesData phys=0xd9516000 pages=1
+[0000009133]   [183] BootServicesCode phys=0xd9517000 pages=1
+[0000009182]   [184] BootServicesData phys=0xd9518000 pages=1
+[0000009231]   [185] BootServicesCode phys=0xd9519000 pages=3
+[0000009280]   [186] BootServicesData phys=0xd951c000 pages=2
+[0000009329]   [187] BootServicesCode phys=0xd951e000 pages=1
+[0000009378]   [188] BootServicesData phys=0xd951f000 pages=1
+[0000009427]   [189] BootServicesCode phys=0xd9520000 pages=30
+[0000009477]   [190] BootServicesData phys=0xd953e000 pages=1
+[0000009526]   [191] BootServicesCode phys=0xd953f000 pages=21
+[0000009576]   [192] BootServicesData phys=0xd9554000 pages=4
+[0000009625]   [193] BootServicesCode phys=0xd9558000 pages=1
+[0000009674]   [194] BootServicesData phys=0xd9559000 pages=2
+[0000009723]   [195] BootServicesCode phys=0xd955b000 pages=4
+[0000009772]   [196] BootServicesData phys=0xd955f000 pages=2
+[0000009821]   [197] BootServicesCode phys=0xd9561000 pages=5
+[0000009870]   [198] BootServicesData phys=0xd9566000 pages=2
+[0000009919]   [199] BootServicesCode phys=0xd9568000 pages=1
+[0000009968]   [200] BootServicesData phys=0xd9569000 pages=2
+[0000010017]   [201] BootServicesCode phys=0xd956b000 pages=21
+[0000010067]   [202] BootServicesData phys=0xd9580000 pages=1
+[0000010116]   [203] BootServicesCode phys=0xd9581000 pages=3
+[0000010165]   [204] BootServicesData phys=0xd9584000 pages=2
+[0000010214]   [205] BootServicesCode phys=0xd9586000 pages=7
+[0000010263]   [206] BootServicesData phys=0xd958d000 pages=1
+[0000010312]   [207] BootServicesCode phys=0xd958e000 pages=15
+[0000010362]   [208] BootServicesData phys=0xd959d000 pages=2
+[0000010411]   [209] BootServicesCode phys=0xd959f000 pages=2
+[0000010460]   [210] BootServicesData phys=0xd95a1000 pages=2
+[0000010509]   [211] BootServicesCode phys=0xd95a3000 pages=1
+[0000010558]   [212] BootServicesData phys=0xd95a4000 pages=1
+[0000010607]   [213] BootServicesCode phys=0xd95a5000 pages=1
+[0000010656]   [214] BootServicesData phys=0xd95a6000 pages=1
+[0000010705]   [215] BootServicesCode phys=0xd95a7000 pages=8
+[0000010754]   [216] BootServicesData phys=0xd95af000 pages=6
+[0000010803]   [217] BootServicesCode phys=0xd95b5000 pages=1
+[0000010852]   [218] BootServicesData phys=0xd95b6000 pages=2
+[0000010901]   [219] BootServicesCode phys=0xd95b8000 pages=2
+[0000010950]   [220] BootServicesData phys=0xd95ba000 pages=1
+[0000010999]   [221] BootServicesCode phys=0xd95bb000 pages=3
+[0000011048]   [222] BootServicesData phys=0xd95be000 pages=8
+[0000011097]   [223] BootServicesCode phys=0xd95c6000 pages=9
+[0000011146]   [224] BootServicesData phys=0xd95cf000 pages=9
+[0000011195]   [225] BootServicesCode phys=0xd95d8000 pages=28
+[0000011245]   [226] BootServicesData phys=0xd95f4000 pages=1
+[0000011294]   [227] BootServicesCode phys=0xd95f5000 pages=3
+[0000011343]   [228] BootServicesData phys=0xd95f8000 pages=1
+[0000011392]   [229] BootServicesCode phys=0xd95f9000 pages=1
+[0000011441]   [230] BootServicesData phys=0xd95fa000 pages=1
+[0000011490]   [231] BootServicesCode phys=0xd95fb000 pages=7
+[0000011539]   [232] BootServicesData phys=0xd9602000 pages=3
+[0000011588]   [233] BootServicesCode phys=0xd9605000 pages=3
+[0000011637]   [234] BootServicesData phys=0xd9608000 pages=6
+[0000011686]   [235] BootServicesCode phys=0xd960e000 pages=8
+[0000011735]   [236] BootServicesData phys=0xd9616000 pages=2
+[0000011784]   [237] BootServicesCode phys=0xd9618000 pages=2
+[0000011833]   [238] BootServicesData phys=0xd961a000 pages=1
+[0000011882]   [239] BootServicesCode phys=0xd961b000 pages=1
+[0000011931]   [240] BootServicesData phys=0xd961c000 pages=1
+[0000011980]   [241] BootServicesCode phys=0xd961d000 pages=5
+[0000012029]   [242] BootServicesData phys=0xd9622000 pages=1
+[0000012078]   [243] BootServicesCode phys=0xd9623000 pages=1
+[0000012127]   [244] BootServicesData phys=0xd9624000 pages=1
+[0000012176]   [245] BootServicesCode phys=0xd9625000 pages=2
+[0000012225]   [246] BootServicesData phys=0xd9627000 pages=61
+[0000012275]   [247] BootServicesCode phys=0xd9664000 pages=18
+[0000012325]   [248] BootServicesData phys=0xd9676000 pages=4
+[0000012374]   [249] BootServicesCode phys=0xd967a000 pages=3
+[0000012423]   [250] BootServicesData phys=0xd967d000 pages=5
+[0000012472]   [251] BootServicesCode phys=0xd9682000 pages=1
+[0000012521]   [252] BootServicesData phys=0xd9683000 pages=1
+[0000012570]   [253] BootServicesCode phys=0xd9684000 pages=1
+[0000012619]   [254] BootServicesData phys=0xd9685000 pages=3
+[0000012668]   [255] BootServicesCode phys=0xd9688000 pages=3
+[0000012717]   [256] BootServicesData phys=0xd968b000 pages=1
+[0000012766]   [257] BootServicesCode phys=0xd968c000 pages=14
+[0000012816]   [258] BootServicesData phys=0xd969a000 pages=1
+[0000012865]   [259] BootServicesCode phys=0xd969b000 pages=14
+[0000012915]   [260] BootServicesData phys=0xd96a9000 pages=5
+[0000012964]   [261] BootServicesCode phys=0xd96ae000 pages=2
+[0000013013]   [262] BootServicesData phys=0xd96b0000 pages=1
+[0000013062]   [263] BootServicesCode phys=0xd96b1000 pages=1
+[0000013111]   [264] BootServicesData phys=0xd96b2000 pages=2
+[0000013160]   [265] BootServicesCode phys=0xd96b4000 pages=4
+[0000013209]   [266] BootServicesData phys=0xd96b8000 pages=1
+[0000013258]   [267] BootServicesCode phys=0xd96b9000 pages=2
+[0000013307]   [268] BootServicesData phys=0xd96bb000 pages=2
+[0000013356]   [269] BootServicesCode phys=0xd96bd000 pages=3
+[0000013405]   [270] BootServicesData phys=0xd96c0000 pages=1
+[0000013454]   [271] BootServicesCode phys=0xd96c1000 pages=2
+[0000013503]   [272] BootServicesData phys=0xd96c3000 pages=1
+[0000013552]   [273] BootServicesCode phys=0xd96c4000 pages=7
+[0000013601]   [274] BootServicesData phys=0xd96cb000 pages=3
+[0000013650]   [275] BootServicesCode phys=0xd96ce000 pages=1
+[0000013699]   [276] BootServicesData phys=0xd96cf000 pages=1
+[0000013748]   [277] BootServicesCode phys=0xd96d0000 pages=6
+[0000013797]   [278] BootServicesData phys=0xd96d6000 pages=1
+[0000013846]   [279] BootServicesCode phys=0xd96d7000 pages=28
+[0000013896]   [280] BootServicesData phys=0xd96f3000 pages=1
+[0000013945]   [281] BootServicesCode phys=0xd96f4000 pages=1
+[0000013994]   [282] BootServicesData phys=0xd96f5000 pages=1
+[0000014043]   [283] BootServicesCode phys=0xd96f6000 pages=13
+[0000014093]   [284] BootServicesData phys=0xd9703000 pages=1
+[0000014142]   [285] BootServicesCode phys=0xd9704000 pages=1
+[0000014191]   [286] BootServicesData phys=0xd9705000 pages=1
+[0000014240]   [287] BootServicesCode phys=0xd9706000 pages=1
+[0000014289]   [288] BootServicesData phys=0xd9707000 pages=1
+[0000014338]   [289] BootServicesCode phys=0xd9708000 pages=1
+[0000014387]   [290] BootServicesData phys=0xd9709000 pages=1025
+[0000014439]   [291] BootServicesCode phys=0xd9b0a000 pages=12
+[0000014489]   [292] BootServicesData phys=0xd9b16000 pages=1
+[0000014538]   [293] BootServicesCode phys=0xd9b17000 pages=5
+[0000014587]   [294] BootServicesData phys=0xd9b1c000 pages=4
+[0000014636]   [295] BootServicesCode phys=0xd9b20000 pages=1
+[0000014685]   [296] BootServicesData phys=0xd9b21000 pages=63
+[0000014735]   [297] BootServicesCode phys=0xd9b60000 pages=1
+[0000014784]   [298] BootServicesData phys=0xd9b61000 pages=418
+[0000014835]   [299] BootServicesCode phys=0xd9d03000 pages=4
+[0000014884]   [300] BootServicesData phys=0xd9d07000 pages=1
+[0000014933]   [301] BootServicesCode phys=0xd9d08000 pages=1
+[0000014982]   [302] BootServicesData phys=0xd9d09000 pages=1
+[0000015031]   [303] BootServicesCode phys=0xd9d0a000 pages=1
+[0000015080]   [304] BootServicesData phys=0xd9d0b000 pages=10
+[0000015130]   [305] BootServicesCode phys=0xd9d15000 pages=7
+[0000015179]   [306] BootServicesData phys=0xd9d1c000 pages=2175
+[0000015231]   [307] BootServicesCode phys=0xda59b000 pages=3
+[0000015280]   [308] BootServicesData phys=0xda59e000 pages=3
+[0000015329]   [309] BootServicesCode phys=0xda5a1000 pages=1
+[0000015378]   [310] BootServicesData phys=0xda5a2000 pages=1
+[0000015427]   [311] BootServicesCode phys=0xda5a3000 pages=1
+[0000015476]   [312] BootServicesData phys=0xda5a4000 pages=2730
+[0000015528]   [313] Reserved phys=0xdb04e000 pages=1026
+[0000015572]   [314] ACPIReclaim phys=0xdb450000 pages=100
+[0000015618]   [315] ACPIMemoryNVS phys=0xdb4b4000 pages=5887
+[0000015667]   [316] RuntimeServicesData phys=0xdcbb3000 pages=3990
+[0000015722]   [317] RuntimeServicesCode phys=0xddb49000 pages=182
+[0000015776]   [318] BootServicesData phys=0xddbff000 pages=1025
+[0000015828]   [319] Conventional phys=0xde000000 pages=297
+[0000015875]   [320] BootServicesData phys=0xde129000 pages=256
+[0000015926]   [321] BootServicesCode phys=0xde229000 pages=26
+[0000015976]   [322] BootServicesData phys=0xde243000 pages=42
+[0000016026]   [323] BootServicesCode phys=0xde26d000 pages=40
+[0000016076]   [324] BootServicesData phys=0xde295000 pages=24
+[0000016126]   [325] BootServicesCode phys=0xde2ad000 pages=18
+[0000016176]   [326] BootServicesData phys=0xde2bf000 pages=3333
+[0000016228]   [327] BootServicesCode phys=0xdefc4000 pages=3
+[0000016277]   [328] BootServicesData phys=0xdefc7000 pages=19
+[0000016327]   [329] BootServicesCode phys=0xdefda000 pages=2
+[0000016376]   [330] BootServicesData phys=0xdefdc000 pages=18
+[0000016426]   [331] BootServicesCode phys=0xdefee000 pages=18
+[0000016476]   [332] Conventional phys=0x100000000 pages=262144
+[0000016527]   [333] LoaderCode phys=0x140000000 pages=7390
+[0000016574]   [334] Conventional phys=0x141cde000 pages=7198242
+[0000016626]   [335] Reserved phys=0xa0000 pages=96
+[0000016665]   [336] Reserved phys=0xdf000000 pages=4096
+[0000016709]   [337] MMIO phys=0xf0000000 pages=32768
+[0000016750]   [338] MMIO phys=0xfd200000 pages=256
+[0000016789]   [339] MMIO phys=0xfd600000 pages=512
+[0000016828]   [340] MMIO phys=0xfea00000 pages=16
+[0000016866]   [341] MMIO phys=0xfeb80000 pages=130
+[0000016905]   [342] MMIO phys=0xfec10000 pages=1
+[0000016942]   [343] MMIO phys=0xfec30000 pages=1
+[0000016979]   [344] MMIO phys=0xfed00000 pages=1
+[0000017016]   [345] MMIO phys=0xfed40000 pages=5
+[0000017053]   [346] MMIO phys=0xfed80000 pages=16
+[0000017091]   [347] MMIO phys=0xfedc2000 pages=14
+[0000017129]   [348] MMIO phys=0xfedd4000 pages=2
+[0000017166]   [349] MMIO phys=0xff000000 pages=4096
+[0000017206]   [350] Reserved phys=0x81f300000 pages=3328
+[0000017251] fw-1 RAMPOOL: reserved 26076 MiB at host-physical 0x1c1600000 (usable 32663 MiB, margin 2041 MiB) [#449]
+[0000017356] cpu: 16 physical core(s), 16 with SMT -- on an Intel hybrid part that is the P-core count (E-cores are single-threaded); UEFI cannot tell them apart, CPUID leaf 0x1A can [#360]
+[0000017533] cpu: APIC IDs 0[p0/c0/t0](BSP) 1[p0/c0/t1] 2[p0/c1/t0] 3[p0/c1/t1] 4[p0/c2/t0] 5[p0/c2/t1] 6[p0/c3/t0] 7[p0/c3/t1] 8[p0/c4/t0] 9[p0/c4/t1] 10[p0/c5/t0] 11[p0/c5/t1] 12[p0/c6/t0] 13[p0/c6/t1] 14[p0/c7/t0] 15[p0/c7/t1] 16[p0/c8/t0] 17[p0/c8/t1] 18[p0/c9/t0] 19[p0/c9/t1] 20[p0/c10/t0] 21[p0/c10/t1] 22[p0/c11/t0] 23[p0/c1 -- 32 usable, 31 AP(s), consecutive=1 [#360]
+[0000017898] RT-1b: no prior boot log found in RAM (expected after a cold power cycle; persistent live-run capture is on USB)
+[0000018011] fw-1: Phase 0 sizes per-VM state for 31 VM(s) -- 32 usable core(s), BSP reserved (decision 33) [#450]
+[0000018113] fw-1: g_vms arena 31 VM(s) x 4726784 B, page-aligned @0xcaa1c000 [#394]
+[0000018185] fw-1: per-VM aux arena for 31 VM(s) allocated [#394]
+[0000018238] fw-1: vm0 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000018447] fw-1: vm1 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000018656] fw-1: vm2 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000018865] fw-1: vm3 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000019074] fw-1: vm4 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000019283] fw-1: vm5 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000019492] fw-1: vm6 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000019701] fw-1: vm7 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000019910] fw-1: vm8 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000020119] fw-1: vm9 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000020328] fw-1: vm10 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000020538] fw-1: vm11 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000020748] fw-1: vm12 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000020958] fw-1: vm13 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000021168] fw-1: vm14 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000021378] fw-1: vm15 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000021588] fw-1: vm16 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000021798] fw-1: vm17 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000022008] fw-1: vm18 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000022218] fw-1: vm19 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000022428] fw-1: vm20 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000022638] fw-1: vm21 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000022848] fw-1: vm22 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000023058] fw-1: vm23 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000023268] fw-1: vm24 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000023478] fw-1: vm25 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000023688] fw-1: vm26 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000023898] fw-1: vm27 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000024108] fw-1: vm28 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000024318] fw-1: vm29 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000024528] fw-1: vm30 vcpus 1 (= physical core(s); the guest sees this x threads/core) -- built-in default (no hype.cfg value) (requested 0, max 8) -- PROVISIONAL, re-resolved in Phase 1 once hype.cfg is read [#185 #564]
+[0000024738] fw-1: vCPU pools sized for 32 vCPU(s) -- the host's bound across up to 31 VM(s) [#185 #450]
+[0000024830] TERM-7: GOP reports 9 mode(s), snapshotted pre-ExitBootServices [#443 #462]
+[0000024906] TERM-7: GOP mode set to 1920x1080 -- nearest of 9 offered to the 1920x1080 target [#529]
+[0000024995] gop: FrameBufferBase=0x7800000000 FrameBufferSize=0x7e9000
+[0000025054] cpu: vendor=AMD vmx=0 svm=1
+[0000025082] cpu: GUEST-CPUID leaf0 vendor='AuthenticAMD' -- this is the string a guest reads; it must match vendor= above [#298]
+[0000025199] cpu: svm_feature_edx=0x101bbcff pause_filter=1 pause_threshold=1
+[0000025264] host-pci: storage[1]=NVMe at 01:00.0 vid=144d did=a80a bar=0xfcf00000
+[0000025334] host-pci: storage[2]=AHCI at 02:00.1 vid=1022 did=43eb bar=0xfc880000
+[0000025404] host-pci: storage[3]=NVMe at 04:00.0 vid=15b7 did=5063 bar=0xfc700000
+[0000025474] vmm: SVM detected
+[0000025492] fw-1: guest RAM 0 MiB backed at host-physical 0x0
+[0000025542] fw-1 RAMPOOL: vm0 vdisk backing carve 64 MiB @0x1c1600000 (26012 MiB left) [#449]
+[0000025624] fw-1: vm0 virtio-blk fallback RAM scratch reserved @0x1c1600000 (64 MiB) -- backend chosen later
+[0000025721] fw-1: host TSC calibrated at 3400763300 Hz (3400 MHz)
+[0000025775] about to call ExitBootServices...
+[0000025809] ExitBootServices returned
+[0000025835] interrupts masked (cli)
+[0000025859] about to load own GDT...
+[0000025884] own GDT loaded
+[0000025899] about to load own paging (identity-mapping 64 GB)...
+[0000025952] paging: framebuffer BAR 0x7800000000+0x7e9000 is above the 64GB map -- mapped 1 extra GB slot(s)
+[0000026049] paging: high framebuffer 0x7800000000+0x7e9000 marked write-combining (PERF-2, 1 GB slot(s))
+[0000026142] paging: NX applied to every host page except hype's own image (0x140000000+0x1cde000) [#604]
+[0000026235] own paging loaded
+[0000026253] about to load own IDT...
+[0000026278] own IDT loaded
+[0000026293] hype: Boot Services exited, hypervisor now running
+[0000026344] vmm: about to enable SVM...
+[0000026372] svm: VM_CR=0x8 SVMDIS=0
+[0000026396] svm: about to enable SVM (hsave=0x141c7a000)...
+[0000026444] svm: SVM enable complete
+[0000026469] vmm: SVM enabled
+[0000026486] about to enable interrupts (sti)...
+[0000026522] interrupts enabled -- host timer live
+[0000026560] pci-dump: full device census (buses 0-255)
+[0000026603] pci-dump: 00:00.0 vid=1022 did=1480 class=06 sub=00 pi=00
+[0000026661] pci-dump: 00:00.2 vid=1022 did=1481 class=08 sub=06 pi=00
+[0000026719] pci-dump: 00:01.0 vid=1022 did=1482 class=06 sub=00 pi=00
+[0000026777] pci-dump: 00:01.1 vid=1022 did=1483 class=06 sub=04 pi=00
+[0000026835] pci-dump: 00:01.2 vid=1022 did=1483 class=06 sub=04 pi=00
+[0000026893] pci-dump: 00:02.0 vid=1022 did=1482 class=06 sub=00 pi=00
+[0000026951] pci-dump: 00:03.0 vid=1022 did=1482 class=06 sub=00 pi=00
+[0000027009] pci-dump: 00:03.1 vid=1022 did=1483 class=06 sub=04 pi=00
+[0000027067] pci-dump: 00:04.0 vid=1022 did=1482 class=06 sub=00 pi=00
+[0000027125] pci-dump: 00:05.0 vid=1022 did=1482 class=06 sub=00 pi=00
+[0000027183] pci-dump: 00:07.0 vid=1022 did=1482 class=06 sub=00 pi=00
+[0000027241] pci-dump: 00:07.1 vid=1022 did=1484 class=06 sub=04 pi=00
+[0000027299] pci-dump: 00:08.0 vid=1022 did=1482 class=06 sub=00 pi=00
+[0000027357] pci-dump: 00:08.1 vid=1022 did=1484 class=06 sub=04 pi=00
+[0000027415] pci-dump: 00:14.0 vid=1022 did=790b class=0c sub=05 pi=00
+[0000027473] pci-dump: 00:14.3 vid=1022 did=790e class=06 sub=01 pi=00
+[0000027531] pci-dump: 00:18.0 vid=1022 did=1440 class=06 sub=00 pi=00
+[0000027589] pci-dump: 00:18.1 vid=1022 did=1441 class=06 sub=00 pi=00
+[0000027647] pci-dump: 00:18.2 vid=1022 did=1442 class=06 sub=00 pi=00
+[0000027705] pci-dump: 00:18.3 vid=1022 did=1443 class=06 sub=00 pi=00
+[0000027763] pci-dump: 00:18.4 vid=1022 did=1444 class=06 sub=00 pi=00
+[0000027821] pci-dump: 00:18.5 vid=1022 did=1445 class=06 sub=00 pi=00
+[0000027879] pci-dump: 00:18.6 vid=1022 did=1446 class=06 sub=00 pi=00
+[0000027937] pci-dump: 00:18.7 vid=1022 did=1447 class=06 sub=00 pi=00
+[0000027995] pci-dump: 01:00.0 vid=144d did=a80a class=01 sub=08 pi=02
+[0000028053] pci-dump: 02:00.0 vid=1022 did=43ee class=0c sub=03 pi=30
+[0000028111] pci-dump: 02:00.1 vid=1022 did=43eb class=01 sub=06 pi=01
+[0000028169] pci-dump: 02:00.2 vid=1022 did=43e9 class=06 sub=04 pi=00
+[0000028227] pci-dump: 03:00.0 vid=1022 did=43ea class=06 sub=04 pi=00
+[0000028285] pci-dump: 03:07.0 vid=1022 did=43ea class=06 sub=04 pi=00
+[0000028343] pci-dump: 03:09.0 vid=1022 did=43ea class=06 sub=04 pi=00
+[0000028401] pci-dump: 04:00.0 vid=15b7 did=5063 class=01 sub=08 pi=02
+[0000028459] pci-dump: 05:00.0 vid=10ec did=8168 class=02 sub=00 pi=00
+[0000028517] pci-dump: 2a:00.0 vid=10ec did=8125 class=02 sub=00 pi=00
+[0000028575] pci-dump: 2b:00.0 vid=1002 did=1478 class=06 sub=04 pi=00
+[0000028633] pci-dump: 2c:00.0 vid=1002 did=1479 class=06 sub=04 pi=00
+[0000028691] pci-dump: 2d:00.0 vid=1002 did=73df class=03 sub=00 pi=00
+[0000028749] pci-dump: 2d:00.1 vid=1002 did=ab28 class=04 sub=03 pi=00
+[0000028807] pci-dump: 2e:00.0 vid=1022 did=148a class=13 sub=00 pi=00
+[0000028865] pci-dump: 2f:00.0 vid=1022 did=1485 class=13 sub=00 pi=00
+[0000028923] pci-dump: 2f:00.1 vid=1022 did=1486 class=10 sub=80 pi=00
+[0000028981] pci-dump: 2f:00.3 vid=1022 did=149c class=0c sub=03 pi=30
+[0000029039] pci-dump: 2f:00.4 vid=1022 did=1487 class=04 sub=03 pi=00
+[0000029097] pci-dump: 43 PCI functions total
+[0000029130] host-nvme: 01:00.0 woke to D0, Command=0x0406
+[0000029176] #255dbg nvme: queues allocated NSQA=1 NCQA=1 (dw0=0x00000000)
+[0000029238] host-nvme: init OK, LBA0 read OK -- mbrsig=55aa
+[0000029286] media: registered host device 0 = nvme serial='S6WSNJ0W127664M'
+[0000029350] host-nvme: serial='S6WSNJ0W127664M' model='Samsung SSD 980 PRO with Heatsink 1TB' sectors=1953525168 (953869 MiB)
+[0000029464] host-nvme: 04:00.0 woke to D0, Command=0x0407
+[0000029510] #255dbg nvme: queues allocated NSQA=64 NCQA=64 (dw0=0x003f003f)
+[0000029574] host-nvme: init OK, LBA0 read OK -- mbrsig=55aa
+[0000029622] host-nvme: serial='25435A802951' model='WD Blue SN5100 2TB' sectors=3907029168 (1907729 MiB)
+[0000029715] net: NIC 1 at 05:00.0 10ec:8168 BAR0=0x0 -- no hype driver for this device [#80]
+[0000029796] net: NIC 2 at 2a:00.0 10ec:8125 BAR0=0x0 -- no hype driver for this device [#80]
+[0000029877] net: 2 NIC(s) present, none hype can drive -- networking unavailable [#80]
+[0000029952] host-xhci: controller[1] at 02:00.0 vid=1022 did=43ee bar=0xfc8a0000
+[0000030021] host-xhci: caps -- slots=127 ports=14 ctx=32B scratchpads=31 pagesize=0x0001
+[0000030098] host-xhci: up -- slots=127 ports=14 ctx=32B
+[0000030142] host-xhci:   port 1 down: PORTSC=0x000002a0 (CCS=0 PED=0 PP=1 PR=0 speed=0)
+[0000030218] host-xhci:   port 2 down: PORTSC=0x000002a0 (CCS=0 PED=0 PP=1 PR=0 speed=0)
+[0000030294] host-xhci:   port 3 down: PORTSC=0x000002a0 (CCS=0 PED=0 PP=1 PR=0 speed=0)
+[0000030370] host-xhci: port 4 connected (speed id 4)
+[0000030411] host-xhci: PORT EVENT port=12 (event #1 on this controller) [#760]
+[0000030478] host-xhci: PORT EVENT port=4 (event #2 on this controller) [#760]
+[0000030544] host-xhci: PORT EVENT port=6 (event #3 on this controller) [#760]
+[0000030610] host-xhci: port 4 dev -- USB 3.00 class=00 mps0=9 vid=152d pid=1561
+[0000030678] host-xhci: MSC -- slot 1 cfg=1 iface=0 bulk-in=0x81 bulk-out=0x02 mps=1024
+[0000030753] host-xhci: bulk endpoints configured -- MSC datapath ready
+[0000030812] host-xhci: MSC identity serial='DB9876543214E' source=inquiry-vpd80 [#340]
+[0000030887] host-xhci: USB disk -- last LBA 1000215215, block 512 bytes (488386 MiB)
+[0000030960] host-xhci: SCSI READ(10) LBA0 OK -- mbrsig=55aa
+[0000031008] host-xhci: blk_usb backend read LBA0 OK -- mbrsig=55aa (cap 1000215216 sectors)
+[0000031088] usb-log: base LBA 0 -- mounts, but is not the volume hype booted from -- leaving it alone [#638]
+[0000031185] usb-log: base LBA 1 -- mounts, but is not the volume hype booted from -- leaving it alone [#638]
+[0000031282] fw-1: boot #1 on this volume [#643]
+[0000031318] usb-log: \HYPE.LOG + per-VM logs on FAT32 at disk LBA 2048; \HYPEFULL.LOG is retired -- merge the split files by their [offset] prefix to recover the combined stream [#338]
+[0000031491] usb-log: split diagnostics -- 0 of 0 per-VM log(s) open; hype's own output to \HYPE.LOG, each guest's serial to its own file; the combined stream lives on the serial port and is recoverable from the [offset] prefixes [#338 #558]
+[0000031720] media: registered host device 1 = usb serial='DB9876543214E'
+[0000031781] host-xhci:   port 5 down: PORTSC=0x000002a0 (CCS=0 PED=0 PP=1 PR=0 speed=0)
+[0000031857] host-xhci: port 6 connected (speed id 3)
+[0000031898] host-xhci: port 6 dev -- USB 2.00 class=09 mps0=64 vid=05e3 pid=0608
+[0000031967] host-xhci: port 6 is a USB hub -- descending (#231 pt5b)
+[0000032024] host-xhci:   hub slot 2 (tier 1) has 4 downstream port(s)
+[0000032082] host-xhci: CTXDUMP hub-status slot=2 dci=3 | SLOT route=0x00000 speed=3 entries=3 mtt=0 hub=1 rootport=6 ttslot=0 ttport=0 ttt=3 | EP state=1 interval=11 mult=0 maxburst=0 mps=1 cerr=3 type=7 esit=1 [#734]
+[0000032288] host-xhci:   hub slot 2 status-change endpoint 0x81 armed (1 byte bitmap) -- its ports can hot-plug [#746]
+[0000032395] host-xhci:   hub slot 2 port 4: device attached (speed id 1)
+[0000032456] host-xhci:   hub slot 2 port 4 dev class=00 vid=1e71 pid=2007
+[0000032518] host-usb:   behind-hub device ctrl1 port6 route=0x00004 slot3 1e71:2007 class=03 -- recorded [#241]
+[0000032618] host-xhci: no storage behind hub on port 6 (its devices are still in the inventory)
+[0000032702] host-xhci:   port 7 down: PORTSC=0x000002a0 (CCS=0 PED=0 PP=1 PR=0 speed=0)
+[0000032778] host-xhci:   port 8 down: PORTSC=0x000002a0 (CCS=0 PED=0 PP=1 PR=0 speed=0)
+[0000032854] host-xhci:   port 9 down: PORTSC=0x000002a0 (CCS=0 PED=0 PP=1 PR=0 speed=0)
+[0000032930] host-xhci:   port 10 down: PORTSC=0x000002a0 (CCS=0 PED=0 PP=1 PR=0 speed=0)
+[0000033007] host-xhci:   port 11 down: PORTSC=0x000002a0 (CCS=0 PED=0 PP=1 PR=0 speed=0)
+[0000033084] host-xhci: port 12 connected (speed id 1)
+[0000033126] host-xhci: port 12 dev -- USB 1.10 class=00 mps0=64 vid=1462 pid=7c91
+[0000033196] host-xhci: port 12 dev is not MSC or hub (class=00, cfg 41 bytes) -- HID: slot RETAINED for #217
+[0000033293] host-xhci:   port 13 down: PORTSC=0x000002a0 (CCS=0 PED=0 PP=1 PR=0 speed=0)
+[0000033370] host-xhci:   port 14 down: PORTSC=0x000002a0 (CCS=0 PED=0 PP=1 PR=0 speed=0)
+[0000033447] usb-probe: ctrl[1] 02:00.0 ports=14 CCS=0x0828 PED=0x0828 PP=0x3fff (bit0=port1)
+[0000033528] host-xhci: controller[2] at 2f:00.3 vid=1022 did=149c bar=0xfc900000
+[0000033597] host-xhci: caps -- slots=64 ports=8 ctx=64B scratchpads=2 pagesize=0x0001
+[0000033671] host-xhci: up -- slots=64 ports=8 ctx=64B
+[0000033713] host-xhci: port 1 connected (speed id 3)
+[0000033754] host-xhci: PORT EVENT port=4 (event #1 on this controller) [#760]
+[0000033820] host-xhci: PORT EVENT port=3 (event #2 on this controller) [#760]
+[0000033886] host-xhci: PORT EVENT port=1 (event #3 on this controller) [#760]
+[0000033952] host-xhci: PORT EVENT port=7 (event #4 on this controller) [#760]
+[0000034018] host-xhci: PORT EVENT port=8 (event #5 on this controller) [#760]
+[0000034084] host-xhci: port 1 dev -- USB 2.01 class=ef mps0=64 vid=1bcf pid=2284
+[0000034153] host-xhci: port 1 dev is not MSC or hub (class=ef, cfg 256 bytes) -- skipping
+[0000034231] host-xhci:     Disable Slot: 1 [#734]
+[0000034269] host-xhci:   port 2 down: PORTSC=0x000002a0 (CCS=0 PED=0 PP=1 PR=0 speed=0)
+[0000034345] host-xhci: port 3 connected (speed id 3)
+[0000034386] host-xhci:     Enable Slot: 1 -- RECYCLED, this id was enabled and disabled before [#734]
+[0000034476] host-xhci: port 3 dev -- USB 2.10 class=09 mps0=64 vid=0bda pid=5411
+[0000034545] host-xhci: port 3 is a USB hub -- descending (#231 pt5b)
+[0000034602] host-xhci:   hub slot 1 (tier 1) has 4 downstream port(s)
+[0000034660] host-xhci: CTXDUMP hub-status slot=1 dci=3 | SLOT route=0x00000 speed=3 entries=3 mtt=0 hub=1 rootport=3 ttslot=0 ttport=0 ttt=1 | EP state=1 interval=11 mult=0 maxburst=0 mps=1 cerr=3 type=7 esit=1 [#734]
+[0000034866] host-xhci:   hub slot 1 status-change endpoint 0x81 armed (1 byte bitmap) -- its ports can hot-plug [#746]
+[0000034973] host-xhci: no storage behind hub on port 3 (its devices are still in the inventory)
+[0000035057] host-xhci: port 4 connected (speed id 3)
+[0000035098] host-xhci: port 4 dev -- USB 2.10 class=09 mps0=64 vid=05e3 pid=0610
+[0000035167] host-xhci: port 4 is a USB hub -- descending (#231 pt5b)
+[0000035224] host-xhci:   hub slot 2 (tier 1) has 4 downstream port(s)
+[0000035282] host-xhci: CTXDUMP hub-status slot=2 dci=3 | SLOT route=0x00000 speed=3 entries=3 mtt=0 hub=1 rootport=4 ttslot=0 ttport=0 ttt=3 | EP state=1 interval=11 mult=0 maxburst=0 mps=1 cerr=3 type=7 esit=1 [#734]
+[0000035488] host-xhci:   hub slot 2 status-change endpoint 0x81 armed (1 byte bitmap) -- its ports can hot-plug [#746]
+[0000035595] host-xhci:   hub slot 2 port 1: device attached (speed id 3)
+[0000035656] host-xhci:   hub slot 2 port 1 dev class=ef vid=eba4 pid=6579
+[0000035718] host-usb:   behind-hub device ctrl2 port4 route=0x00001 slot3 eba4:6579 class=ef -- recorded [#241]
+[0000035818] host-xhci:   hub slot 2 port 2: device attached (speed id 1)
+[0000035879] host-xhci:   hub slot 2 port 2 dev class=00 vid=3434 pid=0da4
+[0000035941] host-usb:   behind-hub device ctrl2 port4 route=0x00002 slot4 3434:0da4 class=03 -- recorded [#241]
+[0000036041] host-xhci:   hub slot 2 port 4: device attached (speed id 1)
+[0000036102] host-xhci:   hub slot 2 port 4 dev class=00 vid=046d pid=c547
+[0000036164] host-usb:   behind-hub device ctrl2 port4 route=0x00004 slot5 046d:c547 class=03 -- recorded [#241]
+[0000036264] host-xhci: no storage behind hub on port 4 (its devices are still in the inventory)
+[0000036348] host-xhci:   port 5 down: PORTSC=0x000002a0 (CCS=0 PED=0 PP=1 PR=0 speed=0)
+[0000036424] host-xhci:   port 6 down: PORTSC=0x000002a0 (CCS=0 PED=0 PP=1 PR=0 speed=0)
+[0000036500] host-xhci: port 7 connected (speed id 4)
+[0000036541] host-xhci: port 7 dev -- USB 3.10 class=09 mps0=9 vid=0bda pid=0411
+[0000036609] host-xhci: port 7 is a USB hub -- descending (#231 pt5b)
+[0000036666] host-xhci:   hub slot 6 (tier 1) has 4 downstream port(s)
+[0000036724] host-xhci: CTXDUMP hub-status slot=6 dci=3 | SLOT route=0x00000 speed=4 entries=3 mtt=0 hub=1 rootport=7 ttslot=0 ttport=0 ttt=0 | EP state=1 interval=7 mult=0 maxburst=0 mps=1 cerr=3 type=7 esit=1 [#734]
+[0000036929] host-xhci:   hub slot 6 status-change endpoint 0x81 armed (1 byte bitmap) -- its ports can hot-plug [#746]
+[0000037036] host-xhci: no storage behind hub on port 7 (its devices are still in the inventory)
+[0000037120] host-xhci: port 8 connected (speed id 4)
+[0000037161] host-xhci: port 8 dev -- USB 3.20 class=09 mps0=9 vid=05e3 pid=0626
+[0000037229] host-xhci: port 8 is a USB hub -- descending (#231 pt5b)
+[0000037286] host-xhci:   hub slot 7 (tier 1) has 4 downstream port(s)
+[0000037344] host-xhci: CTXDUMP hub-status slot=7 dci=3 | SLOT route=0x00000 speed=4 entries=3 mtt=0 hub=1 rootport=8 ttslot=0 ttport=0 ttt=0 | EP state=1 interval=7 mult=0 maxburst=0 mps=1 cerr=3 type=7 esit=1 [#734]
+[0000037549] host-xhci:   hub slot 7 status-change endpoint 0x81 armed (1 byte bitmap) -- its ports can hot-plug [#746]
+[0000037656] host-xhci: no storage behind hub on port 8 (its devices are still in the inventory)
+[0000037740] usb-probe: ctrl[2] 2f:00.3 ports=8 CCS=0x00cd PED=0x00cd PP=0x00ff (bit0=port1)
+[0000037820] host-xhci: controller[2] -- no USB mass-storage on any root port or behind any hub
+[0000037903] host-hid: keyboard 3434:0da4 cfg 91 bytes -- picked iface=0 ep=0x81 mps=8 interval=1 cfgval=1 [#734]
+[0000038004] host-xhci: CTXDUMP int-in slot=4 dci=3 | SLOT route=0x00002 speed=1 entries=3 mtt=0 hub=0 rootport=4 ttslot=2 ttport=2 ttt=0 | EP state=1 interval=3 mult=0 maxburst=0 mps=8 cerr=3 type=7 esit=8 [#734]
+[0000038205] host-xhci: CTXDUMP its-TT-hub slot=2 dci=1 | SLOT route=0x00000 speed=3 entries=3 mtt=0 hub=1 rootport=4 ttslot=0 ttport=0 ttt=3 | EP state=1 interval=0 mult=0 maxburst=0 mps=64 cerr=3 type=4 esit=0 [#734]
+[0000038411] host-hid: USB keyboard CLAIMED -- 3434:0da4 port4 slot4 ep=0x81 mps=8 (1 claimed); host input now reaches hype
+[0000038522] host-hid: keyboard 046d:c547 cfg 84 bytes -- picked iface=1 ep=0x82 mps=64 interval=1 cfgval=1 [#734]
+[0000038624] host-xhci: CTXDUMP int-in slot=5 dci=5 | SLOT route=0x00004 speed=1 entries=5 mtt=0 hub=0 rootport=4 ttslot=2 ttport=4 ttt=0 | EP state=1 interval=3 mult=0 maxburst=0 mps=64 cerr=3 type=7 esit=64 [#734]
+[0000038827] host-xhci: CTXDUMP its-TT-hub slot=2 dci=1 | SLOT route=0x00000 speed=3 entries=3 mtt=0 hub=1 rootport=4 ttslot=0 ttport=0 ttt=3 | EP state=1 interval=0 mult=0 maxburst=0 mps=64 cerr=3 type=4 esit=0 [#734]
+[0000039033] host-hid: USB keyboard CLAIMED -- 046d:c547 port4 slot5 ep=0x82 mps=64 (2 claimed); host input now reaches hype
+[0000039145] host-hid: mouse 046d:c547 cfg 84 bytes -- picked iface=0 ep=0x81 mps=64 interval=1 cfgval=1 [#734]
+[0000039244] host-xhci: CTXDUMP int-in slot=5 dci=3 | SLOT route=0x00004 speed=1 entries=5 mtt=0 hub=0 rootport=4 ttslot=2 ttport=4 ttt=0 | EP state=1 interval=3 mult=0 maxburst=0 mps=64 cerr=3 type=7 esit=64 [#734]
+[0000039447] host-xhci: CTXDUMP its-TT-hub slot=2 dci=1 | SLOT route=0x00000 speed=3 entries=3 mtt=0 hub=1 rootport=4 ttslot=0 ttport=0 ttt=3 | EP state=1 interval=0 mult=0 maxburst=0 mps=64 cerr=3 type=4 esit=0 [#734]
+[0000039653] host-hid: USB mouse CLAIMED -- 046d:c547 port4 slot5 ep=0x81 mps=64 (1 claimed); host input now reaches hype
+[0000039762] host-usb: INVENTORY -- 12 device(s) across 2 controller(s) (3 claimed by hype, 9 free) [#241]
+[0000039856] host-usb:   [0] ctrl1 port4 route=0x00000 slot1 speed4 152d:1561 class=08/06/50 owner=hype
+[0000039947] host-usb:        ep 0x81 bulk-in mps=1024 interval=0
+[0000040000] host-usb:        ep 0x02 bulk-out mps=1024 interval=0
+[0000040054] host-usb:        ep 0x01 bulk-out mps=1024 interval=0
+[0000040108] host-usb:        ep 0x82 bulk-in mps=1024 interval=0
+[0000040161] host-usb:        ep 0x83 bulk-in mps=1024 interval=0
+[0000040214] host-usb:        ep 0x04 bulk-out mps=1024 interval=0
+[0000040268] host-usb:   [1] ctrl1 port6 route=0x00000 slot2 speed3 05e3:0608 class=09/00/01 owner=free
+[0000040359] host-usb:        ep 0x81 int-in mps=1 interval=12
+[0000040409] host-usb:   [2] ctrl1 port6 route=0x00004 slot3 speed1 1e71:2007 class=03/00/00 owner=free
+[0000040500] host-usb:        ep 0x81 int-in mps=64 interval=1
+[0000040550] host-usb:        ep 0x01 int-out mps=64 interval=1
+[0000040601] host-usb:   [3] ctrl1 port12 route=0x00000 slot4 speed1 1462:7c91 class=03/00/00 owner=free
+[0000040693] host-usb:        ep 0x81 int-in mps=64 interval=5
+[0000040743] host-usb:        ep 0x02 int-out mps=64 interval=5
+[0000040794] host-usb:   [4] ctrl2 port1 route=0x00000 slot0 speed3 1bcf:2284 class=ef/02/01 owner=free
+[0000040885] host-usb:        ep 0x87 int-in mps=16 interval=8
+[0000040935] host-usb:   [5] ctrl2 port3 route=0x00000 slot1 speed3 0bda:5411 class=09/00/02 owner=free
+[0000041026] host-usb:        ep 0x81 int-in mps=1 interval=12
+[0000041076] host-usb:        ep 0x81 int-in mps=1 interval=12
+[0000041126] host-usb:   [6] ctrl2 port4 route=0x00000 slot2 speed3 05e3:0610 class=09/00/01 owner=free
+[0000041217] host-usb:        ep 0x81 int-in mps=1 interval=12
+[0000041267] host-usb:   [7] ctrl2 port4 route=0x00001 slot3 speed3 eba4:6579 class=ef/02/01 owner=free
+[0000041358] host-usb:        ep 0x81 int-in mps=16 interval=8
+[0000041408] host-usb:   [8] ctrl2 port4 route=0x00002 slot4 speed1 3434:0da4 class=03/01/01 owner=hype
+[0000041499] host-usb:        ep 0x81 int-in mps=8 interval=1
+[0000041548] host-usb:        ep 0x82 int-in mps=32 interval=1
+[0000041598] host-usb:        ep 0x02 int-out mps=32 interval=1
+[0000041649] host-usb:        ep 0x83 int-in mps=32 interval=1
+[0000041699] host-usb:   [9] ctrl2 port4 route=0x00004 slot5 speed1 046d:c547 class=03/01/02 owner=hype
+[0000041790] host-usb:        ep 0x81 int-in mps=64 interval=1
+[0000041840] host-usb:        ep 0x82 int-in mps=64 interval=1
+[0000041890] host-usb:        ep 0x83 int-in mps=64 interval=1
+[0000041940] host-usb:   [10] ctrl2 port7 route=0x00000 slot6 speed4 0bda:0411 class=09/00/03 owner=free
+[0000042032] host-usb:        ep 0x81 int-in mps=2 interval=8
+[0000042081] host-usb:   [11] ctrl2 port8 route=0x00000 slot7 speed4 05e3:0626 class=09/00/03 owner=free
+[0000042173] host-usb:        ep 0x81 int-in mps=2 interval=8
+[0000042222] host-ahci: 02:00.1 woke to D0, Command=0x0406 (MEM=1 BME=1)
+[0000042282] host-disk: inventory + 02:00.1 port 4 serial='PNY1220003922210D6B2' model='PNY CS900 960GB SSD' sectors=1875385008 [#258]
+[0000042404] media: registered host device 2 = ahci serial='(unknown)'
+[0000042462] ahci-rd[1] enter lba=0 cnt=1 tfd=0x50 ci=0x0
+[0000042507] ahci-rd[1] ready, issuing
+[0000042533] ahci-rd[1] done rc=0
+[0000042554] host-ahci: port 4 LBA0 read OK -- mbrsig=55aa
+[0000042600] host-disk: serial='PNY1220003922210D6B2' model='PNY CS900 960GB SSD' sectors=1875385008 (915715 MiB)
+[0000042701] ahci-rd[2] enter lba=1 cnt=1 tfd=0x50 ci=0x0
+[0000042746] ahci-rd[2] ready, issuing
+[0000042772] ahci-rd[2] done rc=0
+[0000042793] host-disk: gpt-guid dc3fd39d-87e6-1c4d-a5ac-137f4da2e07c
+[0000042850] ahci-rd[3] enter lba=1 cnt=1 tfd=0x50 ci=0x0
+[0000042895] ahci-rd[3] ready, issuing
+[0000042921] ahci-rd[3] done rc=0
+[0000042942] ahci-rd[4] enter lba=0 cnt=1 tfd=0x50 ci=0x0
+[0000042987] ahci-rd[4] ready, issuing
+[0000043013] ahci-rd[4] done rc=0
+[0000043034] ahci-rd[5] enter lba=1 cnt=1 tfd=0x50 ci=0x0
+[0000043079] ahci-rd[5] ready, issuing
+[0000043105] ahci-rd[5] done rc=0
+[0000043126] media: registered host device 3 = nvme serial='S6WSNJ0W127664M'
+[0000043190] fw-1 BOOTVOL: hype's boot volume mounted for writing -- fat32 on device 1 at LBA 2048, \hype.cfg verified byte-identical [#447]
+[0000043318] cfg: loaded \hype.cfg (1535 bytes) -- 1 VM(s)
+[0000043364] cfg: autostart = all -- a VM it excludes is left OFF at boot and started with 'start <name>' [#732]
+[0000043464] cfg:   vm[0] 'run1a' vcpus=2 mem=1024MB target=file:\hype\disks\run1a-scratch.img
+[0000043546] log: level 'debug' -- from hype.cfg. Lines below are filtered to it; Phase 0 above is always complete, and a panic is never filtered [#533]
+[0000043686] fw-1 RAMPOOL: vm0 firmware carve 4 MiB @0x1c5600000 (26008 MiB left) [#449]
+[0000043762] fw-1: firmware 4194304 B (VARS 540672 + CODE 3653632) read through hype's own stack in 68ms, mapped 4194304 B @0x1c5600000 [#451]
+[0000043892] fw-1 M9-4: no \hype-state.txt on the boot volume -- the ABSENT case, not a failure: every VM starts [#177]
+[0000043999] fw-1: vm0 guest RAM 1024 MiB -- from hype.cfg (requested 1024, limits 128..3072) [#290]
+[0000044087] fw-1: vm0 os_hint=linux hyper-v-leaves=off (KVM identity) [#91]
+[0000044151] fw-1: vm0 vcpus 2 (= physical core(s); the guest sees this x threads/core) -- from hype.cfg (requested 2, max 8) [#185 #564]
+[0000044276] input: vm0 armed \input\vm0.txt (3002 bytes, 19 directive(s))
+[0000044338] fw-1 RAMPOOL: vm0 guest RAM carve 1024 MiB @0x1c5a00000 (24984 MiB left) [#449]
+[0000044418] usb-log: split diagnostics -- 1 of 1 per-VM log(s) open; hype's own output to \HYPE.LOG, each guest's serial to its own file; the combined stream lives on the serial port and is recoverable from the [offset] prefixes [#338 #558]
+[0000044647] host-fat: vm0 resolved \iso\test.iso on exFAT partition 2 of the usb device
+[0000044723] media-scan: vm0 dev 1 (usb) probed -- 33 reads
+[0000044770] host-fat: \iso\test.iso vol-LBA 35072 -> disk-LBA 8425728, 278921216 bytes, 1 extent(s)
+[0000044858] host-stream: vm0 CD001 verified streaming from a FILE on a host volume -- backing guest CD via streaming
+[0000044963] gop: BSP transferred exclusive framebuffer ownership to the view renderer [#380]
+[0000045044] fw-1 STEP: dashboard ready (240x135) [#756]
+[0000045088] fw-1 STEP: dropped 8 port-change bit(s) banked during enumeration across 2 controller(s) -- hot-plug starts from here [#757]
+[0000045213] fw-1 STEP: phys-confirm gate passed [#756]
+[0000045256] fw-1 STEP: USB log owner latched to the BSP [#756]
+[0000045307] fw-1 SMP: vm0 granted 2 whole physical core(s) -> 4 logical CPU(s), 2 thread(s)/core (SMT bonus) [#564 #190]
+[0000045416] fw-1 SMP: 2 whole physical core(s) granted -> 4 logical CPU(s) (2 offered, 4 thread(s) selected), siblings known [#190 #479 #564]
+[0000045546] fw-1 AP[vm0 vCPU 0]-SMOKETEST: apic_id=2 -> rc=0 (long-mode=yes), last_phase=3 c_entry_ran=1 ap_vmm_ok=1 [#414 #190]
+[0000045663] fw-1 AP[vm0 vCPU 1]-SMOKETEST: apic_id=3 -> rc=0 (long-mode=yes), last_phase=3 c_entry_ran=1 ap_vmm_ok=1 [#414 #190]
+[0000045780] fw-1 AP[vm0 vCPU 2]-SMOKETEST: apic_id=4 -> rc=0 (long-mode=yes), last_phase=3 c_entry_ran=1 ap_vmm_ok=1 [#414 #190]
+[0000045897] fw-1 AP[vm0 vCPU 3]-SMOKETEST: apic_id=5 -> rc=0 (long-mode=yes), last_phase=3 c_entry_ran=1 ap_vmm_ok=1 [#414 #190]
+[0000046014] fw-1: guest dispatched to the AP (dedicated core); BSP owns console + 3s bursts drained in 10ms/4096-byte USB log slices (#239 #374 #377)
+[0000046152] fw-1 FBTYPE: fb=0x7800000000 PAT=0x7040600070106 PA1=WC MTRR=UC def=UC vcnt=8 mtrr_enabled=1 [#368]
+[0000046252] fw-1 FBSPEED: t=0ms fb=27us ram=13us scat=23us cli=29us | chunk min=0us max=0us slow=0/64 | ticks=0 smi=+0 [#368]
+[0000046366] fw-1 FBCLOCK: delivered/nominal = 1382/1000 (aperf=137753 mperf=99654) | cr0=0x80010011 therm=0x0 [#368 #370]
+[0000046476] fw-1 FBINFLIGHT: during the masked loop: usb_waiters_max=0 usb_held=0/64 | usb_sectors=+0 usb_calls=+0 [#368]
+[0000046586] host-xhci: hub slot 1 status bitmap 0x02 (nports=4) [#746]
+[0000046645] host-usb: hub slot 1 port 1 changed -- something is attached [#746]
+[0000046713] host-xhci: hub slot 1 port 1 -- reset did not enable the port (status 0x0511) [#746]
+[0000046798] host-usb: hub slot 1 port 1 -- could not work out the child's topology, not enumerating [#746]
+[0000046893] host-xhci: hub slot 6 status bitmap 0x02 (nports=4) [#746]
+[0000046952] host-usb: hub slot 6 port 1 changed -- something is attached [#746]
+[0000047020] fw-1 BSPCOST render 0% total=1ms hits=2 mean=813us [#773]
+[0000047078] fw-1 BSPCOST input 78% total=148ms hits=1 mean=148537us [#773]
+[0000047141] fw-1 BSPCOST fbprobe 4% total=8ms hits=1 mean=8837us [#773]
+[0000047201] fw-1 BSPCOST fbcli 0% total=0ms hits=1 mean=29us [#773]
+[0000047257] fw-1 BSPCOST fbreport 15% total=29ms hits=1 mean=29201us [#773]
+[0000047321] fw-1 BSPCOST inval 0% total=0ms hits=1 mean=0us [#773]
+[0000047376] fw-1 BSPCOST band 0% total=0ms hits=1 mean=524us [#773]
+[0000047432] fw-1 BSPCOST gopflush 0% total=0ms hits=1 mean=893us [#773]
+[0000047492] fw-1 BSPCOST dash 0% total=0ms hits=1 mean=13us [#773]
+[0000047547] fw-1 BSPCOST loop iterations=1 hz=3400763300 gate=hz/125=27206106 cycles -- the input tick fires when this many cycles have passed [#773]
+[0000047685] fw-1 BLIT: calls=280 bytes=1006850816 total=115ms MB_per_s=8717 us_each=412 [#368]
+[0000047768] fw-1 ISOCACHE vm0: hits=0 misses=1 hit_pct=0 [#365]
+[0000047820] fw-1 USBWAIT: lock wait total=0ms max=0us (device time is measured AFTER the lock) [#365]
+[0000047910] fw-1 USBFLUSH: slices=0 drained=0B(all sinks) total=0ms max=0us | produced=47910B behind=1896B peak=0B | bursts=0 caught=0 stalled=0 [#374 #522]
+[0000048055] fw-1 USBRD: media=1725 calls/8910 sec | fatvol=29 calls/30 sec [#365]
+[0000048125] fw-1 FBPROBE: entries=1 ran=1 skip_null=0 skip_rate=0 [#368]
+[0000048186] fw-1 KBDIRQ: isr_entries=0 (+0 since last) eois=0 last_apic=0 | polled=1 chords=0 ps2polled=1 | bsp_usb_timeouts=0 bsp_ahci_timeouts=0 bsp_nvme_timeouts=0 nvme_lock_contended=0 [#363 #658 #660]
+[0000048380] fw-1 APLOOP vm0: section=0 iter=0 reason=0x0 grip=0x0 HOSTRIP=0x0 [#436]
+[0000048453] fw-1 GUESTKBD vm0: routed=0 handed=0 route_drop=0 pending=0 | device=0 read=0 device_drop=0 irq1=0 [#375]
+[0000048559] fw-1 PICMASK vm0: master imr=0xff after 0 write(s): [#436]
+[0000048618] fw-1 KBDTRACE vm0: last 0 of 0: [#436]
+[0000048657] fw-1 PS2STATE vm0: kbd_fifo=0 kbd_port=0 mouse_pending=0 | atapi last_cdb=0x00 cmds=0 [#92]
+[0000048749] fw-1 ATAPIOPS vm0: [#92]
+[0000048774] fw-1 #92 PCI-AHCI: cmd=0x0000 status=0x0000 bar5=00000000 cap=0x00 msi_ctl=0x0000 msi_data=0x0000
+[0000048872] fw-1 #440 ICH9-PORT: npf=0 ghc=0x0 p_cmd=0x0 p_is=0x0 p_ie=0x0 p_ci=0x0 p_tfd=0x0 p_ssts=0x0 p_serr=0x0 p_sig=0x0 p_clb=0x0
+[0000048996] fw-1 #440 ATAWR: total=0 last(off=val): [#440]
+[0000049043] fw-1 #440 CFGRING: total=0 last(dd.f reg rw): [#440]
+[0000049096] fw-1 KBDPOLL: p64 0ms ago val=0x00 rip=0x0 | p60 0ms ago val=0x00 [#436]
+[0000049169] fw-1 FLASH: vars_writes=0 vars_reads=0 trap_flips=0 code_writes_ignored=0 trap_now=0 [#457 #556]
+[0000049266] fw-1 BSPPROBE vm0: exits=0 last=0x0@0x0 IN-HOST for 0ms section=0 [#483]
+[0000049339] fw-1 SPIN cpuid(rip=0x0): [#92]
+[0000049371] fw-1 SPIN msr(rip=0x0): [#92]
+[0000049401] host-hid: FIRST report received from 046d:c547 slot5 -- that USB keyboard is live [#217 #742]
+[0000049495] m5-8: FILE-backed guest disk \hype\disks\run1a-scratch.img on exFAT -- 2147483648 bytes, 1 extent(s), 4194304 sectors [writable, persists to the file]
+[0000049646] host-xhci: hub slot 6 status bitmap 0x02 (nports=4) [#746]
+[0000049705] fw-1: disk front-end = virtio-blk -- no SATA disk attached (#333)
+[0000049771] host-usb: hub slot 6 port 1 changed -- something is attached [#746]
+[0000049839] fw-1: launching real OVMF at cs_base=0xffff0000 rip=0xfff0 (guest-physical [0xffc00000,0x100000000) -> host-physical 0x1c5600000)
+[0000049969] svm: slot 0 -> ASID 1 (NASID=32768), flush-this-guest armed (#244)
+[0000050036] svm: slot 1 -> ASID 2 (NASID=32768), flush-this-guest armed (#244)
+[0000050103] svm: slot 2 -> ASID 3 (NASID=32768), flush-this-guest armed (#244)
+[0000050170] svm: slot 3 -> ASID 4 (NASID=32768), flush-this-guest armed (#244)
+[0000050237] fw-1 vm0: 4 vCPU context(s) on one NPT/EPT root 0xcaa2d000, 2 thread(s)/core -- guest is told 4 until AP dispatch (SMP-6); AP(s) parked in wait-for-SIPI [#185 #186]
+[0000050402] fw-1 SCRIPT vm0: armed, 19 directive(s) -- driving this guest
+[0000050464] fw-1: SVM pause-filtering armed (count=65535) -- guest spin loops now yield control for tick injection
+[0000050567] fw-1: AMD AVIC AVAILABLE on this host -- not enabled (build -DHYPE_ENABLE_AVIC=1 to use it) [#193]
+[0000050666] fw-1: INTR-intercept armed -- host timer ticks now preempt the guest (RT-2b)
+[0000050743] fw-1 M9-4: vm0 'run1a' starts (no run-state record covers it, so it takes the default) [#177]
+[0000050837] fw-1 VECHIST vm0: (injected/requested)
+[0000050876] fw-1 IOAPICRT vm0: (unmasked only)
+[0000050911] fw-1 ATAPIXFER: xfers=0 short=0 owed=0 req=0 done=0
+[0000050963] fw-1 USBLOCK: acquires=6716 spins=0 avg=0 max=0 on apic=0 [#362]
+[0000051028] fw-1 USBXFER: calls=6484 chunks=6484 sectors=13684 total=610ms us_per_call=94 us_per_chunk=94 max=1234us [#365]
+[0000051140] fw-1 AHCIREG vm0: top +0x00=0 +0x00=0 +0x00=0 +0x00=0 other=0 | GHC=0x00000000 IS=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxCMD=0x00040000 PxTFD=0x00000050 PxCI=0x00000000 PxSSTS=0x00000123 [#364]
+[0000051340] host-xhci:     Address Device slot 8 try 1: completion code 4 (ctx_size=64B speed=4 route=0x00001)
+[0000051439] fw-1 AHCIIRQ: cd=0/0 ata=0/0 (delivered/pending) | ahci_npf=0 reads=0 mmio_per_read=0 [#365]
+[0000051532] fw-1 EXHIST: total=1 hlt=0 npf=0(ahci=0) ioio=0(io80=0) msr=0 cpuid=1 vintr=0 pause=0 intr=0 other=0
+[0000051633] fw-1 OVMF-DBGPORT: writes=0 bytes=0 reads=0 lines=0 [#286]
+[0000051692] host-xhci:     Address Device slot 8 try 2: completion code 4 (ctx_size=64B speed=4 route=0x00001)
+[0000051791] fw-1 IOHIST vm0 total=0:
+[0000051816] fw-1 #262 HBA[cd-works]: cap=0x80041f05 ghc=0x00000000 is=0x00000000 pi=0x0000003f vs=0x00010301
+[0000051913] fw-1 #262 HBA[cd-works]: p_is=0x00000000 p_ie=0x00000000 p_cmd=0x00040000 p_tfd=0x00000050 p_sig=0xeb140101
+[0000052021] host-xhci:     Address Device slot 8 try 3: completion code 4 (ctx_size=64B speed=4 route=0x00001)
+[0000052120] fw-1 #262 HBA[cd-works]: p_ssts=0x00000123 p_sctl=0x00000000 p_serr=0x00000000 p_sact=0x00000000 p_ci=0x00000000 clb=0x00000000 fb=0x00000000
+[0000052262] host-usb: hub slot 6 port 1 Address Device FAILED (route 0x00001 tt_hub=0 tt_port=0) [#746]
+[0000052354] fw-1 #262 HBA[sata-fails]: cap=0x80041f05 ghc=0x00000000 is=0x00000000 pi=0x0000003f vs=0x00010301
+[0000052453] host-xhci:     Disable Slot: 8 [#734]
+[0000052491] fw-1 #262 HBA[sata-fails]: p_is=0x00000000 p_ie=0x00000000 p_cmd=0x00040000 p_tfd=0x00000050 p_sig=0x00000101
+[0000052601] host-xhci: hub slot 6 status bitmap 0x02 (nports=4) [#746]
+[0000052660] fw-1 #262 HBA[sata-fails]: p_ssts=0x00000123 p_sctl=0x00000000 p_serr=0x00000000 p_sact=0x00000000 p_ci=0x00000000 clb=0x00000000 fb=0x00000000
+[0000052804] host-usb: hub slot 6 port 1 changed -- something is attached [#746]
+[0000052872] fw-1 SCRIPTFEED vm0: seen=0 fed=0 armed=1 [#302]
+[0000052921] fw-1 VMSTAT vm0: state=0 uptime=0s cpu=0% roots=[0xcaa2d000,0x0]
+[0000052986] fw-1 DISPCOST vm0 us/exit(count): npf=0(0) ioio=0(0) msr=0(0) cpuid=0(0) hlt=0(0) intr=0(0) iwin=0(0) other=0(0) [#509]
+[0000053106] fw-1 POSTSTAT vm0: posted0=0 posted1=0 drained1=0 ipi_to0=0 ipi_to1=0 drained0=0 [#512]
+[0000053194] fw-1 VECSTAT vm0/0: fb=0/0 fc=0/0 s22=0/0 ec=0/0 f9=0/0 fa=0/0 (req/inj) [#512 #735 #750]
+[0000053284] fw-1 VECSTAT vm0/1: fb=0/0 fc=0/0 s22=0/0 ec=0/0 f9=0/0 fa=0/0 (req/inj) [#512 #735 #750]
+[0000053374] fw-1 VECSTAT vm0/2: fb=0/0 fc=0/0 s22=0/0 ec=0/0 f9=0/0 fa=0/0 (req/inj) [#512 #735 #750]
+[0000053464] fw-1 VECSTAT vm0/3: fb=0/0 fc=0/0 s22=0/0 ec=0/0 f9=0/0 fa=0/0 (req/inj) [#512 #735 #750]
+[0000053554] fw-1 TMRLATE vm0/0: deliveries=0 programmed=0us worst_late=0us [#484]
+[0000053624] fw-1 TMRLATE vm0/1: deliveries=0 programmed=0us worst_late=0us [#484]
+[0000053694] fw-1 TMRLATE vm0/2: deliveries=0 programmed=0us worst_late=0us [#484]
+[0000053764] fw-1 TMRLATE vm0/3: deliveries=0 programmed=0us worst_late=0us [#484]
+[0000053834] fw-1 IPIOUT vm0/0: sent=0 dropped=0 pending=0 [#190]
+[0000053887] fw-1 IPIOUT vm0/1: sent=0 dropped=0 pending=0 [#190]
+[0000053940] fw-1 IPIOUT vm0/2: sent=0 dropped=0 pending=0 [#190]
+[0000053993] fw-1 IPIOUT vm0/3: sent=0 dropped=0 pending=0 [#190]
+[0000054046] fw-1 APVCPU vm0/1: live=1 exits=0 unhandled=0 unclaimed=0 last=0x0@0x0 timer_irqs=0 init=0 cur=0 lvt=0x10000 ahci=0 ecam=0 vblk=0 lt=0 span=0 lockwait=0 lockmax=0 lockmaxsec=0 | held_max=7174 held_tot=7174 house_tot=0 house_max=0 [#190]
+[0000054283] host-xhci:     Enable Slot: 8 -- RECYCLED, this id was enabled and disabled before [#734]
+[0000054373] fw-1 DIAG: BLK WRITE count=196 sectors=270 max=7 hist=183/13/0/0/0/0 vec=0/0/0 elapsed=6366ms thru=21KB/s
+[0000054479] host-xhci:     Address Device slot 8 try 1: completion code 4 (ctx_size=64B speed=4 route=0x00001)
+[0000054578] fw-1 DIAG: MOUSE polls=1 reports=0 errors=0 packets=0 (slot5 ep=0x81) [#219]
+[0000054655] fw-1 DIAG: HID[0/2] 3434:0da4 polls=3 reports=0 arms=4 errors=0 (slot4 ep=0x81) [#217 #742]
+[0000054747] fw-1 DIAG: HID[0] modseen=0x00 -- RCtrl(bit4)=never RAlt(bit6)=never LCtrl=never LAlt=never [#734]
+[0000054846] host-xhci:     Address Device slot 8 try 2: completion code 4 (ctx_size=64B speed=4 route=0x00001)
+[0000054945] fw-1 DIAG: HID[1/2] 046d:c547 polls=3 reports=2 arms=6 errors=0 (slot5 ep=0x82) [#217 #742]
+[0000055037] fw-1 DIAG: HID[1] modseen=0x00 -- RCtrl(bit4)=never RAlt(bit6)=never LCtrl=never LAlt=never [#734]
+[0000055136] fw-1 DIAG: host-kbd scancodes=1 chords=0 (merged from 2 keyboard(s)) [#217]
+[0000055212] host-xhci:     Address Device slot 8 try 3: completion code 4 (ctx_size=64B speed=4 route=0x00001)
+[0000055311] fw-1 DIAG: HUBPOLL hub-devices=5 polls=14 reports=4 errors=0 (a USB-3 hub is TWO devices, a 2.0 and a 3.0 half) [#746 #765]
+[0000055435] host-usb: hub slot 6 port 1 Address Device FAILED (route 0x00001 tt_hub=0 tt_port=0) [#746]
+[0000055527] fw-1 COSTHIST: mean_per_exit vmrun=2579ns body=0ns (vmrun_tot=0ms body_tot=0ms)
+[0000055607] host-xhci:     Disable Slot: 8 [#734]
+[0000055645] fw-1 COSTBREAK:
+[0000055661] fw-1 LOOPPHASE: diag=0ms persist=0ms house=0ms dispatch=0ms [#365]
+[0000055728] host-xhci: hub slot 6 status bitmap 0x02 (nports=4) [#746]
+[0000055787] fw-1 RECOVER: irq0_pending_undelivered=0ms (tick lateness, upper bound) | blocked_by_isr_IF1=0ms (priority-fix reclaims)
+[0000055908] host-usb: hub slot 6 port 1 changed -- something is attached [#746]
+[0000055976] fw-1 PREEMPT: max_single_vmrun=0ms vmruns_over_100ms=0
+[0000056031] fw-1 RIPHIST: kernel=0 user=0 lowmem=0 | hot 0x0=0 0x0=0 0x0=0
+[0000056094] fw-1 KRIPHIST:
+[0000056109] fw-1 PERF: elapsed=463ms hlt_wait=0ms (0%) | hlt_if1=0 hlt_if0=0 | preempt_if1=0 preempt_if0=0
+[0000056204] fw-1 HLTWAIT: req[<100us=0 <1ms=0 <10ms=0 >=10ms=0] act[<100us=0 <1ms=0 <10ms=0 >=10ms=0] zero=0 | src pit=0 lapic=0 both=0
+[0000056328] fw-1 UARTHIST: COM1 in[thr=0 ier=0 iir=0 lcr=0 mcr=0 lsr=0 msr=0 scr=0] out[thr=0 ier=0 iir=0 lcr=0 mcr=0 lsr=0 msr=0 scr=0] | RTE[4]=0x10000 RTE[1]=0x10000 ier=0x0
+[0000056493] fw-1 UARTTX: COM1 written=0 stalled=0 dropped=0 | COM2 written=0 stalled=0 dropped=0
+[0000056578] fw-1 PITROUTE vm0: edges=0 coalesced=0 pic_delivered=0 apic_delivered=0 apic_refused=0 | RTE[2]=0x10000 RTE[0]=0x10000 mIMR=0xff mIRR=0x0 mISR=0x0 | PIT0 mode=0 reload=0 | THIS-VCPU defer=0 overwrite=0 [#557/#563]
+[0000056792] fw-1 TIMERHIST: pit_irq0=0 lapic_irq=0 ahci_irq=0 | PIT0 mode=0 reload=0 counter=0 | LAPIC lvt=0x10000(masked) init=0 cur=0 | svr=0xff dcr=0x0 ever_armed=0x0 | mIMR=0xff sIMR=0xff mISR=0x0 sISR=0x0
+[0000056990] fw-1 INTDEFER vm0/0: cannot_accept=0 vintr_prio=0 | worst_wait=0ms (vec 0x00) | max_gap_between_entries=0ms [#750]
+[0000057105] fw-1 INTDIAG vm0/0: eventinj=0 defer=0 window=0 coalesced=0 collisions=0 | pending=0(top 0x0) staged_eventinj=0x0 IF=0 shadow=0x0 [#750]
+[0000057242] fw-1 INTDEFER vm0/1: cannot_accept=0 vintr_prio=0 | worst_wait=0ms (vec 0x00) | max_gap_between_entries=0ms [#750]
+[0000057357] host-xhci:     Enable Slot: 8 -- RECYCLED, this id was enabled and disabled before [#734]
+[0000057447] fw-1 INTDIAG vm0/1: eventinj=0 defer=0 window=0 coalesced=0 collisions=0 | pending=0(top 0x0) staged_eventinj=0x0 IF=0 shadow=0x0 [#750]
+[0000057584] host-xhci:     Address Device slot 8 try 1: completion code 4 (ctx_size=64B speed=4 route=0x00001)
+[0000057683] fw-1 INTDEFER vm0/2: cannot_accept=0 vintr_prio=0 | worst_wait=0ms (vec 0x00) | max_gap_between_entries=0ms [#750]
+[0000057798] fw-1 INTDIAG vm0/2: eventinj=0 defer=0 window=0 coalesced=0 collisions=0 | pending=0(top 0x0) staged_eventinj=0x0 IF=0 shadow=0x0 [#750]
+[0000057935] host-xhci:     Address Device slot 8 try 2: completion code 4 (ctx_size=64B speed=4 route=0x00001)
+[0000058034] fw-1 INTDEFER vm0/3: cannot_accept=0 vintr_prio=0 | worst_wait=0ms (vec 0x00) | max_gap_between_entries=0ms [#750]
+[0000058149] fw-1 INTDIAG vm0/3: eventinj=0 defer=0 window=0 coalesced=0 collisions=0 | pending=0(top 0x0) staged_eventinj=0x0 IF=0 shadow=0x0 [#750]
+[0000058286] host-xhci:     Address Device slot 8 try 3: completion code 4 (ctx_size=64B speed=4 route=0x00001)
+[0000058385] fw-1 PVCLOCK: arm_count=0
+[0000058411] host-usb: hub slot 6 port 1 Address Device FAILED (route 0x00001 tt_hub=0 tt_port=0) [#746]
+[0000058503] fw-1 RENDERHIST: calls=4 pushes=4 cells_drawn=21120 (full redraw would be 32400 cells/call) -- PERF-2
+[0000058605] host-xhci:     Disable Slot: 8 [#734]
+[0000058643] fw-1 AP: rc=0 tramp=0x9e000 host_cr3=0x140167000 ap_cr3=0xc85fc000 phase=3 c_alive=1 vmm_ok=1
+[0000058737] host-usb: giving up on hub slot 6 port 1 after 3 failed arrivals (Address Device) -- it will not be retried, and the hub will stop being asked about it, until the port reports empty [#763 #770]
+[0000058931] fw-1 AP2: rc=-2 (apic_id=0)
+[0000058959] fw-1 FBSPEED: t=1260ms fb=28us ram=14us scat=46us cli=29us | chunk min=0us max=0us slow=0/64 | ticks=0 smi=+0 [#368]
+[0000059076] fw-1 CORE: vm0 run_fw_1_test executing on apic_id=2 (0=BSP 1=AP1 2=AP2)
+[0000059148] fw-1 FBCLOCK: delivered/nominal = 1375/1000 (aperf=137516 mperf=99994) | cr0=0x80010011 therm=0x0 [#368 #370]
+[0000059258] fw-1 LAPSTATE: feed+737872344/5s pend=0 insvc=0 cur=0 init=0 lvt=0x10000 eoi=0 [#436]
+[0000059344] fw-1 FBINFLIGHT: during the masked loop: usb_waiters_max=0 usb_held=0/64 | usb_sectors=+0 usb_calls=+0 [#368]
+[0000059454] fw-1 LVTMASK: changes=0 last 0x0->0x0 [#436]
+[0000059499] host-xhci: hub slot 6 status bitmap 0x02 (nports=4) [#746]
+[0000059558] fw-1 GUESTPC vm0: exits=1 lastreason=0x72 lastrip=0xfffff93d | cs=0x10:0x0 rip=0xfffff93d rflags=0x46 cr0=0x33 cr3=0x0 cr4=0x640 rsp=0x820000 activity=4294965567 intrblk/entryinj=0x0 exitintr=0x0 [#520]
+[0000059761] host-usb: hub slot 6 port 1 changed -- something is attached [#746]
+[0000059829] fw-1 DRAIN: iters=1 kbd_pending=0 q_pending=0 [#436]
+[0000059882] host-xhci: hub slot 6 status bitmap 0x02 (nports=4) [#746]
+[0000059941] fw-1 DIAG: 1st NPF decode-assist n=15 (0=none->ptwalk) insn=8b 06 eb 0f guest_rip=0xfffd006b
+[0000060034] fw-1 PREEMPT-RIP: host tick preempted guest at rip=0xfffd3fdc cr3=0x800000 | rcx=0x6 rdx=0xbf67 rbx=0x75a776b rsi=0xc9f9bbb rdi=0xf94164a6 rbp=0x800 r8=0x3 r9=0x4a9 | insn=44 29 cd c1 ed 05 44 01 cd eb 16 29 de 44 89 cb [#436]
+[0000060261] fw-1 PMLIVE selftest: tsc_hz=3400763300 div=950 | over 1ms (tsc +3400782) PM advanced 3580 ticks (expect ~3579) v0=0x3b91fa v1=0x3b9ff6
+[0000060397] fw-1 PMLIVE#00: rip=0x835631 raw_tsc=0x17210fb7de pm=0x3b91fa d=3903994
+[0000060469] fw-1 PMLIVE#01: rip=0x835631 raw_tsc=0x1724f20ef6 pm=0x3c9ded d=68595
+[0000060539] fw-1 PMLIVE#02: rip=0x835631 raw_tsc=0x1726320cc8 pm=0x3cf428 d=22075
+[0000060609] fw-1 PMLIVE#03: rip=0x835631 raw_tsc=0x17277401b2 pm=0x3d4aea d=22210
+[0000060679] fw-1: unhandled port 0xcd8 OUT size=4 rip=0x84106f -- absorbing (further hits on this port silenced)
+[0000060780] fw-1: unhandled port 0xcdd OUT size=1 rip=0x840f59 -- absorbing (further hits on this port silenced)
+[0000060881] fw-1 VARS: vars-run1a.bin saved (540672 bytes) [#441]
+[0000060935] fw-1: unhandled port 0xcd8 IN size=4 rip=0x841018 -- absorbing (further hits on this port silenced)
+[0000061035] host-xhci: hub slot 6 status bitmap 0x02 (nports=4) [#746]
+[0000061094] fw-1: unhandled port 0x92 IN size=1 rip=0x840f02 -- absorbing (further hits on this port silenced)
+[0000061193] fw-1: unhandled port 0x92 OUT size=1 rip=0x840f59 -- absorbing (further hits on this port silenced)
+[0000061293] fw-1 PMLIVE#04: rip=0x3ff7a4f1 raw_tsc=0x1734d69e0c pm=0x40e64c d=236386
+[0000061366] fw-1 PMLIVE#05: rip=0x3ff7a4f1 raw_tsc=0x1736271f06 pm=0x4140f9 d=23213
+[0000061438] fw-1 PMLIVE#06: rip=0x3ff7a4f1 raw_tsc=0x17377750b6 pm=0x419b92 d=23193
+[0000061510] fw-1 PMLIVE#07: rip=0x3ff665e3 raw_tsc=0x1738d93904 pm=0x41faf0 d=24414
+[0000061582] fw-1 PMLIVE#08: rip=0x3ff665e3 raw_tsc=0x173a243cf8 pm=0x425423 d=22835
+[0000061654] fw-1 PMLIVE#09: rip=0x3ff665e3 raw_tsc=0x173b74e0be pm=0x42aedb d=23224
+[0000061726] svm: slot 1 -> ASID 2 (NASID=32768), flush-this-guest armed (#244)
+[0000061793] fw-1 vm0 SIPIBUF @0x9f000: 66 89 c5 8c c8 8e d8 8e c0 8e d0 31 c0 8e e0 8e e8 be 7c 00 66 8b 1c be 94 00 66 8b 14 66 bf cc 00 00 00 be 68 00 2e 66 0f 01 14 0f 20 c0 66 83 c8 03 0f 22 c0 2e 66 ff [#190]
+[0000061995] fw-1 vm0: SIPI -> vCPU 1 started at 0x9f000 (real mode) [#188]
+[0000062058] fw-1 vm0 vCPU 1: SIPI received, entering guest [#190]
+[0000062112] svm: slot 2 -> ASID 3 (NASID=32768), flush-this-guest armed (#244)
+[0000062179] fw-1 vm0 SIPIBUF @0x9f000: 66 89 c5 8c c8 8e d8 8e c0 8e d0 31 c0 8e e0 8e e8 be 7c 00 66 8b 1c be 94 00 66 8b 14 66 bf cc 00 00 00 be 68 00 2e 66 0f 01 14 0f 20 c0 66 83 c8 03 0f 22 c0 2e 66 ff [#190]
+[0000062381] fw-1 vm0: SIPI -> vCPU 2 started at 0x9f000 (real mode) [#188]
+[0000062444] fw-1 vm0 vCPU 2: SIPI received, entering guest [#190]
+[0000062498] svm: slot 3 -> ASID 4 (NASID=32768), flush-this-guest armed (#244)
+[0000062565] fw-1 vm0: SIPI -> vCPU 3 started at 0x9f000 (real mode) [#188]
+[0000062628] fw-1 vm0 vCPU 3: SIPI received, entering guest [#190]
+[0000062682] fw-1 PMLIVE#10: rip=0x3ff665e3 raw_tsc=0x174e1052e2 pm=0x47b27a d=328607
+[0000062755] fw-1 APVCPU vm0/2 MPDATA: InitFlag=1 NumApsExecuting=0 ApIndex=0 (exit 1, reason 0x7c) [#190]
+[0000062849] fw-1 APVCPU vm0/1 MPDATA: InitFlag=1 NumApsExecuting=0 ApIndex=0 (exit 1, reason 0x7c) [#190]
+[0000062943] fw-1 APVCPU vm0/2 MPDATA: InitFlag=1 NumApsExecuting=1 ApIndex=1 (exit 5, reason 0x7c) [#190]
+[0000063037] fw-1 APVCPU vm0/1 MPDATA: InitFlag=1 NumApsExecuting=2 ApIndex=2 (exit 5, reason 0x7c) [#190]
+[0000063131] fw-1 APVCPU vm0/3 MPDATA: InitFlag=1 NumApsExecuting=0 ApIndex=0 (exit 1, reason 0x7c) [#190]
+[0000063225] fw-1 APVCPU vm0/1 MPDATA: InitFlag=1 NumApsExecuting=2 ApIndex=2 (exit 20, reason 0x72) [#190]
+[0000063320] fw-1 APVCPU vm0/2 MPDATA: InitFlag=1 NumApsExecuting=2 ApIndex=2 (exit 20, reason 0x72) [#190]
+[0000063415] fw-1 APVCPU vm0/1 MPDATA: InitFlag=1 NumApsExecuting=3 ApIndex=3 (exit 60, reason 0x72) [#190]
+[0000063510] fw-1 APVCPU vm0/3 MPDATA: InitFlag=1 NumApsExecuting=3 ApIndex=3 (exit 5, reason 0x7c) [#190]
+[0000063604] fw-1 APVCPU vm0/1 MPDATA: InitFlag=1 NumApsExecuting=3 ApIndex=3 (exit 150, reason 0x72) [#190]
+[0000063700] fw-1 APVCPU vm0/2 MPDATA: InitFlag=1 NumApsExecuting=3 ApIndex=3 (exit 60, reason 0x72) [#190]
+[0000063795] fw-1 PMLIVE#11: rip=0x3ff665e3 raw_tsc=0x174f8df428 pm=0x481951 d=26327
+[0000063867] fw-1 APVCPU vm0/3 MPDATA: InitFlag=1 NumApsExecuting=3 ApIndex=3 (exit 20, reason 0x72) [#190]
+[0000063962] fw-1 APVCPU vm0/1 MPDATA: InitFlag=1 NumApsExecuting=2 ApIndex=3 (exit 400, reason 0x78) [#190]
+[0000064058] fw-1 APVCPU vm0/2 MPDATA: InitFlag=1 NumApsExecuting=2 ApIndex=3 (exit 150, reason 0x72) [#190]
+[0000064154] fw-1 PMLIVE#12: rip=0x3ff665e3 raw_tsc=0x17649efdb4 pm=0x4dc699 d=372040
+[0000064227] fw-1 APVCPU vm0/2 MPDATA: InitFlag=1 NumApsExecuting=1 ApIndex=3 (exit 400, reason 0x78) [#190]
+[0000064323] fw-1 PMLIVE#13: rip=0x3ff665e3 raw_tsc=0x176a5c4bb4 pm=0x4f5289 d=101360
+[0000064396] fw-1 APVCPU vm0/2 MPDATA: InitFlag=1 NumApsExecuting=1 ApIndex=3 (exit 1000, reason 0x78) [#190]
+[0000064493] fw-1 APVCPU vm0/1 MPDATA: InitFlag=1 NumApsExecuting=2 ApIndex=3 (exit 1000, reason 0x78) [#190]
+[0000064590] fw-1 APVCPU vm0/2 MPDATA: InitFlag=1 NumApsExecuting=1 ApIndex=3 (exit 2500, reason 0x78) [#190]
+[0000064687] fw-1 APVCPU vm0/3 MPDATA: InitFlag=1 NumApsExecuting=2 ApIndex=3 (exit 60, reason 0x72) [#190]
+[0000064782] fw-1 APVCPU vm0/1 MPDATA: InitFlag=1 NumApsExecuting=1 ApIndex=3 (exit 2500, reason 0x78) [#190]
+[0000064879] fw-1 PMLIVE#14: rip=0x3ff665e3 raw_tsc=0x176d72da50 pm=0x502792 d=54537
+[0000064951] fw-1 APVCPU vm0/3 MPDATA: InitFlag=1 NumApsExecuting=1 ApIndex=3 (exit 150, reason 0x72) [#190]
+[0000065047] fw-1 PMLIVE#15: rip=0x3ff665e3 raw_tsc=0x177792966a pm=0x52e1fa d=178792
+[0000065120] fw-1 APVCPU vm0/3 MPDATA: InitFlag=1 NumApsExecuting=0 ApIndex=3 (exit 400, reason 0x78) [#190]
+[0000065216] fw-1 vm0 vCPU 1: INIT -- parking [#190]
+[0000065256] fw-1 APVCPU vm0/3 MPDATA: InitFlag=2 NumApsExecuting=0 ApIndex=0 (exit 1000, reason 0x78) [#190]
+[0000065353] fw-1 vm0 vCPU 2: INIT -- parking [#190]
+[0000065393] fw-1 APVCPU vm0/3 MPDATA: InitFlag=2 NumApsExecuting=0 ApIndex=0 (exit 2500, reason 0x78) [#190]
+[0000065490] fw-1 vm0 vCPU 3: INIT -- parking [#190]
+[0000065530] fw-1 PMLIVE#16: rip=0x3ff665e3 raw_tsc=0x17822d54a0 pm=0x55bd87 d=187277
+[0000065603] fw-1 PMLIVE#17: rip=0x3ff665e3 raw_tsc=0x178383a1ea pm=0x5619c5 d=23614
+[0000065675] fw-1 PMLIVE#18: rip=0x3ff665e3 raw_tsc=0x1784d59a38 pm=0x5674d8 d=23315
+[0000065747] svm: slot 1 -> ASID 2 (NASID=32768), flush-this-guest armed (#244)
+[0000065814] fw-1 vm0: SIPI -> vCPU 1 started at 0x9f000 (real mode) [#188]
+[0000065877] fw-1 vm0 vCPU 1: SIPI received, entering guest [#190]
+[0000065931] svm: slot 2 -> ASID 3 (NASID=32768), flush-this-guest armed (#244)
+[0000065998] fw-1 vm0: SIPI -> vCPU 2 started at 0x9f000 (real mode) [#188]
+[0000066061] fw-1 vm0 vCPU 2: SIPI received, entering guest [#190]
+[0000066115] svm: slot 3 -> ASID 4 (NASID=32768), flush-this-guest armed (#244)
+[0000066182] fw-1 vm0: SIPI -> vCPU 3 started at 0x9f000 (real mode) [#188]
+[0000066245] fw-1 vm0 vCPU 3: SIPI received, entering guest [#190]
+[0000066299] fw-1 PMLIVE#19: rip=0x3ff665e3 raw_tsc=0x17905e1dfe pm=0x599078 d=203680
+[0000066372] fw-1 vm0 vCPU 1: INIT -- parking [#190]
+[0000066412] fw-1 vm0 vCPU 2: INIT -- parking [#190]
+[0000066452] fw-1 vm0 vCPU 3: INIT -- parking [#190]
+[0000066492] fw-1 PMLIVE#20: rip=0x3ff665e3 raw_tsc=0x1793e76e32 pm=0x5a846d d=62453
+[0000066564] fw-1 PMLIVE#21: rip=0x3ff665e3 raw_tsc=0x179539ae9e pm=0x5adf93 d=23334
+[0000066636] fw-1 PMLIVE#22: rip=0x3ff665e3 raw_tsc=0x1796888e90 pm=0x5b39d1 d=23102
+[0000066708] svm: slot 1 -> ASID 2 (NASID=32768), flush-this-guest armed (#244)
+[0000066775] fw-1 vm0: SIPI -> vCPU 1 started at 0x9f000 (real mode) [#188]
+[0000066838] fw-1 vm0 vCPU 1: SIPI received, entering guest [#190]
+[0000066892] svm: slot 2 -> ASID 3 (NASID=32768), flush-this-guest armed (#244)
+[0000066959] fw-1 vm0: SIPI -> vCPU 2 started at 0x9f000 (real mode) [#188]
+[0000067022] fw-1 vm0 vCPU 2: SIPI received, entering guest [#190]
+[0000067076] svm: slot 3 -> ASID 4 (NASID=32768), flush-this-guest armed (#244)
+[0000067143] fw-1 vm0: SIPI -> vCPU 3 started at 0x9f000 (real mode) [#188]
+[0000067206] fw-1 vm0 vCPU 3: SIPI received, entering guest [#190]
+[0000067260] fw-1 PMLIVE#23: rip=0x3ff665e3 raw_tsc=0x17a204a448 pm=0x5e5217 d=202822
+[0000067333] fw-1 vm0 vCPU 1: INIT -- parking [#190]
+[0000067373] fw-1 vm0 vCPU 2: INIT -- parking [#190]
+[0000067413] fw-1 vm0 vCPU 3: INIT -- parking [#190]
+[0000067453] fw-1 PMLIVE#24: rip=0x3ff665e3 raw_tsc=0x17a65dfdc4 pm=0x5f7e1c d=76805
+[0000067525] fw-1 PMLIVE#25: rip=0x3ff665e3 raw_tsc=0x17a7adeca6 pm=0x5fd8a2 d=23174
+[0000067597] fw-1 PMLIVE#26: rip=0x3ff665e3 raw_tsc=0x17a8fe78c8 pm=0x603353 d=23217
+[0000067669] svm: slot 1 -> ASID 2 (NASID=32768), flush-this-guest armed (#244)
+[0000067736] fw-1 vm0: SIPI -> vCPU 1 started at 0x9f000 (real mode) [#188]
+[0000067799] fw-1 vm0 vCPU 1: SIPI received, entering guest [#190]
+[0000067853] svm: slot 2 -> ASID 3 (NASID=32768), flush-this-guest armed (#244)
+[0000067920] fw-1 vm0: SIPI -> vCPU 2 started at 0x9f000 (real mode) [#188]
+[0000067983] fw-1 vm0 vCPU 2: SIPI received, entering guest [#190]
+[0000068037] svm: slot 3 -> ASID 4 (NASID=32768), flush-this-guest armed (#244)
+[0000068104] fw-1 vm0: SIPI -> vCPU 3 started at 0x9f000 (real mode) [#188]
+[0000068167] fw-1 vm0 vCPU 3: SIPI received, entering guest [#190]
+[0000068221] fw-1 PMLIVE#27: rip=0x3ff665e3 raw_tsc=0x17b48f432e pm=0x63512e d=204251
+[0000068294] fw-1 vm0 vCPU 1: INIT -- parking [#190]
+[0000068334] fw-1 vm0 vCPU 2: INIT -- parking [#190]
+[0000068374] fw-1 vm0 vCPU 3: INIT -- parking [#190]
+[0000068414] fw-1 PMLIVE#28: rip=0x3ff665e3 raw_tsc=0x17b8154e22 pm=0x644442 d=62228
+[0000068486] fw-1 PMLIVE#29: rip=0x3ff665e3 raw_tsc=0x17b96537b4 pm=0x649ec7 d=23173
+[0000068558] fw-1 PMLIVE#30: rip=0x3ff665e3 raw_tsc=0x17bb84a02a pm=0x653136 d=37487
+[0000068630] svm: slot 1 -> ASID 2 (NASID=32768), flush-this-guest armed (#244)
+[0000068697] fw-1 vm0: SIPI -> vCPU 1 started at 0x9f000 (real mode) [#188]
+[0000068760] fw-1 vm0 vCPU 1: SIPI received, entering guest [#190]
+[0000068814] svm: slot 2 -> ASID 3 (NASID=32768), flush-this-guest armed (#244)
+[0000068881] fw-1 vm0: SIPI -> vCPU 2 started at 0x9f000 (real mode) [#188]
+[0000068944] fw-1 vm0 vCPU 2: SIPI received, entering guest [#190]
+[0000068998] svm: slot 3 -> ASID 4 (NASID=32768), flush-this-guest armed (#244)
+[0000069065] fw-1 vm0: SIPI -> vCPU 3 started at 0x9f000 (real mode) [#188]
+[0000069128] fw-1 vm0 vCPU 3: SIPI received, entering guest [#190]
+[0000069182] fw-1 FBSPEED: t=2262ms fb=28us ram=13us scat=91us cli=29us | chunk min=0us max=0us slow=0/64 | ticks=0 smi=+0 [#368]
+[0000069299] fw-1 PMLIVE#31: rip=0x3ff7a4f1 raw_tsc=0x17c710309c pm=0x684da8 d=203890
+[0000069372] fw-1 FBCLOCK: delivered/nominal = 1382/1000 (aperf=137676 mperf=99586) | cr0=0x80010011 therm=0x0 [#368 #370]
+[0000069482] fw-1: unhandled MMIO 0xffc00010 write -- absorbing (read=all-ones, write=dropped; region silenced) rip=0x3faea058
+[0000069596] fw-1 FBINFLIGHT: during the masked loop: usb_waiters_max=0 usb_held=0/64 | usb_sectors=+0 usb_calls=+0 [#368]
+[0000069706] fw-1 FLASH: VARS read #0 gpa=0xffc00010 mode=1 trap=1 [#556]
+[0000069767] fw-1 FLASH: VARS read #1 gpa=0xffc00010 mode=1 trap=1 [#556]
+[0000069828] fw-1 vm0 vCPU 1: INIT -- parking [#190]
+[0000069868] fw-1 vm0 vCPU 2: INIT -- parking [#190]
+[0000069908] fw-1 vm0 vCPU 3: INIT -- parking [#190]
+[0000069948] svm: slot 1 -> ASID 2 (NASID=32768), flush-this-guest armed (#244)
+[0000070015] fw-1 vm0: SIPI -> vCPU 1 started at 0x87000 (real mode) [#188]
+[0000070078] fw-1 vm0 vCPU 1: SIPI received, entering guest [#190]
+[0000070132] svm: slot 2 -> ASID 3 (NASID=32768), flush-this-guest armed (#244)
+[0000070199] fw-1 vm0: SIPI -> vCPU 2 started at 0x87000 (real mode) [#188]
+[0000070262] fw-1 vm0 vCPU 2: SIPI received, entering guest [#190]
+[0000070316] svm: slot 3 -> ASID 4 (NASID=32768), flush-this-guest armed (#244)
+[0000070383] fw-1 vm0: SIPI -> vCPU 3 started at 0x87000 (real mode) [#188]
+[0000070446] fw-1 vm0 vCPU 3: SIPI received, entering guest [#190]
+[0000070500] fw-1 vm0 vCPU 1: INIT -- parking [#190]
+[0000070540] fw-1 vm0 vCPU 2: INIT -- parking [#190]
+[0000070580] fw-1 vm0 vCPU 3: INIT -- parking [#190]
+[0000070620] svm: slot 1 -> ASID 2 (NASID=32768), flush-this-guest armed (#244)
+[0000070687] fw-1 vm0: SIPI -> vCPU 1 started at 0x87000 (real mode) [#188]
+[0000070750] fw-1 vm0 vCPU 1: SIPI received, entering guest [#190]
+[0000070804] svm: slot 2 -> ASID 3 (NASID=32768), flush-this-guest armed (#244)
+[0000070871] fw-1 vm0: SIPI -> vCPU 2 started at 0x87000 (real mode) [#188]
+[0000070934] fw-1 vm0 vCPU 2: SIPI received, entering guest [#190]
+[0000070988] svm: slot 3 -> ASID 4 (NASID=32768), flush-this-guest armed (#244)
+[0000071055] fw-1 vm0: SIPI -> vCPU 3 started at 0x87000 (real mode) [#188]
+[0000071118] fw-1 vm0 vCPU 3: SIPI received, entering guest [#190]
+[0000071172] fw-1 vm0 vCPU 1: INIT -- parking [#190]
+[0000071212] fw-1 vm0 vCPU 2: INIT -- parking [#190]
+[0000071252] fw-1 vm0 vCPU 3: INIT -- parking [#190]
+[0000071292] svm: slot 1 -> ASID 2 (NASID=32768), flush-this-guest armed (#244)
+[0000071359] fw-1 vm0: SIPI -> vCPU 1 started at 0x87000 (real mode) [#188]
+[0000071422] fw-1 vm0 vCPU 1: SIPI received, entering guest [#190]
+[0000071476] svm: slot 2 -> ASID 3 (NASID=32768), flush-this-guest armed (#244)
+[0000071543] fw-1 vm0: SIPI -> vCPU 2 started at 0x87000 (real mode) [#188]
+[0000071606] fw-1 vm0 vCPU 2: SIPI received, entering guest [#190]
+[0000071660] svm: slot 3 -> ASID 4 (NASID=32768), flush-this-guest armed (#244)
+[0000071727] fw-1 vm0: SIPI -> vCPU 3 started at 0x87000 (real mode) [#188]
+[0000071790] fw-1 vm0 vCPU 3: SIPI received, entering guest [#190]
+[0000071844] fw-1 vm0 vCPU 1: INIT -- parking [#190]
+[0000071884] fw-1 vm0 vCPU 2: INIT -- parking [#190]
+[0000071924] fw-1 vm0 vCPU 3: INIT -- parking [#190]
+[0000071964] fw-1 INJ#01 vec=0x20 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000072027] fw-1 LAPIC-EOI#1 rte16=0x10000 rte21=0x10000
+[0000072072] fw-1 INJ#02 vec=0x20 direct rflags_if=1 shadow=0 einj_busy=0
+[0000072133] fw-1 LAPIC-EOI#2 rte16=0x10000 rte21=0x10000
+[0000072178] fw-1 INJ#03 vec=0x20 direct rflags_if=1 shadow=0 einj_busy=0
+[0000072239] fw-1 LAPIC-EOI#3 rte16=0x10000 rte21=0x10000
+[0000072284] fw-1 INJ#04 vec=0x20 direct rflags_if=1 shadow=0 einj_busy=0
+[0000072345] fw-1 LAPIC-EOI#4 rte16=0x10000 rte21=0x10000
+[0000072390] fw-1 INJ#05 vec=0x20 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000072453] svm: slot 1 -> ASID 2 (NASID=32768), flush-this-guest armed (#244)
+[0000072520] fw-1 vm0: SIPI -> vCPU 1 started at 0x87000 (real mode) [#188]
+[0000072583] fw-1 vm0 vCPU 1: SIPI received, entering guest [#190]
+[0000072637] svm: slot 2 -> ASID 3 (NASID=32768), flush-this-guest armed (#244)
+[0000072704] fw-1 vm0: SIPI -> vCPU 2 started at 0x87000 (real mode) [#188]
+[0000072767] fw-1 vm0 vCPU 2: SIPI received, entering guest [#190]
+[0000072821] svm: slot 3 -> ASID 4 (NASID=32768), flush-this-guest armed (#244)
+[0000072888] fw-1 vm0: SIPI -> vCPU 3 started at 0x87000 (real mode) [#188]
+[0000072951] fw-1 vm0 vCPU 3: SIPI received, entering guest [#190]
+[0000073005] fw-1 LAPIC-EOI#5 rte16=0x10000 rte21=0x10000
+[0000073050] fw-1 LAPIC-EOI#6 rte16=0x10000 rte21=0x10000
+[0000073095] fw-1 LAPIC-EOI#7 rte16=0x10000 rte21=0x10000
+[0000073140] fw-1 LAPIC-EOI#8 rte16=0x10000 rte21=0x10000
+[0000073185] fw-1 LAPIC-EOI#9 rte16=0x10000 rte21=0x10000
+[0000073230] fw-1 LAPIC-EOI#10 rte16=0x10000 rte21=0x10000
+[0000073276] fw-1 LAPIC-EOI#11 rte16=0x10000 rte21=0x10000
+[0000073322] fw-1 LAPIC-EOI#12 rte16=0x10000 rte21=0x10000
+[0000073368] fw-1: AHCI BAR5 (ABAR) enabled at guest-physical 0x80004000 -- routing its MMIO to the CD-ROM model now
+[0000073472] fw-1 LAPIC-EOI#13 rte16=0x10000 rte21=0x10000
+[0000073518] fw-1: virtio-blk BAR4 enabled at guest-physical 0x80000000 -- routing its MMIO to the virtio-blk model now
+[0000073625] fw-1 LAPIC-EOI#14 rte16=0x10000 rte21=0x10000
+[0000073671] fw-1 LAPIC-EOI#15 rte16=0x10000 rte21=0x10000
+[0000073717] fw-1 LAPIC-EOI#16 rte16=0x10000 rte21=0x10000
+[0000073763] fw-1 LAPIC-EOI#17 rte16=0x10000 rte21=0x10000
+[0000073809] fw-1 LAPIC-EOI#18 rte16=0x10000 rte21=0x10000
+[0000073855] fw-1 LAPIC-EOI#19 rte16=0x10000 rte21=0x10000
+[0000073901] fw-1 LAPIC-EOI#20 rte16=0x10000 rte21=0x10000
+[0000073947] fw-1 LAPIC-EOI#21 rte16=0x10000 rte21=0x10000
+[0000073993] fw-1 LAPIC-EOI#22 rte16=0x10000 rte21=0x10000
+[0000074039] fw-1 SCRIPTFEED vm0: FIRST byte reaches the matcher now [#302]
+[0000074102] fw-1 LAPIC-EOI#23 rte16=0x10000 rte21=0x10000
+[0000074148] fw-1 LAPIC-EOI#24 rte16=0x10000 rte21=0x10000
+[0000074194] fw-1 ps2| OUT 0x64 <-=0x20 rip=0x3ebd7fb4
+[0000074236] fw-1 ps2| IN  0x60 ->=0x0 rip=0x3ebd7f53
+[0000074277] fw-1 ps2| OUT 0x64 <-=0x60 rip=0x3ebd7fb4
+[0000074319] fw-1 ps2| OUT 0x60 <-=0x67 rip=0x3ebd7fb4
+[0000074361] fw-1 ps2| OUT 0x60 <-=0xf4 rip=0x3ebd7fb4
+[0000074403] fw-1 ps2| IN  0x60 ->=0xfa rip=0x3ebd7f53
+[0000074445] fw-1 ps2| OUT 0x64 <-=0xab rip=0x3ebd7fb4
+[0000074487] fw-1 ps2| IN  0x60 ->=0x0 rip=0x3ebd7f53
+[0000074528] fw-1 ps2| OUT 0x60 <-=0xff rip=0x3ebd7fb4
+[0000074570] fw-1 ps2| IN  0x60 ->=0xfa rip=0x3ebd7f53
+[0000074612] fw-1 ps2| IN  0x60 ->=0xaa rip=0x3ebd7f53
+[0000074654] fw-1 ps2| OUT 0x60 <-=0xf0 rip=0x3ebd7fb4
+[0000074696] fw-1 ps2| IN  0x60 ->=0xfa rip=0x3ebd7f53
+[0000074738] fw-1 ps2| OUT 0x60 <-=0x2 rip=0x3ebd7fb4
+[0000074779] fw-1 ps2| IN  0x60 ->=0xfa rip=0x3ebd7f53
+[0000074821] fw-1 ps2| OUT 0x60 <-=0xf4 rip=0x3ebd7fb4
+[0000074863] fw-1 ps2| IN  0x60 ->=0xfa rip=0x3ebd7f53
+[0000074905] fw-1 ps2| OUT 0x60 <-=0xed rip=0x3ebd7fb4
+[0000074947] usb-log: BEHIND -- logbuf has 74821 bytes, file has 49495 (#338)
+[0000075012] fw-1 ps2| IN  0x60 ->=0xfa rip=0x3ebd7f53
+[0000075054] fw-1 ps2| OUT 0x60 <-=0x0 rip=0x3ebd7fb4
+[0000075095] fw-1 ps2| IN  0x60 ->=0xfa rip=0x3ebd7f53
+[0000075137] fw-1 ps2| OUT 0x64 <-=0xa8 rip=0x3ebd7fb4
+[0000075179] fw-1 ps2| OUT 0x60 <-=0xed rip=0x3ebd7fb4
+[0000075221] fw-1 ps2| IN  0x60 ->=0xfa rip=0x3ebd7f53
+[0000075263] fw-1 ps2| OUT 0x60 <-=0x0 rip=0x3ebd7fb4
+[0000075304] fw-1 ps2| IN  0x60 ->=0xfa rip=0x3ebd7f53
+[0000075346] fw-1 AHCIWR vm0 #1: +0x04 | PxCMD 0x00040000->0x00040000 GHC 0x00000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000075465] fw-1 AHCIWR vm0 #2: +0x04 | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000075584] fw-1 AHCIWR vm0 #3: +0x108 | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000075704] fw-1 AHCIWR vm0 #4: +0x10c | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000075824] fw-1 AHCIWR vm0 #5: +0x100 | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000075944] fw-1 AHCIWR vm0 #6: +0x104 | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000076064] fw-1 AHCIWR vm0 #7: +0x12c | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000076184] fw-1 AHCIWR vm0 #8: +0x114 | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000076304] fw-1 AHCIWR vm0 #9: +0x118 | PxCMD 0x00040000->0x00044010 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000076424] fw-1 AHCIWR vm0 #10: +0x118 | PxCMD 0x00044010->0x00044010 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000076545] fw-1 AHCIWR vm0 #11: +0x130 | PxCMD 0x00044010->0x00044010 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000076666] fw-1 PxIS-ACK#01 val=0x0 p_is_before=0x0
+[0000076707] fw-1 AHCIWR vm0 #12: +0x110 | PxCMD 0x00044010->0x00044010 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000076828] fw-1 AHCIWR vm0 #13: +0x08 | PxCMD 0x00044010->0x00044010 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000076948] fw-1 AHCIWR vm0 #14: +0x118 | PxCMD 0x00044010->0x00044010 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000077069] fw-1 AHCICYC vm0 #1 START: PxCMD=0x0004c011 PxCI=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=0 [#364]
+[0000077225] fw-1 AHCIWR vm0 #15: +0x118 | PxCMD 0x00044010->0x0004c011 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000077346] fw-1 AHCICYC vm0 #2 ISSUE: PxCMD=0x0004c011 PxCI=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=0 [#364]
+[0000077502] fw-1 FBSPEED: t=3262ms fb=28us ram=14us scat=91us cli=29us | chunk min=0us max=0us slow=0/64 | ticks=0 smi=+0 [#368]
+[0000077619] ahci-cpl #1 slot=0 xfer=512 short=0 tfd=0x0050 st=0x50 err=0x00 pis=0x00000003 | pio[0..3]=5f605000 cnt=0000 | d2h[0..3]=34005000 [#344]
+[0000077756] fw-1 FBCLOCK: delivered/nominal = 1360/1000 (aperf=137461 mperf=101048) | cr0=0x80010011 therm=0x0 [#368 #370]
+[0000077867] fw-1 AHCICYC vm0 #3 ISSUE: PxCMD=0x0004c011 PxCI=0x00000000 PxIS=0x00000003 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=0 [#364]
+[0000078023] fw-1 FBINFLIGHT: during the masked loop: usb_waiters_max=0 usb_held=0/64 | usb_sectors=+0 usb_calls=+0 [#368]
+[0000078133] fw-1 AHCICYC vm0 #4 STOP: PxCMD=0x00044010 PxCI=0x00000000 PxIS=0x00000003 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=0 [#364]
+[0000078288] fw-1 AHCIWR vm0 #16: +0x118 | PxCMD 0x0004c011->0x00044010 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000078409] fw-1 AHCIWR vm0 #17: +0x118 | PxCMD 0x00044010->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000078530] fw-1 AHCIWR vm0 #18: +0x118 | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000078651] fw-1 AHCIWR vm0 #19: +0x130 | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000078772] fw-1 PxIS-ACK#02 val=0x3 p_is_before=0x3
+[0000078813] fw-1 AHCIWR vm0 #20: +0x110 | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000078934] fw-1 AHCIWR vm0 #21: +0x08 | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000079054] fw-1 AHCIWR vm0 #22: +0x118 | PxCMD 0x00040000->0x00044010 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000079175] fw-1 AHCICYC vm0 #5 START: PxCMD=0x0004c011 PxCI=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=0 [#364]
+[0000079331] fw-1 AHCIWR vm0 #23: +0x118 | PxCMD 0x00044010->0x0004c011 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000079452] fw-1 AHCICYC vm0 #6 ISSUE: PxCMD=0x0004c011 PxCI=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=0 [#364]
+[0000079608] ahci-cpl #2 slot=0 xfer=0 short=0 tfd=0x0050 st=0x50 err=0x00 pis=0x00000001 | pio[0..3]=00000000 cnt=0000 | d2h[0..3]=34005000 [#344]
+[0000079743] fw-1 AHCICYC vm0 #7 ISSUE: PxCMD=0x0004c011 PxCI=0x00000000 PxIS=0x00000001 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=0 [#364]
+[0000079899] fw-1 AHCICYC vm0 #8 STOP: PxCMD=0x00044010 PxCI=0x00000000 PxIS=0x00000001 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=0 [#364]
+[0000080054] fw-1 AHCIWR vm0 #24: +0x118 | PxCMD 0x0004c011->0x00044010 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000080175] fw-1 AHCIWR vm0 #25: +0x118 | PxCMD 0x00044010->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000080296] fw-1 AHCIWR vm0 #26: +0x188 | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000080417] fw-1 AHCIWR vm0 #27: +0x18c | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000080538] fw-1 AHCIWR vm0 #28: +0x180 | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000080659] fw-1 AHCIWR vm0 #29: +0x184 | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000080780] fw-1 AHCIWR vm0 #30: +0x1ac | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000080901] fw-1 AHCIWR vm0 #31: +0x194 | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000081022] fw-1 AHCIWR vm0 #32: +0x198 | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000081143] fw-1 AHCIWR vm0 #33: +0x198 | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000081264] fw-1 AHCIWR vm0 #34: +0x208 | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000081385] fw-1 AHCIWR vm0 #35: +0x20c | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000081506] fw-1 AHCIWR vm0 #36: +0x200 | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000081627] fw-1 AHCIWR vm0 #37: +0x204 | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000081748] fw-1 AHCIWR vm0 #38: +0x22c | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000081869] fw-1 AHCIWR vm0 #39: +0x214 | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000081990] fw-1 AHCIWR vm0 #40: +0x218 | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000082111] fw-1 AHCIWR vm0 #41: +0x218 | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000082232] fw-1 AHCIWR vm0 #42: +0x288 | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000082353] fw-1 AHCIWR vm0 #43: +0x28c | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000082474] fw-1 AHCIWR vm0 #44: +0x280 | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000082595] fw-1 AHCIWR vm0 #45: +0x284 | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000082716] fw-1 AHCIWR vm0 #46: +0x2ac | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000082837] fw-1 AHCIWR vm0 #47: +0x294 | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000082958] fw-1 AHCIWR vm0 #48: +0x298 | PxCMD 0x00040000->0x00040000 GHC 0x80000000->0x80000000 PxIE 0x00000000->0x00000000 [#364]
+[0000083079] fw-1 PxIS-ACK#03 val=0x1 p_is_before=0x1
+[0000083120] fw-1 AHCICYC vm0 #9 START: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=0 [#364]
+[0000083276] fw-1 AHCICYC vm0 #10 ISSUE: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=0 [#364]
+[0000083433] ahci-cpl #3 slot=0 xfer=36 short=0 tfd=0x0050 st=0x50 err=0x00 pis=0x00000003 | pio[0..3]=5f605000 cnt=0000 | d2h[0..3]=34005000 [#344]
+[0000083569] fw-1 AHCICYC vm0 #11 ISSUE: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000003 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=1 [#364]
+[0000083726] fw-1 DIAG: guest issued 1st ATAPI CDB (opcode=0x12)
+[0000083778] fw-1 AHCICYC vm0 #12 STOP: PxCMD=0x03044010 PxCI=0x00000000 PxIS=0x00000003 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=1 [#364]
+[0000083934] fw-1 PxIS-ACK#04 val=0x3 p_is_before=0x3
+[0000083975] fw-1 AHCICYC vm0 #13 START: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=1 [#364]
+[0000084132] fw-1 AHCICYC vm0 #14 ISSUE: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=1 [#364]
+[0000084289] ahci-cpl #4 slot=0 xfer=36 short=0 tfd=0x0050 st=0x50 err=0x00 pis=0x00000003 | pio[0..3]=5f605000 cnt=0000 | d2h[0..3]=34005000 [#344]
+[0000084425] fw-1 AHCICYC vm0 #15 ISSUE: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000003 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=2 [#364]
+[0000084582] fw-1 AHCICYC vm0 #16 STOP: PxCMD=0x03044010 PxCI=0x00000000 PxIS=0x00000003 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=2 [#364]
+[0000084738] fw-1 PxIS-ACK#05 val=0x3 p_is_before=0x3
+[0000084779] fw-1 AHCICYC vm0 #17 START: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=2 [#364]
+[0000084936] fw-1 AHCICYC vm0 #18 ISSUE: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=2 [#364]
+[0000085093] fw-1 PxCI-ISSUE-TOTAL=5 (p_ci=0x1)
+[0000085128] ahci-cpl #5 slot=0 xfer=0 short=0 tfd=0x0050 st=0x50 err=0x00 pis=0x00000001 | pio[0..3]=00000000 cnt=0000 | d2h[0..3]=34005000 [#344]
+[0000085263] fw-1 AHCICYC vm0 #19 ISSUE: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000001 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=3 [#364]
+[0000085420] fw-1 AHCICYC vm0 #20 STOP: PxCMD=0x03044010 PxCI=0x00000000 PxIS=0x00000001 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=3 [#364]
+[0000085576] fw-1 PxIS-ACK#06 val=0x1 p_is_before=0x1
+[0000085617] fw-1 AHCICYC vm0 #21 START: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=3 [#364]
+[0000085774] fw-1 AHCICYC vm0 #22 ISSUE: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=3 [#364]
+[0000085931] ahci-cpl #6 slot=0 xfer=18 short=0 tfd=0x0050 st=0x50 err=0x00 pis=0x00000003 | pio[0..3]=5f605000 cnt=0000 | d2h[0..3]=34005000 [#344]
+[0000086067] fw-1 AHCICYC vm0 #23 ISSUE: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000003 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=4 [#364]
+[0000086224] fw-1 AHCICYC vm0 #24 STOP: PxCMD=0x03044010 PxCI=0x00000000 PxIS=0x00000003 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=4 [#364]
+[0000086380] fw-1 PxIS-ACK#07 val=0x3 p_is_before=0x3
+[0000086421] fw-1 AHCICYC vm0 #25 START: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=4 [#364]
+[0000086578] fw-1 AHCICYC vm0 #26 ISSUE: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=4 [#364]
+[0000086735] ahci-cpl #7 slot=0 xfer=8 short=0 tfd=0x0050 st=0x50 err=0x00 pis=0x00000003 | pio[0..3]=5f605000 cnt=0000 | d2h[0..3]=34005000 [#344]
+[0000086870] fw-1 AHCICYC vm0 #27 ISSUE: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000003 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=5 [#364]
+[0000087027] fw-1 AHCICYC vm0 #28 STOP: PxCMD=0x03044010 PxCI=0x00000000 PxIS=0x00000003 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=5 [#364]
+[0000087183] fw-1 PxIS-ACK#08 val=0x3 p_is_before=0x3
+[0000087224] fw-1 AHCICYC vm0 #29 START: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=5 [#364]
+[0000087381] fw-1 FBSPEED: t=4264ms fb=28us ram=14us scat=23us cli=29us | chunk min=0us max=0us slow=0/64 | ticks=0 smi=+0 [#368]
+[0000087498] fw-1 AHCICYC vm0 #30 ISSUE: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=5 [#364]
+[0000087655] fw-1 FBCLOCK: delivered/nominal = 1359/1000 (aperf=137551 mperf=101150) | cr0=0x80010011 therm=0x0 [#368 #370]
+[0000087766] ahci-cpl #8 slot=0 xfer=0 short=0 tfd=0x0050 st=0x50 err=0x00 pis=0x00000001 | pio[0..3]=00000000 cnt=0000 | d2h[0..3]=34005000 [#344]
+[0000087901] fw-1 FBINFLIGHT: during the masked loop: usb_waiters_max=0 usb_held=0/64 | usb_sectors=+0 usb_calls=+0 [#368]
+[0000088011] fw-1 AHCICYC vm0 #31 ISSUE: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000001 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=6 [#364]
+[0000088168] fw-1 AHCICYC vm0 #32 STOP: PxCMD=0x03044010 PxCI=0x00000000 PxIS=0x00000001 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=6 [#364]
+[0000088324] fw-1 PxIS-ACK#09 val=0x1 p_is_before=0x1
+[0000088365] fw-1 AHCICYC vm0 #33 START: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=6 [#364]
+[0000088522] fw-1 AHCICYC vm0 #34 ISSUE: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=6 [#364]
+[0000088679] ahci-cpl #9 slot=0 xfer=18 short=0 tfd=0x0050 st=0x50 err=0x00 pis=0x00000003 | pio[0..3]=5f605000 cnt=0000 | d2h[0..3]=34005000 [#344]
+[0000088815] fw-1 AHCICYC vm0 #35 ISSUE: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000003 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=7 [#364]
+[0000088972] fw-1 AHCICYC vm0 #36 STOP: PxCMD=0x03044010 PxCI=0x00000000 PxIS=0x00000003 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=7 [#364]
+[0000089128] fw-1 PxIS-ACK#10 val=0x3 p_is_before=0x3
+[0000089169] fw-1 AHCICYC vm0 #37 START: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=7 [#364]
+[0000089326] fw-1 AHCICYC vm0 #38 ISSUE: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=7 [#364]
+[0000089483] stream-rd #1: off=0 chunk=2048 lba0=8425728 isosz=278921216 ret=0 dst=33 ed 90 90 90 90 90 90
+[0000089577] ahci-cpl #10 slot=0 xfer=2048 short=0 tfd=0x0050 st=0x50 err=0x00 pis=0x00000003 | pio[0..3]=5f605000 cnt=0000 | d2h[0..3]=34005000 [#344]
+[0000089716] fw-1 AHCICYC vm0 #39 ISSUE: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000003 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=8 [#364]
+[0000089873] fw-1 DIAG: 1st ATAPI READ(10) done -- CD data I/O works on real HW (cmds=8)
+[0000089949] fw-1 AHCICYC vm0 #40 STOP: PxCMD=0x03044010 PxCI=0x00000000 PxIS=0x00000003 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=8 [#364]
+[0000090105] fw-1 PxIS-ACK#11 val=0x3 p_is_before=0x3
+[0000090146] fw-1 AHCICYC vm0 #41 START: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=8 [#364]
+[0000090303] fw-1 AHCICYC vm0 #42 ISSUE: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=8 [#364]
+[0000090460] ahci-cpl #11 slot=0 xfer=0 short=0 tfd=0x0050 st=0x50 err=0x00 pis=0x00000001 | pio[0..3]=00000000 cnt=0000 | d2h[0..3]=34005000 [#344]
+[0000090596] fw-1 AHCICYC vm0 #43 ISSUE: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000001 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=9 [#364]
+[0000090753] fw-1 AHCICYC vm0 #44 STOP: PxCMD=0x03044010 PxCI=0x00000000 PxIS=0x00000001 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=9 [#364]
+[0000090909] fw-1 PxIS-ACK#12 val=0x1 p_is_before=0x1
+[0000090950] fw-1 AHCICYC vm0 #45 START: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=9 [#364]
+[0000091107] fw-1 AHCICYC vm0 #46 ISSUE: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=9 [#364]
+[0000091264] ahci-cpl #12 slot=0 xfer=18 short=0 tfd=0x0050 st=0x50 err=0x00 pis=0x00000003 | pio[0..3]=5f605000 cnt=0000 | d2h[0..3]=34005000 [#344]
+[0000091401] fw-1 AHCICYC vm0 #47 ISSUE: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000003 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=10 [#364]
+[0000091559] fw-1 AHCICYC vm0 #48 STOP: PxCMD=0x03044010 PxCI=0x00000000 PxIS=0x00000003 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=10 [#364]
+[0000091716] fw-1 AHCICYC vm0 #49 START: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=10 [#364]
+[0000091874] fw-1 AHCICYC vm0 #50 ISSUE: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=10 [#364]
+[0000092032] stream-rd #2: off=32768 chunk=2048 lba0=8425728 isosz=278921216 ret=0 dst=01 43 44 30 30 31 01 00
+[0000092130] ahci-cpl #13 slot=0 xfer=2048 short=0 tfd=0x0050 st=0x50 err=0x00 pis=0x00000003 | pio[0..3]=5f605000 cnt=0000 | d2h[0..3]=34005000 [#344]
+[0000092269] fw-1 AHCICYC vm0 #51 ISSUE: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000003 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=11 [#364]
+[0000092427] fw-1 AHCICYC vm0 #52 STOP: PxCMD=0x03044010 PxCI=0x00000000 PxIS=0x00000003 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=11 [#364]
+[0000092584] fw-1 AHCICYC vm0 #53 START: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=11 [#364]
+[0000092742] fw-1 AHCICYC vm0 #54 ISSUE: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=11 [#364]
+[0000092900] ahci-cpl #14 slot=0 xfer=0 short=0 tfd=0x0050 st=0x50 err=0x00 pis=0x00000001 | pio[0..3]=00000000 cnt=0000 | d2h[0..3]=34005000 [#344]
+[0000093036] fw-1 AHCICYC vm0 #55 ISSUE: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000001 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=12 [#364]
+[0000093194] fw-1 AHCICYC vm0 #56 STOP: PxCMD=0x03044010 PxCI=0x00000000 PxIS=0x00000001 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=12 [#364]
+[0000093351] fw-1 AHCICYC vm0 #57 START: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=12 [#364]
+[0000093509] fw-1 AHCICYC vm0 #58 ISSUE: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=12 [#364]
+[0000093667] ahci-cpl #15 slot=0 xfer=18 short=0 tfd=0x0050 st=0x50 err=0x00 pis=0x00000003 | pio[0..3]=5f605000 cnt=0000 | d2h[0..3]=34005000 [#344]
+[0000093804] fw-1 AHCICYC vm0 #59 ISSUE: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000003 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=13 [#364]
+[0000093962] fw-1 AHCICYC vm0 #60 STOP: PxCMD=0x03044010 PxCI=0x00000000 PxIS=0x00000003 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=13 [#364]
+[0000094119] fw-1 AHCICYC vm0 #61 START: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=13 [#364]
+[0000094277] fw-1 AHCICYC vm0 #62 ISSUE: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000000 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=13 [#364]
+[0000094435] stream-rd #3: off=34816 chunk=2048 lba0=8425728 isosz=278921216 ret=0 dst=00 43 44 30 30 31 01 45
+[0000094533] ahci-cpl #16 slot=0 xfer=2048 short=0 tfd=0x0050 st=0x50 err=0x00 pis=0x00000003 | pio[0..3]=5f605000 cnt=0000 | d2h[0..3]=34005000 [#344]
+[0000094672] fw-1 AHCICYC vm0 #63 ISSUE: PxCMD=0x0304c011 PxCI=0x00000000 PxIS=0x00000003 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=14 [#364]
+[0000094830] fw-1 AHCICYC vm0 #64 STOP: PxCMD=0x03044010 PxCI=0x00000000 PxIS=0x00000003 PxIE=0x00000000 PxTFD=0x00000050 PxSERR=0x00000000 GHC=0x80000000 cmds=14 [#364]
+[0000094987] ahci-cpl #17 slot=0 xfer=0 short=0 tfd=0x0050 st=0x50 err=0x00 pis=0x00000001 | pio[0..3]=00000000 cnt=0000 | d2h[0..3]=34005000 [#344]
+[0000095123] ahci-cpl #18 slot=0 xfer=18 short=0 tfd=0x0050 st=0x50 err=0x00 pis=0x00000003 | pio[0..3]=5f605000 cnt=0000 | d2h[0..3]=34005000 [#344]
+[0000095260] stream-rd #4: off=112640 chunk=2048 lba0=8425728 isosz=278921216 ret=0 dst=01 00 00 00 00 00 00 00
+[0000095359] ahci-cpl #19 slot=0 xfer=2048 short=0 tfd=0x0050 st=0x50 err=0x00 pis=0x00000003 | pio[0..3]=5f605000 cnt=0000 | d2h[0..3]=34005000 [#344]
+[0000095498] fw-1 PxIS-ACK-TOTAL=20 (still acking)
+[0000095536] fw-1 PxCI-ISSUE-TOTAL=20 (p_ci=0x1)
+[0000095572] ahci-cpl #20 slot=0 xfer=0 short=0 tfd=0x0050 st=0x50 err=0x00 pis=0x00000001 | pio[0..3]=00000000 cnt=0000 | d2h[0..3]=34005000 [#344]
+[0000095708] ahci-cpl #21 slot=0 xfer=18 short=0 tfd=0x0050 st=0x50 err=0x00 pis=0x00000003 | pio[0..3]=5f605000 cnt=0000 | d2h[0..3]=34005000 [#344]
+[0000095845] stream-rd #5: off=36864 chunk=2048 lba0=8425728 isosz=278921216 ret=0 dst=02 43 44 30 30 31 01 00
+[0000095943] ahci-cpl #22 slot=0 xfer=2048 short=0 tfd=0x0050 st=0x50 err=0x00 pis=0x00000003 | pio[0..3]=5f605000 cnt=0000 | d2h[0..3]=34005000 [#344]
+[0000096082] ahci-cpl #23 slot=0 xfer=0 short=0 tfd=0x0050 st=0x50 err=0x00 pis=0x00000001 | pio[0..3]=00000000 cnt=0000 | d2h[0..3]=34005000 [#344]
+[0000096218] ahci-cpl #24 slot=0 xfer=18 short=0 tfd=0x0050 st=0x50 err=0x00 pis=0x00000003 | pio[0..3]=5f605000 cnt=0000 | d2h[0..3]=34005000 [#344]
+[0000096355] stream-rd #6: off=38912 chunk=2048 lba0=8425728 isosz=278921216 ret=0 dst=ff 43 44 30 30 31 01 00
+[0000096453] stream-rd #7: off=32768 chunk=2048 lba0=8425728 isosz=278921216 ret=0 dst=01 43 44 30 30 31 01 00
+[0000096551] stream-rd #8: off=34816 chunk=2048 lba0=8425728 isosz=278921216 ret=0 dst=00 43 44 30 30 31 01 45
+[0000096649] stream-rd #9: off=36864 chunk=2048 lba0=8425728 isosz=278921216 ret=0 dst=02 43 44 30 30 31 01 00
+[0000096747] stream-rd #10: off=38912 chunk=2048 lba0=8425728 isosz=278921216 ret=0 dst=ff 43 44 30 30 31 01 00
+[0000096846] stream-rd #11: off=40960 chunk=2048 lba0=8425728 isosz=278921216 ret=0 dst=84 00 14 00 00 00 00 00
+[0000096945] dirsec lba=56 off=114688: fa ea 6c 7c 00 00 90 90 10 00 00 00 38 00 00 00
+[0000097019] stream-rd #12: off=114688 chunk=2048 lba0=8425728 isosz=278921216 ret=0 dst=fa ea 6c 7c 00 00 90 90
+[0000097119] dirsec lba=56 off=114688: fa ea 6c 7c 00 00 90 90 10 00 00 00 38 00 00 00
+[0000097193] stream-rd #13: off=114688 chunk=2048 lba0=8425728 isosz=278921216 ret=0 dst=fa ea 6c 7c 00 00 90 90
+[0000097293] dirsec lba=56 off=114688: fa ea 6c 7c 00 00 90 90 10 00 00 00 38 00 00 00
+[0000097367] stream-rd #14: off=114688 chunk=2048 lba0=8425728 isosz=278921216 ret=0 dst=fa ea 6c 7c 00 00 90 90
+[0000097467] fw-1 PxIS-ACK-TOTAL=50 (still acking)
+[0000097505] fw-1 PxCI-ISSUE-TOTAL=50 (p_ci=0x1)
+[0000097541] stream-rd #15: off=157696 chunk=2048 lba0=8425728 isosz=278921216 ret=0 dst=eb 3c 90 4d 54 4f 4f 34
+[0000097641] stream-rd #16: off=190464 chunk=2048 lba0=8425728 isosz=278921216 ret=0 dst=48 c1 e2 06 49 8b 76 20
+[0000097741] fw-1 BLIT: calls=337 bytes=1014680320 total=116ms MB_per_s=8720 us_each=345 [#368]
+[0000097824] stream-rd #17: off=190464 chunk=2048 lba0=8425728 isosz=278921216 ret=0 dst=48 c1 e2 06 49 8b 76 20
+[0000097924] fw-1 ISOCACHE vm0: hits=10 misses=8 hit_pct=55 [#365]
+[0000097978] stream-rd #18: off=157696 chunk=2048 lba0=8425728 isosz=278921216 ret=0 dst=eb 3c 90 4d 54 4f 4f 34
+[0000098078] fw-1 USBWAIT: lock wait total=0ms max=0us (device time is measured AFTER the lock) [#365]
+[0000098168] stream-rd #19: off=157696 chunk=2048 lba0=8425728 isosz=278921216 ret=0 dst=eb 3c 90 4d 54 4f 4f 34
+[0000098268] fw-1 USBFLUSH: slices=9 drained=60100B(all sinks) total=43ms max=5176us | produced=98168B behind=22104B peak=28807B | bursts=1 caught=1 stalled=0 [#374 #522]
+[0000098426] stream-rd #20: off=190464 chunk=2048 lba0=8425728 isosz=278921216 ret=0 dst=48 c1 e2 06 49 8b 76 20
+[0000098526] fw-1 USBRD: media=1767 calls/9098 sec | fatvol=59 calls/61 sec [#365]
+[0000098596] stream-rd #21: off=190464 chunk=2048 lba0=8425728 isosz=278921216 ret=0 dst=48 c1 e2 06 49 8b 76 20
+[0000098696] fw-1 FBPROBE: entries=1145571 ran=5 skip_null=0 skip_rate=1145566 [#368]
+[0000098769] stream-rd #22: off=157696 chunk=2048 lba0=8425728 isosz=278921216 ret=0 dst=eb 3c 90 4d 54 4f 4f 34
+[0000098869] fw-1 KBDIRQ: isr_entries=0 (+0 since last) eois=0 last_apic=0 | polled=1 chords=0 ps2polled=1 | bsp_usb_timeouts=0 bsp_ahci_timeouts=0 bsp_nvme_timeouts=0 nvme_lock_contended=0 [#363 #658 #660]
+[0000099063] stream-rd #23: off=157696 chunk=2048 lba0=8425728 isosz=278921216 ret=0 dst=eb 3c 90 4d 54 4f 4f 34
+[0000099163] fw-1 APLOOP vm0: section=774 iter=69752 reason=0x400 grip=0x3f664769 HOSTRIP=0x14003ae41 [#436]
+[0000099259] stream-rd #24: off=157696 chunk=2048 lba0=8425728 isosz=278921216 ret=0 dst=eb 3c 90 4d 54 4f 4f 34
+[0000099359] fw-1 GUESTKBD vm0: routed=0 handed=0 route_drop=0 pending=0 | device=0 read=0 device_drop=0 irq1=0 [#375]
+[0000099465] fw-1 PICMASK vm0: master imr=0xff after 1 write(s): ff [#436]
+[0000099527] fw-1 KBDTRACE vm0: last 26 of 26:fw-1 PxIS-ACK-TOTAL=100 (still acking)
+[0000099599]  cmd20 rd00 cmd60 wr67 wrf4 rdfa cmdab rd00 wrff rdfadirsec lba=56 off=114688: fa ea 6c 7c 00 00 90 90 10 00 00 00 38 00 00 00
+[0000099726]  rdaa wrf0 rdfadirsec lba=56 off=114688: fa ea 6c 7c 00 00 90 90 10 00 00 00 38 00 00 00
+[0000099815]  wr02 rdfadirsec lba=56 off=114688: fa ea 6c 7c 00 00 90 90 10 00 00 00 38 00 00 00
+[0000099899]  wrf4 rdfa wred rdfa wr00 rdfa cmda8 wred rdfa wr00 rdfa [#436]
+[0000099963] fw-1 PS2STATE vm0: kbd_fifo=0 kbd_port=1 mouse_pending=0 | atapi last_cdb=0x28 cmds=131 [#92]
+[0000100057] fw-1 FLASH: guest write to CODE range gpa=0xffc84010 IGNORED [#457]
+[0000100125] fw-1 ATAPIOPS vm0:dirsec lba=56 off=114688: fa ea 6c 7c 00 00 90 90 10 00 00 00 38 00 00 00
+[0000100217]  12=2/f0dirsec lba=56 off=114688: fa ea 6c 7c 00 00 90 90 10 00 00 00 38 00 00 00
+[0000100299]  00=56/f0dirsec lba=56 off=114688: fa ea 6c 7c 00 00 90 90 10 00 00 00 38 00 00 00
+[0000100382]  03=57/f0 25=1/f0 28=58/f0 [#92]
+[0000100415] fw-1 #92 PCI-AHCI: cmd=0x0017 status=0x0010 bar5=80004000 cap=0x50 msi_ctl=0x0000 msi_data=0x0000
+[0000100513] fw-1 PxCI-ISSUE-TOTAL=200 (p_ci=0x1)
+[0000100550] fw-1 #440 ICH9-PORT: npf=0 ghc=0x0 p_cmd=0x40000 p_is=0x0 p_ie=0x0 p_ci=0x0 p_tfd=0x50 p_ssts=0x123 p_serr=0x0 p_sig=0x101 p_clb=0x0
+[0000100683] fw-1 BSPALIVE: ticks=1145571 phase=3 seq=8025540 (0=idle 1=render 2=input 3=kbddiag 4=flush 5=fbprobe 6=fbcli 7=fbreport 8=inval 9=band 10=gopflush 11=dash) [#363 #370]
+[0000100852] fw-1 #440 ATAWR: total=0 last(off=val):fw-1 DIAG: ATAPI READ(10) count=65 (cmds=200) sectors=67 max=3 hist=64/1/0/0/0/0 seq=19/11/35(contig/near/far) elapsed=1014ms thru=132KB/s [#365]
+[0000101037]  [#440]
+[0000101045] fw-1 #440 CFGRING: total=2417 last(dd.f reg rw): 03.0:3fr 03.0:09r 03.0:0ar 03.0:0br 00.0:09r 00.0:0ar 00.0:0brfw-1 vm0 ttyS0| BdsDxe: loading Boot0002 "UEFI HYPE VIRTUAL CD-ROM HYPE0000000000000001" from PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)
+[0000101297]  02.0:09r 02.0:0ar 02.0:0brfw-1 vm0 ttyS1| BdsDxe: loading Boot0002 "UEFI HYPE VIRTUAL CD-ROM HYPE0000000000000001" from PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)
+[0000101465]  03.0:09r 03.0:0arfw-1 vm0 ttyS0| BdsDxe: starting Boot0002 "UEFI HYPE VIRTUAL CD-ROM HYPE0000000000000001" from PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)
+[0000101625]  03.0:0br 31.0:09rfw-1 vm0 ttyS1| BdsDxe: starting Boot0002 "UEFI HYPE VIRTUAL CD-ROM HYPE0000000000000001" from PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)
+[0000101785]  31.0:0ar 31.0:0br [#440]
+[0000101811] fw-1 KBDPOLL: p64 29ms ago val=0x04 rip=0x3ebd7f53 | p60 2572ms ago val=0xfa [#436]
+[0000101895] fw-1 FLASH: vars_writes=10880 vars_reads=2 trap_flips=10975 code_writes_ignored=2 trap_now=0 [#457 #556]
+[0000102039] fw-1 BSPPROBE vm0: exits=78670 last=0x7b@0x3ebda92d IN-HOST for 5ms section=5 [#483]
+[0000102163] fw-1 SPIN cpuid(rip=0x3efff275): 0x0=2674 0x80000000=637 0x1=2335 0x80000001=238 0x80000008=121 0x7=120 0xb=200 [#92]
+[0000102298] fw-1 SPIN msr(rip=0x3efffad9): 0xc0000080=313 0x1b=2035 0x2ff=164 0xfe=375 0x20f=1 0x201=134 0x202=134 0x203=134 [#92]
+[0000102434] fw-1 SPINCODE @0x3efffad9(phys): 0f 32 48 c1 e2 20 89 c0 48 09 d0 48 89 44 24 38 48 8b 44 24 38 48 83 c4 40 5b c3 48 83 ec 38 48 [#92]
+[0000102569] fw-1 SPINCODE @0x3efff275(phys): 0f a2 4d 85 c9 74 03 41 89 09 59 e3 02 89 01 4c 89 c1 e3 02 89 19 48 8b 4c 24 38 e3 02 89 11 58 [#92]
+[0000102704] fw-1 FBSPEED: t=5696ms fb=28us ram=14us scat=24us cli=29us | chunk min=0us max=0us slow=0/64 | ticks=0 smi=+0 [#368]
+[0000102929] fw-1 FBCLOCK: delivered/nominal = 1360/1000 (aperf=146585 mperf=107746) | cr0=0x80010011 therm=0x0 [#368 #370]
+[0000103148] fw-1 FBINFLIGHT: during the masked loop: usb_waiters_max=0 usb_held=0/64 | usb_sectors=+0 usb_calls=+0 [#368]
+[0000105384] host-hid: FIRST report received from 3434:0da4 slot4 -- that USB keyboard is live [#217 #742]
+[0000107382] fw-1 LAPSTATE: feed+5000003353/5s pend=0 insvc=0 cur=8095731 init=10000000 lvt=0x20020 eoi=264 [#436]
+[0000107484] fw-1 LVTMASK: changes=0 last 0x0->0x0 [#436]
+[0000107529] fw-1 GUESTPC vm0: exits=112421 lastreason=0x7b lastrip=0x3ebd7f53 | cs=0x38:0x0 rip=0x3ebd7f53 rflags=0x200246 cr0=0x80010033 cr3=0x3fc01000 cr4=0x668 rsp=0x3ff0e3e0 activity=1052606292 intrblk/entryinj=0x0 exitintr=0x0 [#520]
+[0000107756] fw-1 #94 RTCRATE: delivered=0/5s programmed=1024Hz regA=0x26 regB=0x02
+[0000107827] fw-1 DRAIN: iters=117217 kbd_pending=0 q_pending=0 [#436]
+[0000108695] fw-1 FBSPEED: t=7371ms fb=28us ram=14us scat=24us cli=29us | chunk min=0us max=0us slow=0/64 | ticks=0 smi=+0 [#368]
+[0000108812] fw-1 FBCLOCK: delivered/nominal = 1360/1000 (aperf=137536 mperf=101082) | cr0=0x80010011 therm=0x0 [#368 #370]
+[0000108923] fw-1 FBINFLIGHT: during the masked loop: usb_waiters_max=0 usb_held=0/64 | usb_sectors=+0 usb_calls=+0 [#368]
+[0000109033] fw-1 BSPALIVE: ticks=1463068 phase=2 seq=10249464 (0=idle 1=render 2=input 3=kbddiag 4=flush 5=fbprobe 6=fbcli 7=fbreport 8=inval 9=band 10=gopflush 11=dash) [#363 #370]
+[0000109203] fw-1 DIAG: ATAPI READ(10) count=129 (cmds=392) sectors=15643 max=351 hist=70/2/8/1/0/48 seq=69/14/46(contig/near/far) elapsed=3127ms thru=10005KB/s [#365]
+[0000109358] fw-1 vm0 vCPU 1: INIT -- parking [#190]
+[0000109398] fw-1 vm0 vCPU 2: INIT -- parking [#190]
+[0000109438] fw-1 vm0 vCPU 3: INIT -- parking [#190]
+[0000109478] svm: slot 1 -> ASID 2 (NASID=32768), flush-this-guest armed (#244)
+[0000109545] fw-1 vm0: SIPI -> vCPU 1 started at 0x87000 (real mode) [#188]
+[0000109608] fw-1 vm0 vCPU 1: SIPI received, entering guest [#190]
+[0000109662] svm: slot 2 -> ASID 3 (NASID=32768), flush-this-guest armed (#244)
+[0000109729] fw-1 vm0: SIPI -> vCPU 2 started at 0x87000 (real mode) [#188]
+[0000109792] fw-1 vm0 vCPU 2: SIPI received, entering guest [#190]
+[0000109846] svm: slot 3 -> ASID 4 (NASID=32768), flush-this-guest armed (#244)
+[0000109913] fw-1 vm0: SIPI -> vCPU 3 started at 0x87000 (real mode) [#188]
+[0000109976] fw-1 vm0 vCPU 3: SIPI received, entering guest [#190]
+[0000110030] svm: guest wrote TSC_AUX=0x0 -- per-guest RDTSCP value now swapped around VMRUN (#275)
+[0000110117] fw-1 INJ#06 vec=0x01 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000110180] fw-1 PICIMR 0x0->0x30 rip=0xffffffffa304eb6f
+[0000110225] fw-1 PICIMR 0x0->0xff rip=0xffffffffa304ec15
+[0000110270] fw-1: unhandled port 0x80 OUT size=1 rip=0xffffffffa3056a2e -- absorbing (further hits on this port silenced)
+[0000110380] fw-1 INJ#07 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000110443] fw-1 INJ#08 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000110506] fw-1 INJ#09 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000110569] fw-1 INJ#10 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000110632] fw-1 INJ#11 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000110695] fw-1 INJ#12 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000110758] fw-1 INJ#13 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000110821] fw-1 INJ#14 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000110884] fw-1 INJ#15 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000110947] fw-1 INJ#16 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000111010] fw-1 INJ#17 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000111073] fw-1 INJ#18 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000111136] fw-1 INJ#19 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000111199] fw-1 INJ#20 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000111262] fw-1 INJ#21 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000111325] fw-1 INJ#22 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000111388] fw-1 INJ#23 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000111451] fw-1 INJ#24 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000111514] fw-1 INJ#25 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000111577] fw-1 INJ#26 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000111640] fw-1 INJ#27 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000111703] fw-1 INJ#28 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000111766] fw-1 INJ#29 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000111829] fw-1 INJ#30 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000111892] fw-1 INJ#31 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000111955] fw-1 INJ#32 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000112018] fw-1 RTEWR gsi=0 lo=0x10000 rip=0xffffffffa308e710
+[0000112069] fw-1 RTEWR gsi=0 hi=0x0 rip=0xffffffffa308e72c
+[0000112116] fw-1 INJ#33 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000112179] fw-1 INJ#34 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000112242] fw-1 INJ#35 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000112305] fw-1 RTEWR gsi=1 lo=0x10000 rip=0xffffffffa308e710
+[0000112356] fw-1 RTEWR gsi=1 hi=0x0 rip=0xffffffffa308e72c
+[0000112403] fw-1 INJ#36 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000112466] fw-1 INJ#37 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000112529] fw-1 INJ#38 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000112592] fw-1 RTEWR gsi=2 lo=0x10000 rip=0xffffffffa308e710
+[0000112643] fw-1 RTEWR gsi=2 hi=0x0 rip=0xffffffffa308e72c
+[0000112690] fw-1 INJ#39 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000112753] fw-1 INJ#40 vec=0x30 deferred rflags_if=0 shadow=0 einj_busy=0
+[0000112816] fw-1 RTEWR gsi=3 lo=0x10000 rip=0xffffffffa308e710
+[0000112867] fw-1 RTEWR gsi=3 hi=0x0 rip=0xffffffffa308e72c
+[0000112914] fw-1 RTEWR gsi=4 lo=0x10000 rip=0xffffffffa308e710
+[0000112965] fw-1 RTEWR gsi=4 hi=0x0 rip=0xffffffffa308e72c
+[0000113012] fw-1 RTEWR gsi=5 lo=0x10000 rip=0xffffffffa308e710
+[0000113063] fw-1 RTEWR gsi=5 hi=0x0 rip=0xffffffffa308e72c
+[0000113110] fw-1 RTEWR gsi=6 lo=0x10000 rip=0xffffffffa308e710
+[0000113161] fw-1 RTEWR gsi=6 hi=0x0 rip=0xffffffffa308e72c
+[0000113208] fw-1 RTEWR gsi=7 lo=0x10000 rip=0xffffffffa308e710
+[0000113259] fw-1 RTEWR gsi=7 hi=0x0 rip=0xffffffffa308e72c
+[0000113306] fw-1 RTEWR gsi=8 lo=0x10000 rip=0xffffffffa308e710
+[0000113357] fw-1 RTEWR gsi=8 hi=0x0 rip=0xffffffffa308e72c
+[0000113404] fw-1 RTEWR gsi=9 lo=0x10000 rip=0xffffffffa308e710
+[0000113455] fw-1 RTEWR gsi=9 hi=0x0 rip=0xffffffffa308e72c
+[0000113502] fw-1 RTEWR gsi=10 lo=0x10000 rip=0xffffffffa308e710
+[0000113554] fw-1 RTEWR gsi=10 hi=0x0 rip=0xffffffffa308e72c
+[0000113602] fw-1 RTEWR gsi=11 lo=0x10000 rip=0xffffffffa308e710
+[0000113654] fw-1 RTEWR gsi=11 hi=0x0 rip=0xffffffffa308e72c
+[0000113702] fw-1 RTEWR gsi=12 lo=0x10000 rip=0xffffffffa308e710
+[0000113754] fw-1 RTEWR gsi=12 hi=0x0 rip=0xffffffffa308e72c
+[0000113802] fw-1 FBSPEED: t=8371ms fb=28us ram=14us scat=93us cli=29us | chunk min=0us max=0us slow=0/64 | ticks=0 smi=+0 [#368]
+[0000113919] fw-1 RTEWR gsi=13 lo=0x10000 rip=0xffffffffa308e710
+[0000113971] fw-1 FBCLOCK: delivered/nominal = 1360/1000 (aperf=137518 mperf=101082) | cr0=0x80010011 therm=0x0 [#368 #370]
+[0000114082] fw-1 RTEWR gsi=13 hi=0x0 rip=0xffffffffa308e72c
+[0000114130] fw-1 FBINFLIGHT: during the masked loop: usb_waiters_max=0 usb_held=0/64 | usb_sectors=+0 usb_calls=+0 [#368]
+[0000114240] fw-1 RTEWR gsi=14 lo=0x10000 rip=0xffffffffa308e710
+[0000114292] fw-1 RTEWR gsi=14 hi=0x0 rip=0xffffffffa308e72c
+[0000114340] fw-1 RTEWR gsi=15 lo=0x10000 rip=0xffffffffa308e710
+[0000114392] fw-1 RTEWR gsi=15 hi=0x0 rip=0xffffffffa308e72c
+[0000114440] fw-1 RTEWR gsi=16 lo=0x10000 rip=0xffffffffa308e710
+[0000114492] fw-1 RTEWR gsi=16 hi=0x0 rip=0xffffffffa308e72c
+[0000114540] fw-1 RTEWR gsi=17 lo=0x10000 rip=0xffffffffa308e710
+[0000114592] fw-1 RTEWR gsi=17 hi=0x0 rip=0xffffffffa308e72c
+[0000114640] fw-1 RTEWR gsi=18 lo=0x10000 rip=0xffffffffa308e710
+[0000114692] fw-1 RTEWR gsi=18 hi=0x0 rip=0xffffffffa308e72c
+[0000114740] fw-1 RTEWR gsi=19 lo=0x10000 rip=0xffffffffa308e710
+[0000114792] fw-1 RTEWR gsi=19 hi=0x0 rip=0xffffffffa308e72c
+[0000114840] fw-1 RTEWR gsi=20 lo=0x10000 rip=0xffffffffa308e710
+[0000114892] fw-1 RTEWR gsi=20 hi=0x0 rip=0xffffffffa308e72c
+[0000114940] fw-1 RTEWR gsi=21 lo=0x10000 rip=0xffffffffa308e710
+[0000114992] fw-1 RTEWR gsi=21 hi=0x0 rip=0xffffffffa308e72c
+[0000115040] fw-1 RTEWR gsi=22 lo=0x10000 rip=0xffffffffa308e710
+[0000115092] fw-1 RTEWR gsi=22 hi=0x0 rip=0xffffffffa308e72c
+[0000115140] fw-1 RTEWR gsi=23 lo=0x10000 rip=0xffffffffa308e710
+[0000115192] fw-1 RTEWR gsi=23 hi=0x0 rip=0xffffffffa308e72c
+[0000115240] fw-1 PICIMR 0x0->0x30 rip=0xffffffffa304eb6f
+[0000115285] fw-1 PICIMR 0x0->0x3 rip=0xffffffffa304eb99
+[0000115329] fw-1 PICIMR 0x0->0xff rip=0xffffffffa304ec15
+[0000115374] fw-1 RTEWR gsi=2 lo=0x10000 rip=0xffffffffa308e710
+[0000115425] fw-1 RTEWR gsi=2 hi=0x0 rip=0xffffffffa308e72c
+[0000115472] svm: guest wrote SPEC_CTRL=0x1 (legal_mask=0x7) -- per-guest value now swapped around VMRUN (#608)
+[0000115571] fw-1 vm0 vCPU 2: INIT -- parking [#190]
+[0000115611] svm: slot 2 -> ASID 3 (NASID=32768), flush-this-guest armed (#244)
+[0000115678] fw-1 vm0: SIPI -> vCPU 2 started at 0x99000 (real mode) [#188]
+[0000115741] fw-1 vm0 vCPU 2: SIPI received, entering guest [#190]
+[0000115795] svm: guest wrote TSC_AUX=0x2 -- per-guest RDTSCP value now swapped around VMRUN (#275)
+[0000115882] svm: guest wrote SPEC_CTRL=0x0 (legal_mask=0x7) -- per-guest value now swapped around VMRUN (#608)
+[0000115981] fw-1 vm0 vCPU 1: INIT -- parking [#190]
+[0000116021] svm: slot 1 -> ASID 2 (NASID=32768), flush-this-guest armed (#244)
+[0000116088] fw-1 vm0: SIPI -> vCPU 1 started at 0x99000 (real mode) [#188]
+[0000116151] fw-1 vm0 vCPU 1: SIPI received, entering guest [#190]
+[0000116205] fw-1 vm0 vCPU 3: INIT -- parking [#190]
+[0000116245] svm: guest wrote TSC_AUX=0x1 -- per-guest RDTSCP value now swapped around VMRUN (#275)
+[0000116332] svm: slot 3 -> ASID 4 (NASID=32768), flush-this-guest armed (#244)
+[0000116399] fw-1 vm0: SIPI -> vCPU 3 started at 0x99000 (real mode) [#188]
+[0000116462] fw-1 vm0 vCPU 3: SIPI received, entering guest [#190]
+[0000116516] svm: guest wrote SPEC_CTRL=0x0 (legal_mask=0x7) -- per-guest value now swapped around VMRUN (#608)
+[0000116615] svm: guest wrote TSC_AUX=0x3 -- per-guest RDTSCP value now swapped around VMRUN (#275)
+[0000116702] svm: guest wrote SPEC_CTRL=0x2 (legal_mask=0x7) -- per-guest value now swapped around VMRUN (#608)
+[0000116801] fw-1 RTEWR gsi=9 hi=0x1000000 rip=0xffffffffa308ebc4
+[0000116854] fw-1 RTEWR gsi=9 lo=0x1a020 rip=0xffffffffa308ebdf
+[0000116905] fw-1 vm0 vCPU 2: unmodelled port 0x87 in -- absorbed [#191]
+[0000116965] fw-1 UARTIER=0xf rip=0xffffffffa380571a
+[0000117005] fw-1 vm0 vCPU 3: unmodelled port 0x3e9 in -- absorbed [#191]
+[0000117066] fw-1 vm0 vCPU 3: unmodelled port 0x3e9 out -- absorbed [#191]
+[0000117128] fw-1 vm0 vCPU 3: unmodelled port 0x3e9 in -- absorbed [#191]
+[0000117189] fw-1 vm0 vCPU 3: unmodelled port 0x3e9 out -- absorbed [#191]
+[0000117251] fw-1 vm0 vCPU 3: unmodelled port 0x3e9 in -- absorbed [#191]
+[0000117312] fw-1 vm0 vCPU 3: unmodelled port 0x3e9 out -- absorbed [#191]
+[0000117374] fw-1 vm0 vCPU 3: unmodelled port 0x2e9 in -- absorbed [#191]
+[0000117435] fw-1 vm0 vCPU 3: unmodelled port 0x2e9 out -- absorbed [#191]
+[0000117497] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000117547] fw-1 ps2| IN  0x60 ->=0x67 rip=0xffffffffa38dbde8
+[0000117597] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000117647] fw-1 ps2| IN  0x60 ->=0x67 rip=0xffffffffa38dbde8
+[0000117697] fw-1 ps2| OUT 0x64 <-=0x60 rip=0xffffffffa38dbcf5
+[0000117747] fw-1 ps2| OUT 0x60 <-=0x76 rip=0xffffffffa38dbd56
+[0000117797] fw-1 ps2| OUT 0x64 <-=0xd3 rip=0xffffffffa38dbcf5
+[0000117847] fw-1 ps2| OUT 0x60 <-=0x5a rip=0xffffffffa38dbd56
+[0000117897] fw-1 ps2| OUT 0x64 <-=0xa9 rip=0xffffffffa38dbcf5
+[0000117947] fw-1 ps2| IN  0x60 ->=0xfa rip=0xffffffffa38dbde8
+[0000117997] fw-1 ps2| OUT 0x64 <-=0xa7 rip=0xffffffffa38dbcf5
+[0000118047] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000118097] fw-1 ps2| IN  0x60 ->=0x0 rip=0xffffffffa38dbde8
+[0000118146] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000118196] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000118246] fw-1 ps2| OUT 0x64 <-=0xa8 rip=0xffffffffa38dbcf5
+[0000118296] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000118346] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000118396] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000118446] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000118496] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000118546] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000118596] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000118646] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000118696] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000118746] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000118796] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000118846] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000118896] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000118946] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000118996] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000119046] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000119096] fw-1 FBSPEED: t=9371ms fb=28us ram=14us scat=96us cli=29us | chunk min=0us max=0us slow=0/64 | ticks=0 smi=+0 [#368]
+[0000119213] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000119263] fw-1 FBCLOCK: delivered/nominal = 1375/1000 (aperf=137951 mperf=100300) | cr0=0x80010011 therm=0x0 [#368 #370]
+[0000119374] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000119424] fw-1 FBINFLIGHT: during the masked loop: usb_waiters_max=0 usb_held=0/64 | usb_sectors=+0 usb_calls=+0 [#368]
+[0000119534] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000119584] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000119634] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000119684] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000119734] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000119784] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000119834] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000119884] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000119934] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000119984] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000120034] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000120084] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000120134] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000120184] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000120234] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000120284] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000120334] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000120384] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000120434] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000120484] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000120534] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000120584] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000120634] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000120684] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000120734] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000120784] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000120834] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000120884] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000120934] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000120984] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000121034] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000121084] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000121134] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000121184] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000121234] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000121284] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000121334] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000121384] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000121434] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000121484] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000121534] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000121584] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000121634] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000121684] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000121734] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000121784] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000121834] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000121884] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000121934] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000121984] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000122034] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000122084] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000122134] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000122184] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000122234] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000122284] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000122334] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000122384] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000122434] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000122484] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000122534] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000122584] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000122634] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000122684] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000122734] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000122784] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000122834] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000122884] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000122934] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000122984] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000123034] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000123084] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000123134] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000123184] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000123234] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000123284] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000123334] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000123384] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000123434] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000123484] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000123534] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000123584] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000123634] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000123684] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000123734] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000123784] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000123834] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000123884] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000123934] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000123984] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000124034] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000124084] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000124134] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000124184] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000124234] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000124284] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000124334] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000124384] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000124434] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000124484] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000124534] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000124584] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000124634] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000124684] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000124734] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000124784] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000124834] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000124884] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000124934] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000124984] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000125034] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000125084] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000125134] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000125184] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000125234] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000125284] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000125334] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000125384] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000125434] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000125484] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000125534] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000125584] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000125634] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000125684] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000125734] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000125784] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000125834] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000125884] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000125934] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000125984] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000126034] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000126084] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000126134] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000126184] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000126234] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000126284] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000126334] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000126384] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000126434] fw-1 ps2| OUT 0x64 <-=0x20 rip=0xffffffffa38dbcf5
+[0000126484] fw-1 ps2| IN  0x60 ->=0x76 rip=0xffffffffa38dbde8
+[0000126534] fw-1 RTEWR gsi=1 hi=0x2000000 rip=0xffffffffa308ebc4
+[0000126587] fw-1 RTEWR gsi=1 lo=0x20 rip=0xffffffffa308ebdf
+[0000126635] fw-1 #512 POST: vec=0x20 dest=0x2 logical=0 -> vcpu2
+[0000126688] fw-1 #512 POST: vec=0x20 dest=0x2 logical=0 -> vcpu2
+[0000126741] fw-1 #512 POST: vec=0x20 dest=0x2 logical=0 -> vcpu2
+[0000126794] fw-1 #512 POST: vec=0x20 dest=0x2 logical=0 -> vcpu2
+[0000126847] fw-1 #512 POST: vec=0x20 dest=0x2 logical=0 -> vcpu2
+[0000126900] fw-1 #512 POST: vec=0x20 dest=0x2 logical=0 -> vcpu2
+[0000126953] fw-1 #512 POST: vec=0x20 dest=0x2 logical=0 -> vcpu2
+[0000127006] fw-1 #512 POST: vec=0x20 dest=0x2 logical=0 -> vcpu2
+[0000127059] fw-1 RTEWR gsi=8 hi=0x3000000 rip=0xffffffffa308ebc4
+[0000127112] fw-1 RTEWR gsi=8 lo=0x20 rip=0xffffffffa308ebdf
+[0000127160] fw-1 #512 POST: vec=0x20 dest=0x2 logical=0 -> vcpu2
+[0000127213] fw-1 #512 POST: vec=0x20 dest=0x2 logical=0 -> vcpu2
+[0000127266] fw-1 #512 POST: vec=0x20 dest=0x2 logical=0 -> vcpu2
+[0000127319] fw-1 #512 POST: vec=0x20 dest=0x2 logical=0 -> vcpu2
+[0000127372] fw-1 #512 POST: vec=0x20 dest=0x2 logical=0 -> vcpu2
+[0000127425] fw-1 #512 POST: vec=0x20 dest=0x2 logical=0 -> vcpu2
+[0000127478] fw-1 BSPCOST idle 0% total=51ms hits=2538889 mean=0us [#773]
+[0000127539] fw-1 #512 POST: vec=0x20 dest=0x2 logical=0 -> vcpu2
+[0000127592] fw-1 BSPCOST render 1% total=140ms hits=5077738 mean=0us [#773]
+[0000127656] fw-1 #512 POST: vec=0x20 dest=0x2 logical=0 -> vcpu2
+[0000127709] fw-1 BSPCOST input 78% total=8047ms hits=2538869 mean=3us [#773]
+[0000127774] fw-1 #512 POST: vec=0x20 dest=0x2 logical=0 -> vcpu2
+[0000127827] fw-1 BSPCOST kbddiag 7% total=731ms hits=2538868 mean=0us [#773]
+[0000127892] fw-1 BSPCOST flush 3% total=331ms hits=2538889 mean=0us [#773]
+[0000127955] fw-1 BSPCOST fbprobe 0% total=52ms hits=2538869 mean=0us [#773]
+[0000128019] fw-1 BSPCOST fbcli 0% total=0ms hits=9 mean=29us [#773]
+[0000128075] fw-1 BSPCOST fbreport 3% total=395ms hits=9 mean=43946us [#773]
+[0000128139] fw-1 BSPCOST inval 0% total=0ms hits=1 mean=0us [#773]
+[0000128194] fw-1 BSPCOST band 3% total=372ms hits=6398 mean=58us [#773]
+[0000128254] fw-1 BSPCOST gopflush 0% total=1ms hits=236 mean=7us [#773]
+[0000128314] fw-1 BSPCOST dash 0% total=63ms hits=6398 mean=9us [#773]
+[0000128372] fw-1 BSPCOST loop iterations=2538869 hz=3400763300 gate=hz/125=27206106 cycles -- the input tick fires when this many cycles have passed [#773]
+[0000128516] fw-1 BSPCOST input tick fired 863 times in 10s = 86 Hz (want 125) [#773]
+[0000128589] fw-1 BLIT: calls=515 bytes=1014754560 total=116ms MB_per_s=8720 us_each=225 [#368]
+[0000128672] fw-1 ISOCACHE vm0: hits=41 misses=568 hit_pct=6 [#365]
+[0000128727] fw-1 USBWAIT: lock wait total=3ms max=168us (device time is measured AFTER the lock) [#365]
+[0000128819] fw-1 USBFLUSH: slices=21 drained=144364B(all sinks) total=96ms max=8635us | produced=128819B behind=10673B peak=30774B | bursts=3 caught=3 stalled=0 [#374 #522]
+[0000128980] fw-1 USBRD: media=2327 calls/77730 sec | fatvol=59 calls/61 sec [#365]
+[0000129051] fw-1 FBPROBE: entries=2538869 ran=9 skip_null=0 skip_rate=2538860 [#368]
+[0000129124] fw-1 KBDIRQ: isr_entries=0 (+0 since last) eois=0 last_apic=0 | polled=34 chords=0 ps2polled=1 | bsp_usb_timeouts=0 bsp_ahci_timeouts=0 bsp_nvme_timeouts=0 nvme_lock_contended=0 [#363 #658 #660]
+[0000129319] fw-1 APLOOP vm0: section=78 iter=321805 reason=0x78 grip=0xffffffffa3c81c2e HOSTRIP=0x14002a997 [#436]
+[0000129422] fw-1 GUESTKBD vm0: routed=0 handed=0 route_drop=0 pending=0 | device=0 read=0 device_drop=0 irq1=0 [#375]
+[0000129528] fw-1 PICMASK vm0: master imr=0xff after 197 write(s): ff ff ff fe ff fe ff fe [#436]
+[0000129613] fw-1 KBDTRACE vm0: last 48 of 261: rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 rd76 cmd60 wr67 wrf2 rdfa rdab rd83 wrf5 rdfa wred rdfa wr00 rdfa wrf3 rdfa wr00 rdfa wrf4 rdfa [#436]
+[0000129910] fw-1 PS2STATE vm0: kbd_fifo=0 kbd_port=1 mouse_pending=0 | atapi last_cdb=0x28 cmds=410 [#92]
+[0000130004] fw-1 ATAPIOPS vm0: 12=2/f0 00=136/f0 03=136/f0 25=1/f0 28=135/f0 [#92]
+[0000130075] fw-1 #92 PCI-AHCI: cmd=0x0017 status=0x0010 bar5=80004000 cap=0x50 msi_ctl=0x0000 msi_data=0x0000
+[0000130173] fw-1 #440 ICH9-PORT: npf=0 ghc=0x0 p_cmd=0x40000 p_is=0x0 p_ie=0x0 p_ci=0x0 p_tfd=0x50 p_ssts=0x123 p_serr=0x0 p_sig=0x101 p_clb=0x0
+[0000130306] fw-1 #440 ATAWR: total=0 last(off=val): [#440]
+[0000130353] fw-1 #440 CFGRING: total=2518 last(dd.f reg rw): 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r [#440]
+[0000130569] fw-1 KBDPOLL: p64 253ms ago val=0x05 rip=0xffffffffa38db490 | p60 253ms ago val=0xfa [#436]
+[0000130661] fw-1 FLASH: vars_writes=10880 vars_reads=2 trap_flips=10975 code_writes_ignored=2 trap_now=0 [#457 #556]
+[0000130766] fw-1 BSPPROBE vm0: exits=321870 last=0x78@0xffffffffa3c81c2e IN-HOST for 4ms section=78 [#483]
+[0000130861] fw-1 SPIN cpuid(rip=0x7f46f07a198a): 0x0=73721 0x80000000=891 0x1=3227 0x80000001=349 0x80000008=170 0x7=176 0xb=224 0x80000020=1 [#92]
+[0000130997] fw-1 SPIN msr(rip=0xffffffffa30a8789): 0xc0000080=424 0x1b=2528 0x2ff=208 0xfe=458 0x49=3 0x201=170 0x202=170 0x203=170 [#92]
+[0000131123] fw-1 FBSPEED: t=10527ms fb=28us ram=14us scat=92us cli=29us | chunk min=0us max=0us slow=0/64 | ticks=0 smi=+0 [#368]
+[0000131241] fw-1 FBCLOCK: delivered/nominal = 1360/1000 (aperf=138013 mperf=101456) | cr0=0x80010011 therm=0x0 [#368 #370]
+[0000131352] fw-1 FBINFLIGHT: during the masked loop: usb_waiters_max=0 usb_held=0/64 | usb_sectors=+0 usb_calls=+0 [#368]
+[0000131462] fw-1 TIMER-STARVE vm0: IRQ0 undelivered >2s | IF=1 shadow=0x1 can_accept=0 pending=1/vec0xfb eventinj=0x0 | mIRR=0x1 mISR=0x1 mIMR=0xff sIRR=0x0 sISR=0x0 sIMR=0xff | ahci p_is=0x3 p_ie=0x0 p_ci=0x0 | defer=392 overwrite=0 | pit_irqs=92 ahci_irqs=1
+[0000131710] host-hid: guest set typematic 0x00 -> delay 250ms rate period 33ms, applied to 2 keyboard(s) [#774]
+[0000131810] fw-1 IDLEPROBE: rip=0xffffffffa3c81c2e IF=1 shadow=0x1 eventinj=0x0 vintr=0x1000000 can_accept=0 irr_hi=0/vec0x0 insn=f4 e9 d7 24
+[0000131940] fw-1 IDLECODE: polled-counter VA = 0x0
+[0000131979] fw-1 IDLECODE 0xffffffffa3c81c0e: 00 00 90 90 90 90 90 90 90 90 90 90 90 90 90 90
+[0000132061] fw-1 IDLECODE 0xffffffffa3c81c1e: 90 90 f3 0f 1e fa 66 90 0f 00 2d 15 c1 38 00 fb
+[0000132143] fw-1 IDLECODE 0xffffffffa3c81c2e: f4 e9 d7 24 28 00 66 66 2e 0f 1f 84 00 00 00 00
+[0000132225] fw-1 IDLECODE 0xffffffffa3c81c3e: 00 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90
+[0000132307] fw-1 IDLEPROBE2: LAPIC lvt=0xec tmr_pend=0 tmr_insvc=0 | ioRTE[16]=0x10000 ioRTE[8]=0x300000000000020 ioRTE[4]=0x10000 ioRTE[3]=0x10000 ioRTE[1]=0x200000000000020
+[0000132470] fw-1 IDLEPROBE3: mIRR=0x1 mISR=0x1 mIMR=0xff sIRR=0x0 sISR=0x0 sIMR=0xff | AHCI p_is=0x3 p_ie=0x0 p_ci=0x0 irq_pending=0
+[0000132591] fw-1 TR#00: rip=0xffffffffa3817a35 reason=0x6e qual=0x0
+[0000132647] fw-1 TR#01: rip=0xffffffffa3c81c2f reason=0x64 qual=0x0
+[0000132703] fw-1 TR#02: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000132759] fw-1 TR#03: rip=0xffffffffa3817a35 reason=0x6e qual=0x0
+[0000132815] fw-1 TR#04: rip=0xffffffffa3c81c2f reason=0x64 qual=0x0
+[0000132871] fw-1 TR#05: rip=0xffffffffa3c81c2f reason=0x64 qual=0x0
+[0000132927] fw-1 TR#06: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000132983] fw-1 TR#07: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000133039] fw-1 TR#08: rip=0xffffffffa3c81c2f reason=0x64 qual=0x0
+[0000133095] fw-1 TR#09: rip=0xffffffffa3c81c2f reason=0x64 qual=0x0
+[0000133151] fw-1 TR#10: rip=0xffffffffa3c81c2f reason=0x64 qual=0x0
+[0000133207] fw-1 TR#11: rip=0xffffffffa3c81c2f reason=0x64 qual=0x0
+[0000133263] fw-1 TR#12: rip=0xffffffffa3c81c2f reason=0x64 qual=0x0
+[0000133319] fw-1 TR#13: rip=0xffffffffa3c81c2f reason=0x64 qual=0x0
+[0000133375] fw-1 TR#14: rip=0xffffffffa3c81c2f reason=0x64 qual=0x0
+[0000133431] fw-1 TR#15: rip=0xffffffffa3c81c2f reason=0x64 qual=0x0
+[0000133487] fw-1 TR#16: rip=0xffffffffa3c81c2f reason=0x64 qual=0x0
+[0000133543] fw-1 TR#17: rip=0xffffffffa3c81c2f reason=0x64 qual=0x0
+[0000133599] fw-1 TR#18: rip=0xffffffffa3c81c2f reason=0x64 qual=0x0
+[0000133655] fw-1 TR#19: rip=0xffffffffa3c81c2f reason=0x64 qual=0x0
+[0000133711] fw-1 TR#20: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000133767] fw-1 TR#21: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000133823] fw-1 TR#22: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000133879] fw-1 TR#23: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000133935] fw-1 TR#24: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000133991] fw-1 TR#25: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000134047] fw-1 TR#26: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000134103] fw-1 TR#27: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000134159] fw-1 TR#28: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000134215] fw-1 TR#29: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000134271] fw-1 TR#30: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000134327] fw-1 TR#31: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000134383] fw-1 TR#32: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000134439] fw-1 TR#33: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000134495] fw-1 TR#34: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000134551] fw-1 TR#35: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000134607] fw-1 TR#36: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000134663] fw-1 TR#37: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000134719] fw-1 TR#38: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000134775] fw-1 TR#39: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000134831] fw-1 TR#40: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000134887] fw-1 TR#41: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000134943] fw-1 TR#42: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000134999] fw-1 TR#43: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000135055] fw-1 TR#44: rip=0xffffffffa3c92fa2 reason=0x64 qual=0x0
+[0000135111] fw-1 TR#45: rip=0xffffffffa3817a35 reason=0x6e qual=0x0
+[0000135167] fw-1 TR#46: rip=0xffffffffa3c81c2f reason=0x64 qual=0x0
+[0000135223] fw-1 TR#47: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000135279] fw-1 TR#48: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000135335] fw-1 TR#49: rip=0xffffffffa3817a35 reason=0x6e qual=0x0
+[0000135391] fw-1 TR#50: rip=0xffffffffa3c81c2f reason=0x64 qual=0x0
+[0000135447] fw-1 TR#51: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000135503] fw-1 TR#52: rip=0xffffffffa3c81c2f reason=0x64 qual=0x0
+[0000135559] fw-1 TR#53: rip=0xffffffffa3817a35 reason=0x6e qual=0x0
+[0000135615] fw-1 TR#54: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000135671] fw-1 TR#55: rip=0xffffffffa31bbba9 reason=0x64 qual=0x0
+[0000135727] fw-1 TR#56: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000135783] fw-1 TR#57: rip=0xffffffffa3c81c2f reason=0x64 qual=0x0
+[0000135839] fw-1 TR#58: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000135895] fw-1 TR#59: rip=0xffffffffa31bbba9 reason=0x64 qual=0x0
+[0000135951] fw-1 TR#60: rip=0xffffffffa3c81c2f reason=0x64 qual=0x0
+[0000136007] fw-1 TR#61: rip=0xffffffffa3c81c2f reason=0x64 qual=0x0
+[0000136063] fw-1 TR#62: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000136119] fw-1 TR#63: rip=0xffffffffa30cd69b reason=0x64 qual=0x0
+[0000136175] fw-1 TASKWALK: slide=0x22000000 init_task=0xffffffffa4c10940 comm="swapper/0" (expect swapper)
+[0000136270] fw-1 TASK pid=1 state=0x1 [S] comm="init"
+[0000136312] fw-1 TASK pid=2 state=0x1 [S] comm="kthreadd"
+[0000136358] fw-1 TASK pid=3 state=0x1 [S] comm="pool_workqueue_"
+[0000136411] fw-1 TASK pid=4 state=0x402 [D] comm="kworker/R-kvfre"
+[0000136466] fw-1 TASK pid=5 state=0x402 [D] comm="kworker/R-rcu_g"
+[0000136521] fw-1 TASK pid=6 state=0x402 [D] comm="kworker/R-sync_"
+[0000136576] fw-1 TASK pid=7 state=0x402 [D] comm="kworker/R-slub_"
+[0000136631] fw-1 TASK pid=8 state=0x402 [D] comm="kworker/R-netns"
+[0000136686] fw-1 TASK pid=9 state=0x402 [D] comm="kworker/0:0"
+[0000136737] fw-1 TASK pid=10 state=0x402 [D] comm="kworker/0:1"
+[0000136789] fw-1 TASK pid=11 state=0x402 [D] comm="kworker/0:0H"
+[0000136842] fw-1 TASK pid=12 state=0x402 [D] comm="kworker/u16:0"
+[0000136896] fw-1 TASK pid=13 state=0x402 [D] comm="kworker/u16:1"
+[0000136950] fw-1 TASK pid=14 state=0x402 [D] comm="kworker/R-mm_pe"
+[0000137006] fw-1 TASK pid=15 state=0x402 [D] comm="rcu_tasks_kthre"
+[0000137062] fw-1 TASK pid=16 state=0x402 [D] comm="rcu_tasks_rude_"
+[0000137118] fw-1 TASK pid=17 state=0x402 [D] comm="rcu_tasks_trace"
+[0000137174] fw-1 TASK pid=18 state=0x1 [S] comm="ksoftirqd/0"
+[0000137224] fw-1 TASK pid=19 state=0x402 [D] comm="rcu_preempt"
+[0000137276] fw-1 TASK pid=20 state=0x1 [S] comm="rcu_exp_par_gp_"
+[0000137330] fw-1 TASK pid=21 state=0x1 [S] comm="rcu_exp_gp_kthr"
+[0000137384] fw-1 TASK pid=22 state=0x1 [S] comm="migration/0"
+[0000137434] fw-1 TASK pid=23 state=0x1 [S] comm="idle_inject/0"
+[0000137486] fw-1 TASK pid=24 state=0x1 [S] comm="cpuhp/0"
+[0000137532] fw-1 TASK pid=25 state=0x1 [S] comm="cpuhp/2"
+[0000137578] fw-1 TASK pid=26 state=0x1 [S] comm="idle_inject/2"
+[0000137630] fw-1 TASK pid=27 state=0x1 [S] comm="migration/2"
+[0000137680] fw-1 TASK pid=28 state=0x1 [S] comm="ksoftirqd/2"
+[0000137730] fw-1 TASK pid=29 state=0x402 [D] comm="kworker/2:0"
+[0000137782] fw-1 TASK pid=30 state=0x402 [D] comm="kworker/2:0H"
+[0000137835] fw-1 TASK pid=31 state=0x1 [S] comm="cpuhp/1"
+[0000137881] fw-1 TASK pid=32 state=0x1 [S] comm="idle_inject/1"
+[0000137933] fw-1 TASK pid=33 state=0x1 [S] comm="migration/1"
+[0000137983] fw-1 TASK pid=34 state=0x1 [S] comm="ksoftirqd/1"
+[0000138033] fw-1 TASK pid=35 state=0x402 [D] comm="kworker/1:0"
+[0000138085] fw-1 TASK pid=36 state=0x402 [D] comm="kworker/1:0H"
+[0000138138] fw-1 FBSPEED: t=11527ms fb=28us ram=14us scat=84us cli=29us | chunk min=0us max=0us slow=0/64 | ticks=0 smi=+0 [#368]
+[0000138256] fw-1 TASK pid=37 state=0x1 [S] comm="cpuhp/3"
+[0000138302] fw-1 FBCLOCK: delivered/nominal = 1360/1000 (aperf=137557 mperf=101116) | cr0=0x80010011 therm=0x0 [#368 #370]
+[0000138413] fw-1 TASK pid=38 state=0x1 [S] comm="idle_inject/3"
+[0000138465] fw-1 FBINFLIGHT: during the masked loop: usb_waiters_max=0 usb_held=0/64 | usb_sectors=+0 usb_calls=+0 [#368]
+[0000138575] fw-1 TASK pid=39 state=0x1 [S] comm="migration/3"
+[0000138625] fw-1 TASK pid=40 state=0x1 [S] comm="ksoftirqd/3"
+[0000138675] fw-1 TASK pid=41 state=0x402 [D] comm="kworker/3:0"
+[0000138727] fw-1 TASK pid=42 state=0x402 [D] comm="kworker/3:0H"
+[0000138780] fw-1 TASK pid=43 state=0x1 [S] comm="kdevtmpfs"
+[0000138828] fw-1 TASK pid=44 state=0x402 [D] comm="kworker/R-inet_"
+[0000138884] fw-1 TASK pid=45 state=0x2001 [S] comm="kauditd"
+[0000138933] fw-1 TASK pid=46 state=0x2001 [S] comm="oom_reaper"
+[0000138985] fw-1 TASK pid=47 state=0x402 [D] comm="kworker/u16:2"
+[0000139039] fw-1 TASK pid=48 state=0x402 [D] comm="kworker/R-write"
+[0000139095] fw-1 TASK pid=49 state=0x2001 [S] comm="kcompactd0"
+[0000139147] fw-1 TASK pid=50 state=0x2001 [S] comm="ksmd"
+[0000139193] fw-1 TASK pid=51 state=0x2001 [S] comm="khugepaged"
+[0000139245] fw-1 TASK pid=52 state=0x402 [D] comm="kworker/R-kinte"
+[0000139301] fw-1 TASK pid=53 state=0x402 [D] comm="kworker/R-kbloc"
+[0000139357] fw-1 TASK pid=54 state=0x402 [D] comm="kworker/R-blkcg"
+[0000139413] fw-1 TASK pid=55 state=0x1 [S] comm="irq/9-acpi"
+[0000139462] fw-1 TASK pid=56 state=0x402 [D] comm="kworker/1:1"
+[0000139514] fw-1 TASK pid=57 state=0x2 [D] comm="kworker/3:1"
+[0000139564] fw-1 TASK pid=58 state=0x0 [R] comm="kworker/2:1"
+[0000139614] fw-1 TASK pid=59 state=0x402 [D] comm="kworker/R-md"
+[0000139667] fw-1 TASK pid=60 state=0x402 [D] comm="kworker/R-md_bi"
+[0000139723] fw-1 TASK pid=61 state=0x402 [D] comm="kworker/R-edac-"
+[0000139779] fw-1 TASK pid=62 state=0x402 [D] comm="kworker/R-devfr"
+[0000139835] fw-1 TASK pid=63 state=0x1 [S] comm="watchdogd"
+[0000139883] fw-1 TASK pid=64 state=0x402 [D] comm="kworker/R-quota"
+[0000139939] fw-1 TASK pid=65 state=0x402 [D] comm="kworker/3:1H"
+[0000139992] fw-1 TASK pid=69 state=0x200 [?] comm="kworker/u16:3"
+[0000140046] fw-1 TASK pid=70 state=0x1 [S] comm="kswapd0"
+[0000140092] fw-1 TASK pid=87 state=0x402 [D] comm="kworker/R-kthro"
+[0000140148] fw-1 TASK pid=90 state=0x402 [D] comm="kworker/u16:4"
+[0000140202] fw-1 TASK pid=191 state=0x402 [D] comm="kworker/0:2"
+[0000140255] fw-1 TASK pid=198 state=0x402 [D] comm="kworker/1:2"
+[0000140308] fw-1 TASK pid=199 state=0x402 [D] comm="kworker/R-mld"
+[0000140363] fw-1 TASK pid=200 state=0x402 [D] comm="kworker/R-ipv6_"
+[0000140420] fw-1 TASK pid=201 state=0x402 [D] comm="kworker/1:1H"
+[0000140474] fw-1 TASK pid=218 state=0x402 [D] comm="kworker/R-kstrp"
+[0000140531] fw-1 TASK pid=476 state=0x402 [D] comm="kworker/u17:0"
+[0000140586] fw-1 TASK pid=477 state=0x402 [D] comm="kworker/0:1H"
+[0000140640] fw-1 TASK pid=493 state=0x0 [R] comm="modprobe"
+[0000140688] fw-1 TASK pid=513 state=0x402 [D] comm="kworker/3:2"
+[0000140741] fw-1 TASK pid=519 state=0x402 [D] comm="kworker/2:1H"
+[0000140795] fw-1 TASKWALK: done, 80 tasks
+[0000140825] fw-1 VECMAP: pcpu0=0xffff8a0bfd400000 vector_irq=0xffff8a0bfd41bfe0
+[0000140893] fw-1 VEC 0x30 irq=0 chip="IO-APIC" action="timer"
+[0000140943] fw-1 VEC 0x31 irq=4294967295 chip="" action=""
+[0000140990] fw-1 VEC 0x32 irq=2 chip="XT-PIC" action=""
+[0000141034] fw-1 VEC 0x33 irq=4294967295 chip="" action=""
+[0000141081] fw-1 VEC 0x34 irq=4294967295 chip="" action=""
+[0000141128] fw-1 VEC 0x35 irq=4294967295 chip="" action=""
+[0000141175] fw-1 VEC 0x36 irq=4294967295 chip="" action=""
+[0000141222] fw-1 VEC 0x37 irq=4294967295 chip="" action=""
+[0000141269] fw-1 VEC 0x38 irq=4294967295 chip="" action=""
+[0000141316] fw-1 VEC 0x39 irq=4294967295 chip="" action=""
+[0000141363] fw-1 VEC 0x3a irq=4294967295 chip="" action=""
+[0000141410] fw-1 VEC 0x3b irq=4294967295 chip="" action=""
+[0000141457] fw-1 VEC 0x3c irq=4294967295 chip="" action=""
+[0000141504] fw-1 VEC 0x3d irq=4294967295 chip="" action=""
+[0000141551] fw-1 VEC 0x3e irq=4294967295 chip="" action=""
+[0000141598] fw-1 VEC 0x3f irq=4294967295 chip="" action=""
+[0000141645] fw-1 VECMAP: done
+[0000141663] fw-1 LAPSTATE: feed+4677078601/5s pend=0 insvc=0 cur=12576296 init=13914158 lvt=0xec eoi=883 [#436]
+[0000141763] fw-1 LVTMASK: changes=0 last 0x0->0x0 [#436]
+[0000141808] fw-1 GUESTPC vm0: exits=322239 lastreason=0x78 lastrip=0xffffffffa3c81c2e | cs=0x10:0x0 rip=0xffffffffa3c81c2e rflags=0x246 cr0=0x80050033 cr3=0x2ac36000 cr4=0x750ef0 rsp=0xffffffffa4c03e88 activity=18446744072162384943 intrblk/entryinj=0x7f63db75979d exitintr=0x0 [#520]
+[0000142080] fw-1 #94 RTCRATE: delivered=0/5s programmed=1024Hz regA=0x26 regB=0x02
+[0000142151] fw-1 DRAIN: iters=322239 kbd_pending=0 q_pending=0 [#436]
+[0000142209] usb-log: BEHIND -- logbuf has 142209 bytes, file has 121434 (#338)
+[0000142276] fw-1 PREEMPT-RIP: host tick preempted guest at rip=0xffffffffa31c7652 cr3=0x4518000 | rcx=0x1 rdx=0x1 rbx=0x246 rsi=0xffff8a0bfd4b6380 rdi=0x0 rbp=0xffff8a0bfd432d80 r8=0x0 r9=0x0 | insn=8b 4e 08 83 e1 01 75 f6 83 c0 01 eb c1 48 83 c4 [#436]
+[0000142518] fw-1 #436 KMOD: no MZ within 32MB below rip=0xffffffffa31c7652 (cr3=0x4518000)
+[0000142597] fw-1 #436 STACK: rsp=0xffffcf138039f908 +00=0 +08=ffff8a0bfd432d88 +10=400000042 +18=ffffffffa30a81e0 +20=32d40 +28=3010147df +30=ffff8a0bfd432da8 +38=3 +40=0 +48=ffffcf138039f998 +50=0 +58=ffffcf138039fa28
+[0000142804] fw-1 #436 MODULE: rip=0xffffffffa31c7652 base=0x0 off=0x0 (scanned 4096 pages back)
+[0000142888] fw-1 #436 TSCCHK: hype_tsc=0x1fc4409128 guest_r8(start)=0x0 guest_r9(target)=0x0 | hype_tsc >= (should have exited) target [#436]
+[0000143018] fw-1 #436 PRECODE @0xffffffffa31c7632: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+[0000143153] fw-1 #436 NODE0 @0x0: 0000000000000000 0000000000000000 0000000000000000 0000000000000000
+[0000143243] fw-1 #436 NODE1 @0x1: 0000000000000000 0000000000000000 0000000000000000 0000000000000000
+[0000143333] fw-1 #436 CHAIN rcx=0x1 (+0x18 walk):
+[0000143371]   hop 0: 0x1 out of guest RAM -- not a list node
+[0000143420] fw-1 #436 CHAIN rdx=0x1 (+0x18 walk):
+[0000143458]   hop 0: 0x1 out of guest RAM -- not a list node
+[0000143507] fw-1 #436 CHAIN rsi=0xffff8a0bfd4b6380 (+0x18 walk):
+[0000143560]   hop 0: 0xffff8a0bfd4b6380 out of guest RAM -- not a list node
+[0000143624] fw-1 #436 CHAIN rdi=0x0 (+0x18 walk):
+[0000143662]   hop 0: 0x0 out of guest RAM -- not a list node
+[0000143711] fw-1 FBSPEED: t=12527ms fb=28us ram=14us scat=80us cli=29us | chunk min=0us max=0us slow=0/64 | ticks=0 smi=+0 [#368]
+[0000143829] fw-1 FBCLOCK: delivered/nominal = 1360/1000 (aperf=137644 mperf=101184) | cr0=0x80010011 therm=0x0 [#368 #370]
+[0000143940] fw-1 FBINFLIGHT: during the masked loop: usb_waiters_max=0 usb_held=0/64 | usb_sectors=+0 usb_calls=+0 [#368]
+[0000144050] fw-1 FBSPEED: t=13527ms fb=28us ram=16us scat=72us cli=29us | chunk min=0us max=0us slow=0/64 | ticks=0 smi=+0 [#368]
+[0000144168] fw-1 FBCLOCK: delivered/nominal = 1360/1000 (aperf=137632 mperf=101184) | cr0=0x80010011 therm=0x0 [#368 #370]
+[0000144279] fw-1 FBINFLIGHT: during the masked loop: usb_waiters_max=0 usb_held=0/64 | usb_sectors=+0 usb_calls=+0 [#368]
+[0000144389] fw-1 RTEWR gsi=20 hi=0x1000000 rip=0xffffffffa308ebc4
+[0000144443] fw-1 RTEWR gsi=20 lo=0x1a021 rip=0xffffffffa308ebdf
+[0000144495] fw-1 #512 POST: vec=0x21 dest=0x1 logical=0 -> vcpu1
+[0000144548] fw-1 #512 POST: vec=0x21 dest=0x1 logical=0 -> vcpu1
+[0000144601] fw-1 #512 POST: vec=0x21 dest=0x1 logical=0 -> vcpu1
+[0000144654] fw-1 #512 POST: vec=0x21 dest=0x1 logical=0 -> vcpu1
+[0000144707] fw-1 #512 POST: vec=0x21 dest=0x1 logical=0 -> vcpu1
+[0000144760] fw-1 #512 POST: vec=0x21 dest=0x1 logical=0 -> vcpu1
+[0000144813] fw-1 #512 POST: vec=0x21 dest=0x1 logical=0 -> vcpu1
+[0000144866] fw-1 #512 POST: vec=0x21 dest=0x1 logical=0 -> vcpu1
+[0000144919] fw-1 #512 POST: vec=0x21 dest=0x1 logical=0 -> vcpu1
+[0000144972] fw-1 #512 POST: vec=0x21 dest=0x1 logical=0 -> vcpu1
+[0000145025] fw-1 #512 POST: vec=0x21 dest=0x1 logical=0 -> vcpu1
+[0000145078] fw-1 #512 POST: vec=0x21 dest=0x1 logical=0 -> vcpu1
+[0000145131] fw-1 #512 POST: vec=0x21 dest=0x1 logical=0 -> vcpu1
+[0000145184] fw-1 #512 POST: vec=0x21 dest=0x1 logical=0 -> vcpu1
+[0000145237] fw-1 #512 POST: vec=0x21 dest=0x1 logical=0 -> vcpu1
+[0000145290] dirsec lba=56 off=114688: fa ea 6c 7c 00 00 90 90 10 00 00 00 38 00 00 00
+[0000145364] dirsec lba=56 off=118784: 3c 10 72 2c 89 c1 83 e0 08 c1 e0 0d 83 e1 07 74
+[0000145438] dirsec lba=56 off=122880: 43 24 04 f7 d0 46 01 14 85 21 92 2b 8a 00 9b 5e
+[0000145512] dirsec lba=56 off=131072: 84 05 75 ec 4a 02 ae f9 03 01 14 f9 98 5f 06 e9
+[0000145586] dirsec lba=56 off=135168: 6c 60 4e 45 b1 b9 22 7f 79 ba 1e 9c 40 04 7c 7e
+[0000145660] dirsec lba=56 off=139264: 55 8f 3f 11 cc 46 21 51 55 8b 90 0e 21 6f 8c 48
+[0000145734] dirsec lba=56 off=143360: 48 8f c5 11 68 75 14 c6 2b 0a 01 cc e7 8d 10 06
+[0000145808] dirsec lba=56 off=147456: 41 6e 28 b8 03 fe 1c 77 61 68 2e 23 57 2d 63 65
+[0000145882] dirsec lba=56 off=151552: 23 34 d3 02 50 58 45 52 65 22 88 d5 27 a4 d2 29
+[0000145956] dirsec lba=56 off=155648: 1b 1f bd 00 4d dd 00 5c dd 00 8d dd 00 ab dd 00
+[0000146030] dirsec lba=56 off=159744: 01 24 40 03 44 40 05 64 40 07 84 40 09 a4 40 0b
+[0000146104] dirsec lba=56 off=163840: c2 2a ad e2 2a af 02 2b b1 22 2b b3 42 2b b5 62
+[0000146178] dirsec lba=56 off=167936: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+[0000146252] dirsec lba=56 off=172032: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+[0000146326] dirsec lba=56 off=176128: 2e 72 65 6c 6f 63 00 00 00 10 00 00 00 00 0b 00
+[0000146400] dirsec lba=56 off=184320: 49 be 6e a7 00 00 00 00 00 00 4c 89 fe ff d0 85
+[0000146474] dirsec lba=56 off=188416: d3 e8 48 89 d9 48 89 c6 49 8b 45 08 ff 50 28 85
+[0000146548] dirsec lba=56 off=192512: b8 59 3d 00 00 00 00 00 00 ff d0 bf 10 00 00 00
+[0000146622] dirsec lba=56 off=196608: 0f b7 c7 48 ba c9 da 00 00 00 00 00 00 48 bf d2
+[0000146696] dirsec lba=56 off=200704: be 10 00 00 00 31 c0 41 ff d5 4c 89 e1 48 89 da
+[0000146770] dirsec lba=56 off=204800: 49 8b 45 00 48 89 43 30 49 89 5d 00 48 8b 5b 20
+[0000146844] dirsec lba=56 off=208896: 00 00 00 00 00 00 4c 89 ef 31 c0 41 ff d4 31 db
+[0000146918] dirsec lba=56 off=212992: 48 be 91 e4 00 00 00 00 00 00 e9 b7 00 00 00 48
+[0000146992] dirsec lba=56 off=217088: 02 00 00 00 48 b8 b6 a6 00 00 00 00 00 00 ff d0
+[0000147066] dirsec lba=56 off=221184: 44 39 33 7e 6a 4d 85 f6 75 1c 48 b8 7d ac 00 00
+[0000147140] dirsec lba=56 off=225280: 8b 60 08 4d 8b 69 08 4c 89 e1 49 8d 54 1d 00 44
+[0000147214] dirsec lba=56 off=229376: ce c2 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+[0000147288] dirsec lba=56 off=233472: 27 20 73 79 6d 62 6f 6c 00 61 74 74 65 6d 70 74
+[0000147362] dirsec lba=56 off=237568: 6d 65 6d 61 6c 69 67 6e 5f 64 6d 61 33 32 00 67
+[0000147436] dirsec lba=56 off=241664: 70 ef 00 00 00 00 00 00 a3 71 00 00 00 00 00 00
+[0000147510] fw-1 FBSPEED: t=14527ms fb=28us ram=14us scat=70us cli=29us | chunk min=0us max=0us slow=0/64 | ticks=0 smi=+0 [#368]
+[0000147628] fw-1 FBCLOCK: delivered/nominal = 1360/1000 (aperf=137659 mperf=101184) | cr0=0x80010011 therm=0x0 [#368 #370]
+[0000147739] fw-1 FBINFLIGHT: during the masked loop: usb_waiters_max=0 usb_held=0/64 | usb_sectors=+0 usb_calls=+0 [#368]
+[0000147849] fw-1 BLIT: calls=693 bytes=1014842368 total=116ms MB_per_s=8719 us_each=167 [#368]
+[0000147932] fw-1 ISOCACHE vm0: hits=94 misses=574 hit_pct=14 [#365]
+[0000147988] fw-1 USBWAIT: lock wait total=3ms max=168us (device time is measured AFTER the lock) [#365]
+[0000148080] fw-1 USBFLUSH: slices=29 drained=194458B(all sinks) total=131ms max=8635us | produced=148080B behind=4837B peak=30774B | bursts=4 caught=4 stalled=0 [#374 #522]
+[0000148241] fw-1 USBRD: media=2918 calls/83018 sec | fatvol=59 calls/61 sec [#365]
+[0000148312] fw-1 FBPROBE: entries=4891182 ran=14 skip_null=0 skip_rate=4891168 [#368]
+[0000148386] fw-1 KBDIRQ: isr_entries=0 (+0 since last) eois=0 last_apic=0 | polled=152 chords=0 ps2polled=1 | bsp_usb_timeouts=0 bsp_ahci_timeouts=0 bsp_nvme_timeouts=0 nvme_lock_contended=0 [#363 #658 #660]
+[0000148582] fw-1 APLOOP vm0: section=78 iter=327385 reason=0x78 grip=0xffffffffa3c81c2e HOSTRIP=0x14002a997 [#436]
+[0000148685] fw-1 GUESTKBD vm0: routed=0 handed=0 route_drop=0 pending=0 | device=0 read=0 device_drop=0 irq1=0 [#375]
+[0000148791] fw-1 PICMASK vm0: master imr=0xff after 197 write(s): ff ff ff fe ff fe ff fe [#436]
+[0000148876] fw-1 KBDTRACE vm0: last 48 of 261: rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 rd76 cmd60 wr67 wrf2 rdfa rdab rd83 wrf5 rdfa wred rdfa wr00 rdfa wrf3 rdfa wr00 rdfa wrf4 rdfa [#436]
+[0000149173] fw-1 PS2STATE vm0: kbd_fifo=0 kbd_port=1 mouse_pending=0 | atapi last_cdb=0x00 cmds=460 [#92]
+[0000149267] fw-1 ATAPIOPS vm0: 12=4/f0 00=147/f0 03=136/f0 25=3/f0 28=140/f0 5a=1/f0 43=12/f0 51=4/f0 52=4/f4 4a=4/f0 1e=3/f0 46=2/f0 [#92]
+[0000149395] fw-1 #92 PCI-AHCI: cmd=0x0417 status=0x0010 bar5=80004000 cap=0x50 msi_ctl=0x0001 msi_data=0x0020
+[0000149493] fw-1 #440 ICH9-PORT: npf=0 ghc=0x0 p_cmd=0x40000 p_is=0x0 p_ie=0x0 p_ci=0x0 p_tfd=0x50 p_ssts=0x123 p_serr=0x0 p_sig=0x101 p_clb=0x0
+[0000149626] fw-1 #440 ATAWR: total=0 last(off=val): [#440]
+[0000149673] fw-1 #440 CFGRING: total=2518 last(dd.f reg rw): 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r [#440]
+[0000149889] fw-1 KBDPOLL: p64 5258ms ago val=0x05 rip=0xffffffffa38db490 | p60 5258ms ago val=0xfa [#436]
+[0000149983] fw-1 FLASH: vars_writes=10880 vars_reads=2 trap_flips=10975 code_writes_ignored=2 trap_now=0 [#457 #556]
+[0000150088] fw-1 BSPPROBE vm0: exits=327410 last=0x78@0xffffffffa3c81c2e IN-HOST for 1ms section=78 [#483]
+[0000150183] fw-1 SPIN cpuid(rip=0x7fe54ad2b98a): 0x0=73727 0x80000000=893 0x1=3233 0x80000001=351 0x80000008=172 0x7=178 0xb=224 0x80000020=1 [#92]
+[0000150319] fw-1 SPIN msr(rip=0xffffffffa30a8789): 0xc0000080=424 0x1b=2528 0x2ff=208 0xfe=458 0x49=4 0x201=170 0x202=170 0x203=170 [#92]
+[0000150445] fw-1 FBSPEED: t=15537ms fb=28us ram=14us scat=72us cli=29us | chunk min=0us max=0us slow=0/64 | ticks=0 smi=+0 [#368]
+[0000150563] fw-1 FBCLOCK: delivered/nominal = 1360/1000 (aperf=138092 mperf=101524) | cr0=0x80010011 therm=0x0 [#368 #370]
+[0000150674] fw-1 FBINFLIGHT: during the masked loop: usb_waiters_max=0 usb_held=0/64 | usb_sectors=+0 usb_calls=+0 [#368]
+[0000150784] fw-1 FBSPEED: t=16537ms fb=28us ram=14us scat=49us cli=29us | chunk min=0us max=0us slow=0/64 | ticks=0 smi=+0 [#368]
+[0000150902] fw-1 FBCLOCK: delivered/nominal = 1367/1000 (aperf=137492 mperf=100538) | cr0=0x80010011 therm=0x0 [#368 #370]
+[0000151013] fw-1 FBINFLIGHT: during the masked loop: usb_waiters_max=0 usb_held=0/64 | usb_sectors=+0 usb_calls=+0 [#368]
+[0000151123] fw-1 LAPSTATE: feed+5898043216/5s pend=0 insvc=0 cur=834801 init=57084811 lvt=0xec eoi=1929 [#436]
+[0000151222] fw-1 LVTMASK: changes=0 last 0x0->0x0 [#436]
+[0000151267] fw-1 GUESTPC vm0: exits=327550 lastreason=0x78 lastrip=0xffffffffa3c81c2e | cs=0x10:0x0 rip=0xffffffffa3c81c2e rflags=0x246 cr0=0x80050033 cr3=0x2ac36000 cr4=0x750ef0 rsp=0xffffffffa4c03e88 activity=18446744072162384943 intrblk/entryinj=0x7eff038e7000 exitintr=0x0 [#520]
+[0000151539] fw-1 #94 RTCRATE: delivered=0/5s programmed=1024Hz regA=0x26 regB=0x02
+[0000151610] fw-1 DRAIN: iters=327550 kbd_pending=0 q_pending=0 [#436]
+[0000151668] fw-1 FBSPEED: t=17537ms fb=28us ram=14us scat=44us cli=29us | chunk min=0us max=0us slow=0/64 | ticks=0 smi=+0 [#368]
+[0000151786] fw-1 FBCLOCK: delivered/nominal = 1367/1000 (aperf=137482 mperf=100538) | cr0=0x80010011 therm=0x0 [#368 #370]
+[0000151897] fw-1 FBINFLIGHT: during the masked loop: usb_waiters_max=0 usb_held=0/64 | usb_sectors=+0 usb_calls=+0 [#368]
+[0000152007] fw-1 FBSPEED: t=18537ms fb=28us ram=14us scat=43us cli=29us | chunk min=0us max=0us slow=0/64 | ticks=0 smi=+0 [#368]
+[0000152125] fw-1 FBCLOCK: delivered/nominal = 1367/1000 (aperf=137620 mperf=100606) | cr0=0x80010011 therm=0x0 [#368 #370]
+[0000152236] fw-1 FBINFLIGHT: during the masked loop: usb_waiters_max=0 usb_held=0/64 | usb_sectors=+0 usb_calls=+0 [#368]
+[0000152346] fw-1 FBSPEED: t=19537ms fb=28us ram=14us scat=39us cli=29us | chunk min=0us max=0us slow=0/64 | ticks=0 smi=+0 [#368]
+[0000152464] fw-1 FBCLOCK: delivered/nominal = 1367/1000 (aperf=137553 mperf=100572) | cr0=0x80010011 therm=0x0 [#368 #370]
+[0000152575] fw-1 FBINFLIGHT: during the masked loop: usb_waiters_max=0 usb_held=0/64 | usb_sectors=+0 usb_calls=+0 [#368]
+[0000152685] fw-1 BSPCOST idle 0% total=141ms hits=7524044 mean=0us [#773]
+[0000152747] fw-1 BSPCOST render 2% total=411ms hits=15048024 mean=0us [#773]
+[0000152812] fw-1 BSPCOST input 78% total=15870ms hits=7524012 mean=2us [#773]
+[0000152878] fw-1 BSPCOST kbddiag 7% total=1428ms hits=7524011 mean=0us [#773]
+[0000152944] fw-1 BSPCOST flush 2% total=455ms hits=7524044 mean=0us [#773]
+[0000153007] fw-1 BSPCOST fbprobe 0% total=136ms hits=7524012 mean=0us [#773]
+[0000153072] fw-1 BSPCOST fbcli 0% total=0ms hits=19 mean=29us [#773]
+[0000153129] fw-1 BSPCOST fbreport 3% total=703ms hits=19 mean=37025us [#773]
+[0000153194] fw-1 BSPCOST inval 0% total=0ms hits=1 mean=0us [#773]
+[0000153249] fw-1 BSPCOST band 4% total=883ms hits=15391 mean=57us [#773]
+[0000153310] fw-1 BSPCOST gopflush 0% total=1ms hits=431 mean=4us [#773]
+[0000153370] fw-1 BSPCOST dash 0% total=155ms hits=15391 mean=10us [#773]
+[0000153431] fw-1 BSPCOST loop iterations=7524012 hz=3400763300 gate=hz/125=27206106 cycles -- the input tick fires when this many cycles have passed [#773]
+[0000153575] fw-1 BSPCOST input tick fired 1134 times in 9s = 126 Hz (want 125) [#773]
+[0000153649] fw-1 BLIT: calls=710 bytes=1014852096 total=116ms MB_per_s=8719 us_each=163 [#368]
+[0000153732] fw-1 ISOCACHE vm0: hits=94 misses=574 hit_pct=14 [#365]
+[0000153788] fw-1 USBWAIT: lock wait total=3ms max=168us (device time is measured AFTER the lock) [#365]
+[0000153880] fw-1 USBFLUSH: slices=33 drained=212664B(all sinks) total=146ms max=8635us | produced=153880B behind=1534B peak=30774B | bursts=6 caught=6 stalled=0 [#374 #522]
+[0000154041] fw-1 USBRD: media=3179 calls/85106 sec | fatvol=59 calls/61 sec [#365]
+[0000154112] fw-1 FBPROBE: entries=7534358 ran=19 skip_null=0 skip_rate=7534339 [#368]
+[0000154186] fw-1 KBDIRQ: isr_entries=0 (+0 since last) eois=0 last_apic=0 | polled=269 chords=0 ps2polled=1 | bsp_usb_timeouts=0 bsp_ahci_timeouts=0 bsp_nvme_timeouts=0 nvme_lock_contended=0 [#363 #658 #660]
+[0000154382] fw-1 APLOOP vm0: section=78 iter=327948 reason=0x78 grip=0xffffffffa3c81c2e HOSTRIP=0x14002a995 [#436]
+[0000154485] fw-1 GUESTKBD vm0: routed=0 handed=0 route_drop=0 pending=0 | device=0 read=0 device_drop=0 irq1=0 [#375]
+[0000154591] fw-1 PICMASK vm0: master imr=0xff after 197 write(s): ff ff ff fe ff fe ff fe [#436]
+[0000154676] fw-1 KBDTRACE vm0: last 48 of 261: rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 cmd20 rd76 rd76 cmd60 wr67 wrf2 rdfa rdab rd83 wrf5 rdfa wred rdfa wr00 rdfa wrf3 rdfa wr00 rdfa wrf4 rdfa [#436]
+[0000154973] fw-1 PS2STATE vm0: kbd_fifo=0 kbd_port=1 mouse_pending=0 | atapi last_cdb=0x00 cmds=460 [#92]
+[0000155067] fw-1 ATAPIOPS vm0: 12=4/f0 00=147/f0 03=136/f0 25=3/f0 28=140/f0 5a=1/f0 43=12/f0 51=4/f0 52=4/f4 4a=4/f0 1e=3/f0 46=2/f0 [#92]
+[0000155195] fw-1 #92 PCI-AHCI: cmd=0x0417 status=0x0010 bar5=80004000 cap=0x50 msi_ctl=0x0001 msi_data=0x0020
+[0000155293] fw-1 #440 ICH9-PORT: npf=0 ghc=0x0 p_cmd=0x40000 p_is=0x0 p_ie=0x0 p_ci=0x0 p_tfd=0x50 p_ssts=0x123 p_serr=0x0 p_sig=0x101 p_clb=0x0
+[0000155426] fw-1 #440 ATAWR: total=0 last(off=val): [#440]
+[0000155473] fw-1 #440 CFGRING: total=2518 last(dd.f reg rw): 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r 00.0:100r [#440]
+[0000155689] fw-1 KBDPOLL: p64 10258ms ago val=0x05 rip=0xffffffffa38db490 | p60 10258ms ago val=0xfa [#436]
+[0000155785] fw-1 FLASH: vars_writes=10880 vars_reads=2 trap_flips=10975 code_writes_ignored=2 trap_now=0 [#457 #556]
+[0000155890] fw-1 BSPPROBE vm0: exits=327961 last=0x78@0xffffffffa3c81c2e IN-HOST for 3ms section=78 [#483]
+[0000155985] fw-1 SPIN cpuid(rip=0x7fe54ad2b98a): 0x0=73727 0x80000000=893 0x1=3233 0x80000001=351 0x80000008=172 0x7=178 0xb=224 0x80000020=1 [#92]
+[0000156121] fw-1 SPIN msr(rip=0xffffffffa30a8789): 0xc0000080=424 0x1b=2528 0x2ff=208 0xfe=458 0x49=4 0x201=170 0x202=170 0x203=170 [#92]
+[0000156247] fw-1 FBSPEED: t=20537ms fb=28us ram=14us scat=37us cli=29us | chunk min=0us max=0us slow=0/64 | ticks=0 smi=+0 [#368]
+[0000156365] fw-1 FBCLOCK: delivered/nominal = 1367/1000 (aperf=137444 mperf=100504) | cr0=0x80010011 therm=0x0 [#368 #370]
+[0000156476] fw-1 FBINFLIGHT: during the masked loop: usb_waiters_max=0 usb_held=0/64 | usb_sectors=+0 usb_calls=+0 [#368]
+[0000156586] fw-1 FBSPEED: t=21537ms fb=28us ram=14us scat=33us cli=29us | chunk min=0us max=0us slow=0/64 | ticks=0 smi=+0 [#368]
+[0000156704] fw-1 FBCLOCK: delivered/nominal = 1367/1000 (aperf=137552 mperf=100572) | cr0=0x80010011 therm=0x0 [#368 #370]
+[0000156815] fw-1 FBINFLIGHT: during the masked loop: usb_waiters_max=0 usb_held=0/64 | usb_sectors=+0 usb_calls=+0 [#368]
+[0000156925] fw-1 LAPSTATE: feed+5001132266/5s pend=0 insvc=0 cur=4739241 init=31276056 lvt=0xec eoi=1954 [#436]
+[0000157025] fw-1 LVTMASK: changes=0 last 0x0->0x0 [#436]
+[0000157070] fw-1 GUESTPC vm0: exits=328115 lastreason=0x78 lastrip=0xffffffffa3c81c2e | cs=0x10:0x0 rip=0xffffffffa3c81c2e rflags=0x246 cr0=0x80050033 cr3=0x2ac36000 cr4=0x750ef0 rsp=0xffffffffa4c03e88 activity=18446744072162384943 intrblk/entryinj=0x7eff038e7000 exitintr=0x0 [#520]
+[0000157342] fw-1 #94 RTCRATE: delivered=0/5s programmed=1024Hz regA=0x26 regB=0x02
+[0000157413] fw-1 DRAIN: iters=328115 kbd_pending=0 q_pending=0 [#436]
+[0000157471] fw-1 FBSPEED: t=22537ms fb=28us ram=14us scat=33us cli=29us | chunk min=0us max=0us slow=0/64 | ticks=0 smi=+0 [#368]
+[0000157589] fw-1 FBCLOCK: delivered/nominal = 1360/1000 (aperf=137581 mperf=101116) | cr0=0x80010011 therm=0x0 [#368 #370]
+[0000157700] fw-1 FBINFLIGHT: during the masked loop: usb_waiters_max=0 usb_held=0/64 | usb_sectors=+0 usb_calls=+0 [#368]
+[0000157810] fw-1 FBSPEED: t=23537ms fb=28us ram=14us scat=30us cli=29us | chunk min=0us max=0us slow=0/64 | ticks=0 smi=+0 [#368]
+[0000157928] fw-1 FBCLOCK: delivered/nominal = 1360/1000 (aperf=137450 mperf=101048) | cr0=0x80010011 therm=0x0 [#368 #370]
+[0000158039] fw-1 FBINFLIGHT: during the masked loop: usb_waiters_max=0 usb_held=0/64 | usb_sectors=+0 usb_calls=+0 [#368]
+[0000158149] fw-1 FBSPEED: t=24537ms fb=28us ram=14us scat=29us cli=29us | chunk min=0us max=0us slow=0/64 | ticks=0 smi=+0 [#368]
+[0000158267] fw-1 FBCLOCK: delivered/nominal = 1360/1000 (aperf=137489 mperf=101082) | cr0=0x80010011 therm=0x0 [#368 #370]
+[0000158378] fw-1 FBINFLIGHT: during the masked loop: usb_waiters_max=0 usb_held=0/64 | usb_sectors=+0 usb_calls=+0 [#368]
