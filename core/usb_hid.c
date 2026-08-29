@@ -327,6 +327,8 @@ void hype_usb_hid_typematic_init(hype_usb_hid_typematic_t *t) {
     t->delay_ms = HYPE_USB_HID_TYPEMATIC_DELAY_MS;
     t->period_ms = HYPE_USB_HID_TYPEMATIC_PERIOD_MS;
     t->started = 0;
+    t->began_ms = 0;
+    t->abandoned = 0;
 }
 
 void hype_usb_hid_typematic_note(hype_usb_hid_typematic_t *t, const uint8_t report[8],
@@ -360,6 +362,8 @@ void hype_usb_hid_typematic_note(hype_usb_hid_typematic_t *t, const uint8_t repo
     t->code = g_usage_to_set1[hold];
     t->ext = g_usage_is_ext[hold] ? 1 : 0;
     t->started = 0;
+    t->abandoned = 0;
+    t->began_ms = now_ms;
     t->next_at_ms = now_ms + (uint64_t)t->delay_ms;
 }
 
@@ -367,8 +371,19 @@ unsigned int hype_usb_hid_typematic_tick(hype_usb_hid_typematic_t *t, uint64_t n
                                          uint8_t *out, unsigned int out_cap) {
     unsigned int n = 0;
 
-    if (t == 0 || out == 0 || t->usage == 0u || t->code == 0u) return 0;
+    if (t == 0 || out == 0 || t->usage == 0u || t->code == 0u || t->abandoned) return 0;
     if (now_ms < t->next_at_ms) return 0;
+
+    /*
+     * #777: this hold has gone on longer than any real one. The evidence that the key is
+     * still down is the absence of a report saying otherwise, and that absence is exactly
+     * what a lost report or a silent endpoint looks like -- so stop, and send the BREAK so
+     * the guest does not go on believing the key is held.
+     */
+    if (now_ms - t->began_ms >= (uint64_t)HYPE_USB_HID_TYPEMATIC_MAX_MS) {
+        t->abandoned = 1;
+        return emit_code(out, 0u, out_cap, t->code, t->ext, 1 /* break */);
+    }
 
     n = emit_code(out, 0u, out_cap, t->code, t->ext, 0 /* make */);
     if (n == 0u) return 0; /* no room for the whole sequence -- emit nothing, never a lone 0xE0 */

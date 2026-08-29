@@ -620,6 +620,51 @@ static void test_typematic_null_safe(void) {
     hype_usb_hid_typematic_set_f3(0, 0);
 }
 
+
+static void test_typematic_a_hold_cannot_repeat_forever(void) {
+    hype_usb_hid_typematic_t t;
+    uint8_t r[8], out[8];
+    unsigned int n;
+
+    hype_usb_hid_typematic_init(&t);
+    mk_report(r, 0, 0x04, 0, 0); /* 'a' down, and no report ever arrives again */
+    hype_usb_hid_typematic_note(&t, r, 0);
+
+    CHECK_HEX("no repeat before the delay", 1,
+              (hype_usb_hid_typematic_tick(&t, 400, out, sizeof out) == 0) ? 1 : 0);
+    CHECK_HEX("repeats while the hold is plausible", 1,
+              (hype_usb_hid_typematic_tick(&t, 600, out, sizeof out) == 1) ? 1 : 0);
+
+    /*
+     * Past the bound, typematic must give up AND tell the guest the key came up. Repeating
+     * forever is what a lost release looked like on hardware: a key locked on, with no other
+     * key able to displace it because no further report ever arrived.
+     */
+    n = hype_usb_hid_typematic_tick(&t, HYPE_USB_HID_TYPEMATIC_MAX_MS + 1u, out, sizeof out);
+    CHECK_HEX("emits one byte at the bound", 1, n);
+    CHECK_HEX("and it is the BREAK code, not another make", 0x9E, out[0]);
+    CHECK_HEX("nothing further, ever", 0,
+              hype_usb_hid_typematic_tick(&t, 60000, out, sizeof out));
+}
+
+static void test_typematic_a_new_key_revives_it_after_a_bound(void) {
+    hype_usb_hid_typematic_t t;
+    uint8_t r[8], out[8];
+
+    hype_usb_hid_typematic_init(&t);
+    mk_report(r, 0, 0x04, 0, 0);
+    hype_usb_hid_typematic_note(&t, r, 0);
+    (void)hype_usb_hid_typematic_tick(&t, HYPE_USB_HID_TYPEMATIC_MAX_MS + 1u, out, sizeof out);
+    CHECK_HEX("abandoned", 0, hype_usb_hid_typematic_tick(&t, 60000, out, sizeof out));
+
+    /* A real report arriving afterwards must bring it back -- giving up on one hold must not
+     * disable typematic for the rest of the boot. */
+    mk_report(r, 0, 0x05, 0, 0); /* 'b' */
+    hype_usb_hid_typematic_note(&t, r, 60000);
+    CHECK_HEX("a later key repeats again", 1,
+              (hype_usb_hid_typematic_tick(&t, 60000 + 500, out, sizeof out) == 1) ? 1 : 0);
+}
+
 int main(void) {
     test_find_mouse_picks_the_mouse_interface();
     test_find_mouse_refuses_a_non_boot_mouse();
@@ -652,6 +697,8 @@ int main(void) {
     test_typematic_extended_key_repeats_with_its_prefix();
     test_typematic_honours_the_guest_f3_setting();
     test_typematic_null_safe();
+    test_typematic_a_hold_cannot_repeat_forever();
+    test_typematic_a_new_key_revives_it_after_a_bound();
     test_find_keyboard_ignores_interrupt_out();
     test_find_keyboard_rejects_non_boot_and_malformed();
 

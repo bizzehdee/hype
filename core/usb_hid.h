@@ -59,6 +59,20 @@
 #define HYPE_USB_HID_TYPEMATIC_DELAY_MS 500u
 #define HYPE_USB_HID_TYPEMATIC_PERIOD_MS 92u /* ~10.9/s, the PS/2 default rate */
 
+/*
+ * #777: how long a single hold may repeat before hype gives up on it.
+ *
+ * Typematic infers "still held" from the ABSENCE of a new report, so a report that goes
+ * missing -- or an endpoint that stops delivering -- reads as a key held forever. On
+ * hardware that showed up as a key locking itself on, repeating 30 times a second, with no
+ * other key able to displace it because no further report ever arrived.
+ *
+ * A stuck key is worse than a dropped repeat, so the repeat is bounded and hype emits the
+ * BREAK code when the bound is reached -- otherwise the guest is left believing the key is
+ * still down. Ten seconds is far longer than any real hold and far shorter than "forever".
+ */
+#define HYPE_USB_HID_TYPEMATIC_MAX_MS 10000u
+
 typedef struct {
     uint8_t usage;        /* the HID usage repeating, 0 = nothing held */
     uint8_t code;         /* its Set-1 make code */
@@ -67,6 +81,8 @@ typedef struct {
     unsigned int delay_ms;
     unsigned int period_ms;
     int started;          /* past the initial delay, so the period applies */
+    uint64_t began_ms;    /* #777: when this hold started, so it can be bounded */
+    int abandoned;        /* #777: bound hit -- break emitted, no more repeats */
 } hype_usb_hid_typematic_t;
 
 /* Power-on defaults. Call once per keyboard before the first report. */
