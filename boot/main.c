@@ -8494,11 +8494,13 @@ static void fw_1_hid_watch(uint64_t now_h, uint64_t hz) {
         hype_xhci_event_health((hype_xhci_ctrl_t *)&kb->xc, &hce, &rfull, &evict);
         hype_debug_print("fw-1 HIDTICK[%u]: %04x:%04x slot%u ep=0x%02x polls=%llu reports=%llu "
                          "arms=%llu lost=%llu skipped=%llu hcevt=%llu ringfull=%llu evict=%llu "
-                         "| mouse polls=%llu reports=%llu [#775]\n",
+                         "revives=%llu | mouse polls=%llu reports=%llu [#775]\n",
                          k, (unsigned)kb->vid, (unsigned)kb->pid, kb->slot, kb->ep,
                          kb->polls, kb->reports,
                          hype_xhci_int_in_arms((hype_xhci_ctrl_t *)&kb->xc, kb->slot, kb->ep),
-                         lost, skipped, hce, rfull, evict, g_mouse_polls, g_mouse_reports);
+                         lost, skipped, hce, rfull, evict,
+                         hype_xhci_int_in_revives((hype_xhci_ctrl_t *)&kb->xc, kb->slot, kb->ep),
+                         g_mouse_polls, g_mouse_reports);
     }
 }
 

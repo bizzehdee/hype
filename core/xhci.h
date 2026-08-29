@@ -578,6 +578,10 @@ unsigned int hype_xhci_pump_events(hype_xhci_ctrl_t *c, unsigned int budget);
 /* #775: how many times this interrupt-IN endpoint has been armed. With the report count
  * beside it, "armed once and never answered" is distinguishable from "armed repeatedly and
  * answering", which no other pair of numbers says. */
+/* Revives performed on this endpoint -- see hype_xhci_int_in_revives(). */
+unsigned long long hype_xhci_int_in_revives(hype_xhci_ctrl_t *c, unsigned int slot,
+                                            unsigned int ep_addr);
+
 /* Per-endpoint loss counters; see the implementation for what each one means. */
 void hype_xhci_int_in_losses(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int ep_addr,
                              unsigned long long *lost, unsigned long long *skipped);

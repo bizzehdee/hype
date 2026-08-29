@@ -271,6 +271,14 @@ typedef struct {
     unsigned int silent_polls;
     unsigned long long rearms;
     /*
+     * The revive trigger. `revive_after` starts at HYPE_INT_IN_SILENT_MAX and DOUBLES each
+     * time a revive fails to bring the endpoint back, so a keyboard nobody is touching
+     * settles into revives that are rare rather than one every thirty seconds for ever,
+     * while a genuinely deaf one is caught promptly the first time.
+     */
+    unsigned int revive_after;
+    unsigned long long revives;
+    /*
      * #764 capture: what this endpoint was doing when it diverged.
      *
      * The existing report fires after HYPE_INT_IN_SILENT_MAX polls, which on a 125 Hz tick
@@ -900,6 +908,7 @@ static int int_in_deliver(xhci_int_in_hw_t *iin, uint64_t trb, uint32_t cc,
         return 0;
     }
     iin->silent_polls = 0;
+    iin->revive_after = HYPE_INT_IN_SILENT_MAX; /* it works: be prompt again next time */
     return 1;
 }
 
@@ -1270,6 +1279,7 @@ int hype_xhci_configure_int_in_endpoint(hype_xhci_ctrl_t *c, unsigned int slot,
     zero(iin->ring, XPAGE);
     ring_init_link(iin->ring);
     iin->enq = 0; iin->cyc = 1; hype_iiq_reset(&iin->q);
+    iin->revive_after = HYPE_INT_IN_SILENT_MAX; iin->revives = 0;
     iin->mps = mps; iin->recoveries = 0; iin->backoff = 0;
     iin->silent_polls = 0; iin->rearms = 0;
     iin->claim_n = 0; iin->diverged = 0; iin->reports = 0;
@@ -1485,6 +1495,7 @@ int hype_xhci_configure_hub_int_in(hype_xhci_ctrl_t *c, unsigned int slot,
     zero(iin->ring, XPAGE);
     ring_init_link(iin->ring);
     iin->enq = 0; iin->cyc = 1; hype_iiq_reset(&iin->q);
+    iin->revive_after = HYPE_INT_IN_SILENT_MAX; iin->revives = 0;
     iin->mps = mps; iin->recoveries = 0; iin->backoff = 0;
     iin->silent_polls = 0; iin->rearms = 0;
     iin->claim_n = 0; iin->diverged = 0; iin->reports = 0;
@@ -1917,6 +1928,53 @@ static int ep_recover_halted(hype_xhci_ctrl_t *c, unsigned int slot, unsigned in
 #define INT_IN_MAX_RECOVERIES 2u
 #define INT_IN_BACKOFF_POLLS  200000u
 
+/*
+ * Revive an endpoint that is RUNNING, attached, awake -- and not delivering.
+ *
+ * This is the fix the last eighteen boots were narrowing down to, and it is only defensible
+ * now because boot 25 removed every alternative. At the moment two devices went permanently
+ * silent, their hub ports read connected=1 enabled=1 SUSPENDED=0 -- attached and awake, not
+ * asleep -- with the endpoint armed, the doorbell rung, no error, no Host Controller Event,
+ * and nothing lost in software. And boot 23 showed what fixes it: a hot-plug, which tears the
+ * endpoint down and builds it again. This does the same thing without the hand.
+ *
+ * Stop Endpoint then Set TR Dequeue Pointer, per xHCI 4.6.9 and 4.6.10. NOT Reset Endpoint:
+ * that is for a HALTED endpoint and returns Context State Error against a running one, which
+ * is the mistake ep_recover_halted() exists to avoid. The ring restarts at index 0 with
+ * cycle 1 and the queue state is cleared, so the next poll re-arms from scratch.
+ *
+ * Triggered on silence, which cannot distinguish a deaf endpoint from an idle one -- that
+ * ambiguity is why #764's detector was withdrawn. The difference is what happens on a false
+ * positive: a detector REPORTED a fault that was not there, while reviving an idle endpoint
+ * costs two commands and loses nothing, because an idle endpoint has no reports in flight.
+ * The backoff below keeps that cost bounded for a keyboard nobody is using.
+ */
+static int int_in_revive(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int dci,
+                         xhci_int_in_hw_t *iin) {
+    xhci_hw_t *hw = HW(c);
+    uint32_t cmd[4], evt[4];
+    unsigned int i;
+
+    hype_xhci_trb_stop_endpoint(cmd, slot, dci, (int)hw->cmd_cyc);
+    if (cmd_submit_wait(c, cmd, evt) != 0) return -1;
+
+    for (i = 0; i < XPAGE; i++) { iin->ring[i] = 0; }
+    ring_init_link(iin->ring);
+    iin->enq = 0;
+    iin->cyc = 1;
+    hype_xhci_trb_set_tr_dequeue(cmd, phys(iin->ring) | 1u /* DCS=1 */, slot, dci,
+                                 (int)hw->cmd_cyc);
+    if (cmd_submit_wait(c, cmd, evt) != 0) return -1;
+    if (hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS) return -1;
+
+    /* Everything the old ring owned is gone with it: outstanding TRBs name addresses the
+     * controller will never complete now, and queued completions belong to a ring that no
+     * longer exists. The next poll re-arms from an empty queue. */
+    hype_iiq_reset(&iin->q);
+    iin->revives++;
+    return 0;
+}
+
 static void int_in_recover(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int dci,
                            xhci_int_in_hw_t *iin) {
     static unsigned int backoff_reported = 0;
@@ -2167,7 +2225,34 @@ static int int_in_poll_body(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int
      * next poll, or waiting in the parked table.
      */
     if (next_event_budget(hw, bar, c->rtsoff, evt, XHCI_POLL_PEEK, &spins) != 0) {
-        return 0; /* idle -- the common case, NOT an error */
+        /*
+         * Idle -- the common case, NOT an error. But an endpoint that stays idle while
+         * armed is either a device with nothing to say or one hype can no longer hear, and
+         * boot 25 established that the second case is real: attached, awake, armed, and
+         * permanently silent. Rebuild it rather than wait for a hand on the cable.
+         */
+        if (iin->q.inflight != 0u && ++iin->silent_polls >= iin->revive_after) {
+            unsigned int after = iin->revive_after;
+            iin->silent_polls = 0;
+            if (int_in_revive(c, slot, dci, iin) == 0) {
+                if (iin->revive_after < HYPE_INT_IN_SILENT_MAX * 8u) {
+                    iin->revive_after *= 2u; /* back off: an idle endpoint must not pay this
+                                              * every thirty seconds for the whole boot */
+                }
+                if (iin->revives <= 8ull) {
+                    /* Says only what this code checked. The port status that established
+                     * "attached and awake" was read by the HIDQUIET probe in boot 25, NOT
+                     * here -- claiming it at the moment of revive would be asserting a
+                     * measurement that was never taken. */
+                    hype_debug_print("host-xhci: REVIVE slot=%u ep=%u -- armed and silent for "
+                                     "%u polls. Stop Endpoint + Set TR Dequeue, ring restarted "
+                                     "(revive %llu) [#775]\n",
+                                     slot, dci, after, iin->revives);
+                }
+            }
+            int_in_fill(c, iin, slot, dci, len);
+        }
+        return 0;
     }
     if (hype_xhci_event_slot_id(evt) != slot || hype_xhci_event_ep_id(evt) != dci) {
         unsigned int oslot = hype_xhci_event_slot_id(evt);
@@ -3574,6 +3659,16 @@ unsigned long long hype_xhci_int_in_arms(hype_xhci_ctrl_t *c, unsigned int slot,
  * LATER one completed, which means their own events were never seen. Both should stay at
  * zero; either one moving says where to look next.
  */
+/* Revives performed on this endpoint. Non-zero means hype rebuilt a silent endpoint; if
+ * reports resume afterwards, the revive worked and the deafness is recoverable in software. */
+unsigned long long hype_xhci_int_in_revives(hype_xhci_ctrl_t *c, unsigned int slot,
+                                            unsigned int ep_addr) {
+    xhci_int_in_hw_t *iin;
+    if (c == (hype_xhci_ctrl_t *)0 || !c->inited) return 0ull;
+    iin = iin_hw_for(c, slot, hype_xhci_ep_dci(ep_addr), 0);
+    return (iin != (xhci_int_in_hw_t *)0) ? iin->revives : 0ull;
+}
+
 void hype_xhci_int_in_losses(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int ep_addr,
                              unsigned long long *lost, unsigned long long *skipped) {
     xhci_int_in_hw_t *iin;
