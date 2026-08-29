@@ -50,7 +50,7 @@ CORE_SRCS := core/format.c core/console.c core/halt.c core/memmap.c \
              core/host_pci.c core/host_pci_hw.c core/host_pci_dma.c core/host_pci_irq.c core/host_nic.c core/ahci_host.c core/ahci_host_hw.c \
              core/gpt.c core/iso_stream.c core/fat.c core/file_range.c core/fs_ops.c core/ntfs.c core/ntfs_journal.c core/fs_owner_guard.c core/ext2_alloc.c core/jbd2.c core/ext_jalloc.c core/ext_csum.c core/ext.c core/ext_write.c core/ext_dirent.c core/ext_namespace.c core/ext2_namespace.c core/extj_namespace.c core/blk_image.c core/blk_image_sparse.c core/blk_qcow2.c core/nvme_host.c core/nvme_host_hw.c core/blk_backend.c core/blk_phys.c core/blk_phys_hw.c core/phys_guard.c \
              core/kbd_decode.c core/vt_screen.c core/vt_render.c core/dashboard.c core/dump_fmt.c core/vm_lifecycle.c core/vm_isolation.c core/input_script.c core/input_runner.c core/vm_watchdog.c core/cmdparse.c \
-             core/cfg.c core/phys_confirm.c core/scancode.c core/xhci.c core/xhci_hw.c core/usb_msc.c core/usb_hid.c core/blk_usb.c \
+             core/cfg.c core/phys_confirm.c core/scancode.c core/xhci.c core/int_in_queue.c core/xhci_hw.c core/usb_msc.c core/usb_hid.c core/blk_usb.c \
              core/fat_write.c core/fat_write_fs.c core/fat_exfat.c core/fat_exfat_fs.c core/fat32_selftest.c \
              core/rtc.c core/rtc_hw.c \
              core/log_sink.c core/log_split.c core/disk_inventory.c core/cpu_topology.c core/smp_pack.c core/e1000.c core/e1000_hw.c core/arp.c core/virtio_net_ring.c core/nat.c core/e1000_dev_ring.c core/guest_nic.c core/pe_ident.c core/mtrr.c core/guest_mtrr.c core/run_state.c
