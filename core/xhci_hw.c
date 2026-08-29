@@ -1691,13 +1691,21 @@ int hype_xhci_hub_child_path(hype_xhci_ctrl_t *c, unsigned int hub_slot, unsigne
  *
  * Returns 0 and fills st[] plus the hub slot and port on success.
  */
-int hype_xhci_port_status_for_route(hype_xhci_ctrl_t *c, unsigned int route, uint8_t st[4],
+int hype_xhci_port_status_for_route(hype_xhci_ctrl_t *c, unsigned int root_port,
+                                    unsigned int route, uint8_t st[4],
                                     unsigned int *out_hub_slot, unsigned int *out_port) {
     unsigned int i, port;
 
     if (c == (hype_xhci_ctrl_t *)0 || !c->inited || st == (uint8_t *)0) return -1;
     for (i = 0; i < HYPE_XHCI_HUB_MAX; i++) {
         if (!g_hubs[i].used || g_hubs[i].ctrl != c->hw_slot) continue;
+        /*
+         * ROOT PORT TOO. A route string is only unique WITHIN a root port -- two tier-1 hubs
+         * on different root ports both give their port 2 the route 0x00002. Matching on
+         * route alone found the wrong hub in boot 24 and read an empty port on it, reporting
+         * connected=0 for two devices that were reporting normally at the time.
+         */
+        if (g_hubs[i].path.root_port != root_port) continue;
         for (port = 1u; port <= g_hubs[i].nports; port++) {
             unsigned int r = 0;
             if (hype_xhci_hub_child_route(c, g_hubs[i].slot, port, &r) != 0) continue;

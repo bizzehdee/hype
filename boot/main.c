@@ -8444,22 +8444,23 @@ static void fw_1_hid_probe_port(unsigned int k, const hype_host_kbd_t *kb) {
     unsigned int hub_slot = 0, port = 0;
 
     if (probes >= FW1_HID_PROBE_MAX) return;
-    if (hype_xhci_port_status_for_route((hype_xhci_ctrl_t *)&kb->xc, kb->route, st,
-                                        &hub_slot, &port) != 0) {
+    if (hype_xhci_port_status_for_route((hype_xhci_ctrl_t *)&kb->xc, kb->root_port,
+                                        kb->route, st, &hub_slot, &port) != 0) {
         probes++;
         hype_debug_print("fw-1 HIDQUIET[%u]: %04x:%04x route=0x%05x -- no hub port found for "
                          "it, so its link state is unknown [#775]\n",
-                         k, (unsigned)kb->vid, (unsigned)kb->pid, kb->route);
+                         k, (unsigned)kb->vid, (unsigned)kb->pid, kb->route, kb->root_port);
         return;
     }
     probes++;
     /* USB 2.0 11.24.2.7.1 wPortStatus: CONNECTION(0) ENABLE(1) SUSPEND(2) OVERCURRENT(3)
      * RESET(4) POWER(8) LOWSPEED(9) HIGHSPEED(10). */
-    hype_debug_print("fw-1 HIDQUIET[%u]: %04x:%04x hub slot %u port %u status=0x%02x%02x -- "
+    hype_debug_print("fw-1 HIDQUIET[%u]: %04x:%04x rp%u route=0x%05x -> hub slot %u port %u "
+                     "status=0x%02x%02x -- "
                      "connected=%u enabled=%u SUSPENDED=%u reset=%u | reports=%llu polls=%llu "
                      "[#775]\n",
-                     k, (unsigned)kb->vid, (unsigned)kb->pid, hub_slot, port,
-                     (unsigned)st[1], (unsigned)st[0],
+                     k, (unsigned)kb->vid, (unsigned)kb->pid, kb->root_port, kb->route,
+                     hub_slot, port, (unsigned)st[1], (unsigned)st[0],
                      (unsigned)(st[0] & 0x01u), (unsigned)((st[0] >> 1) & 0x01u),
                      (unsigned)((st[0] >> 2) & 0x01u), (unsigned)((st[0] >> 4) & 0x01u),
                      kb->reports, kb->polls);
