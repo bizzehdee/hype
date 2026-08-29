@@ -2119,6 +2119,32 @@ static int int_in_poll_body(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int
      * A report resets this, wherever the completion was routed from.
      */
     iin->silent_polls++;
+    /*
+     * Evaluated on EVERY poll of this endpoint, not only when the shared ring happens to be
+     * empty. The check used to live in the idle branch, so a poll that dequeued ANOTHER
+     * endpoint's event returned before reaching it -- and boot 28 showed exactly that: the
+     * Pico went deaf and revived ZERO times while a hub endpoint reviving in a loop kept the
+     * ring busy enough that the Pico's condition was almost never tested. Counting silence
+     * correctly is useless if the test only runs when the bus is quiet.
+     */
+    if (iin->q.inflight != 0u && iin->silent_polls >= iin->revive_after) {
+        unsigned int after = iin->revive_after;
+        iin->silent_polls = 0;
+        if (int_in_revive(c, slot, dci, iin) == 0) {
+            if (iin->revive_after < HYPE_INT_IN_SILENT_MAX * 8u) {
+                iin->revive_after *= 2u;
+            }
+            if (iin->revives <= 8ull) {
+                hype_debug_print("host-xhci: REVIVE slot=%u ep=%u -- silent for %u polls "
+                                 "(next at %u). Stop Endpoint + Set TR Dequeue, ring restarted "
+                                 "(revive %llu, reports so far %llu) [#775]\n",
+                                 slot, dci, after, iin->revive_after, iin->revives,
+                                 iin->reports);
+            }
+        }
+        int_in_fill(c, iin, slot, dci, len);
+        return 0;
+    }
 
     /* Arm exactly one transfer on THIS endpoint, and only when none is outstanding.
      *
@@ -2244,27 +2270,6 @@ static int int_in_poll_body(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int
          * boot 25 established that the second case is real: attached, awake, armed, and
          * permanently silent. Rebuild it rather than wait for a hand on the cable.
          */
-        if (iin->q.inflight != 0u && iin->silent_polls >= iin->revive_after) {
-            unsigned int after = iin->revive_after;
-            iin->silent_polls = 0;
-            if (int_in_revive(c, slot, dci, iin) == 0) {
-                if (iin->revive_after < HYPE_INT_IN_SILENT_MAX * 8u) {
-                    iin->revive_after *= 2u; /* back off: an idle endpoint must not pay this
-                                              * every thirty seconds for the whole boot */
-                }
-                if (iin->revives <= 8ull) {
-                    /* Says only what this code checked. The port status that established
-                     * "attached and awake" was read by the HIDQUIET probe in boot 25, NOT
-                     * here -- claiming it at the moment of revive would be asserting a
-                     * measurement that was never taken. */
-                    hype_debug_print("host-xhci: REVIVE slot=%u ep=%u -- armed and silent for "
-                                     "%u polls. Stop Endpoint + Set TR Dequeue, ring restarted "
-                                     "(revive %llu) [#775]\n",
-                                     slot, dci, after, iin->revives);
-                }
-            }
-            int_in_fill(c, iin, slot, dci, len);
-        }
         return 0;
     }
     if (hype_xhci_event_slot_id(evt) != slot || hype_xhci_event_ep_id(evt) != dci) {
