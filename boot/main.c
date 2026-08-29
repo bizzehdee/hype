@@ -8414,9 +8414,75 @@ static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_t
  * behaviour a fault is worse than no detector. A timestamped sample every two seconds says
  * when reports stopped without having to guess what stopping means.
  */
+/*
+ * When an endpoint has been quiet a while, ASK THE PORT why.
+ *
+ * Silence on the endpoint cannot separate "the device has nothing to say" from "hype can no
+ * longer hear it" -- that ambiguity withdrew #764 and made a later deafness detector fire on
+ * a keyboard nobody was typing on. The port answers directly, over ep0, so it still answers
+ * when the endpoint is dead:
+ *
+ *   suspended=1  the device slept. The operator's Keychron advertises Remote Wakeup and has
+ *                an idle power-saving state, and hype has NO resume path -- so it would stay
+ *                asleep until physically re-plugged. That would be a second bug wearing the
+ *                same symptom as the first.
+ *   suspended=0  awake and connected, and hype is not hearing a running endpoint. That is
+ *                the real deafness, and the Pico -- which types every ten seconds and never
+ *                idles long enough to sleep -- is the case that proves it exists.
+ *
+ * This LOGS A MEASUREMENT, never a verdict, which is why it is safe to fire on an ordinary
+ * typing pause: "silent and not suspended" and "silent and suspended" are both facts worth
+ * having. Once per silence episode, and capped, so a control transfer per quiet spell cannot
+ * become a cost of its own.
+ */
+#define FW1_HID_QUIET_TICKS 500u /* ~4 s at 125 Hz -- longer than any gap in real typing */
+#define FW1_HID_PROBE_MAX    64u /* an overnight run must not fill the log with these */
+
+static void fw_1_hid_probe_port(unsigned int k, const hype_host_kbd_t *kb) {
+    static unsigned int probes;
+    uint8_t st[4];
+    unsigned int hub_slot = 0, port = 0;
+
+    if (probes >= FW1_HID_PROBE_MAX) return;
+    if (hype_xhci_port_status_for_route((hype_xhci_ctrl_t *)&kb->xc, kb->route, st,
+                                        &hub_slot, &port) != 0) {
+        probes++;
+        hype_debug_print("fw-1 HIDQUIET[%u]: %04x:%04x route=0x%05x -- no hub port found for "
+                         "it, so its link state is unknown [#775]\n",
+                         k, (unsigned)kb->vid, (unsigned)kb->pid, kb->route);
+        return;
+    }
+    probes++;
+    /* USB 2.0 11.24.2.7.1 wPortStatus: CONNECTION(0) ENABLE(1) SUSPEND(2) OVERCURRENT(3)
+     * RESET(4) POWER(8) LOWSPEED(9) HIGHSPEED(10). */
+    hype_debug_print("fw-1 HIDQUIET[%u]: %04x:%04x hub slot %u port %u status=0x%02x%02x -- "
+                     "connected=%u enabled=%u SUSPENDED=%u reset=%u | reports=%llu polls=%llu "
+                     "[#775]\n",
+                     k, (unsigned)kb->vid, (unsigned)kb->pid, hub_slot, port,
+                     (unsigned)st[1], (unsigned)st[0],
+                     (unsigned)(st[0] & 0x01u), (unsigned)((st[0] >> 1) & 0x01u),
+                     (unsigned)((st[0] >> 2) & 0x01u), (unsigned)((st[0] >> 4) & 0x01u),
+                     kb->reports, kb->polls);
+}
+
 static void fw_1_hid_watch(uint64_t now_h, uint64_t hz) {
     static uint64_t watch_last;
+    static unsigned long long prev_reports[HYPE_HOST_KBD_MAX];
+    static unsigned int quiet[HYPE_HOST_KBD_MAX];
     unsigned int k;
+
+    /* The quiet probe rides the same tick, but is counted in TICKS rather than seconds so it
+     * is independent of how long the periodic line takes. */
+    for (k = 0; k < g_hid_count && k < HYPE_HOST_KBD_MAX; k++) {
+        hype_host_kbd_t *kb = &g_hid[k];
+        if (kb->reports != prev_reports[k]) {
+            prev_reports[k] = kb->reports;
+            quiet[k] = 0;
+            continue;
+        }
+        if (kb->reports == 0ull) continue; /* never worked: nothing to have stopped */
+        if (++quiet[k] == FW1_HID_QUIET_TICKS) fw_1_hid_probe_port(k, kb);
+    }
 
     if (hz == 0ull || (watch_last != 0ull && now_h - watch_last < hz * 2ull)) return;
     watch_last = now_h;

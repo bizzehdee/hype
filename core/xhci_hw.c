@@ -1667,6 +1667,50 @@ int hype_xhci_hub_child_path(hype_xhci_ctrl_t *c, unsigned int hub_slot, unsigne
     return 0;
 }
 
+/*
+ * Read the hub port status for the device at `route`, over a CONTROL transfer.
+ *
+ * This is the discriminator that silence could never provide. An interrupt-IN endpoint that
+ * has gone quiet is either a device with nothing to say or a device hype can no longer hear,
+ * and no amount of watching the endpoint separates them -- that ambiguity is why #764 was
+ * withdrawn and why a later "went deaf" detector fired on a keyboard nobody was typing on.
+ *
+ * The PORT tells you directly, and it answers over ep0, so it still answers when the
+ * endpoint is dead:
+ *
+ *   PORT_SUSPEND (bit 2) set    the device put itself to sleep. The operator's Keychron
+ *                               advertises Remote Wakeup (bmAttributes 0xa0) and has a
+ *                               documented idle power-saving state, and hype has no resume
+ *                               path at all -- so it would stay asleep for ever.
+ *   PORT_SUSPEND clear          the device is awake and connected, and hype is not hearing
+ *                               an endpoint that is running. That is the real deafness.
+ *
+ * Behind-hub devices only. A root-port device reports its link state in PORTSC PLS instead,
+ * which is a different register and a different decode; every device this is aimed at sits
+ * behind a hub.
+ *
+ * Returns 0 and fills st[] plus the hub slot and port on success.
+ */
+int hype_xhci_port_status_for_route(hype_xhci_ctrl_t *c, unsigned int route, uint8_t st[4],
+                                    unsigned int *out_hub_slot, unsigned int *out_port) {
+    unsigned int i, port;
+
+    if (c == (hype_xhci_ctrl_t *)0 || !c->inited || st == (uint8_t *)0) return -1;
+    for (i = 0; i < HYPE_XHCI_HUB_MAX; i++) {
+        if (!g_hubs[i].used || g_hubs[i].ctrl != c->hw_slot) continue;
+        for (port = 1u; port <= g_hubs[i].nports; port++) {
+            unsigned int r = 0;
+            if (hype_xhci_hub_child_route(c, g_hubs[i].slot, port, &r) != 0) continue;
+            if (r != route) continue;
+            if (hub_get_port_status(c, g_hubs[i].slot, port, st) != 0) return -1;
+            if (out_hub_slot) *out_hub_slot = g_hubs[i].slot;
+            if (out_port) *out_port = port;
+            return 0;
+        }
+    }
+    return -1;
+}
+
 unsigned int hype_xhci_hub_count(void) {
     unsigned int i, n = 0;
     for (i = 0; i < HYPE_XHCI_HUB_MAX; i++) {

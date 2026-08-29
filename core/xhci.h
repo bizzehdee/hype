@@ -683,6 +683,15 @@ int hype_xhci_configure_hub_int_in(hype_xhci_ctrl_t *c, unsigned int slot,
  * chain depth and unrelated to how many hubs exist.
  */
 #define HYPE_XHCI_HUB_MAX 16u
+/*
+ * Hub port status for the device at `route`, read over ep0 so it answers even when that
+ * device's interrupt-IN endpoint has stopped completing. st[0] bit 2 is PORT_SUSPEND: set
+ * means the device slept, clear means it is awake and hype simply is not hearing it. Behind-
+ * hub devices only. Returns 0 on success.
+ */
+int hype_xhci_port_status_for_route(hype_xhci_ctrl_t *c, unsigned int route, uint8_t st[4],
+                                    unsigned int *out_hub_slot, unsigned int *out_port);
+
 unsigned int hype_xhci_hub_count(void);
 int hype_xhci_hub_at(unsigned int i, unsigned int *out_ctrl, unsigned int *out_slot,
                      unsigned int *out_nports, unsigned int *out_ep);
