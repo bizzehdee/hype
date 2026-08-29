@@ -1,0 +1,739 @@
+[0000109298] ttyS0| BdsDxe: loading Boot0002 "UEFI HYPE VIRTUAL CD-ROM HYPE0000000000000001" from PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)
+[0000109549] ttyS1| BdsDxe: loading Boot0002 "UEFI HYPE VIRTUAL CD-ROM HYPE0000000000000001" from PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)
+[0000109849] ttyS0| BdsDxe: starting Boot0002 "UEFI HYPE VIRTUAL CD-ROM HYPE0000000000000001" from PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)
+[0000110148] ttyS1| BdsDxe: starting Boot0002 "UEFI HYPE VIRTUAL CD-ROM HYPE0000000000000001" from PciRoot(0x0)/Pci(0x2,0x0)/Sata(0x0,0xFFFF,0x0)
+[0000110449] ttyS0| GNU GRUB  version 2.12
+[0000110549] ttyS1| GNU GRUB  version 2.12
+[0000110588] ttyS0| 
+[0000110605] ttyS1| 
+[0000110719] ttyS0|      Use the  and  keys to select which entry is highlighted.                              
+[0000110827] ttyS1|      Use the  and  keys to select which entry is highlighted.                              
+[0000110935] ttyS0|       Press enter to boot the selected OS, `e' to edit the commands before booting or `c' for 
+[0000111046] ttyS1|       Press enter to boot the selected OS, `e' to edit the commands before booting or `c' for 
+[0000111157] ttyS0|       a command-line.                                                                          *Linux lts                                                                                                                                                      
+[0000111489] ttyS1|       a command-line.                                                                          *Linux lts                                                                                                                                                      
+[0000111857] ttyS0|                                                                                                                                                                                                                                                                
+[0000112129] ttyS1|                                                                                                                                                                                                                                                                
+[0000112902] ttyS0|                                                                                                                                                                                                                                                                
+[0000113174] ttyS1|                                                                                                                                                                                                                                                                
+[0000113446] ttyS0|                                                                                                                                                                                                                                                                
+[0000113718] ttyS1|                                                                                                                                                                                                                                                                
+[0000113990] ttyS0|                                                                                                                                                                                                                                                                
+[0000114262] ttyS1|                                                                                                                                                                                                                                                                
+[0000114534] ttyS0|                                                                                                                                                                                                                                                                
+[0000114806] ttyS1|                                                                                                                                                                                                                                                                
+[0000115078] ttyS0|                                                                                                                                                                                                                                                                
+[0000115411] ttyS1|                                                                                                                                                                                                                                                                
+[0000116116] ttyS0|                                                                                                                                           The highlighted entry will be executed automatically in 1s.                                        The highlighted en
+[0000116388] ttyS1|                                                                                                                                           The highlighted entry will be executed automatically in 1s.                                        The highlighted en
+[0000116660] ttyS0| try will be executed automatically in 0s.                                       Booting `Linux lts'
+[0000116776] ttyS1| try will be executed automatically in 0s.                                       Booting `Linux lts'
+[0000116892] ttyS0| 
+[0000116909] ttyS1| 
+[0000188538] screen|   Booting `Linux lts'
+[0000200326] ttyS1| 
+[0000200343] ttyS1| Welcome to Alpine Linux 3.21
+[0000200388] ttyS1| Kernel 6.12.81-0-lts on an x86_64 (/dev/ttyS1)
+[0000200451] ttyS1| 
+[0000200468] ttyS1| localhost login: 
+[0000200582] ttyS0| 
+[0000200599] ttyS0| Welcome to Alpine Linux 3.21
+[0000200644] ttyS0| Kernel 6.12.81-0-lts on an x86_64 (/dev/ttyS0)
+[0000200707] ttyS0| 
+[0000200724] ttyS0| localhost login: root
+[0000200802] ttyS0| Welcome to Alpine!
+[0000200837] ttyS0| 
+[0000200854] ttyS0| The Alpine Wiki contains a large amount of how-to guides and general
+[0000200939] ttyS0| information about administrating Alpine systems.
+[0000201004] ttyS0| See <https://wiki.alpinelinux.org/>.
+[0000201057] ttyS0| 
+[0000201074] ttyS0| You can setup the system with the command: setup-alpine
+[0000201146] ttyS0| 
+[0000201163] ttyS0| You may change this message by editing /etc/motd.
+[0000201229] ttyS0| 
+[0000201246] ttyS0| localhost:~# 
+[0000203413] ttyS0| setsid sh -c 'dmesg -w > /dev/ttyS0' &
+[0000203468] ttyS0| localhost:~# dmesg -n 8
+[0000203508] ttyS0| localhost:~# echo DMESG-STREAMING-NOW
+[0000203562] ttyS0| DMESG-STREAMING-NOW
+[0000203598] ttyS0| localhost:~# 
+[0000203628] ttyS0| dmesgs: unrecognized option: w
+[0000203836] ttyS0| etsidBusyBox v1.37.0 (2025-11-23 13:10:04 UTC) multi-call binary.
+[0000204079] ttyS0|  
+[0000204258] ttyS0| Usage: sdmesgh  [-cr] [-n LEVEL] [-s SIZE]
+[0000204317] ttyS0| 
+[0000204334] ttyS0| Print or control the kernel ring buffer
+[0000204390] ttyS0| 
+[0000204407] ttyS0|  -c  Clear ring buffer after printing
+[0000204461] ttyS0|  -n LEVEL Set console logging level
+[0000204513] ttyS0|  -s SIZE  Buffer size
+[0000204551] ttyS0|  -r  Print raw message buffer-
+[0000204598] ttyS0| c 'while :; do echo HB-$(cut -d. -f1 /proc/uptime) > /de
+[0000204671] ttyS0| v/ttyS0; sleep 10; done' &
+[0000204714] ttyS0| [1]-  Done                       setsid sh -c "dmesg -w > /dev/ttyS0"
+[0000204800] ttyS0| localhost:~# echo HEARTBEAT-STARTED
+[0000204852] ttyS0| HEARTBEAT-STARTED
+[0000204886] ttyS0| localhost:~# HB-25
+[0000204921] ttyS0| echo CPUS-$(nproc); grep -c ^processor /proc/cpuinfo
+[0000205233] ttyS0| CPUS-4
+[0000205256] ttyS0| 4
+[0000205274] ttyS0| [2]+  Done                       setsid sh -c "while :; do echo HB-\$(cut -d. -f1 /proc/uptime) > /dev/ttyS0; sleep 10; done"
+[0000205416] ttyS0| localhost:~# awk '/^cpu[0-9]/{print "IDLE-START-" $1 "-" $5}' /proc/stat
+[0000205505] ttyS0| IDLE-START-cpu0-1550
+[0000205542] ttyS0| IDLE-START-cpu1-1430
+[0000205579] ttyS0| IDLE-START-cpu2-1862
+[0000205616] ttyS0| IDLE-START-cpu3-1915
+[0000205653] ttyS0| localhost:~# echo OPERATOR-GO -- start the RUN-CARD sequence now
+[0000205734] ttyS0| OPERATOR-GO -- start the RUN-CARD sequence now
+[0000205797] ttyS0| localhost:~# 
+[0000219590] ttyS0| HB-35
+[0000233178] ttyS0| HB-45
+[0000243520] screen|   Booting `Linux lts'
+[0000243684] screen| Welcome to Alpine Linux 3.21
+[0000243730] screen| Kernel 6.12.81-0-lts on an x86_64 (/dev/ttyS0)
+[0000243794] screen| localhost login: root
+[0000243833] screen| Welcome to Alpine!
+[0000243869] screen| The Alpine Wiki contains a large amount of how-to guides and general
+[0000243955] screen| information about administrating Alpine systems.
+[0000244021] screen| See <https://wiki.alpinelinux.org/>.
+[0000244075] screen| You can setup the system with the command: setup-alpine
+[0000244148] screen| You may change this message by editing /etc/motd.
+[0000244215] screen| localhost:~# setsid sh -c 'dmesg -w > /dev/ttyS0' &
+[0000244284] screen| localhost:~# dmesg -n 8
+[0000244325] screen| localhost:~# echo DMESG-STREAMING-NOW
+[0000244380] screen| DMESG-STREAMING-NOW
+[0000244417] screen| localhost:~# dmesgs: unrecognized option: w
+[0000244478] screen| etsidBusyBox v1.37.0 (2025-11-23 13:10:04 UTC) multi-call binary.
+[0000244561] screen| Usage: sdmesgh  [-cr] [-n LEVEL] [-s SIZE]
+[0000244621] screen| Print or control the kernel ring buffer
+[0000244678] screen|         -c              Clear ring buffer after printing
+[0000244752] screen|         -n LEVEL        Set console logging level
+[0000244819] screen|         -s SIZE         Buffer size
+[0000244872] screen|         -r              Print raw message buffer-
+[0000244939] screen| c 'while :; do echo HB-$(cut -d. -f1 /proc/uptime) > /de
+[0000245013] screen| v/ttyS0; sleep 10; done' &
+[0000245057] screen| [1]-  Done                       setsid sh -c "dmesg -w > /dev/ttyS0"
+[0000245144] screen| localhost:~# echo HEARTBEAT-STARTED
+[0000245197] screen| HEARTBEAT-STARTED
+[0000245232] screen| localhost:~# HB-25
+[0000245268] screen| echo CPUS-$(nproc); grep -c ^processor /proc/cpuinfo
+[0000245338] screen| CPUS-4
+[0000245362] screen| 4
+[0000245381] screen| [2]+  Done                       setsid sh -c "while :; do echo HB-\$(cut -d. -f1 /proc/uptime) > /dev/ttyS0; sleep 10; done"
+[0000245524] screen| localhost:~# awk '/^cpu[0-9]/{print "IDLE-START-" $1 "-" $5}' /proc/stat
+[0000245614] screen| IDLE-START-cpu0-1550
+[0000245652] screen| IDLE-START-cpu1-1430
+[0000245690] screen| IDLE-START-cpu2-1862
+[0000245728] screen| IDLE-START-cpu3-1915
+[0000245766] screen| localhost:~# echo OPERATOR-GO -- start the RUN-CARD sequence now
+[0000245848] screen| OPERATOR-GO -- start the RUN-CARD sequence now
+[0000245912] screen| localhost:~# HB-35
+[0000245948] screen| HB-45
+[0000257755] ttyS0| HB-55
+[0000269877] ttyS0| HB-65
+[0000283108] ttyS0| HB-75
+[0000289775] screen|   Booting `Linux lts'
+[0000289814] screen| Welcome to Alpine Linux 3.21
+[0000289860] screen| Kernel 6.12.81-0-lts on an x86_64 (/dev/ttyS0)
+[0000289924] screen| localhost login: root
+[0000289963] screen| Welcome to Alpine!
+[0000289999] screen| The Alpine Wiki contains a large amount of how-to guides and general
+[0000290085] screen| information about administrating Alpine systems.
+[0000290151] screen| See <https://wiki.alpinelinux.org/>.
+[0000290205] screen| You can setup the system with the command: setup-alpine
+[0000290278] screen| You may change this message by editing /etc/motd.
+[0000290345] screen| localhost:~# setsid sh -c 'dmesg -w > /dev/ttyS0' &
+[0000290414] screen| localhost:~# dmesg -n 8
+[0000290455] screen| localhost:~# echo DMESG-STREAMING-NOW
+[0000290510] screen| DMESG-STREAMING-NOW
+[0000290547] screen| localhost:~# dmesgs: unrecognized option: w
+[0000290608] screen| etsidBusyBox v1.37.0 (2025-11-23 13:10:04 UTC) multi-call binary.
+[0000290691] screen| Usage: sdmesgh  [-cr] [-n LEVEL] [-s SIZE]
+[0000290751] screen| Print or control the kernel ring buffer
+[0000290808] screen|         -c              Clear ring buffer after printing
+[0000290882] screen|         -n LEVEL        Set console logging level
+[0000290949] screen|         -s SIZE         Buffer size
+[0000291002] screen|         -r              Print raw message buffer-
+[0000291069] screen| c 'while :; do echo HB-$(cut -d. -f1 /proc/uptime) > /de
+[0000291143] screen| v/ttyS0; sleep 10; done' &
+[0000291187] screen| [1]-  Done                       setsid sh -c "dmesg -w > /dev/ttyS0"
+[0000291274] screen| localhost:~# echo HEARTBEAT-STARTED
+[0000291327] screen| HEARTBEAT-STARTED
+[0000291362] screen| localhost:~# HB-25
+[0000291398] screen| echo CPUS-$(nproc); grep -c ^processor /proc/cpuinfo
+[0000291468] screen| CPUS-4
+[0000291492] screen| 4
+[0000291511] screen| [2]+  Done                       setsid sh -c "while :; do echo HB-\$(cut -d. -f1 /proc/uptime) > /dev/ttyS0; sleep 10; done"
+[0000291654] screen| localhost:~# awk '/^cpu[0-9]/{print "IDLE-START-" $1 "-" $5}' /proc/stat
+[0000291744] screen| IDLE-START-cpu0-1550
+[0000291782] screen| IDLE-START-cpu1-1430
+[0000291820] screen| IDLE-START-cpu2-1862
+[0000291858] screen| IDLE-START-cpu3-1915
+[0000291896] screen| localhost:~# echo OPERATOR-GO -- start the RUN-CARD sequence now
+[0000291978] screen| OPERATOR-GO -- start the RUN-CARD sequence now
+[0000292042] screen| localhost:~# HB-35
+[0000292078] screen| HB-45
+[0000292101] screen| HB-55
+[0000292124] screen| HB-65
+[0000292147] screen| HB-75
+[0000306395] ttyS0| HB-85
+[0000319848] ttyS0| HB-95
+[0000332927] ttyS0| HB-106
+[0000339143] screen|   Booting `Linux lts'
+[0000339182] screen| Welcome to Alpine Linux 3.21
+[0000339228] screen| Kernel 6.12.81-0-lts on an x86_64 (/dev/ttyS0)
+[0000339292] screen| localhost login: root
+[0000339331] screen| Welcome to Alpine!
+[0000339367] screen| The Alpine Wiki contains a large amount of how-to guides and general
+[0000339453] screen| information about administrating Alpine systems.
+[0000339519] screen| See <https://wiki.alpinelinux.org/>.
+[0000339573] screen| You can setup the system with the command: setup-alpine
+[0000339646] screen| You may change this message by editing /etc/motd.
+[0000339713] screen| localhost:~# setsid sh -c 'dmesg -w > /dev/ttyS0' &
+[0000339782] screen| localhost:~# dmesg -n 8
+[0000339823] screen| localhost:~# echo DMESG-STREAMING-NOW
+[0000339878] screen| DMESG-STREAMING-NOW
+[0000339915] screen| localhost:~# dmesgs: unrecognized option: w
+[0000339976] screen| etsidBusyBox v1.37.0 (2025-11-23 13:10:04 UTC) multi-call binary.
+[0000340059] screen| Usage: sdmesgh  [-cr] [-n LEVEL] [-s SIZE]
+[0000340119] screen| Print or control the kernel ring buffer
+[0000340176] screen|         -c              Clear ring buffer after printing
+[0000340250] screen|         -n LEVEL        Set console logging level
+[0000340317] screen|         -s SIZE         Buffer size
+[0000340370] screen|         -r              Print raw message buffer-
+[0000340437] screen| c 'while :; do echo HB-$(cut -d. -f1 /proc/uptime) > /de
+[0000340511] screen| v/ttyS0; sleep 10; done' &
+[0000340555] screen| [1]-  Done                       setsid sh -c "dmesg -w > /dev/ttyS0"
+[0000340642] screen| localhost:~# echo HEARTBEAT-STARTED
+[0000340695] screen| HEARTBEAT-STARTED
+[0000340730] screen| localhost:~# HB-25
+[0000340766] screen| echo CPUS-$(nproc); grep -c ^processor /proc/cpuinfo
+[0000340836] screen| CPUS-4
+[0000340860] screen| 4
+[0000340879] screen| [2]+  Done                       setsid sh -c "while :; do echo HB-\$(cut -d. -f1 /proc/uptime) > /dev/ttyS0; sleep 10; done"
+[0000341022] screen| localhost:~# awk '/^cpu[0-9]/{print "IDLE-START-" $1 "-" $5}' /proc/stat
+[0000341112] screen| IDLE-START-cpu0-1550
+[0000341150] screen| IDLE-START-cpu1-1430
+[0000341188] screen| IDLE-START-cpu2-1862
+[0000341226] screen| IDLE-START-cpu3-1915
+[0000341264] screen| localhost:~# echo OPERATOR-GO -- start the RUN-CARD sequence now
+[0000341346] screen| OPERATOR-GO -- start the RUN-CARD sequence now
+[0000341410] screen| localhost:~# HB-35
+[0000341446] screen| HB-45
+[0000341469] screen| HB-55
+[0000341492] screen| HB-65
+[0000341515] screen| HB-75
+[0000341538] screen| HB-85
+[0000341561] screen| HB-95
+[0000341584] screen| HB-106
+[0000356251] ttyS0| HB-116
+[0000369290] ttyS0| HB-126
+[0000382981] ttyS0| HB-136
+[0000389247] screen|   Booting `Linux lts'
+[0000389286] screen| Welcome to Alpine Linux 3.21
+[0000389332] screen| Kernel 6.12.81-0-lts on an x86_64 (/dev/ttyS0)
+[0000389396] screen| localhost login: root
+[0000389435] screen| Welcome to Alpine!
+[0000389471] screen| The Alpine Wiki contains a large amount of how-to guides and general
+[0000389557] screen| information about administrating Alpine systems.
+[0000389623] screen| See <https://wiki.alpinelinux.org/>.
+[0000389677] screen| You can setup the system with the command: setup-alpine
+[0000389750] screen| You may change this message by editing /etc/motd.
+[0000389817] screen| localhost:~# setsid sh -c 'dmesg -w > /dev/ttyS0' &
+[0000389886] screen| localhost:~# dmesg -n 8
+[0000389927] screen| localhost:~# echo DMESG-STREAMING-NOW
+[0000389982] screen| DMESG-STREAMING-NOW
+[0000390019] screen| localhost:~# dmesgs: unrecognized option: w
+[0000390080] screen| etsidBusyBox v1.37.0 (2025-11-23 13:10:04 UTC) multi-call binary.
+[0000390163] screen| Usage: sdmesgh  [-cr] [-n LEVEL] [-s SIZE]
+[0000390223] screen| Print or control the kernel ring buffer
+[0000390280] screen|         -c              Clear ring buffer after printing
+[0000390354] screen|         -n LEVEL        Set console logging level
+[0000390421] screen|         -s SIZE         Buffer size
+[0000390474] screen|         -r              Print raw message buffer-
+[0000390541] screen| c 'while :; do echo HB-$(cut -d. -f1 /proc/uptime) > /de
+[0000390615] screen| v/ttyS0; sleep 10; done' &
+[0000390659] screen| [1]-  Done                       setsid sh -c "dmesg -w > /dev/ttyS0"
+[0000390746] screen| localhost:~# echo HEARTBEAT-STARTED
+[0000390799] screen| HEARTBEAT-STARTED
+[0000390834] screen| localhost:~# HB-25
+[0000390870] screen| echo CPUS-$(nproc); grep -c ^processor /proc/cpuinfo
+[0000390940] screen| CPUS-4
+[0000390964] screen| 4
+[0000390983] screen| [2]+  Done                       setsid sh -c "while :; do echo HB-\$(cut -d. -f1 /proc/uptime) > /dev/ttyS0; sleep 10; done"
+[0000391126] screen| localhost:~# awk '/^cpu[0-9]/{print "IDLE-START-" $1 "-" $5}' /proc/stat
+[0000391216] screen| IDLE-START-cpu0-1550
+[0000391254] screen| IDLE-START-cpu1-1430
+[0000391292] screen| IDLE-START-cpu2-1862
+[0000391330] screen| IDLE-START-cpu3-1915
+[0000391368] screen| localhost:~# echo OPERATOR-GO -- start the RUN-CARD sequence now
+[0000391450] screen| OPERATOR-GO -- start the RUN-CARD sequence now
+[0000391514] screen| localhost:~# HB-35
+[0000391550] screen| HB-45
+[0000391573] screen| HB-55
+[0000391596] screen| HB-65
+[0000391619] screen| HB-75
+[0000391642] screen| HB-85
+[0000391665] screen| HB-95
+[0000391688] screen| HB-106
+[0000391712] screen| HB-116
+[0000391736] screen| HB-126
+[0000391760] screen| HB-136
+[0000406784] ttyS0| HB-146
+[0000420351] ttyS0| HB-156
+[0000434071] ttyS0| HB-166
+[0000440148] screen|   Booting `Linux lts'
+[0000440187] screen| Welcome to Alpine Linux 3.21
+[0000440233] screen| Kernel 6.12.81-0-lts on an x86_64 (/dev/ttyS0)
+[0000440297] screen| localhost login: root
+[0000440336] screen| Welcome to Alpine!
+[0000440372] screen| The Alpine Wiki contains a large amount of how-to guides and general
+[0000440458] screen| information about administrating Alpine systems.
+[0000440524] screen| See <https://wiki.alpinelinux.org/>.
+[0000440578] screen| You can setup the system with the command: setup-alpine
+[0000440651] screen| You may change this message by editing /etc/motd.
+[0000440718] screen| localhost:~# setsid sh -c 'dmesg -w > /dev/ttyS0' &
+[0000440787] screen| localhost:~# dmesg -n 8
+[0000440828] screen| localhost:~# echo DMESG-STREAMING-NOW
+[0000440883] screen| DMESG-STREAMING-NOW
+[0000440920] screen| localhost:~# dmesgs: unrecognized option: w
+[0000440981] screen| etsidBusyBox v1.37.0 (2025-11-23 13:10:04 UTC) multi-call binary.
+[0000441064] screen| Usage: sdmesgh  [-cr] [-n LEVEL] [-s SIZE]
+[0000441124] screen| Print or control the kernel ring buffer
+[0000441181] screen|         -c              Clear ring buffer after printing
+[0000441255] screen|         -n LEVEL        Set console logging level
+[0000441322] screen|         -s SIZE         Buffer size
+[0000441375] screen|         -r              Print raw message buffer-
+[0000441442] screen| c 'while :; do echo HB-$(cut -d. -f1 /proc/uptime) > /de
+[0000441516] screen| v/ttyS0; sleep 10; done' &
+[0000441560] screen| [1]-  Done                       setsid sh -c "dmesg -w > /dev/ttyS0"
+[0000441647] screen| localhost:~# echo HEARTBEAT-STARTED
+[0000441700] screen| HEARTBEAT-STARTED
+[0000441735] screen| localhost:~# HB-25
+[0000441771] screen| echo CPUS-$(nproc); grep -c ^processor /proc/cpuinfo
+[0000441841] screen| CPUS-4
+[0000441865] screen| 4
+[0000441884] screen| [2]+  Done                       setsid sh -c "while :; do echo HB-\$(cut -d. -f1 /proc/uptime) > /dev/ttyS0; sleep 10; done"
+[0000442027] screen| localhost:~# awk '/^cpu[0-9]/{print "IDLE-START-" $1 "-" $5}' /proc/stat
+[0000442117] screen| IDLE-START-cpu0-1550
+[0000442155] screen| IDLE-START-cpu1-1430
+[0000442193] screen| IDLE-START-cpu2-1862
+[0000442231] screen| IDLE-START-cpu3-1915
+[0000442269] screen| localhost:~# echo OPERATOR-GO -- start the RUN-CARD sequence now
+[0000442351] screen| OPERATOR-GO -- start the RUN-CARD sequence now
+[0000442415] screen| localhost:~# HB-35
+[0000442451] screen| HB-45
+[0000442474] screen| HB-55
+[0000442497] screen| HB-65
+[0000442520] screen| HB-75
+[0000442543] screen| HB-85
+[0000442566] screen| HB-95
+[0000442589] screen| HB-106
+[0000442613] screen| HB-116
+[0000442637] screen| HB-126
+[0000442661] screen| HB-136
+[0000442685] screen| HB-146
+[0000442709] screen| HB-156
+[0000442733] screen| HB-166
+[0000458584] ttyS0| HB-176
+[0000471738] ttyS0| HB-186
+[0000484868] ttyS0| HB-196
+[0000491734] screen|   Booting `Linux lts'
+[0000491773] screen| Welcome to Alpine Linux 3.21
+[0000491819] screen| Kernel 6.12.81-0-lts on an x86_64 (/dev/ttyS0)
+[0000491883] screen| localhost login: root
+[0000491922] screen| Welcome to Alpine!
+[0000491958] screen| The Alpine Wiki contains a large amount of how-to guides and general
+[0000492044] screen| information about administrating Alpine systems.
+[0000492110] screen| See <https://wiki.alpinelinux.org/>.
+[0000492164] screen| You can setup the system with the command: setup-alpine
+[0000492237] screen| You may change this message by editing /etc/motd.
+[0000492304] screen| localhost:~# setsid sh -c 'dmesg -w > /dev/ttyS0' &
+[0000492373] screen| localhost:~# dmesg -n 8
+[0000492414] screen| localhost:~# echo DMESG-STREAMING-NOW
+[0000492469] screen| DMESG-STREAMING-NOW
+[0000492506] screen| localhost:~# dmesgs: unrecognized option: w
+[0000492567] screen| etsidBusyBox v1.37.0 (2025-11-23 13:10:04 UTC) multi-call binary.
+[0000492650] screen| Usage: sdmesgh  [-cr] [-n LEVEL] [-s SIZE]
+[0000492710] screen| Print or control the kernel ring buffer
+[0000492767] screen|         -c              Clear ring buffer after printing
+[0000492841] screen|         -n LEVEL        Set console logging level
+[0000492908] screen|         -s SIZE         Buffer size
+[0000492961] screen|         -r              Print raw message buffer-
+[0000493028] screen| c 'while :; do echo HB-$(cut -d. -f1 /proc/uptime) > /de
+[0000493102] screen| v/ttyS0; sleep 10; done' &
+[0000493146] screen| [1]-  Done                       setsid sh -c "dmesg -w > /dev/ttyS0"
+[0000493233] screen| localhost:~# echo HEARTBEAT-STARTED
+[0000493392] screen| HEARTBEAT-STARTED
+[0000493591] screen| localhost:~# HB-25
+[0000493791] screen| echo CPUS-$(nproc); grep -c ^processor /proc/cpuinfo
+[0000494026] screen| CPUS-4
+[0000494050] screen| 4
+[0000494069] screen| [2]+  Done                       setsid sh -c "while :; do echo HB-\$(cut -d. -f1 /proc/uptime) > /dev/ttyS0; sleep 10; done"
+[0000494212] screen| localhost:~# awk '/^cpu[0-9]/{print "IDLE-START-" $1 "-" $5}' /proc/stat
+[0000494302] screen| IDLE-START-cpu0-1550
+[0000494340] screen| IDLE-START-cpu1-1430
+[0000494378] screen| IDLE-START-cpu2-1862
+[0000494416] screen| IDLE-START-cpu3-1915
+[0000494454] screen| localhost:~# echo OPERATOR-GO -- start the RUN-CARD sequence now
+[0000494536] screen| OPERATOR-GO -- start the RUN-CARD sequence now
+[0000494600] screen| localhost:~# HB-35
+[0000494636] screen| HB-45
+[0000494659] screen| HB-55
+[0000494682] screen| HB-65
+[0000494705] screen| HB-75
+[0000494728] screen| HB-85
+[0000494751] screen| HB-95
+[0000494774] screen| HB-106
+[0000494798] screen| HB-116
+[0000494822] screen| HB-126
+[0000494846] screen| HB-136
+[0000494870] screen| HB-146
+[0000494894] screen| HB-156
+[0000494918] screen| HB-166
+[0000494942] screen| HB-176
+[0000494966] screen| HB-186
+[0000494990] screen| HB-196
+[0000510198] ttyS0| HB-206
+[0000523767] ttyS0| HB-216
+[0000537462] ttyS0| HB-226
+[0000543458] screen|   Booting `Linux lts'
+[0000543497] screen| Welcome to Alpine Linux 3.21
+[0000543543] screen| Kernel 6.12.81-0-lts on an x86_64 (/dev/ttyS0)
+[0000543607] screen| localhost login: root
+[0000543646] screen| Welcome to Alpine!
+[0000543682] screen| The Alpine Wiki contains a large amount of how-to guides and general
+[0000543768] screen| information about administrating Alpine systems.
+[0000543834] screen| See <https://wiki.alpinelinux.org/>.
+[0000543888] screen| You can setup the system with the command: setup-alpine
+[0000543961] screen| You may change this message by editing /etc/motd.
+[0000544028] screen| localhost:~# setsid sh -c 'dmesg -w > /dev/ttyS0' &
+[0000544097] screen| localhost:~# dmesg -n 8
+[0000544138] screen| localhost:~# echo DMESG-STREAMING-NOW
+[0000544193] screen| DMESG-STREAMING-NOW
+[0000544230] screen| localhost:~# dmesgs: unrecognized option: w
+[0000544291] screen| etsidBusyBox v1.37.0 (2025-11-23 13:10:04 UTC) multi-call binary.
+[0000544374] screen| Usage: sdmesgh  [-cr] [-n LEVEL] [-s SIZE]
+[0000544434] screen| Print or control the kernel ring buffer
+[0000544491] screen|         -c              Clear ring buffer after printing
+[0000544565] screen|         -n LEVEL        Set console logging level
+[0000544632] screen|         -s SIZE         Buffer size
+[0000544685] screen|         -r              Print raw message buffer-
+[0000544752] screen| c 'while :; do echo HB-$(cut -d. -f1 /proc/uptime) > /de
+[0000544826] screen| v/ttyS0; sleep 10; done' &
+[0000544870] screen| [1]-  Done                       setsid sh -c "dmesg -w > /dev/ttyS0"
+[0000544957] screen| localhost:~# echo HEARTBEAT-STARTED
+[0000545010] screen| HEARTBEAT-STARTED
+[0000545045] screen| localhost:~# HB-25
+[0000545081] screen| echo CPUS-$(nproc); grep -c ^processor /proc/cpuinfo
+[0000545151] screen| CPUS-4
+[0000545175] screen| 4
+[0000545194] screen| [2]+  Done                       setsid sh -c "while :; do echo HB-\$(cut -d. -f1 /proc/uptime) > /dev/ttyS0; sleep 10; done"
+[0000545337] screen| localhost:~# awk '/^cpu[0-9]/{print "IDLE-START-" $1 "-" $5}' /proc/stat
+[0000545427] screen| IDLE-START-cpu0-1550
+[0000545465] screen| IDLE-START-cpu1-1430
+[0000545503] screen| IDLE-START-cpu2-1862
+[0000545541] screen| IDLE-START-cpu3-1915
+[0000545579] screen| localhost:~# echo OPERATOR-GO -- start the RUN-CARD sequence now
+[0000545661] screen| OPERATOR-GO -- start the RUN-CARD sequence now
+[0000545725] screen| localhost:~# HB-35
+[0000545761] screen| HB-45
+[0000545784] screen| HB-55
+[0000545807] screen| HB-65
+[0000545830] screen| HB-75
+[0000545853] screen| HB-85
+[0000545876] screen| HB-95
+[0000545899] screen| HB-106
+[0000545923] screen| HB-116
+[0000545947] screen| HB-126
+[0000545971] screen| HB-136
+[0000545995] screen| HB-146
+[0000546019] screen| HB-156
+[0000546043] screen| HB-166
+[0000546067] screen| HB-176
+[0000546091] screen| HB-186
+[0000546115] screen| HB-196
+[0000546139] screen| HB-206
+[0000546163] screen| HB-216
+[0000546187] screen| HB-226
+[0000561269] ttyS0| HB-236
+[0000575007] ttyS0| HB-246
+[0000588746] ttyS0| HB-256
+[0000595546] screen|   Booting `Linux lts'
+[0000595694] screen| Welcome to Alpine Linux 3.21
+[0000595850] screen| Kernel 6.12.81-0-lts on an x86_64 (/dev/ttyS0)
+[0000595914] screen| localhost login: root
+[0000595953] screen| Welcome to Alpine!
+[0000595989] screen| The Alpine Wiki contains a large amount of how-to guides and general
+[0000596075] screen| information about administrating Alpine systems.
+[0000596141] screen| See <https://wiki.alpinelinux.org/>.
+[0000596195] screen| You can setup the system with the command: setup-alpine
+[0000596268] screen| You may change this message by editing /etc/motd.
+[0000596335] screen| localhost:~# setsid sh -c 'dmesg -w > /dev/ttyS0' &
+[0000596404] screen| localhost:~# dmesg -n 8
+[0000596445] screen| localhost:~# echo DMESG-STREAMING-NOW
+[0000596500] screen| DMESG-STREAMING-NOW
+[0000596537] screen| localhost:~# dmesgs: unrecognized option: w
+[0000596598] screen| etsidBusyBox v1.37.0 (2025-11-23 13:10:04 UTC) multi-call binary.
+[0000596681] screen| Usage: sdmesgh  [-cr] [-n LEVEL] [-s SIZE]
+[0000596741] screen| Print or control the kernel ring buffer
+[0000596798] screen|         -c              Clear ring buffer after printing
+[0000596872] screen|         -n LEVEL        Set console logging level
+[0000596939] screen|         -s SIZE         Buffer size
+[0000596992] screen|         -r              Print raw message buffer-
+[0000597059] screen| c 'while :; do echo HB-$(cut -d. -f1 /proc/uptime) > /de
+[0000597133] screen| v/ttyS0; sleep 10; done' &
+[0000597177] screen| [1]-  Done                       setsid sh -c "dmesg -w > /dev/ttyS0"
+[0000597264] screen| localhost:~# echo HEARTBEAT-STARTED
+[0000597317] screen| HEARTBEAT-STARTED
+[0000597352] screen| localhost:~# HB-25
+[0000597388] screen| echo CPUS-$(nproc); grep -c ^processor /proc/cpuinfo
+[0000597458] screen| CPUS-4
+[0000597482] screen| 4
+[0000597501] screen| [2]+  Done                       setsid sh -c "while :; do echo HB-\$(cut -d. -f1 /proc/uptime) > /dev/ttyS0; sleep 10; done"
+[0000597644] screen| localhost:~# awk '/^cpu[0-9]/{print "IDLE-START-" $1 "-" $5}' /proc/stat
+[0000597734] screen| IDLE-START-cpu0-1550
+[0000597772] screen| IDLE-START-cpu1-1430
+[0000597810] screen| IDLE-START-cpu2-1862
+[0000597848] screen| IDLE-START-cpu3-1915
+[0000597886] screen| localhost:~# echo OPERATOR-GO -- start the RUN-CARD sequence now
+[0000597968] screen| OPERATOR-GO -- start the RUN-CARD sequence now
+[0000598032] screen| localhost:~# HB-35
+[0000598068] screen| HB-45
+[0000598091] screen| HB-55
+[0000598114] screen| HB-65
+[0000598137] screen| HB-75
+[0000598160] screen| HB-85
+[0000598183] screen| HB-95
+[0000598206] screen| HB-106
+[0000598230] screen| HB-116
+[0000598254] screen| HB-126
+[0000598278] screen| HB-136
+[0000598302] screen| HB-146
+[0000598326] screen| HB-156
+[0000598350] screen| HB-166
+[0000598374] screen| HB-176
+[0000598398] screen| HB-186
+[0000598422] screen| HB-196
+[0000598446] screen| HB-206
+[0000598470] screen| HB-216
+[0000598494] screen| HB-226
+[0000598518] screen| HB-236
+[0000598542] screen| HB-246
+[0000598566] screen| HB-256
+[0000613373] ttyS0| HB-266
+[0000627019] ttyS0| HB-276
+[0000640506] ttyS0| HB-286
+[0000647187] screen|   Booting `Linux lts'
+[0000647226] screen| Welcome to Alpine Linux 3.21
+[0000647272] screen| Kernel 6.12.81-0-lts on an x86_64 (/dev/ttyS0)
+[0000647336] screen| localhost login: root
+[0000647375] screen| Welcome to Alpine!
+[0000647411] screen| The Alpine Wiki contains a large amount of how-to guides and general
+[0000647497] screen| information about administrating Alpine systems.
+[0000647563] screen| See <https://wiki.alpinelinux.org/>.
+[0000647617] screen| You can setup the system with the command: setup-alpine
+[0000647690] screen| You may change this message by editing /etc/motd.
+[0000647757] screen| localhost:~# setsid sh -c 'dmesg -w > /dev/ttyS0' &
+[0000647826] screen| localhost:~# dmesg -n 8
+[0000647867] screen| localhost:~# echo DMESG-STREAMING-NOW
+[0000647922] screen| DMESG-STREAMING-NOW
+[0000647959] screen| localhost:~# dmesgs: unrecognized option: w
+[0000648020] screen| etsidBusyBox v1.37.0 (2025-11-23 13:10:04 UTC) multi-call binary.
+[0000648103] screen| Usage: sdmesgh  [-cr] [-n LEVEL] [-s SIZE]
+[0000648163] screen| Print or control the kernel ring buffer
+[0000648220] screen|         -c              Clear ring buffer after printing
+[0000648294] screen|         -n LEVEL        Set console logging level
+[0000648361] screen|         -s SIZE         Buffer size
+[0000648414] screen|         -r              Print raw message buffer-
+[0000648481] screen| c 'while :; do echo HB-$(cut -d. -f1 /proc/uptime) > /de
+[0000648555] screen| v/ttyS0; sleep 10; done' &
+[0000648599] screen| [1]-  Done                       setsid sh -c "dmesg -w > /dev/ttyS0"
+[0000648686] screen| localhost:~# echo HEARTBEAT-STARTED
+[0000648739] screen| HEARTBEAT-STARTED
+[0000648774] screen| localhost:~# HB-25
+[0000648810] screen| echo CPUS-$(nproc); grep -c ^processor /proc/cpuinfo
+[0000648880] screen| CPUS-4
+[0000648904] screen| 4
+[0000648923] screen| [2]+  Done                       setsid sh -c "while :; do echo HB-\$(cut -d. -f1 /proc/uptime) > /dev/ttyS0; sleep 10; done"
+[0000649066] screen| localhost:~# awk '/^cpu[0-9]/{print "IDLE-START-" $1 "-" $5}' /proc/stat
+[0000649156] screen| IDLE-START-cpu0-1550
+[0000649194] screen| IDLE-START-cpu1-1430
+[0000649232] screen| IDLE-START-cpu2-1862
+[0000649270] screen| IDLE-START-cpu3-1915
+[0000649308] screen| localhost:~# echo OPERATOR-GO -- start the RUN-CARD sequence now
+[0000649390] screen| OPERATOR-GO -- start the RUN-CARD sequence now
+[0000649454] screen| localhost:~# HB-35
+[0000649490] screen| HB-45
+[0000649513] screen| HB-55
+[0000649536] screen| HB-65
+[0000649559] screen| HB-75
+[0000649582] screen| HB-85
+[0000649605] screen| HB-95
+[0000649628] screen| HB-106
+[0000649652] screen| HB-116
+[0000649676] screen| HB-126
+[0000649700] screen| HB-136
+[0000649724] screen| HB-146
+[0000649748] screen| HB-156
+[0000649772] screen| HB-166
+[0000649796] screen| HB-176
+[0000649820] screen| HB-186
+[0000649844] screen| HB-196
+[0000649868] screen| HB-206
+[0000649892] screen| HB-216
+[0000649916] screen| HB-226
+[0000649940] screen| HB-236
+[0000650083] screen| HB-246
+[0000650216] screen| HB-256
+[0000650350] screen| HB-266
+[0000650374] screen| HB-276
+[0000650398] screen| HB-286
+[0000665511] ttyS0| HB-296
+[0000679250] ttyS0| HB-306
+[0000693212] ttyS0| HB-316
+[0000699302] screen|   Booting `Linux lts'
+[0000699341] screen| Welcome to Alpine Linux 3.21
+[0000699387] screen| Kernel 6.12.81-0-lts on an x86_64 (/dev/ttyS0)
+[0000699451] screen| localhost login: root
+[0000699490] screen| Welcome to Alpine!
+[0000699526] screen| The Alpine Wiki contains a large amount of how-to guides and general
+[0000699612] screen| information about administrating Alpine systems.
+[0000699678] screen| See <https://wiki.alpinelinux.org/>.
+[0000699732] screen| You can setup the system with the command: setup-alpine
+[0000699805] screen| You may change this message by editing /etc/motd.
+[0000699872] screen| localhost:~# setsid sh -c 'dmesg -w > /dev/ttyS0' &
+[0000699941] screen| localhost:~# dmesg -n 8
+[0000699982] screen| localhost:~# echo DMESG-STREAMING-NOW
+[0000700037] screen| DMESG-STREAMING-NOW
+[0000700074] screen| localhost:~# dmesgs: unrecognized option: w
+[0000700135] screen| etsidBusyBox v1.37.0 (2025-11-23 13:10:04 UTC) multi-call binary.
+[0000700218] screen| Usage: sdmesgh  [-cr] [-n LEVEL] [-s SIZE]
+[0000700278] screen| Print or control the kernel ring buffer
+[0000700335] screen|         -c              Clear ring buffer after printing
+[0000700409] screen|         -n LEVEL        Set console logging level
+[0000700476] screen|         -s SIZE         Buffer size
+[0000700529] screen|         -r              Print raw message buffer-
+[0000700596] screen| c 'while :; do echo HB-$(cut -d. -f1 /proc/uptime) > /de
+[0000700670] screen| v/ttyS0; sleep 10; done' &
+[0000700714] screen| [1]-  Done                       setsid sh -c "dmesg -w > /dev/ttyS0"
+[0000700801] screen| localhost:~# echo HEARTBEAT-STARTED
+[0000700854] screen| HEARTBEAT-STARTED
+[0000700889] screen| localhost:~# HB-25
+[0000700925] screen| echo CPUS-$(nproc); grep -c ^processor /proc/cpuinfo
+[0000700995] screen| CPUS-4
+[0000701019] screen| 4
+[0000701038] screen| [2]+  Done                       setsid sh -c "while :; do echo HB-\$(cut -d. -f1 /proc/uptime) > /dev/ttyS0; sleep 10; done"
+[0000701181] screen| localhost:~# awk '/^cpu[0-9]/{print "IDLE-START-" $1 "-" $5}' /proc/stat
+[0000701271] screen| IDLE-START-cpu0-1550
+[0000701309] screen| IDLE-START-cpu1-1430
+[0000701347] screen| IDLE-START-cpu2-1862
+[0000701385] screen| IDLE-START-cpu3-1915
+[0000701423] screen| localhost:~# echo OPERATOR-GO -- start the RUN-CARD sequence now
+[0000701505] screen| OPERATOR-GO -- start the RUN-CARD sequence now
+[0000701569] screen| localhost:~# HB-35
+[0000701605] screen| HB-45
+[0000701628] screen| HB-55
+[0000701651] screen| HB-65
+[0000701674] screen| HB-75
+[0000701697] screen| HB-85
+[0000701720] screen| HB-95
+[0000701743] screen| HB-106
+[0000701767] screen| HB-116
+[0000701791] screen| HB-126
+[0000701815] screen| HB-136
+[0000701839] screen| HB-146
+[0000701863] screen| HB-156
+[0000701887] screen| HB-166
+[0000701911] screen| HB-176
+[0000701935] screen| HB-186
+[0000701959] screen| HB-196
+[0000701983] screen| HB-206
+[0000702007] screen| HB-216
+[0000702031] screen| HB-226
+[0000702055] screen| HB-236
+[0000702079] screen| HB-246
+[0000702103] screen| HB-256
+[0000702127] screen| HB-266
+[0000702151] screen| HB-276
+[0000702175] screen| HB-286
+[0000702199] screen| HB-296
+[0000702223] screen| HB-306
+[0000702247] screen| HB-316
+[0000717781] ttyS0| HB-326
+[0000731536] ttyS0| HB-336
+[0000745291] ttyS0| HB-346
+[0000751124] screen|   Booting `Linux lts'
+[0000751163] screen| Welcome to Alpine Linux 3.21
+[0000751209] screen| Kernel 6.12.81-0-lts on an x86_64 (/dev/ttyS0)
+[0000751273] screen| localhost login: root
+[0000751312] screen| Welcome to Alpine!
+[0000751348] screen| The Alpine Wiki contains a large amount of how-to guides and general
+[0000751434] screen| information about administrating Alpine systems.
+[0000751500] screen| See <https://wiki.alpinelinux.org/>.
+[0000751554] screen| You can setup the system with the command: setup-alpine
+[0000751627] screen| You may change this message by editing /etc/motd.
+[0000751694] screen| localhost:~# setsid sh -c 'dmesg -w > /dev/ttyS0' &
+[0000751763] screen| localhost:~# dmesg -n 8
+[0000751804] screen| localhost:~# echo DMESG-STREAMING-NOW
+[0000751859] screen| DMESG-STREAMING-NOW
+[0000751896] screen| localhost:~# dmesgs: unrecognized option: w
+[0000751957] screen| etsidBusyBox v1.37.0 (2025-11-23 13:10:04 UTC) multi-call binary.
+[0000752040] screen| Usage: sdmesgh  [-cr] [-n LEVEL] [-s SIZE]
+[0000752100] screen| Print or control the kernel ring buffer
+[0000752157] screen|         -c              Clear ring buffer after printing
+[0000752231] screen|         -n LEVEL        Set console logging level
+[0000752298] screen|         -s SIZE         Buffer size
+[0000752351] screen|         -r              Print raw message buffer-
+[0000752418] screen| c 'while :; do echo HB-$(cut -d. -f1 /proc/uptime) > /de
+[0000752492] screen| v/ttyS0; sleep 10; done' &
+[0000752536] screen| [1]-  Done                       setsid sh -c "dmesg -w > /dev/ttyS0"
+[0000752623] screen| localhost:~# echo HEARTBEAT-STARTED
+[0000752676] screen| HEARTBEAT-STARTED
+[0000752711] screen| localhost:~# HB-25
+[0000752747] screen| echo CPUS-$(nproc); grep -c ^processor /proc/cpuinfo
+[0000752817] screen| CPUS-4
+[0000752841] screen| 4
+[0000752860] screen| [2]+  Done                       setsid sh -c "while :; do echo HB-\$(cut -d. -f1 /proc/uptime) > /dev/ttyS0; sleep 10; done"
+[0000753122] screen| localhost:~# awk '/^cpu[0-9]/{print "IDLE-START-" $1 "-" $5}' /proc/stat
+[0000753321] screen| IDLE-START-cpu0-1550
+[0000753469] screen| IDLE-START-cpu1-1430
+[0000753507] screen| IDLE-START-cpu2-1862
+[0000753545] screen| IDLE-START-cpu3-1915
+[0000753583] screen| localhost:~# echo OPERATOR-GO -- start the RUN-CARD sequence now
+[0000753665] screen| OPERATOR-GO -- start the RUN-CARD sequence now
+[0000753729] screen| localhost:~# HB-35
+[0000753765] screen| HB-45
+[0000753788] screen| HB-55
+[0000753811] screen| HB-65
+[0000753834] screen| HB-75
+[0000753857] screen| HB-85
+[0000753880] screen| HB-95
+[0000753903] screen| HB-106
+[0000753927] screen| HB-116
+[0000753951] screen| HB-126
+[0000753975] screen| HB-136
+[0000753999] screen| HB-146
+[0000754023] screen| HB-156
+[0000754047] screen| HB-166
+[0000754071] screen| HB-176
+[0000754095] screen| HB-186
+[0000754119] screen| HB-196
+[0000754143] screen| HB-206
+[0000754167] screen| HB-216
+[0000754191] screen| HB-226
+[0000754215] screen| HB-236
+[0000754239] screen| HB-246
+[0000754263] screen| HB-256
+[0000754287] screen| HB-266
+[0000754311] screen| HB-276
+[0000754335] screen| HB-286
+[0000754359] screen| HB-296
+[0000754383] screen| HB-306
+[0000754407] screen| HB-316
+[0000754431] screen| HB-326
+[0000754455] screen| HB-336
+[0000754479] screen| HB-346
+[0000769573] ttyS0| HB-356
+[0000782421] ttyS0| HB-366
+[0000796373] ttyS0| HB-376
