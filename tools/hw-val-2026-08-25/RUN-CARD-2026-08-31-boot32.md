@@ -35,24 +35,46 @@ for tickets that have been sitting On Hold waiting for exactly this machine.
 
 **Everything you type in this part must be typed on the KEYCHRON** (`3434:0da4`), not the
 Pico. The Pico sends fixed scripted bursts and never holds a key down, so it cannot test
-typematic at all and cannot test fast human typing. Leave it armed anyway: its report count
-is an independent control, because it emits a known number of tags and any drop shows up
-against that.
+typematic at all and cannot test fast human typing. Leave it armed anyway -- see the note on
+witnesses below.
 
-All three keyboards currently sit behind the hub on root port 4. That matters for C.
+### The topology, verified on the host before this run
 
-### A. Move the Keychron to a REAR USB-A socket (settles #744 and #745)
+| Where | Device | Notes |
+| --- | --- | --- |
+| `1-6` root port 6, 12M | **Keychron K10** | On controller[1] (02:00.0), directly on a root port, no hub. This is what part A needed -- it is **already done**. |
+| `1-5` root port 5, 480M | SanDisk Cruzer Blade (`sdc`, 7.5 GB) | The only USB drive that is safe to unplug. |
+| `2-4` root port 4, 5000M | **SABRENT bridge = HYPEBOOT (`sdb`)** | Boot medium AND log medium. **Never unplug this one.** |
+| `3-4.3` behind the UGREEN hub | Pico `cafe:4b44` | On controller[2] (2f:00.3). Still armed. |
+| `3-4.4` behind the same hub | Logitech receiver | Also controller[2]. |
 
-1. Unplug the Keychron from the front hub. Wait five seconds.
-2. Plug it into a **rear USB-A socket** on the motherboard.
+### Read this before judging the run: the witnesses have changed
+
+Boot 31's command-ring death was on **controller[2]**, and back then all three keyboards sat
+behind the hub there, so "input died" was a reliable alarm for it.
+
+The Keychron has now moved to **controller[1]**. If controller[2] stops again, the Keychron
+will keep working and the machine will feel fine. **The Pico is now the witness for
+controller[2]** -- so arm it, leave it armed, and judge that controller by its `reports=`
+count in `HIDTICK`, not by whether you can type.
+
+The flip side: the Keychron now shares a controller with the log stick. If controller[1] is
+the one that dies, the log dies with it -- which is exactly the case the DEADMAN warm reboot
+and `\hype-log-prev.txt` exist for, so let it fire rather than powering off.
+
+### A. Cycle the Keychron in its rear socket (settles #744 and #745)
+
+The Keychron is already in the right place (`1-6`, a rear root port). What is still needed is
+the EVENT: hype has to watch it leave and come back.
+
+1. With hype at the dashboard, unplug the Keychron. Wait five seconds.
+2. Plug it back into the **same rear socket**.
 3. Type a few characters to confirm it still reaches the guest.
 
-Leave it there for the rest of the run -- parts B and C are typed on it in its new home.
-
 Why it settles them: #744 (root-port departure and slot teardown) and #745 (root-port arrival
-and CLAIM) have never run on real hardware; every hot-plug in boots 30 and 31 was behind the
+and CLAIM) have never run on real hardware -- every hot-plug in boots 30 and 31 was behind the
 hub. #745's bar is specifically a keyboard or mouse claimed after boot on a root port, so a
-USB drive cannot settle it -- it has to be a HID.
+USB drive cannot settle it; it has to be a HID, which is why the Keychron move matters.
 
 ### B. Type a known sentence twice (settles #773)
 
@@ -80,15 +102,17 @@ the fix working. #777 is "typematic repeats forever when the release report is l
 repeat is bounded at 10 seconds, so the run of `a`s should STOP before you let go. Note
 whether it stopped on its own, and roughly when.
 
-### D. Optional: the two rear drives (extra evidence for #744)
+### D. Optional: cycle the SanDisk (extra evidence for #744)
 
-If you want a second and third root-port event, pull the drive from the rear USB-C socket,
-wait five seconds, and put it back in the SAME socket; then do the same with the drive in the
-rear USB-A socket. Two different sockets are likely two different controllers and two
-different speeds, which exercises more of #744's enumeration path than one does.
+Pull the **SanDisk Cruzer Blade** from its rear socket, wait five seconds, put it back in the
+same socket. It is a mass-storage arrival rather than a HID one, so it exercises a different
+branch of #744's enumeration than part A does.
 
-> **NOT the HYPEBOOT drive.** It is both the boot medium and the log medium; unplugging it
-> ends the run and destroys the record of everything else on this card.
+> **Only the SanDisk.** The other USB drive on this machine is the SABRENT bridge at `2-4`,
+> which is HYPEBOOT -- the boot medium and the log medium both. It is the one on the
+> SuperSpeed port, and unplugging it ends the run and destroys the record of everything else
+> on this card. If you are unsure which is which by feel, do not do part D; it is optional and
+> part A already covers #744.
 
 ## Deliberately NOT in this run
 
