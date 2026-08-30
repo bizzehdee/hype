@@ -138,38 +138,43 @@ void hype_paging_mark_region_wc(hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_T
 }
 
 void hype_paging_apply_nx(hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_TABLE],
-                          unsigned int gb_mapped, uint64_t exec_base, uint64_t exec_size,
-                          uint64_t exec2_base, uint64_t exec2_size) {
-    uint64_t exec_first, exec_last, exec2_first, exec2_last;
-    unsigned int gb, j;
+                          unsigned int gb_mapped, const hype_exec_range_t *exempt,
+                          unsigned int n_exempt) {
+    unsigned int gb, j, k;
 
-    if (exec_size != 0) {
-        exec_first = exec_base & ~(HYPE_PAGING_2MB - 1ULL);
-        exec_last = (exec_base + exec_size - 1ULL) & ~(HYPE_PAGING_2MB - 1ULL);
-    } else {
-        /* No exempt range: exec_first > exec_last so the overlap check below never matches. */
-        exec_first = 1ULL;
-        exec_last = 0ULL;
+    if (exempt == 0) {
+        n_exempt = 0;
     }
-    if (exec2_size != 0) {
-        exec2_first = exec2_base & ~(HYPE_PAGING_2MB - 1ULL);
-        exec2_last = (exec2_base + exec2_size - 1ULL) & ~(HYPE_PAGING_2MB - 1ULL);
-    } else {
-        exec2_first = 1ULL;
-        exec2_last = 0ULL;
+    if (n_exempt > HYPE_PAGING_MAX_EXEC_RANGES) {
+        n_exempt = HYPE_PAGING_MAX_EXEC_RANGES;
     }
-
     for (gb = 0; gb < gb_mapped; gb++) {
         for (j = 0; j < HYPE_PAGING_ENTRIES_PER_TABLE; j++) {
             uint64_t phys = (uint64_t)gb * HYPE_PAGING_1GB + (uint64_t)j * HYPE_PAGING_2MB;
+            int keep_exec = 0;
+
             if ((pd_tables[gb][j] & HYPE_PAGING_PRESENT) == 0) {
                 continue;
             }
-            if (phys >= exec_first && phys <= exec_last) {
-                continue; /* overlaps hype's own image -- must stay executable */
+            /*
+             * A range is compared at 2 MiB granularity: any leaf that OVERLAPS an exempt
+             * range stays executable, because that is the mapping granularity available. A
+             * range of size 0 is an unused slot and matches nothing.
+             */
+            for (k = 0; k < n_exempt; k++) {
+                uint64_t first, last;
+                if (exempt[k].size == 0) {
+                    continue;
+                }
+                first = exempt[k].base & ~(HYPE_PAGING_2MB - 1ULL);
+                last = (exempt[k].base + exempt[k].size - 1ULL) & ~(HYPE_PAGING_2MB - 1ULL);
+                if (phys >= first && phys <= last) {
+                    keep_exec = 1;
+                    break;
+                }
             }
-            if (phys >= exec2_first && phys <= exec2_last) {
-                continue; /* overlaps the AP trampoline page -- must stay executable */
+            if (keep_exec) {
+                continue;
             }
             pd_tables[gb][j] |= HYPE_PAGING_NX;
         }

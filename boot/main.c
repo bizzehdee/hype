@@ -26869,6 +26869,54 @@ static void fw_alloc_vm_aux_arena(EFI_BOOT_SERVICES *bs) {
     HYPE_LOGF(HYPE_LOG_INFO, "fw-1: per-VM aux arena for %u VM(s) allocated [#394]\n", n);
 }
 
+/*
+ * #604 / boot 36: build the list of ranges that must stay executable when the NX pass runs.
+ *
+ * hype's own image and the AP trampoline were the two the pass knew about. The third is UEFI's
+ * Runtime Services code, and leaving it out cost a panic: boot 36 took a page fault with
+ * rip == cr2 = 0xddbbb668 and error_code=0x11 -- present page, instruction fetch, which is a
+ * no-execute violation -- at the exact moment hype called ResetSystem() to reboot the host.
+ * That address sits inside `RuntimeServicesCode phys=0xddb49000 pages=182`, a region hype had
+ * just marked NX.
+ *
+ * It is read from the memory map rather than hardcoded, because how many such regions exist
+ * and where they sit is the firmware's business. RuntimeServicesDATA is deliberately NOT
+ * exempted: nothing executes out of it, and exempting data would give away most of what the
+ * NX pass is for.
+ */
+static unsigned int fw_1_exec_exempt_ranges(hype_exec_range_t *out, unsigned int cap,
+                                            const EFI_MEMORY_DESCRIPTOR *map, UINTN map_size,
+                                            UINTN desc_size, uint64_t tramp_page) {
+    unsigned int n = 0;
+    UINTN count = (desc_size > 0) ? (map_size / desc_size) : 0;
+    UINTN i;
+    const UINT8 *base = (const UINT8 *)map;
+
+    if (out == 0 || cap == 0) {
+        return 0;
+    }
+    if (g_hype_image_size != 0 && n < cap) {
+        out[n].base = g_hype_image_base;
+        out[n].size = g_hype_image_size;
+        n++;
+    }
+    if (tramp_page != 0 && n < cap) {
+        out[n].base = tramp_page;
+        out[n].size = 4096ULL;
+        n++;
+    }
+    for (i = 0; i < count && n < cap; i++) {
+        const EFI_MEMORY_DESCRIPTOR *d = (const EFI_MEMORY_DESCRIPTOR *)(base + i * desc_size);
+        if (d->Type != EfiRuntimeServicesCode) {
+            continue;
+        }
+        out[n].base = d->PhysicalStart;
+        out[n].size = d->NumberOfPages * 4096ULL;
+        n++;
+    }
+    return n;
+}
+
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     hype_stack_protector_init(); /* #604/#711: reseed before any local array is touched */
     EFI_MEMORY_DESCRIPTOR *map = 0;
@@ -27660,8 +27708,11 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
              * PTE anywhere may carry bit 63.
              */
             if (g_hype_nx_supported) {
-                hype_paging_apply_nx(ap_pd, HYPE_PAGING_MAX_GB, g_hype_image_base,
-                                     g_hype_image_size, g_ap_tramp_page, 4096ULL);
+                hype_exec_range_t ex[HYPE_PAGING_MAX_EXEC_RANGES];
+                unsigned int nex = fw_1_exec_exempt_ranges(ex, HYPE_PAGING_MAX_EXEC_RANGES,
+                                                           map, map_size, desc_size,
+                                                           g_ap_tramp_page);
+                hype_paging_apply_nx(ap_pd, HYPE_PAGING_MAX_GB, ex, nex);
             }
             /* PERF-2 (#234): mark the FB pages WC in the AP's own table too (the
              * AP also programs PAT slot 1 = WC in fw_1_ap_main).
@@ -27875,10 +27926,18 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      * ignored one, regardless of what EFER.NXE (never set on such a CPU) says.
      */
     if (g_hype_nx_supported) {
-        hype_paging_apply_nx(g_pd, HYPE_PAGING_MAX_GB, g_hype_image_base, g_hype_image_size, 0, 0);
-        hype_debug_print("paging: NX applied to every host page except hype's own image "
-                         "(0x%llx+0x%llx) [#604]\n", (unsigned long long)g_hype_image_base,
-                         (unsigned long long)g_hype_image_size);
+        hype_exec_range_t ex[HYPE_PAGING_MAX_EXEC_RANGES];
+        unsigned int nex = fw_1_exec_exempt_ranges(ex, HYPE_PAGING_MAX_EXEC_RANGES,
+                                                   map, map_size, desc_size, 0);
+        unsigned int k;
+        hype_paging_apply_nx(g_pd, HYPE_PAGING_MAX_GB, ex, nex);
+        hype_debug_print("paging: NX applied to every host page except %u executable range(s) "
+                         "[#604]\n", nex);
+        for (k = 0; k < nex; k++) {
+            hype_debug_print("paging:   exec-exempt 0x%llx+0x%llx%s\n",
+                             (unsigned long long)ex[k].base, (unsigned long long)ex[k].size,
+                             (k == 0) ? " (hype's own image)" : " (UEFI RuntimeServicesCode)");
+        }
     }
     hype_paging_load(g_pml4);
     hype_paging_set_pat_wc(); /* PERF-2: PAT slot 1 = WC (this core) */

@@ -195,9 +195,29 @@ void hype_paging_mark_region_wc(hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_T
  *
  * Pure table-editing, no CPU state touched -- same shape as hype_paging_mark_region_wc.
  */
+/*
+ * A range that must stay EXECUTABLE when the NX pass runs.
+ *
+ * There used to be exactly two, passed as four scalars: hype's own image and the AP
+ * trampoline page. Boot 36 found the third the hard way -- a page fault with rip == cr2 and
+ * error_code=0x11 (present, instruction fetch), which is a no-execute violation, at
+ * 0xddbbb668 inside `RuntimeServicesCode phys=0xddb49000 pages=182`. hype had marked UEFI's
+ * Runtime Services code non-executable and then called ResetSystem() through it to reboot the
+ * host. An array rather than a third pair of scalars, because firmware may publish more than
+ * one such region and the count is not hype's to assume.
+ */
+typedef struct {
+    uint64_t base;
+    uint64_t size; /* 0 = unused entry, skipped */
+} hype_exec_range_t;
+
+/* Image + AP trampoline + however many RuntimeServicesCode regions the firmware publishes.
+ * Eight is far above the one this hardware reports and costs 128 bytes of stack. */
+#define HYPE_PAGING_MAX_EXEC_RANGES 8u
+
 void hype_paging_apply_nx(hype_pte_t pd_tables[][HYPE_PAGING_ENTRIES_PER_TABLE],
-                          unsigned int gb_mapped, uint64_t exec_base, uint64_t exec_size,
-                          uint64_t exec2_base, uint64_t exec2_size);
+                          unsigned int gb_mapped, const hype_exec_range_t *exempt,
+                          unsigned int n_exempt);
 
 /* Programs IA32_PAT (MSR 0x277) so slot 1 = WC (the default, but with PA1 changed
  * from WT to WC): 0x0007040600070106. Selected by a PDE/PTE with PWT=1,PCD=0,

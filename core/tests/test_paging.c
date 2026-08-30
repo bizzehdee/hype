@@ -276,7 +276,8 @@ static void test_apply_nx_exempts_image_range(void) {
     unsigned int gb, j;
 
     hype_paging_build_identity(g_pml4, g_pdpt, pd, 4);
-    hype_paging_apply_nx(pd, 4, image_base, image_size, 0, 0);
+    { hype_exec_range_t ex[1] = {{image_base, image_size}};
+      hype_paging_apply_nx(pd, 4, ex, 1); }
 
     for (gb = 0; gb < 4; gb++) {
         for (j = 0; j < HYPE_PAGING_ENTRIES_PER_TABLE; j++) {
@@ -305,7 +306,7 @@ static void test_apply_nx_zero_size_exempts_nothing(void) {
     unsigned int j;
 
     hype_paging_build_identity(g_pml4, g_pdpt, pd, 2);
-    hype_paging_apply_nx(pd, 2, 0, 0, 0, 0);
+    hype_paging_apply_nx(pd, 2, 0, 0);
 
     for (j = 0; j < HYPE_PAGING_ENTRIES_PER_TABLE; j++) {
         CHECK_HEX("apply_nx: zero exec_size marks every page NX", HYPE_PAGING_NX,
@@ -322,7 +323,7 @@ static void test_apply_nx_stops_at_gb_mapped(void) {
     hype_pte_t pd[2][HYPE_PAGING_ENTRIES_PER_TABLE];
 
     hype_paging_build_identity(g_pml4, g_pdpt, pd, 2);
-    hype_paging_apply_nx(pd, 1, 0, 0, 0, 0);
+    hype_paging_apply_nx(pd, 1, 0, 0);
 
     CHECK_HEX("apply_nx: gb0 (within bound) gets NX", HYPE_PAGING_NX, pd[0][0] & HYPE_PAGING_NX);
     CHECK_HEX("apply_nx: gb1 (beyond gb_mapped) left alone", 0, pd[1][0] & HYPE_PAGING_NX);
@@ -334,11 +335,66 @@ static void test_apply_nx_exempts_second_range(void) {
     uint64_t tramp_page = 5 * HYPE_PAGING_2MB; /* gb0, index 5 */
 
     hype_paging_build_identity(g_pml4, g_pdpt, pd, 2);
-    hype_paging_apply_nx(pd, 2, HYPE_PAGING_1GB, HYPE_PAGING_2MB, tramp_page, 4096ULL);
+    { hype_exec_range_t ex[2] = {{HYPE_PAGING_1GB, HYPE_PAGING_2MB}, {tramp_page, 4096ULL}};
+      hype_paging_apply_nx(pd, 2, ex, 2); }
 
     CHECK_HEX("apply_nx: second-range page stays executable", 0, pd[0][5] & HYPE_PAGING_NX);
     CHECK_HEX("apply_nx: first-range page stays executable", 0, pd[1][0] & HYPE_PAGING_NX);
     CHECK_HEX("apply_nx: page in neither range gets NX", HYPE_PAGING_NX, pd[0][4] & HYPE_PAGING_NX);
+}
+
+/*
+ * Boot 36 regression (2026-08-30).
+ *
+ * The NX pass took exactly two exempt ranges, so UEFI's RuntimeServicesCode was marked
+ * no-execute -- and hype calls ResetSystem() through it to reboot the host. The panic was a
+ * page fault with rip == cr2 = 0xddbbb668 and error_code=0x11 (present page, instruction
+ * fetch), inside `RuntimeServicesCode phys=0xddb49000 pages=182`.
+ *
+ * The shape that matters: several disjoint ranges, all kept executable, everything else NX.
+ */
+static void test_nx_exempts_several_ranges(void) {
+    static hype_pte_t pd[4][HYPE_PAGING_ENTRIES_PER_TABLE];
+    /* hype's image, the AP trampoline, and a firmware runtime-code region -- the boot 36 set. */
+    hype_exec_range_t ex[3] = {
+        {0x140000000ULL, 0x1ce1000ULL}, /* image */
+        {0x8000ULL, 4096ULL},           /* trampoline */
+        {0xddb49000ULL, 182ULL * 4096ULL},
+    };
+    unsigned int gb, j;
+
+    for (gb = 0; gb < 4; gb++) {
+        for (j = 0; j < HYPE_PAGING_ENTRIES_PER_TABLE; j++) {
+            pd[gb][j] = HYPE_PAGING_PRESENT;
+        }
+    }
+    hype_paging_apply_nx(pd, 4, ex, 3);
+
+    /* The faulting address itself must be executable. */
+    CHECK_HEX("runtime-services code stays executable", 0,
+              pd[3][(0xddbbb668ULL % HYPE_PAGING_1GB) / HYPE_PAGING_2MB] & HYPE_PAGING_NX);
+    /* Both ends of that region, since it spans more than one 2 MiB leaf. */
+    CHECK_HEX("runtime region first leaf executable", 0,
+              pd[3][(0xddb49000ULL % HYPE_PAGING_1GB) / HYPE_PAGING_2MB] & HYPE_PAGING_NX);
+    CHECK_HEX("runtime region last leaf executable", 0,
+              pd[3][((0xddb49000ULL + 182ULL * 4096ULL - 1ULL) % HYPE_PAGING_1GB)
+                    / HYPE_PAGING_2MB] & HYPE_PAGING_NX);
+    /* The trampoline and a page inside the image, both still exempt. */
+    CHECK_HEX("trampoline stays executable", 0, pd[0][0] & HYPE_PAGING_NX);
+    /* And an ordinary page well away from every range is NX. */
+    CHECK_HEX("an unexempt page is NX", HYPE_PAGING_NX, pd[1][100] & HYPE_PAGING_NX);
+    CHECK_HEX("a page just below the runtime region is NX", HYPE_PAGING_NX,
+              pd[3][((0xddb49000ULL % HYPE_PAGING_1GB) / HYPE_PAGING_2MB) - 1u]
+                  & HYPE_PAGING_NX);
+
+    /* A zero-size slot must match nothing rather than exempting the world. */
+    for (gb = 0; gb < 4; gb++) {
+        for (j = 0; j < HYPE_PAGING_ENTRIES_PER_TABLE; j++) pd[gb][j] = HYPE_PAGING_PRESENT;
+    }
+    ex[0].size = 0;
+    hype_paging_apply_nx(pd, 1, ex, 3);
+    CHECK_HEX("a zero-size exempt slot exempts nothing", HYPE_PAGING_NX,
+              pd[0][100] & HYPE_PAGING_NX);
 }
 
 int main(void) {
@@ -358,6 +414,8 @@ int main(void) {
     test_apply_nx_zero_size_exempts_nothing();
     test_apply_nx_stops_at_gb_mapped();
     test_apply_nx_exempts_second_range();
+
+    test_nx_exempts_several_ranges();
 
     if (failures == 0) {
         printf("all tests passed\n");
