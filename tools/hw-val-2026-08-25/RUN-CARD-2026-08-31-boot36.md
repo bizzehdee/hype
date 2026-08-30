@@ -1,13 +1,26 @@
-# Boot 36 -- eight tickets, and the only thing you have to get right is arming the Pico
+# Boot 36, second attempt -- attach the console to the guest FIRST, then arm the Pico
 
-Everything that broke boots 32 to 35 is fixed. The guest boots, the media resolves with the
-spare drives attached, and the Keychron recovers on its own. What is missing is a clean run
-with the Pico actually typing, because that is where four of these eight tickets live.
+The first attempt panicked, and it was worth it -- it found something that had been broken
+since #604 landed and had been quietly costing every salvage attempt.
 
-Boot 35's Pico reported **nothing at all** -- `arms=8, reports=0`, including across 96 seconds
-while its controller was still healthy. If it had been armed and sending its ten-second tags,
-hype would have seen about nine of them. Zero reports on a working controller is what a
-disarmed board looks like.
+**The panic.** `PANIC: ... vector=14 (Page Fault) error_code=0x11 rip=0xddbbb668 cr2=0xddbbb668`.
+When rip equals cr2 and the error code says "present page, instruction fetch", that is a
+no-execute violation on the first instruction at that address -- and 0xddbbb668 is inside UEFI's
+Runtime Services code, which hype had marked NX. hype reboots the host by calling ResetSystem()
+through exactly that code. So **no host reboot has worked since the NX pass landed**, which is
+why the DEADMAN warm reboot and `host reboot` have never once produced a salvage file. Fixed in
+this build; Runtime Services code is now exempt, and the log lists every exempt range.
+
+**Two tickets closed off the short run anyway.** The Pico held `h` for twelve seconds and hype
+produced 95 repeats from one press -- #774, since USB HID devices do not repeat at all. And 95
+is the bounded answer, not the unbounded one: 10 seconds of repeats at the 92 ms period is ~104,
+twelve seconds would be ~126. That is #777's bound firing.
+
+**What went wrong with the test, and it was my error not yours.** The Pico's typing went into
+hype's own terminal, not the guest -- `TERMCMD: 'abcdefghijklmnopqrstuvwxyz0123456789'`, five
+times, perfectly. Nothing had attached the console to vm0, so the guest never saw a keystroke
+(`GUESTKBD vm0: routed=14` against 963 scancodes reaching hype). #773 needs those passes echoed
+by the guest, so step 3 below is new and it matters.
 
 ## Before you boot
 
@@ -21,11 +34,15 @@ them passes for the wrong reason.
 ## The sequence
 
 1. Boot. Stay on the dashboard.
-2. **Press BOOTSEL once. Confirm the LED goes SOLID, not blinking, and that `a0001` appears.**
-   This is the whole run. If the LED is still blinking, press again and check.
-3. Confirm the guest reaches a login prompt.
-4. Leave the machine alone for **90 minutes**. Nothing else to do.
-5. Power off normally. Bring back `HYPE.LOG` and `RUN1A.LOG`, plus `HYPE.1.LOG`,
+2. **Wait for the guest to reach a login prompt.** Do not skip ahead -- step 3 needs it there.
+3. **Press Right-Ctrl + Right-Alt + 1** to attach the console to vm0. The screen should switch
+   from the dashboard to the guest. Type a couple of characters and see them echo. **This is
+   the step the last run was missing**; without it the Pico types into hype's terminal and
+   #773 gets nothing.
+4. **Press BOOTSEL once. Confirm the LED goes SOLID, not blinking, and that `a0001` appears in
+   the guest.** If the LED is still blinking, press again and check.
+5. Leave the machine alone for **90 minutes**. Nothing else to do.
+6. Power off normally. Bring back `HYPE.LOG` and `RUN1A.LOG`, plus `HYPE.1.LOG`,
    `RUN1A.1.LOG` and `hype-log-prev.txt` if a warm reboot happened.
 
 ## The eight
