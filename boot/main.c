@@ -25333,8 +25333,16 @@ static void fw_1_usb_hotplug_poll(void) {
             if (hype_xhci_port_connected(xc, port, &connected) != 0) {
                 continue;
             }
-            hype_debug_print("host-usb: port %u on this controller changed -- %s [#744]\n",
-                             port, connected ? "something is attached" : "now empty");
+            /*
+             * Name the controller. Reading boot 32 back meant cross-referencing three
+             * "port N on this controller changed" lines against two separate port scans to
+             * work out which controller each one meant, and two of the three turned out to
+             * be ports nobody had touched. A root-port number is meaningless on its own
+             * when there are two controllers that both have a port 2.
+             */
+            hype_debug_print("host-usb: ctrl%u port %u changed -- %s [#744]\n",
+                             g_live_xc_idx[k], port,
+                             connected ? "something is attached" : "now empty");
             if (connected) {
                 if (!enumerated) {
                     enumerated = fw_1_usb_enumerate_arrival(xc, g_live_xc_idx[k], port);
