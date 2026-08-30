@@ -142,6 +142,14 @@ typedef struct {
      * so the endless retry becomes one reported death instead of a silent grind.
      */
     unsigned long long cmd_timeouts;
+    /*
+     * Commands abandoned because the 64-event guard ran out before the completion arrived --
+     * "things arrived, none of them ours", which #266 named as the case that needs a
+     * different fix from "nothing arrived" and which then returned -1 with no message and no
+     * counter. Boot 34 needed exactly this distinction: every interrupt-IN endpoint on one
+     * controller went deaf, every revive failed, and cmd_timeouts stayed at 0.
+     */
+    unsigned long long cmd_guard_exhausted;
     unsigned long long cmd_recoveries;
     unsigned long long cmd_recovery_fails;
     int cmd_dead;
@@ -781,7 +789,14 @@ static void route_foreign_event(hype_xhci_ctrl_t *c, xhci_hw_t *hw, const uint32
  * including the boot stick this log is being written to. So that case is named and latched
  * rather than papered over.
  */
-#define XHCI_CMD_ABORT_WAIT_MS 200u
+/*
+ * xHCI 4.6.1.2's own bound for a Command Abort to take effect is FIVE SECONDS. Boot 34 waited
+ * 200 ms, found CRR still set, and declared the ring unrecoverable -- which may well have been
+ * true, but 200 ms is not the spec's answer and the run could not tell the two apart. It is a
+ * long time to hold the input tick, and it is spent only on a path whose alternative is every
+ * device on that controller staying deaf for the rest of the run.
+ */
+#define XHCI_CMD_ABORT_WAIT_MS 5000u
 #define XHCI_CMD_MAX_RECOVERIES 4u
 
 static void cmd_ring_rebuild(xhci_hw_t *hw) {
@@ -835,9 +850,17 @@ static int cmd_ring_recover(hype_xhci_ctrl_t *c) {
                      sts, crcr, (crcr & HYPE_XHCI_CRCR_CRR) ? 1u : 0u,
                      (unsigned long long)hw->cmd_timeouts);
 
-    /* Only CS/CA are writable while the ring is running; the pointer bits are ignored. */
-    wr32(bar, hw->opreg + HYPE_XHCI_OP_CRCR,
-         (crcr & HYPE_XHCI_CRCR_RCS) | HYPE_XHCI_CRCR_CA);
+    /*
+     * A SIXTY-FOUR BIT write. CRCR is one 64-bit register (xHCI 5.4.5), and boot 34 wrote only
+     * its low dword: the abort was issued, and 200 ms later CRR was still set with USBSTS
+     * reporting a perfectly healthy controller (0x00000010, PCD alone -- no HCH, no HSE, no
+     * HCE). A partial write is the first thing to rule out before concluding the ring cannot
+     * be restarted at all.
+     *
+     * Only CS/CA are meaningful while the ring is running; the pointer field is not writable
+     * then, and RCS reads as 0, so this writes the abort bit and nothing else.
+     */
+    wr64(bar, hw->opreg + HYPE_XHCI_OP_CRCR, (uint64_t)HYPE_XHCI_CRCR_CA);
     for (ms = 0; ms < XHCI_CMD_ABORT_WAIT_MS; ms++) {
         crcr = rd32(bar, hw->opreg + HYPE_XHCI_OP_CRCR);
         if ((crcr & HYPE_XHCI_CRCR_CRR) == 0u) {
@@ -848,9 +871,18 @@ static int cmd_ring_recover(hype_xhci_ctrl_t *c) {
     if ((crcr & HYPE_XHCI_CRCR_CRR) != 0u) {
         hw->cmd_dead = 1;
         hw->cmd_recovery_fails++;
+        /*
+         * Past this point software has run out of moves that leave the controller's devices
+         * addressed. The remaining option is a controller RESET, which re-enumerates
+         * everything on it -- viable when the wedged controller is not the one carrying the
+         * boot medium and the log, which is why the message says which one it is.
+         */
         hype_debug_print("host-xhci: command ring still RUNNING %u ms after Command Abort "
-                         "(crcr=0x%08x) -- it cannot be restarted from software [#775]\n",
-                         XHCI_CMD_ABORT_WAIT_MS, crcr);
+                         "(crcr=0x%08x usbsts=0x%08x) -- it cannot be restarted from software. "
+                         "Every device on this controller stays unreachable; only a controller "
+                         "reset would recover them [#775]\n",
+                         XHCI_CMD_ABORT_WAIT_MS, crcr,
+                         rd32(bar, hw->opreg + HYPE_XHCI_OP_USBSTS));
         return -1;
     }
 
@@ -935,6 +967,19 @@ static int cmd_submit_wait(hype_xhci_ctrl_t *c, uint32_t cmd[4], uint32_t evt[4]
          * against 18,400 polls.
          */
         route_foreign_event(c, hw, evt);
+    }
+    /*
+     * The guard ran out: 64 events came off the ring and none was our completion. That is a
+     * different failure from a timeout and wants a different fix -- more budget, or a command
+     * whose completion is genuinely never generated -- so it is counted and named separately
+     * rather than sharing the timeout's silence.
+     */
+    hw->cmd_guard_exhausted++;
+    if (hw->cmd_guard_exhausted <= 8ull) {
+        hype_debug_print("host-xhci: command GUARD EXHAUSTED for trb=0x%llx -- 64 events came "
+                         "off the ring and none was its completion (exhaustion %llu) [#775]\n",
+                         (unsigned long long)my_trb,
+                         (unsigned long long)hw->cmd_guard_exhausted);
     }
     return -1;
 }
@@ -2118,6 +2163,34 @@ static int ep_recover_halted(hype_xhci_ctrl_t *c, unsigned int slot, unsigned in
  * costs two commands and loses nothing, because an idle endpoint has no reports in flight.
  * The backoff below keeps that cost bounded for a keyboard nobody is using.
  */
+/*
+ * Boot 34: which of the three ways a revive fails.
+ *
+ * int_in_revive() had three bare `return -1`s, so an endpoint that could not be rebuilt said
+ * only "revive_fail is going up" -- and the run showed both interrupt-IN devices on one
+ * controller permanently deaf with revive_fail climbing and cmd_timeouts at ZERO, which rules
+ * out the boot-31 mechanism and leaves nothing to distinguish the remaining three. A recovery
+ * that cannot work must say what stopped it, or the next run measures the same nothing.
+ *
+ * `cc` is the completion code where the controller returned one (a Set TR Dequeue against an
+ * endpoint that is not Stopped answers Context State Error, 19), and 0 where the step never
+ * completed at all.
+ */
+static void revive_report_failure(unsigned int slot, unsigned int dci, const char *what,
+                                  uint32_t cc) {
+    static unsigned int reported = 0;
+
+    if (reported++ < 12u) {
+        if (cc != 0u) {
+            hype_debug_print("host-xhci: REVIVE FAILED slot=%u ep=%u -- %s (cc=%u) [#775]\n",
+                             slot, dci, what, cc);
+        } else {
+            hype_debug_print("host-xhci: REVIVE FAILED slot=%u ep=%u -- %s [#775]\n",
+                             slot, dci, what);
+        }
+    }
+}
+
 static int int_in_revive(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int dci,
                          xhci_int_in_hw_t *iin) {
     xhci_hw_t *hw = HW(c);
@@ -2125,7 +2198,10 @@ static int int_in_revive(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int dc
     unsigned int i;
 
     hype_xhci_trb_stop_endpoint(cmd, slot, dci, (int)hw->cmd_cyc);
-    if (cmd_submit_wait(c, cmd, evt) != 0) return -1;
+    if (cmd_submit_wait(c, cmd, evt) != 0) {
+        revive_report_failure(slot, dci, "Stop Endpoint did not complete", 0u);
+        return -1;
+    }
 
     for (i = 0; i < XPAGE; i++) { iin->ring[i] = 0; }
     ring_init_link(iin->ring);
@@ -2133,8 +2209,14 @@ static int int_in_revive(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int dc
     iin->cyc = 1;
     hype_xhci_trb_set_tr_dequeue(cmd, phys(iin->ring) | 1u /* DCS=1 */, slot, dci,
                                  (int)hw->cmd_cyc);
-    if (cmd_submit_wait(c, cmd, evt) != 0) return -1;
-    if (hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS) return -1;
+    if (cmd_submit_wait(c, cmd, evt) != 0) {
+        revive_report_failure(slot, dci, "Set TR Dequeue did not complete", 0u);
+        return -1;
+    }
+    if (hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS) {
+        revive_report_failure(slot, dci, "Set TR Dequeue was REFUSED", hype_xhci_event_cc(evt));
+        return -1;
+    }
 
     /* Everything the old ring owned is gone with it: outstanding TRBs name addresses the
      * controller will never complete now, and queued completions belong to a ring that no
@@ -3905,14 +3987,17 @@ void hype_xhci_int_in_revive_health(hype_xhci_ctrl_t *c, unsigned int slot,
  * unreachable at that point, and saying so is the whole reason this exists.
  */
 void hype_xhci_cmd_ring_health(hype_xhci_ctrl_t *c, unsigned long long *timeouts,
-                               unsigned long long *recoveries, int *dead) {
+                               unsigned long long *guard, unsigned long long *recoveries,
+                               int *dead) {
     xhci_hw_t *hw;
     if (timeouts) *timeouts = 0;
+    if (guard) *guard = 0;
     if (recoveries) *recoveries = 0;
     if (dead) *dead = 0;
     if (c == (hype_xhci_ctrl_t *)0 || !c->inited) return;
     hw = HW(c);
     if (timeouts) *timeouts = hw->cmd_timeouts;
+    if (guard) *guard = hw->cmd_guard_exhausted;
     if (recoveries) *recoveries = hw->cmd_recoveries;
     if (dead) *dead = hw->cmd_dead;
 }

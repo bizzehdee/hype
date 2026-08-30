@@ -656,7 +656,8 @@ void hype_xhci_int_in_revive_health(hype_xhci_ctrl_t *c, unsigned int slot,
  * ring has been given up on. `dead` non-zero means every device on this controller is
  * unreachable. */
 void hype_xhci_cmd_ring_health(hype_xhci_ctrl_t *c, unsigned long long *timeouts,
-                               unsigned long long *recoveries, int *dead);
+                               unsigned long long *guard, unsigned long long *recoveries,
+                               int *dead);
 
 /* Per-endpoint loss counters; see the implementation for what each one means. */
 void hype_xhci_int_in_losses(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int ep_addr,

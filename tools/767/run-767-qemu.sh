@@ -148,7 +148,7 @@ grep -a "hub-devices=" $S/serial.log | tail -1
 echo "=== claims ==="
 grep -a "host-hid: USB .* CLAIMED" $S/serial.log
 echo "=== hot-plug ladder ==="
-grep -a "PORT EVENT\|on this controller changed\|hub slot .* changed\|ARRIVED\|DEPARTED" $S/serial.log | tail -20
+grep -a "PORT EVENT\|ctrl[0-9]* port [0-9]* changed\|hub slot .* changed\|ARRIVED\|DEPARTED" $S/serial.log | tail -20
 
 fail=0
 say() { echo "$@"; fail=1; }
@@ -180,8 +180,8 @@ grep -aq "behind hub slot .* DEPARTED" $S/serial.log ||
 
 # The hub ITSELF leaving, which boots 14 and 15 could not manage. The test is not just that
 # the port went empty -- it is that EVERYTHING behind the hub was released with it.
-if grep -aq "on this controller changed -- now empty" $S/serial.log; then
-  rel=$(grep -a -A6 "on this controller changed -- now empty" $S/serial.log |
+if grep -aqE "ctrl[0-9]+ port [0-9]+ changed -- now empty" $S/serial.log; then
+  rel=$(grep -a -A6 -E "ctrl[0-9]+ port [0-9]+ changed -- now empty" $S/serial.log |
         grep -a -c "DEPARTED -- releasing" || true)
   echo "devices released when a root port emptied: $rel"
   [ "${rel:-0}" -ge 2 ] 2>/dev/null ||

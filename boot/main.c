@@ -8576,7 +8576,7 @@ static void fw_1_hid_watch(uint64_t now_h, uint64_t hz) {
     for (k = 0; k < g_hid_count && k < HYPE_HOST_KBD_MAX; k++) {
         const hype_host_kbd_t *kb = &g_hid[k];
         unsigned long long lost = 0, skipped = 0, hce = 0, rfull = 0, evict = 0;
-        unsigned long long rfail = 0, stopped = 0, cmdto = 0, cmdrec = 0;
+        unsigned long long rfail = 0, stopped = 0, cmdto = 0, cmdguard = 0, cmdrec = 0;
         int cmddead = 0;
         hype_xhci_int_in_losses((hype_xhci_ctrl_t *)&kb->xc, kb->slot, kb->ep, &lost, &skipped);
         hype_xhci_event_health((hype_xhci_ctrl_t *)&kb->xc, &hce, &rfull, &evict);
@@ -8588,17 +8588,18 @@ static void fw_1_hid_watch(uint64_t now_h, uint64_t hz) {
          */
         hype_xhci_int_in_revive_health((hype_xhci_ctrl_t *)&kb->xc, kb->slot, kb->ep,
                                        &rfail, &stopped);
-        hype_xhci_cmd_ring_health((hype_xhci_ctrl_t *)&kb->xc, &cmdto, &cmdrec, &cmddead);
+        hype_xhci_cmd_ring_health((hype_xhci_ctrl_t *)&kb->xc, &cmdto, &cmdguard, &cmdrec,
+                                  &cmddead);
         hype_debug_print("fw-1 HIDTICK[%u]: %04x:%04x slot%u ep=0x%02x polls=%llu reports=%llu "
                          "arms=%llu lost=%llu skipped=%llu hcevt=%llu ringfull=%llu evict=%llu "
                          "revives=%llu revive_fail=%llu stopped=%llu | cmdring timeouts=%llu "
-                         "recoveries=%llu%s | mouse polls=%llu reports=%llu [#775]\n",
+                         "guard=%llu recoveries=%llu%s | mouse polls=%llu reports=%llu [#775]\n",
                          k, (unsigned)kb->vid, (unsigned)kb->pid, kb->slot, kb->ep,
                          kb->polls, kb->reports,
                          hype_xhci_int_in_arms((hype_xhci_ctrl_t *)&kb->xc, kb->slot, kb->ep),
                          lost, skipped, hce, rfull, evict,
                          hype_xhci_int_in_revives((hype_xhci_ctrl_t *)&kb->xc, kb->slot, kb->ep),
-                         rfail, stopped, cmdto, cmdrec, cmddead ? " DEAD" : "",
+                         rfail, stopped, cmdto, cmdguard, cmdrec, cmddead ? " DEAD" : "",
                          g_mouse_polls, g_mouse_reports);
     }
 }
