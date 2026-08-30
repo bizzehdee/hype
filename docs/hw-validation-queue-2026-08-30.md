@@ -26,12 +26,10 @@ Run 90 minutes. No operator actions beyond arming the Pico and confirming the gu
 | #780 | `media: registered host device` and `host-fat: vm0 resolved` | the boot medium keeps its own serial with the spare drives attached, and the guest boots. Confirmed once in boot 34; a second clean run closes it |
 | #641 | `APVCPU vm0/N: exits=` and `PERF: hlt_wait=` | recorded, not passed -- this one is a measurement refresh. It was 328.9M exits in 84 minutes on boot 31 |
 | #426 | the run completing at all | the standing HW-VAL gate: NVMe + xHCI ring math on the shared facility, no regression |
-| #388 | `m5-8: target_disk` resolving a `physical:<serial>` USB disk | **requires a config change first** -- see below |
-
-**#388 needs a config edit before this boot.** It wants `target_disk = physical:<serial>` to
-resolve against a USB disk's identity, and no current config asks for that. Point it at the
-SanDisk Cruzer Blade (`4C530201070308103214`), never the SABRENT -- that one is the boot and
-log medium. If the edit is not made, drop #388 to boot 37 and this run still closes eight.
+**#388 was moved to boot 37**, deliberately. It needs a config change, and boot 36's
+configuration is the one that took four runs to get right -- altering vm0's target disk would
+change the conditions #780 and the guest-boot check depend on. Boot 37 is already about
+physical write targets, which is where it belongs.
 
 ---
 
@@ -45,8 +43,9 @@ running at the same time. **Target the spare drive by serial**, never the intern
 | #713 | `FBSPEED t=` against real elapsed, `PREEMPT`, `LOOPPHASE` | no multi-second dashboard stalls. The original was up to 46 s with a 6-7 s recurring baseline |
 | #660 | `nvme_lock_contended=`, `bsp_nvme_timeouts=` | the lock is exercised (contention non-zero under concurrency) with no timeouts and no wrong bytes |
 | #715 | `DIAG: BLK WRITE ... vec=` | vectored writes actually taken on the NVMe path, not falling back to single-segment |
+| #388 | `m5-8: target_disk` resolving a `physical:<serial>` USB disk | it resolves and the confirm prompt names the right drive. Point it at the SanDisk Cruzer Blade (`4C530201070308103214`), never the SABRENT -- that is the boot and log medium |
 
-Three tickets, one config, one boot. This is the only run that reproduces the symptom at all:
+Four tickets, one config, one boot. This is the only run that reproduces the symptom at all:
 a sandbox's virtual disks are memory-speed and cannot.
 
 ---
@@ -129,13 +128,19 @@ Both are Intel-only and both ride one Linux guest boot.
 
 | Run | Machine | Tickets |
 |---|---|---|
-| Boot 36 | 5950X | 8, or 9 with the #388 config edit |
-| Boot 37 | 5950X | 3 |
+| Boot 36 | 5950X | 8 |
+| Boot 37 | 5950X | 4 |
 | Boot 38 | 5950X | 3, plus #653 once its battery exists |
 | Boot 39 | 5950X | 1 |
 | Boot 40 | Intel | 2, gated on #599 |
 | Boot 41 | Intel | 2 |
 
-Twenty tickets across six boots, four of them on the AMD desktop. Boot 36 is the one to do
-first: it is the largest, it needs no rebuild and no re-partitioning, and it is the run that
-has now failed three times for reasons that are all fixed.
+Twenty tickets across six boots, four of them on the AMD desktop. Boot 36 is staged and is the
+one to do first: it is the largest, it needs no rebuild and no re-partitioning, and it is the
+run that has now failed three times for reasons that are all fixed.
+
+Run cards for every boot are written and staged in `tools/hw-val-2026-08-25/`:
+`RUN-CARD-2026-08-31-boot36.md`, then `RUN-CARD-boot37-physwrite.md`,
+`RUN-CARD-boot38-filesystems.md`, `RUN-CARD-boot39-vmexit.md`,
+`RUN-CARD-boot40-intel-apicv.md`, `RUN-CARD-boot41-intel-vmx.md`. Point `stage.sh`'s
+`RUN_CARD=` at the next one and re-stage; nothing else needs deciding at the time.
