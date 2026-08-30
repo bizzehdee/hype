@@ -769,3 +769,22 @@ void hype_xhci_int_in_release_ctrl(hype_xhci_int_in_key_t *keys, unsigned int n,
         }
     }
 }
+
+/*
+ * A Stop Endpoint command retires every TRB still outstanding on that endpoint with one of
+ * these codes (xHCI 4.6.9). It means "software cancelled this transfer" -- exactly what a
+ * revive asks for -- not "this endpoint failed".
+ *
+ * hype read them as transfer failures and ran endpoint recovery, which issues Reset Endpoint
+ * against an endpoint in the Stopped state. That is a Context State Error, and on boot 31
+ * (2026-08-30) the controller's command ring stopped answering from that moment and every
+ * interrupt-IN endpoint on it was deaf for the remaining 74 minutes of the run.
+ *
+ * It lives HERE, not beside its caller, because core/xhci_hw.c is excluded from the unit-test
+ * build -- which is the stated reason several ownership bugs in that file got as far as they
+ * did. A completion-code classification is pure, so it can be tested, so it is.
+ */
+int hype_xhci_cc_is_stopped(uint32_t cc) {
+    return (cc == HYPE_XHCI_CC_STOPPED || cc == HYPE_XHCI_CC_STOPPED_LENGTH ||
+            cc == HYPE_XHCI_CC_STOPPED_SHORT) ? 1 : 0;
+}

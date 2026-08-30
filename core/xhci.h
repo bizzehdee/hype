@@ -41,6 +41,25 @@
 #define HYPE_XHCI_USBCMD_INTE     (1u << 2)
 #define HYPE_XHCI_USBSTS_HCH      (1u << 0)
 #define HYPE_XHCI_USBSTS_CNR      (1u << 11) /* Controller Not Ready */
+/*
+ * The two status bits that say the controller itself has failed, as opposed to a transfer
+ * having failed. HSE is an error on the controller's own memory accesses; HCE is an
+ * internal error. Neither is recoverable by aborting a command -- both need a controller
+ * reset, which tears down every addressed device -- so they must be read and named apart
+ * from a merely stuck command ring, not lumped in with it.
+ */
+#define HYPE_XHCI_USBSTS_HSE      (1u << 2)  /* Host System Error */
+#define HYPE_XHCI_USBSTS_HCE      (1u << 12) /* Host Controller Error */
+
+/*
+ * Command Ring Control bits (xHCI 5.4.5). The pointer field is only writable while CRR is
+ * clear, which is what makes CA/CRR the whole of command-ring recovery: abort the command
+ * in flight, wait for the controller to stop running the ring, then re-point it.
+ */
+#define HYPE_XHCI_CRCR_RCS        (1u << 0) /* Ring Cycle State */
+#define HYPE_XHCI_CRCR_CS         (1u << 1) /* Command Stop */
+#define HYPE_XHCI_CRCR_CA         (1u << 2) /* Command Abort */
+#define HYPE_XHCI_CRCR_CRR        (1u << 3) /* Command Ring Running */
 
 /* PORTSC bits (xHCI 5.4.8) */
 #define HYPE_XHCI_PORTSC_CCS      (1u << 0)  /* Current Connect Status */
@@ -106,6 +125,25 @@ typedef enum {
  * opposed to "a transfer failed", and hype had no name for it.
  */
 #define HYPE_XHCI_CC_EVENT_RING_FULL 21u
+/*
+ * The completion codes a STOP means, not a failure means.
+ *
+ * A Stop Endpoint command retires every TRB still outstanding on that endpoint with one of
+ * these -- the transfer was cancelled by software, which is the whole point of issuing it.
+ * hype read them as transfer failures and "recovered" an endpoint that was stopped rather
+ * than halted, issuing a Reset Endpoint against a Stopped endpoint. That is a Context State
+ * Error, and on boot 31 (2026-08-30) the command ring stopped answering from that moment on
+ * and every interrupt-IN endpoint on the controller went deaf for the remaining 74 minutes.
+ */
+#define HYPE_XHCI_CC_CMD_RING_STOPPED 24u
+#define HYPE_XHCI_CC_CMD_ABORTED      25u
+#define HYPE_XHCI_CC_STOPPED          26u
+#define HYPE_XHCI_CC_STOPPED_LENGTH   27u
+#define HYPE_XHCI_CC_STOPPED_SHORT    28u
+
+/* 1 if `cc` is one of the STOPPED codes above: the transfer was cancelled by software, not
+ * failed by the device. Pure, so it is unit tested -- see the note at the definition. */
+int hype_xhci_cc_is_stopped(uint32_t cc);
 
 /* Control-transfer TRT (Setup Stage control dword bits 17:16), xHCI 6.4.1.2.1. */
 #define HYPE_XHCI_TRT_NO_DATA     0u
@@ -581,6 +619,19 @@ unsigned int hype_xhci_pump_events(hype_xhci_ctrl_t *c, unsigned int budget);
 /* Revives performed on this endpoint -- see hype_xhci_int_in_revives(). */
 unsigned long long hype_xhci_int_in_revives(hype_xhci_ctrl_t *c, unsigned int slot,
                                             unsigned int ep_addr);
+
+/* Revives that were attempted and FAILED, and transfers retired by hype's own Stop
+ * Endpoint. A silent endpoint with revives=0 used to be indistinguishable from one whose
+ * every revive attempt timed out against a stopped command ring -- see boot 31. */
+void hype_xhci_int_in_revive_health(hype_xhci_ctrl_t *c, unsigned int slot,
+                                    unsigned int ep_addr, unsigned long long *fails,
+                                    unsigned long long *stopped);
+
+/* Command-ring health: timeouts seen, abort/restart recoveries performed, and whether the
+ * ring has been given up on. `dead` non-zero means every device on this controller is
+ * unreachable. */
+void hype_xhci_cmd_ring_health(hype_xhci_ctrl_t *c, unsigned long long *timeouts,
+                               unsigned long long *recoveries, int *dead);
 
 /* Per-endpoint loss counters; see the implementation for what each one means. */
 void hype_xhci_int_in_losses(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int ep_addr,

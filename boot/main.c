@@ -8528,14 +8528,29 @@ static void fw_1_hid_watch(uint64_t now_h, uint64_t hz) {
         if (kb->reports == 0ull) continue; /* never worked: nothing to have stopped */
         if (++quiet[k] == FW1_HID_QUIET_TICKS) fw_1_hid_probe_port(k, kb);
         if (kb->vid == FW1_PICO_VID && kb->pid == FW1_PICO_PID &&
-            quiet[k] == FW1_HID_DEAD_TICKS && g_host_action == HYPE_HOST_ACTION_NONE &&
-            hype_xhci_int_in_revives((hype_xhci_ctrl_t *)&kb->xc, kb->slot, kb->ep) != 0ull) {
-            hype_debug_print("fw-1 DEADMAN: the tag keyboard (%04x:%04x slot%u) delivered "
-                             "reports, then nothing for 5 minutes despite a revive -- the "
-                             "input path is dead. WARM-REBOOTING to salvage the capture "
-                             "buffer; read \\hype-log-prev.txt after the next boot [#175 #452]\n",
-                             (unsigned)kb->vid, (unsigned)kb->pid, kb->slot);
-            (void)fw_1_host_action_begin(HYPE_HOST_ACTION_REBOOT);
+            quiet[k] == FW1_HID_DEAD_TICKS && g_host_action == HYPE_HOST_ACTION_NONE) {
+            /*
+             * A revive that FAILED counts as much as one that ran. Boot 31 is why: the
+             * command ring had stopped, so every revive attempt timed out, `revives` stayed
+             * at 0 -- and this gate, which asked only for revives, would have declined to
+             * fire in the one case where the input path was provably unrecoverable.
+             */
+            unsigned long long rfail = 0, stopped = 0;
+            hype_xhci_int_in_revive_health((hype_xhci_ctrl_t *)&kb->xc, kb->slot, kb->ep,
+                                           &rfail, &stopped);
+            if (hype_xhci_int_in_revives((hype_xhci_ctrl_t *)&kb->xc, kb->slot, kb->ep) != 0ull ||
+                rfail != 0ull) {
+                hype_debug_print("fw-1 DEADMAN: the tag keyboard (%04x:%04x slot%u) delivered "
+                                 "reports, then nothing for 5 minutes despite %llu revive(s) "
+                                 "and %llu failed revive(s) -- the input path is dead. "
+                                 "WARM-REBOOTING to salvage the capture buffer; read "
+                                 "\\hype-log-prev.txt after the next boot [#175 #452]\n",
+                                 (unsigned)kb->vid, (unsigned)kb->pid, kb->slot,
+                                 hype_xhci_int_in_revives((hype_xhci_ctrl_t *)&kb->xc,
+                                                          kb->slot, kb->ep),
+                                 rfail);
+                (void)fw_1_host_action_begin(HYPE_HOST_ACTION_REBOOT);
+            }
         }
     }
 
@@ -8561,16 +8576,29 @@ static void fw_1_hid_watch(uint64_t now_h, uint64_t hz) {
     for (k = 0; k < g_hid_count && k < HYPE_HOST_KBD_MAX; k++) {
         const hype_host_kbd_t *kb = &g_hid[k];
         unsigned long long lost = 0, skipped = 0, hce = 0, rfull = 0, evict = 0;
+        unsigned long long rfail = 0, stopped = 0, cmdto = 0, cmdrec = 0;
+        int cmddead = 0;
         hype_xhci_int_in_losses((hype_xhci_ctrl_t *)&kb->xc, kb->slot, kb->ep, &lost, &skipped);
         hype_xhci_event_health((hype_xhci_ctrl_t *)&kb->xc, &hce, &rfull, &evict);
+        /*
+         * revive_fail and the command-ring state, on the SAME line as the revive count.
+         * Boot 31's endpoints read revives=0 while deaf, which says "the revive never
+         * fired"; they had in fact fired hundreds of times and failed, because the
+         * controller's command ring had stopped. The two numbers are only useful together.
+         */
+        hype_xhci_int_in_revive_health((hype_xhci_ctrl_t *)&kb->xc, kb->slot, kb->ep,
+                                       &rfail, &stopped);
+        hype_xhci_cmd_ring_health((hype_xhci_ctrl_t *)&kb->xc, &cmdto, &cmdrec, &cmddead);
         hype_debug_print("fw-1 HIDTICK[%u]: %04x:%04x slot%u ep=0x%02x polls=%llu reports=%llu "
                          "arms=%llu lost=%llu skipped=%llu hcevt=%llu ringfull=%llu evict=%llu "
-                         "revives=%llu | mouse polls=%llu reports=%llu [#775]\n",
+                         "revives=%llu revive_fail=%llu stopped=%llu | cmdring timeouts=%llu "
+                         "recoveries=%llu%s | mouse polls=%llu reports=%llu [#775]\n",
                          k, (unsigned)kb->vid, (unsigned)kb->pid, kb->slot, kb->ep,
                          kb->polls, kb->reports,
                          hype_xhci_int_in_arms((hype_xhci_ctrl_t *)&kb->xc, kb->slot, kb->ep),
                          lost, skipped, hce, rfull, evict,
                          hype_xhci_int_in_revives((hype_xhci_ctrl_t *)&kb->xc, kb->slot, kb->ep),
+                         rfail, stopped, cmdto, cmdrec, cmddead ? " DEAD" : "",
                          g_mouse_polls, g_mouse_reports);
     }
 }

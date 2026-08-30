@@ -129,6 +129,22 @@ typedef struct {
     unsigned long long hc_events;
     unsigned long long ring_full_events;
     uint32_t opreg; /* operational-register base, so USBSTS is readable where events are drained */
+    /*
+     * Command-ring health (boot 31, 2026-08-30).
+     *
+     * A command that never completes used to be a bare `return -1`: no abort, no register
+     * read, no counter. On that run the ring stopped answering at t=9.9 min and hype went on
+     * enqueuing into it for 74 minutes -- 614 timeouts, one per attempt, each blocking the
+     * input tick for a full second. Nothing in the log said the ring itself had stopped,
+     * because nothing looked.
+     *
+     * cmd_dead latches once recovery has been tried and failed the allowed number of times,
+     * so the endless retry becomes one reported death instead of a silent grind.
+     */
+    unsigned long long cmd_timeouts;
+    unsigned long long cmd_recoveries;
+    unsigned long long cmd_recovery_fails;
+    int cmd_dead;
 
     /* #734: the interrupt-IN rings moved to the per-ENDPOINT pool below (g_iin_hw). One
      * set per controller could not carry a keyboard and a mouse at once -- see
@@ -278,6 +294,20 @@ typedef struct {
      */
     unsigned int revive_after;
     unsigned long long revives;
+    /*
+     * Revives that were ATTEMPTED and failed. Boot 31 is the reason this exists: an endpoint
+     * deaf for 74 minutes reported revives=0 against 416,531 polls, which reads as "the
+     * revive never fired". It fired every 4,000 polls the whole time -- int_in_revive()
+     * returned -1 because its Stop Endpoint command timed out, and that path incremented
+     * nothing and printed nothing. A recovery that cannot succeed must still be visible.
+     */
+    unsigned long long revive_fails;
+    /*
+     * Transfers retired with a STOPPED completion code -- the completion a Stop Endpoint
+     * generates for whatever was still outstanding. Expected, not an error; counted because
+     * hype used to treat these as transfer failures and "recover" a stopped endpoint.
+     */
+    unsigned long long stopped_ccs;
     /*
      * #764 capture: what this endpoint was doing when it diverged.
      *
@@ -731,18 +761,155 @@ static void route_foreign_event(hype_xhci_ctrl_t *c, xhci_hw_t *hw, const uint32
                          hype_xhci_event_cc(evt), hype_xhci_event_xfer_residue(evt));
 }
 
+/*
+ * Command-ring recovery (boot 31, 2026-08-30).
+ *
+ * A command TRB that never completes leaves the ring in a state software cannot reason
+ * about: the controller may still be chewing on it, or may have stopped the ring entirely.
+ * Enqueuing the next command behind it and ringing the doorbell again -- which is what hype
+ * did -- cannot work in either case, and it is not harmless: every attempt costs a full
+ * one-second event wait on the input tick. Boot 31 spent 614 of them, 74 minutes, with every
+ * interrupt-IN endpoint on the controller deaf because reviving one needs two commands.
+ *
+ * xHCI 4.6.1.2 gives the recovery: set CRCR.CA to abort the command in flight, wait for
+ * CRCR.CRR to clear, then re-point the ring (the pointer field is only writable while CRR is
+ * clear) and start again from its base.
+ *
+ * USBSTS is read FIRST because it decides whether recovery is even the right move. HSE or
+ * HCE means the controller itself has failed, and no amount of command-ring surgery brings
+ * that back -- only a controller reset would, and that tears down every addressed device
+ * including the boot stick this log is being written to. So that case is named and latched
+ * rather than papered over.
+ */
+#define XHCI_CMD_ABORT_WAIT_MS 200u
+#define XHCI_CMD_MAX_RECOVERIES 4u
+
+static void cmd_ring_rebuild(xhci_hw_t *hw) {
+    uint32_t link[4];
+
+    zero(hw->cmd_ring, XPAGE);
+    hype_xhci_trb_link(link, phys(hw->cmd_ring), 1);
+    put_le32(hw->cmd_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 0, link[0]);
+    put_le32(hw->cmd_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 4, link[1]);
+    put_le32(hw->cmd_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 8, link[2]);
+    put_le32(hw->cmd_ring + (RING_TRBS - 1u) * HYPE_XHCI_TRB_BYTES + 12, link[3]);
+    hw->cmd_enq = 0;
+    hw->cmd_cyc = 1;
+}
+
+static int cmd_ring_recover(hype_xhci_ctrl_t *c) {
+    xhci_hw_t *hw = HW(c);
+    volatile uint8_t *bar = (volatile uint8_t *)(uintptr_t)c->bar;
+    uint32_t sts = rd32(bar, hw->opreg + HYPE_XHCI_OP_USBSTS);
+    uint32_t crcr;
+    uint32_t drop[4];
+    unsigned int ms;
+
+    if (hw->cmd_dead) {
+        return -1; /* already reported; do not print the same death once per second */
+    }
+    if ((sts & (HYPE_XHCI_USBSTS_HSE | HYPE_XHCI_USBSTS_HCE)) != 0u) {
+        hw->cmd_dead = 1;
+        hw->cmd_recovery_fails++;
+        hype_debug_print("host-xhci: the CONTROLLER has failed, not just a command: "
+                         "usbsts=0x%08x (%s%s). Aborting the command ring cannot fix this; "
+                         "every device on this controller is now unreachable [#775]\n",
+                         sts,
+                         (sts & HYPE_XHCI_USBSTS_HSE) ? "HSE " : "",
+                         (sts & HYPE_XHCI_USBSTS_HCE) ? "HCE" : "");
+        return -1;
+    }
+    if (hw->cmd_recoveries >= (unsigned long long)XHCI_CMD_MAX_RECOVERIES) {
+        hw->cmd_dead = 1;
+        hw->cmd_recovery_fails++;
+        hype_debug_print("host-xhci: command ring recovered %u times and stopped answering "
+                         "again -- giving up on it. usbsts=0x%08x crcr=0x%08x [#775]\n",
+                         (unsigned)XHCI_CMD_MAX_RECOVERIES, sts,
+                         rd32(bar, hw->opreg + HYPE_XHCI_OP_CRCR));
+        return -1;
+    }
+
+    crcr = rd32(bar, hw->opreg + HYPE_XHCI_OP_CRCR);
+    hype_debug_print("host-xhci: command ring stopped answering -- aborting it. "
+                     "usbsts=0x%08x crcr=0x%08x (CRR=%u) after %llu timeout(s) [#775]\n",
+                     sts, crcr, (crcr & HYPE_XHCI_CRCR_CRR) ? 1u : 0u,
+                     (unsigned long long)hw->cmd_timeouts);
+
+    /* Only CS/CA are writable while the ring is running; the pointer bits are ignored. */
+    wr32(bar, hw->opreg + HYPE_XHCI_OP_CRCR,
+         (crcr & HYPE_XHCI_CRCR_RCS) | HYPE_XHCI_CRCR_CA);
+    for (ms = 0; ms < XHCI_CMD_ABORT_WAIT_MS; ms++) {
+        crcr = rd32(bar, hw->opreg + HYPE_XHCI_OP_CRCR);
+        if ((crcr & HYPE_XHCI_CRCR_CRR) == 0u) {
+            break;
+        }
+        delay_ms(1);
+    }
+    if ((crcr & HYPE_XHCI_CRCR_CRR) != 0u) {
+        hw->cmd_dead = 1;
+        hw->cmd_recovery_fails++;
+        hype_debug_print("host-xhci: command ring still RUNNING %u ms after Command Abort "
+                         "(crcr=0x%08x) -- it cannot be restarted from software [#775]\n",
+                         XHCI_CMD_ABORT_WAIT_MS, crcr);
+        return -1;
+    }
+
+    /*
+     * The abort posts a Command Ring Stopped (or Command Aborted) completion, and any
+     * transfer events the controller had queued behind it are still on the ring. Drain what
+     * is there and route the transfer events to their endpoints -- dropping one is how an
+     * interrupt-IN endpoint goes permanently deaf (#761).
+     */
+    for (ms = 0; ms < 64u; ms++) {
+        if (next_event_timed(hw, bar, c->rtsoff, drop, 2000u, 0) != 0) {
+            break;
+        }
+        route_foreign_event(c, hw, drop);
+    }
+
+    cmd_ring_rebuild(hw);
+    wr64(bar, hw->opreg + HYPE_XHCI_OP_CRCR, phys(hw->cmd_ring) | HYPE_XHCI_CRCR_RCS);
+    hw->cmd_recoveries++;
+    hype_debug_print("host-xhci: command ring restarted at its base (recovery %llu) [#775]\n",
+                     hw->cmd_recoveries);
+    return 0;
+}
+
 static int cmd_submit_wait(hype_xhci_ctrl_t *c, uint32_t cmd[4], uint32_t evt[4]) {
     xhci_hw_t *hw = HW(c);
     volatile uint8_t *bar = (volatile uint8_t *)(uintptr_t)c->bar;
     unsigned int guard = 64u; /* bound the number of skipped (e.g. port-change) events */
     uint64_t my_trb = phys(hw->cmd_ring) + (uint64_t)hw->cmd_enq * HYPE_XHCI_TRB_BYTES;
+
+    /*
+     * Once the ring is known dead, fail IMMEDIATELY. Every attempt otherwise costs a
+     * one-second event wait, and the caller is usually the 125 Hz input tick: boot 31 spent
+     * 614 seconds of the run inside this function waiting for a controller that had stopped
+     * listening. Failing fast keeps the tick alive and the dashboard responsive while the
+     * rest of the machine carries on.
+     */
+    if (hw->cmd_dead) {
+        return -1;
+    }
     cmd_enqueue(hw, cmd);
     wr32(bar, hype_xhci_doorbell_offset(c->dboff, 0), 0u); /* command doorbell, target 0 */
     while (guard-- != 0u) {
         if (next_event(hw, bar, c->rtsoff, evt) != 0) {
             /* #266: distinguish "nothing arrived" from "things arrived, none ours". */
-            hype_debug_print("host-xhci: #266 command TIMEOUT waiting for trb=0x%llx "
-                             "(no event arrived)\n", (unsigned long long)my_trb);
+            hw->cmd_timeouts++;
+            if (hw->cmd_timeouts <= 8ull || !hw->cmd_dead) {
+                hype_debug_print("host-xhci: #266 command TIMEOUT waiting for trb=0x%llx "
+                                 "(no event arrived, timeout %llu)\n",
+                                 (unsigned long long)my_trb,
+                                 (unsigned long long)hw->cmd_timeouts);
+            }
+            /*
+             * Do not simply return. The command is still enqueued and the ring may have
+             * stopped; leaving it there means every later command lands behind a wedge and
+             * times out too, which is boot 31 exactly. Abort and restart the ring so the
+             * NEXT command has a chance.
+             */
+            (void)cmd_ring_recover(c);
             return -1;
         }
         if (hype_xhci_trb_type(evt) == HYPE_XHCI_TRB_CMD_COMPLETION) {
@@ -1280,6 +1447,7 @@ int hype_xhci_configure_int_in_endpoint(hype_xhci_ctrl_t *c, unsigned int slot,
     ring_init_link(iin->ring);
     iin->enq = 0; iin->cyc = 1; hype_iiq_reset(&iin->q);
     iin->revive_after = HYPE_INT_IN_SILENT_MAX; iin->revives = 0;
+    iin->revive_fails = 0; iin->stopped_ccs = 0;
     iin->mps = mps; iin->recoveries = 0; iin->backoff = 0;
     iin->silent_polls = 0; iin->rearms = 0;
     iin->claim_n = 0; iin->diverged = 0; iin->reports = 0;
@@ -1496,6 +1664,7 @@ int hype_xhci_configure_hub_int_in(hype_xhci_ctrl_t *c, unsigned int slot,
     ring_init_link(iin->ring);
     iin->enq = 0; iin->cyc = 1; hype_iiq_reset(&iin->q);
     iin->revive_after = HYPE_INT_IN_SILENT_MAX; iin->revives = 0;
+    iin->revive_fails = 0; iin->stopped_ccs = 0;
     iin->mps = mps; iin->recoveries = 0; iin->backoff = 0;
     iin->silent_polls = 0; iin->rearms = 0;
     iin->claim_n = 0; iin->diverged = 0; iin->reports = 0;
@@ -2141,6 +2310,21 @@ static int int_in_poll_body(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int
                                  slot, dci, after, iin->revive_after, iin->revives,
                                  iin->reports);
             }
+        } else {
+            /*
+             * A revive that CANNOT run is the thing boot 31 could not see. int_in_revive()
+             * needs two commands, both timed out against a stopped command ring, and this
+             * branch used to do nothing at all -- so an endpoint deaf for 74 minutes
+             * reported revives=0 and looked as though the trigger had never fired.
+             */
+            iin->revive_fails++;
+            if (iin->revive_fails <= 8ull) {
+                hype_debug_print("host-xhci: REVIVE FAILED slot=%u ep=%u -- silent for %u "
+                                 "polls and the commands did not complete (failure %llu, "
+                                 "reports so far %llu). This endpoint is deaf and hype "
+                                 "cannot rebuild it [#775]\n",
+                                 slot, dci, after, iin->revive_fails, iin->reports);
+            }
         }
         int_in_fill(c, iin, slot, dci, len);
         return 0;
@@ -2228,6 +2412,11 @@ static int int_in_poll_body(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int
         if (hype_iiq_take(&iin->q, &comp)) {
             uint32_t cc = comp.cc;
             unsigned int buf = comp.buf, xlen = comp.actual;
+            if (hype_xhci_cc_is_stopped(cc)) {
+                iin->stopped_ccs++;
+                int_in_fill(c, iin, slot, dci, len);
+                return 0; /* cancelled by our own Stop Endpoint: no report, no recovery */
+            }
             if (cc != HYPE_XHCI_CC_SUCCESS && cc != HYPE_XHCI_CC_SHORT_PACKET) {
                 int_in_report_error(slot, dci, my_trb, cc);
                 int_in_recover(c, slot, dci, iin);
@@ -2304,6 +2493,11 @@ static int int_in_poll_body(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int
             return 0; /* cannot happen: deliver queued one */
         }
         cc = comp.cc; buf = comp.buf; xlen = comp.actual;
+        if (hype_xhci_cc_is_stopped(cc)) {
+            iin->stopped_ccs++;
+            int_in_fill(c, iin, slot, dci, len);
+            return 0; /* cancelled by our own Stop Endpoint: no report, no recovery */
+        }
         if (cc != HYPE_XHCI_CC_SUCCESS && cc != HYPE_XHCI_CC_SHORT_PACKET) {
             int_in_report_error(slot, dci, my_trb, cc);
             int_in_recover(c, slot, dci, iin);
@@ -3685,6 +3879,42 @@ unsigned long long hype_xhci_int_in_revives(hype_xhci_ctrl_t *c, unsigned int sl
     if (c == (hype_xhci_ctrl_t *)0 || !c->inited) return 0ull;
     iin = iin_hw_for(c, slot, hype_xhci_ep_dci(ep_addr), 0);
     return (iin != (xhci_int_in_hw_t *)0) ? iin->revives : 0ull;
+}
+
+/*
+ * Revives ATTEMPTED that failed, and transfers retired by our own Stop Endpoint. A deaf
+ * endpoint with revive_fails climbing is a stopped command ring, not a stopped device --
+ * the distinction boot 31 spent 74 minutes unable to make.
+ */
+void hype_xhci_int_in_revive_health(hype_xhci_ctrl_t *c, unsigned int slot,
+                                    unsigned int ep_addr, unsigned long long *fails,
+                                    unsigned long long *stopped) {
+    xhci_int_in_hw_t *iin;
+    if (fails) *fails = 0;
+    if (stopped) *stopped = 0;
+    if (c == (hype_xhci_ctrl_t *)0 || !c->inited) return;
+    iin = iin_hw_for(c, slot, hype_xhci_ep_dci(ep_addr), 0);
+    if (iin == (xhci_int_in_hw_t *)0) return;
+    if (fails) *fails = iin->revive_fails;
+    if (stopped) *stopped = iin->stopped_ccs;
+}
+
+/*
+ * Command-ring health. `dead` non-zero means hype has stopped trying: either the controller
+ * reported HSE/HCE, or the ring could not be restarted. Every device on this controller is
+ * unreachable at that point, and saying so is the whole reason this exists.
+ */
+void hype_xhci_cmd_ring_health(hype_xhci_ctrl_t *c, unsigned long long *timeouts,
+                               unsigned long long *recoveries, int *dead) {
+    xhci_hw_t *hw;
+    if (timeouts) *timeouts = 0;
+    if (recoveries) *recoveries = 0;
+    if (dead) *dead = 0;
+    if (c == (hype_xhci_ctrl_t *)0 || !c->inited) return;
+    hw = HW(c);
+    if (timeouts) *timeouts = hw->cmd_timeouts;
+    if (recoveries) *recoveries = hw->cmd_recoveries;
+    if (dead) *dead = hw->cmd_dead;
 }
 
 void hype_xhci_int_in_losses(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int ep_addr,

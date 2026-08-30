@@ -135,6 +135,37 @@ static void test_control_transfer_trbs(void) {
     CHECK_HEX("link cycle 0", 0, hype_xhci_trb_cycle(t));
 }
 
+/*
+ * Boot 31 regression (2026-08-30).
+ *
+ * A Stop Endpoint retires whatever was outstanding with a STOPPED code. hype classified
+ * those as transfer failures and ran endpoint recovery -- Reset Endpoint against a Stopped
+ * endpoint, which is a Context State Error. The controller's command ring stopped answering
+ * from that point and every interrupt-IN endpoint on it was deaf for the next 74 minutes.
+ *
+ * SUCCESS and SHORT_PACKET must stay out of this set (they are real reports), and so must
+ * genuine failures like STALL and USB Transaction Error -- classifying one of those as
+ * "cancelled" would silently swallow an endpoint that really does need recovering.
+ */
+static void test_cc_stopped_classification(void) {
+    CHECK_HEX("cc 26 Stopped is a stop", 1, hype_xhci_cc_is_stopped(HYPE_XHCI_CC_STOPPED));
+    CHECK_HEX("cc 27 Stopped-Length is a stop", 1,
+              hype_xhci_cc_is_stopped(HYPE_XHCI_CC_STOPPED_LENGTH));
+    CHECK_HEX("cc 28 Stopped-Short is a stop", 1,
+              hype_xhci_cc_is_stopped(HYPE_XHCI_CC_STOPPED_SHORT));
+
+    CHECK_HEX("success is not a stop", 0, hype_xhci_cc_is_stopped(HYPE_XHCI_CC_SUCCESS));
+    CHECK_HEX("short packet is not a stop", 0,
+              hype_xhci_cc_is_stopped(HYPE_XHCI_CC_SHORT_PACKET));
+    CHECK_HEX("stall is not a stop", 0, hype_xhci_cc_is_stopped(6u));
+    CHECK_HEX("usb transaction error is not a stop", 0, hype_xhci_cc_is_stopped(4u));
+    CHECK_HEX("babble is not a stop", 0, hype_xhci_cc_is_stopped(3u));
+    CHECK_HEX("event ring full is not a stop", 0,
+              hype_xhci_cc_is_stopped(HYPE_XHCI_CC_EVENT_RING_FULL));
+    CHECK_HEX("cc 0 invalid is not a stop", 0, hype_xhci_cc_is_stopped(0u));
+    CHECK_HEX("cc 29 past the range is not a stop", 0, hype_xhci_cc_is_stopped(29u));
+}
+
 static void test_event_decode(void) {
     uint32_t t[4] = {0, 0, 0, 0};
     /* Command Completion Event: TRB ptr in dw0/1, CC in status[31:24],
@@ -1215,6 +1246,7 @@ int main(void) {
     test_cmd_trbs();
     test_control_transfer_trbs();
     test_event_decode();
+    test_cc_stopped_classification();
 
     test_parked_events();
     test_parked_drop_exact();

@@ -3780,6 +3780,43 @@ isn't lost.
     handling of a recycled slot id is correct (`tools/743`), so hot-plug's constant slot
     recycling is a hardware risk to measure on the 5950X, not a design flaw to fix first.
 
+74. **A command that never completes aborts and restarts the command ring, and a ring that
+    cannot be restarted is declared dead rather than retried -- decided (2026-08-30).**
+
+    Boot 31 measured the alternative. A Stop Endpoint command went out at t=9.9 min and no
+    event ever came back. hype's response was a bare `return -1`: the TRB stayed enqueued,
+    the ring was never examined, and the next command went in behind it. Every command for
+    the remaining 74 minutes timed out -- 614 of them, each costing the 125 Hz input tick a
+    full second -- and because reviving a silent interrupt-IN endpoint needs two commands,
+    all three keyboards and all five hub devices on that controller were deaf for the rest
+    of the run with `revives=0` and `errors=0`. Nothing in the log said the ring had
+    stopped, because nothing looked at it.
+
+    **USBSTS is read before anything is attempted.** HSE or HCE means the controller itself
+    has failed, and no command-ring surgery recovers that -- only a controller reset would,
+    and that tears down every addressed device including the stick hype is writing its log
+    to. That case is named and latched, not papered over with a retry that cannot work.
+
+    **Otherwise the recovery is the one xHCI 4.6.1.2 specifies**: set `CRCR.CA` to abort the
+    command in flight, wait for `CRCR.CRR` to clear (the pointer field is only writable
+    then), drain the events the abort posts -- routing transfer events to their endpoints,
+    because dropping one is how an interrupt-IN endpoint goes permanently deaf (#761) --
+    then re-point the ring at its base and carry on.
+
+    **Bounded at four recoveries, then dead.** Retrying for ever is what the old code did by
+    accident, and it is worse than stopping: it spends the input tick, it fills the log, and
+    it hides the failure behind noise. Once the ring is declared dead every later command
+    fails IMMEDIATELY instead of waiting a second first, so the dashboard and the guests keep
+    running while the USB devices on that controller are honestly reported as unreachable.
+
+    **A recovery that fails must be counted.** The same run showed why: an endpoint deaf for
+    74 minutes reported `revives=0`, which reads as "the revive never fired". It had fired
+    hundreds of times and failed, on a path that incremented nothing and printed nothing.
+    `revive_fail` now sits beside `revives` on the same line, and the DEADMAN warm-reboot
+    treats a failed revive as equal evidence to a successful one -- it previously required a
+    revive to have succeeded, so it would have declined to fire in exactly the case where the
+    input path was provably unrecoverable.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what
