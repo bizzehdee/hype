@@ -317,6 +317,31 @@ static inline uint32_t hype_xhci_portsc_write_preserve(uint32_t current, uint32_
     return (current & ~HYPE_XHCI_PORTSC_RW1C) | bits_to_set;
 }
 
+/*
+ * Bits that ACT when written as 1 rather than describing state: PR (Port Reset), LWS (the
+ * Port Link State write strobe) and WPR (Warm Port Reset). A read-modify-write must never
+ * echo them back, or it fires a reset nobody asked for.
+ */
+#define HYPE_XHCI_PORTSC_STROBE ((1u << 4) | (1u << 16) | (1u << 31))
+
+/*
+ * The value to write back to PORTSC to ACK its change bits and change nothing else.
+ *
+ * Boot 32 (2026-08-30) is why this is a named function with a test rather than an
+ * expression at the call site. The ACK was written as `sc & HYPE_XHCI_PORTSC_CHANGE_MASK`,
+ * which does clear the change bits -- and also writes 0 into every other RW bit in the
+ * register, PP (Port Power, bit 9) included. So hype saw the keyboard leave the root port,
+ * ACKed the event, and switched the port off in the same write. Plugging the keyboard back
+ * in did nothing at all: an unpowered port never reports a connect, so no Port Status Change
+ * Event was ever raised and #745's arrival path was never reached.
+ *
+ * Preserve everything, clear only the change bits, fire no strobes.
+ */
+static inline uint32_t hype_xhci_portsc_ack_changes(uint32_t current) {
+    return (current & ~(HYPE_XHCI_PORTSC_RW1C | HYPE_XHCI_PORTSC_STROBE))
+           | (current & HYPE_XHCI_PORTSC_CHANGE_MASK);
+}
+
 /* --- USB Mass Storage endpoint discovery (pure, xHCI-independent USB descr) --- */
 
 /* USB Mass Storage class/subclass/protocol (bulk-only SCSI). */

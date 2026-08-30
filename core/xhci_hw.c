@@ -4009,11 +4009,17 @@ int hype_xhci_port_connected(hype_xhci_ctrl_t *c, unsigned int port, int *out_co
      * #744: ACK the change bits while we are here, by writing them back. PORTSC's change
      * bits are write-1-to-clear and the controller will not raise another event for this
      * port until they are cleared -- so a reader that only read would see the first
-     * unplug and nothing ever again. The status bits (CCS, PED) are write-ignored, and
-     * PORT_LINK_STATE's strobe (bit 16) is deliberately not set, so this writes back only
-     * what it means to clear.
+     * unplug and nothing ever again.
+     *
+     * It must be a read-modify-write. This was `sc & HYPE_XHCI_PORTSC_CHANGE_MASK`, which
+     * clears the change bits correctly and writes 0 into every other RW bit in the register
+     * on the way past -- PP, Port Power, among them. Boot 32 measured the result: hype saw
+     * the keyboard leave root port 10, ACKed the event, and switched the port off in the
+     * same write. Plugging the keyboard back in produced nothing whatsoever, because an
+     * unpowered port never reports a connect, so no further event was ever raised and
+     * #745's arrival path was never reached. See hype_xhci_portsc_ack_changes().
      */
-    wr32(bar, c->op + hype_xhci_portsc_offset(port), sc & HYPE_XHCI_PORTSC_CHANGE_MASK);
+    wr32(bar, c->op + hype_xhci_portsc_offset(port), hype_xhci_portsc_ack_changes(sc));
     *out_connected = (sc & HYPE_XHCI_PORTSC_CCS) ? 1 : 0;
     return 0;
 }

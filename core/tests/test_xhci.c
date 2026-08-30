@@ -166,6 +166,50 @@ static void test_cc_stopped_classification(void) {
     CHECK_HEX("cc 29 past the range is not a stop", 0, hype_xhci_cc_is_stopped(29u));
 }
 
+/*
+ * Boot 32 regression (2026-08-30).
+ *
+ * ACKing a port's change bits must clear those bits and change nothing else. The version
+ * this replaces wrote `sc & HYPE_XHCI_PORTSC_CHANGE_MASK`, which also wrote 0 into PP --
+ * so hype powered the root port down in the act of acknowledging the unplug, and the
+ * re-plug was never reported at all.
+ */
+static void test_portsc_ack_preserves_power(void) {
+    /* Connected, enabled, powered, CSC set -- a device that has just been unplugged. */
+    uint32_t sc = HYPE_XHCI_PORTSC_PP | HYPE_XHCI_PORTSC_CSC | (1u << 10) /* speed */;
+    uint32_t w = hype_xhci_portsc_ack_changes(sc);
+
+    CHECK_HEX("ack keeps port power", HYPE_XHCI_PORTSC_PP, w & HYPE_XHCI_PORTSC_PP);
+    CHECK_HEX("ack clears CSC by writing it back", HYPE_XHCI_PORTSC_CSC,
+              w & HYPE_XHCI_PORTSC_CSC);
+
+    /* Every change bit set at once: all are written back, power still survives. */
+    sc = HYPE_XHCI_PORTSC_PP | HYPE_XHCI_PORTSC_CHANGE_MASK;
+    w = hype_xhci_portsc_ack_changes(sc);
+    CHECK_HEX("all change bits acked", HYPE_XHCI_PORTSC_CHANGE_MASK,
+              w & HYPE_XHCI_PORTSC_CHANGE_MASK);
+    CHECK_HEX("power survives a full ack", HYPE_XHCI_PORTSC_PP, w & HYPE_XHCI_PORTSC_PP);
+
+    /* PED is write-1-to-clear: never echo it, or the ACK disables the port. */
+    sc = HYPE_XHCI_PORTSC_PP | HYPE_XHCI_PORTSC_PED | HYPE_XHCI_PORTSC_CSC;
+    w = hype_xhci_portsc_ack_changes(sc);
+    CHECK_HEX("ack never writes PED", 0u, w & HYPE_XHCI_PORTSC_PED);
+
+    /* PR and the two other write-1 strobes must never be echoed either. */
+    sc = HYPE_XHCI_PORTSC_PP | HYPE_XHCI_PORTSC_PR | (1u << 16) | (1u << 31)
+         | HYPE_XHCI_PORTSC_PRC;
+    w = hype_xhci_portsc_ack_changes(sc);
+    CHECK_HEX("ack fires no strobe", 0u, w & HYPE_XHCI_PORTSC_STROBE);
+    CHECK_HEX("ack still clears PRC", HYPE_XHCI_PORTSC_PRC, w & HYPE_XHCI_PORTSC_PRC);
+
+    /* Nothing to ack: the write is a no-op that still leaves the port powered. */
+    sc = HYPE_XHCI_PORTSC_PP | HYPE_XHCI_PORTSC_CCS;
+    w = hype_xhci_portsc_ack_changes(sc);
+    CHECK_HEX("no spurious change bits", 0u, w & HYPE_XHCI_PORTSC_CHANGE_MASK);
+    CHECK_HEX("power kept when nothing to ack", HYPE_XHCI_PORTSC_PP,
+              w & HYPE_XHCI_PORTSC_PP);
+}
+
 static void test_event_decode(void) {
     uint32_t t[4] = {0, 0, 0, 0};
     /* Command Completion Event: TRB ptr in dw0/1, CC in status[31:24],
@@ -1247,6 +1291,7 @@ int main(void) {
     test_control_transfer_trbs();
     test_event_decode();
     test_cc_stopped_classification();
+    test_portsc_ack_preserves_power();
 
     test_parked_events();
     test_parked_drop_exact();

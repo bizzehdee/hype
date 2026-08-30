@@ -42,7 +42,27 @@
 #define TAP_MS                   12u /* press-to-release, about a real keystroke */
 #define SLOW_CHAR_MS            500u
 #define FAST_CHAR_MS              8u /* one per 1 ms frame is faster than any human */
+#define MED_CHAR_MS              30u /* brisk human typing -- the control for the fast burst */
 #define HOLD_MS               12000u /* > the 10 s bound in #777, so the break is exercised */
+/*
+ * #773's measurement string, and why it looks like this.
+ *
+ * The question is whether a keypress that lands while the endpoint is unarmed is lost. That
+ * produces no completion, so it appears in no counter -- the only place it shows up is the
+ * difference between what was typed and what the guest received. Boot 32 tried it with a
+ * human typing a pangram and the operator reported the obvious problem: at speed they
+ * dropped and doubled keys themselves, so the measurement said more about the typist than
+ * about hype.
+ *
+ * A STRICTLY INCREASING sequence removes the need to count anything. Every character in
+ * 'a'..'z' then '0'..'9' appears exactly once and in order, so a dropped character leaves a
+ * visible gap and a doubled one leaves a visible repeat -- both readable at a glance in the
+ * guest's echo, with no reference copy to diff against and no ambiguity about WHICH
+ * character went missing. A pangram cannot do that: it repeats letters, so a doubled 'o'
+ * and a correctly-typed pair of 'o's look identical.
+ */
+#define TYPETEST_STR "abcdefghijklmnopqrstuvwxyz0123456789"
+#define TYPETEST_REPS             4u
 /*
  * THE BOARD STARTS DISARMED, AND ONLY A HUMAN ARMS IT.
  *
@@ -208,6 +228,23 @@ static void do_chords(void) {
 }
 
 /*
+ * #773: the same known string several times over, at one speed.
+ *
+ * Repeated because a single clean pass proves little -- the unarmed window is a few
+ * milliseconds wide, so a drop is a probabilistic event and four passes at 8 ms per
+ * character is 144 chances rather than 36. Each pass ends with Enter so the guest echoes it
+ * as its own line, which keeps the passes separable in RUN1A.LOG even if one is mangled.
+ */
+static void do_type_test(uint32_t gap_ms) {
+    unsigned int i;
+    for (i = 0; i < TYPETEST_REPS; i++) {
+        type_str(TYPETEST_STR, gap_ms);
+        tap(0, HID_KEY_ENTER);
+        pump_ms(120);
+    }
+}
+
+/*
  * A key held past the typematic bound. hype synthesises repeat because USB HID devices do
  * not, and #777 bounds a single hold to ten seconds and then emits the BREAK -- because a
  * report that goes missing is indistinguishable from a key still held, which locked a key on
@@ -252,14 +289,21 @@ int main(void) {
         }
 
         /* One exercise per gap, rotating, so every behaviour is covered every six tags and
-         * the pattern is obvious in the log rather than random. */
+         * the pattern is obvious in the log rather than random.
+         *
+         * Phases 2 and 5 are #773's typing test at two speeds. Running the SAME string at
+         * both is the whole point: if the fast pass drops characters and the medium pass
+         * does not, the loss is rate-dependent and the unarmed window is the cause. If both
+         * are clean, the window is closed. If both drop, it is not about the window at all.
+         */
         switch (g_phase % 6u) {
         case 0: break;                            /* idle: armed and silent, on purpose */
         case 1: type_str("slow", SLOW_CHAR_MS); break;
-        case 2: type_str("fastfastfa", FAST_CHAR_MS); break;
+        case 2: do_type_test(FAST_CHAR_MS); break;  /* #773: faster than any human */
         case 3: do_chords(); break;
         case 4: do_hold(); break;
-        default: break;                           /* idle again */
+        case 5: do_type_test(MED_CHAR_MS); break;   /* #773 control: brisk but unhurried */
+        default: break;
         }
         g_phase++;
 
