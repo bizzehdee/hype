@@ -3817,6 +3817,58 @@ isn't lost.
     revive to have succeeded, so it would have declined to fire in exactly the case where the
     input path was provably unrecoverable.
 
+75. **A wedged xHCI controller is RESET and re-enumerated -- never the one carrying the log or
+    the boot medium -- and the wedge is made reproducible by injection so it costs one
+    hardware run rather than many -- decided (2026-08-30).**
+
+    Boot 35 closed off the software options. Controller[2]'s command ring stopped answering,
+    hype issued a Command Abort as a full 64-bit CRCR write and waited xHCI 4.6.1.2's own five
+    seconds, and `CRR` was still set -- with `usbsts=0x00000010`, Port Change Detect alone: no
+    halt, no host system error, no host controller error. The controller insists it is healthy
+    and will not release its command ring. Every interrupt-IN endpoint on it is then
+    unrecoverable, because reviving one takes two commands, and hot-plug goes blind with them
+    because a hub reports through the same kind of endpoint. The operator re-plugged a keyboard
+    and hype never saw it.
+
+    **The reset is per CONTROLLER, not per machine.** The DEADMAN warm reboot already exists and
+    works, but it ends the run -- and a run that ends is a run whose remaining ninety minutes of
+    evidence never happened. On the 5950X the wedged controller carries cameras, hubs and the
+    HIDs; the boot medium and the log sink are on the other one. Resetting just the wedged one
+    costs the devices on it and keeps everything else, including the log that has to record
+    whether the recovery worked.
+
+    **hype REFUSES to reset the controller that owns the log sink or the boot medium**, says so,
+    and stays dead instead. Staying deaf with evidence beats recovering input and losing the
+    record of why it was needed; and hype writes its log through that controller, so resetting
+    it would pull the floor out from under the diagnosis mid-write. This needs a fact hype does
+    not currently record -- WHICH controller owns the sink -- so that comes first.
+
+    **Teardown is explicit, and it is the risky half.** A controller owns interrupt-IN blocks,
+    MSC bulk rings and backends, media device entries, USB inventory rows, hub-table rows and
+    claimed HID slots. Some already have per-controller release paths (`hype_xhci_hub_forget_ctrl`,
+    `hype_xhci_int_in_release_slot`, `hype_usb_inventory_note_departed`); **media devices have no
+    removal path at all** -- `media_add_dev()` only ever appends. #780 is the standing warning
+    about what half-tracked media identity costs: a stale entry that names one disk and reads
+    another is worse than a missing one, because the miss is refused loudly and the swap is not
+    noticed.
+
+    **The wedge is injected, not waited for.** It has appeared in three boots out of eleven, and
+    every observation so far has cost a cold boot, an operator session and a verbal report. A
+    recovery path validated that way would take weeks and still be under-tested. So a build-gated
+    fault injection fakes the command timeout on demand, which makes the whole path -- abort,
+    refusal, teardown, reset, re-enumeration, re-claim -- deterministic under QEMU, and leaves
+    exactly ONE hardware run: the confirmation that a real wedge recovers.
+
+    **Bounded and counted.** A fixed number of resets per controller per run, then the controller
+    is left dead and said to be dead. A controller that needs resetting every few minutes is a
+    different bug, and a recovery good enough to hide it is a recovery that stops anyone finding
+    it.
+
+    Decomposed into five tickets rather than one: the injection harness, the ownership facts and
+    the refusal, the teardown, the reset and re-enumeration, and the single hardware
+    confirmation. The first two are independent of each other; nothing else can be written
+    honestly until they exist.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what
