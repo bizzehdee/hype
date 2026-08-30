@@ -1,52 +1,91 @@
-# Boot 32 -- the command-ring fix, on the run that found the bug
+# Boot 32 -- the command-ring fix, plus a harvest of On Hold tickets
 
-Boot 31 answered the question. All input stopped at t=9.9 minutes -- Keychron, Pico and
-Logitech receiver within half a minute of each other, and the hub status endpoints with
-them. Three keyboards and five hub devices do not fail together; one controller does. They
-all sit on controller[2] (2f:00.3), and its COMMAND RING stopped answering at that moment.
+Boot 31 answered why input dies. Every device on controller[2] (2f:00.3) went silent within
+half a minute of t=9.9 min and stayed silent for the remaining 74 minutes of an 84-minute
+run -- three keyboards and five hub devices together, because the controller's COMMAND RING
+stopped answering and hype went on enqueuing behind the wedge. Fixed in `b0669e3`
+(plan.md decision 74, ticket #779).
 
-hype's answer to a command that never completes was to give up on that command and enqueue
-the next one behind it. So every command for the remaining 74 minutes timed out -- 614 of
-them, one second each, taken out of the 125 Hz input tick. Reviving a deaf endpoint needs
-two commands, so nothing could be revived, and the counter said `revives=0` because the
-failure path incremented nothing. The log was healthy for all 84 minutes and never said the
-ring had stopped, because nothing looked at it.
+The log itself has now survived two long runs in a row, so this run can also collect evidence
+for tickets that have been sitting On Hold waiting for exactly this machine.
 
-## What this build changes
-
-- **The command ring recovers itself.** On a timeout hype now reads USBSTS, aborts the
-  command (CRCR.CA), waits for the ring to stop, drains what the abort posts, and restarts
-  the ring at its base -- xHCI 4.6.1.2. Four recoveries, then it declares the ring dead.
-- **A dead ring fails fast.** Once given up on, commands fail immediately instead of waiting
-  a second each. The dashboard and the guests stay responsive even in the worst case.
-- **A FAILED revive is now visible.** `HIDTICK` carries `revive_fail=` next to `revives=`,
-  plus the controller's `cmdring timeouts=/recoveries=` and a `DEAD` marker.
-- **A STOPPED completion (cc 26/27/28) is no longer treated as a transfer failure.** It is
-  what a Stop Endpoint retires outstanding transfers with. hype used to "recover" the
-  endpoint on it, issuing Reset Endpoint against a Stopped endpoint -- boot 31 shows exactly
-  that line immediately before the command ring stopped answering.
-- **The DEADMAN counts a failed revive.** It previously needed a revive to have SUCCEEDED,
-  so it would have declined to fire in exactly boot 31's case.
-
-## The sequence
+## Part 1 -- the main run (no action needed)
 
 1. Boot, stay on the dashboard, press BOOTSEL on the Pico, confirm `a0001`.
-2. Type on the Keychron for ~30 s, then leave the machine alone.
-3. Run for **at least 90 minutes** -- boot 31 died at 9.9 min and ran 84, so this needs to
-   cover the same ground and more.
-4. Come back and try both keyboards. **Whether they work or not is the result**; note which.
-5. Power off normally. Bring back `HYPE.LOG` and `RUN1A.LOG`. If a warm reboot happened
-   (DEADMAN, or you typed `host reboot`), also bring `HYPE.1.LOG`, `RUN1A.1.LOG` and
-   `hype-log-prev.txt`.
+2. Type on the Keychron for ~30 s (part 2 makes this useful), then leave the machine alone.
+3. Leave it running for **at least 90 minutes**.
+4. Come back and try both keyboards. **Whether they still work is the result.**
 
-## What each outcome means
+### What this settles on its own, with no extra work
 
-- **Input alive at the end, `cmdring timeouts=0`**: the ring never stopped this run. Good,
-  but it does not prove the recovery works -- the recovery was never exercised.
-- **Input alive, `cmdring recoveries=` non-zero**: the ring stopped and hype brought it
-  back. That is the fix working, and it is the outcome to hope for.
-- **Input dead, `revive_fail=` climbing and `cmdring ... DEAD`**: the ring stopped and could
-  not be restarted. The fix did not save the run, but it named the failure honestly instead
-  of grinding silently -- and the DEADMAN should have warm-rebooted the machine for you.
-- **Input dead with `cmdring timeouts=0`**: a different fault from boot 31's. Say so; that
-  would be new.
+- **#779 / #775** -- the command ring and the endpoint revive. See the outcome table below.
+- **#641** -- the idle-vCPU HLT storm. `APVCPU` and `PERF` print every run; boot 31 measured
+  328.9M exits on one AP in 84 minutes. Another data point costs nothing.
+
+### The outcome table for #779
+
+| What the log says at the end | What it means |
+| --- | --- |
+| Input alive, `cmdring timeouts=0` | The ring never stopped. Good run, but the recovery was never exercised, so it proves nothing about the fix. |
+| Input alive, `cmdring recoveries=` non-zero | **The result we want.** The ring stopped and hype brought it back. |
+| Input dead, `revive_fail=` climbing, `cmdring ... DEAD` | The ring stopped and could not be restarted. The fix did not save the run but named the failure honestly, and the DEADMAN should have warm-rebooted the machine for you. |
+| Input dead, `cmdring timeouts=0` | A different fault from boot 31's. Say so -- that would be new. |
+
+## Part 2 -- three short actions that clear five On Hold tickets
+
+Each takes well under a minute. Do them in this order, near the START of the run, so the
+90 minutes of part 1 still happen afterwards.
+
+### A. Type a known sentence at the guest login (settles #773)
+
+Log into the guest and type this exact line, at a comfortable speed, then press Enter:
+
+```
+the quick brown fox jumps over the lazy dog 0123456789
+```
+
+Then type it a second time **as fast as you can**.
+
+Why it settles it: #773 is about a keypress landing while the endpoint is unarmed, which
+produces no completion and so shows up in no counter. The guest ECHOES what it receives, and
+`RUN1A.LOG` records the echo, so the two lines can be compared against the text above
+character by character. Missing or doubled characters are the defect; two clean copies are
+the fix. Say roughly how fast the second one was.
+
+### B. Hold one key down for 15 seconds (settles #774 and #777)
+
+At the guest prompt, hold the `a` key for a slow count of fifteen, then release.
+
+Why it settles them: #774 is "a held key never repeats" -- a run of `a`s in the echoed line
+is the fix working. #777 is "typematic repeats forever when the release report is lost" --
+the repeat is bounded at 10 seconds, so the run of `a`s should STOP before you let go. Note
+whether it stopped on its own, and roughly when.
+
+### C. Unplug something from a REAR socket and plug it back (settles #744 and #745)
+
+Pick any device in a **rear root port** -- a spare stick, a webcam, anything. Pull it, wait
+five seconds, plug it back into the SAME socket.
+
+> **NOT the HYPEBOOT drive.** It is both the boot medium and the log medium; unplugging it
+> ends the run and loses the evidence. And not anything on the front hub -- that is the path
+> #746 already covers.
+
+Why it settles them: #744 (root-port departure and slot teardown) and #745 (root-port arrival
+and claim) have never been exercised on real hardware -- every hot-plug in boots 30 and 31 was
+behind the hub. The log should show `PORT EVENT port=N` at the moment you pull it, a teardown,
+then another `PORT EVENT` and an enumeration when you push it back.
+
+## Deliberately NOT in this run
+
+**#754** wants a USB storage device pulled mid-write. That is a good test and it needs its own
+run: the only USB storage in this configuration is the drive hype is writing its log to, and
+pulling it would destroy the record of everything else on this card.
+
+## What to bring back
+
+`HYPE.LOG` and `RUN1A.LOG`. If a warm reboot happened -- the DEADMAN fired, or you typed
+`host reboot` -- also `HYPE.1.LOG`, `RUN1A.1.LOG` and `hype-log-prev.txt`.
+
+Tell me which of parts 2A/2B/2C you actually did, and roughly when. Timestamps in the log are
+byte offsets, not clock time, so knowing "the replug was about ten minutes in" is what lets
+the right lines be found.
