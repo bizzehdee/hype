@@ -8604,6 +8604,50 @@ static void fw_1_hid_watch(uint64_t now_h, uint64_t hz) {
     }
 }
 
+/*
+ * #773: the last characters hype actually handed to a guest.
+ *
+ * This ticket asks whether a keypress landing while the endpoint is unarmed is lost. It
+ * produces no completion, so it appears in no counter -- the only way to see it is to compare
+ * what was typed against what arrived. Two attempts to read that off the guest's own echo have
+ * failed: boot 36's keystrokes went to hype's terminal because nothing had attached the
+ * console, and boot 37's went to the guest correctly (routed=2420 of 2471) but RUN1A.LOG
+ * captured only the heartbeat under `screen|` and not one character of the typing.
+ *
+ * So it is recorded HERE, at the point hype hands a character over, where nothing downstream
+ * can lose it and no guest configuration can hide it. The decoded ASCII is used rather than
+ * the Set-1 bytes on the RAMFB path, because the measurement is a string comparison against a
+ * known string and scancodes would need decoding back before it could be made.
+ *
+ * A ring, not a log line per key: a run types thousands of characters and the question is only
+ * ever asked of the recent ones. 256 holds seven full passes of #773's 36-character alphabet.
+ */
+#define HYPE_KBDCHARS_MAX 256u
+static char g_kbdchars[HYPE_KBDCHARS_MAX];
+static unsigned int g_kbdchars_head;  /* next write position */
+static unsigned long long g_kbdchars_total;
+
+static void fw_1_kbdchars_note(uint8_t ch) {
+    char c;
+
+    /*
+     * Printable ASCII survives as itself. Everything else becomes a single stand-in so the
+     * line stays greppable and, more to the point, stays valid ASCII: these logs are read with
+     * `LC_ALL=C grep -a` precisely because invalid bytes have made greps silently match nothing
+     * before now. Enter is the pass separator and earns its own mark.
+     */
+    if (ch == '\r' || ch == '\n') {
+        c = '/';
+    } else if (ch >= 0x20u && ch < 0x7Fu) {
+        c = (char)ch;
+    } else {
+        c = '.';
+    }
+    g_kbdchars[g_kbdchars_head] = c;
+    g_kbdchars_head = (g_kbdchars_head + 1u) % HYPE_KBDCHARS_MAX;
+    g_kbdchars_total++;
+}
+
 static void fw_1_host_input_poll(void) {
     uint8_t sc;
     /*
@@ -8663,6 +8707,11 @@ static void fw_1_host_input_poll(void) {
              * and guest run on different cores; the SPSC queue preserves device
              * ownership and the guest core raises IRQ1 after accepting a byte.
              */
+            /* #773: record the decoded characters on BOTH paths -- which transport carries
+             * them to the guest is not what this measures. */
+            for (ki = 0; ki < kn; ki++) {
+                fw_1_kbdchars_note(kb[ki]);
+            }
             if (dst->ramfb_reported == 1 && dst->lifecycle == HYPE_VM_RUNNING) {
                 for (ki = 0; ki < pn; ki++) {
                     (void)hype_scancode_queue_enqueue(&dst->host_ps2_queue, ps2_bytes[ki]);
@@ -30003,6 +30052,30 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                         hype_debug_print(" %02x", (unsigned)pc->master.imr_writes[mi]);
                                     }
                                     hype_debug_print(" [#436]\n");
+                                }
+                                /*
+                                 * #773: the characters, not the PS/2 command bytes. KBDTRACE
+                                 * below records i8042 traffic (rd23, cmd20...), which answers
+                                 * a different question entirely -- it cannot say whether the
+                                 * letter 'q' arrived.
+                                 */
+                                if (vi == 0u && g_kbdchars_total != 0ull) {
+                                    unsigned int have = (g_kbdchars_total
+                                                         < (unsigned long long)HYPE_KBDCHARS_MAX)
+                                                            ? (unsigned int)g_kbdchars_total
+                                                            : HYPE_KBDCHARS_MAX;
+                                    unsigned int ci;
+                                    unsigned int first = (g_kbdchars_head + HYPE_KBDCHARS_MAX
+                                                          - have) % HYPE_KBDCHARS_MAX;
+                                    hype_debug_print("fw-1 KBDCHARS: last %u of %llu handed to "
+                                                     "the guest: [", have, g_kbdchars_total);
+                                    for (ci = 0; ci < have; ci++) {
+                                        char one[2];
+                                        one[0] = g_kbdchars[(first + ci) % HYPE_KBDCHARS_MAX];
+                                        one[1] = '\0';
+                                        hype_debug_print("%s", one);
+                                    }
+                                    hype_debug_print("] [#773]\n");
                                 }
                                 {
                                     unsigned n = hype_ps2_kbd_trace_count(&g_vms[vi].ps2);

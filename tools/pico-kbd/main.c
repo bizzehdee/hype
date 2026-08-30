@@ -43,7 +43,26 @@
 #define SLOW_CHAR_MS            500u
 #define FAST_CHAR_MS              8u /* one per 1 ms frame is faster than any human */
 #define MED_CHAR_MS              30u /* brisk human typing -- the control for the fast burst */
-#define HOLD_MS               12000u /* > the 10 s bound in #777, so the break is exercised */
+/*
+ * #787: THREE seconds, not twelve.
+ *
+ * The board went permanently silent immediately after its twelve-second hold, twice -- boot 36
+ * and boot 37 -- and that silence is what provokes the rest: 32 to 64 seconds later hype's
+ * revive fires on the stalled endpoint, its Stop Endpoint never completes, and the whole
+ * controller's command ring dies with it (#781).
+ *
+ * A twelve-second hold is twelve seconds of the device NAKing an armed interrupt-IN transfer,
+ * which is far longer than anything else the script does -- every other exercise finishes
+ * inside two seconds. Whether that length is the trigger is the cheapest question available,
+ * and this is the one-line experiment that answers it: if the board survives its holds at
+ * three seconds, the length matters; if it still dies, the hold is not the cause and the
+ * correlation was coincidence.
+ *
+ * Nothing is lost by shortening it. It was twelve to cross #777's ten-second typematic bound,
+ * and #774 and #777 both closed on boot 36's evidence -- 95 repeats from one press, which is
+ * the bounded answer and not the unbounded one.
+ */
+#define HOLD_MS                3000u
 /*
  * #773's measurement string, and why it looks like this.
  *
