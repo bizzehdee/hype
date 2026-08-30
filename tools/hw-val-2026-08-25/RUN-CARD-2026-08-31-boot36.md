@@ -39,6 +39,18 @@ them passes for the wrong reason.
    from the dashboard to the guest. Type a couple of characters and see them echo. **This is
    the step the last run was missing**; without it the Pico types into hype's terminal and
    #773 gets nothing.
+
+   > **Both modifiers must be the RIGHT-hand ones.** The leader is Right-Ctrl + Right-Alt held
+   > together; the left-hand keys do not form it. This is not pedantry -- #734 was a keyboard
+   > folding its right modifiers onto the left usages, which broke every chord, and the last
+   > run's log carries the near-miss line `chord key seen with only Right-Alt held`.
+   >
+   > `Right-Ctrl + Right-Alt + Right-arrow` gets to the same place by cycling
+   > (dashboard -> vm0 -> vm1 -> ... -> dashboard) if the number key does not take.
+   > `Right-Ctrl + Right-Alt + Esc` goes back to the dashboard.
+   >
+   > Once the view is on a VM, every key that is not a chord goes to that guest -- that is the
+   > whole mechanism, and it is why the echo test in this step is worth the ten seconds.
 4. **Press BOOTSEL once. Confirm the LED goes SOLID, not blinking, and that `a0001` appears in
    the guest.** If the LED is still blinking, press again and check.
 5. Leave the machine alone for **90 minutes**. Nothing else to do.
