@@ -20818,7 +20818,23 @@ static int media_nvme_write(void *ctx, uint64_t lba, uint32_t count, const void 
 static hype_media_dev_t g_media_devs[HYPE_MEDIA_MAX_DEVS];
 unsigned g_media_dev_count;
 
-static const char *g_media_dev_serial[HYPE_MEDIA_MAX_DEVS]; /* #323 */
+/*
+ * #323, and boot 33's failure. A COPY, not a pointer.
+ *
+ * This was `const char *`, pointing at whatever buffer the caller had. For the USB path that
+ * buffer is g_hostusb_serial, which usb_capture_identity() rewrites for EVERY mass-storage
+ * device it probes -- so probing a second stick silently renamed the first one that was
+ * already registered here.
+ *
+ * Boot 33: device 1 registered as 'DB9876543214E' (the boot medium), a second USB disk on the
+ * other controller was probed, and by the time media_disk was matched this array said
+ * '01011954e7bd3f0c929f'. The named drive was "not present", hype correctly refused to stream
+ * media from a different drive, and the guest booted to "no bootable option or device". The
+ * old comment said "static storage, stays valid" -- true about lifetime, false about
+ * immutability, which is the part that mattered.
+ */
+static char g_media_dev_serial_buf[HYPE_MEDIA_MAX_DEVS][64];
+static const char *g_media_dev_serial[HYPE_MEDIA_MAX_DEVS]; /* #323: into the buffers above */
 
 /*
  * #589: a per-inventory-entry media reader. media_ahci_read/media_nvme_read were hardwired to the
@@ -20908,7 +20924,10 @@ static void media_add_dev(int (*rd)(void *, uint64_t, uint32_t, void *),
     g_media_devs[g_media_dev_count].ctx = ctx;
     g_media_devs[g_media_dev_count].bus = bus;
     g_media_devs[g_media_dev_count].part_base_lba = 0;
-    g_media_dev_serial[g_media_dev_count] = serial; /* #323: static storage, stays valid */
+    (void)hype_strlcpy(g_media_dev_serial_buf[g_media_dev_count],
+                       (serial != 0) ? serial : "",
+                       sizeof(g_media_dev_serial_buf[g_media_dev_count]));
+    g_media_dev_serial[g_media_dev_count] = g_media_dev_serial_buf[g_media_dev_count];
     g_media_dev_count++;
     hype_debug_print("media: registered host device %u = %s serial='%s'\n", g_media_dev_count - 1u,
                      bus, (serial != 0 && serial[0] != '\0') ? serial : "(unknown)");
@@ -21073,6 +21092,25 @@ static void usb_capture_identity(hype_xhci_ctrl_t *xc, unsigned int slot,
  * operator wants the stick specifically.
  */
 static void media_select_usb(const hype_blk_backend_t *be) {
+    /*
+     * Boot 33: the FIRST USB mass-storage device keeps this datapath.
+     *
+     * The root-port scan runs once per controller, so this is reached once per controller that
+     * has a stick on it. It used to re-point g_media_usb_be every time, while media_add_dev()
+     * deduplicated the registration on (read fn, ctx) and added no second entry -- so the
+     * device registered as index N kept its name and quietly acquired a different disk's read
+     * path. A media device that reads a drive other than the one it is named after is worse
+     * than one that is missing: the miss is refused loudly (#323), the swap is not noticed at
+     * all.
+     *
+     * A second stick is not lost by this. The #387 extra-MSC sweep gives every further
+     * mass-storage device its own bulk rings, its own serial and its own media entry.
+     */
+    if (g_media_usb_be != 0) {
+        hype_debug_print("media: a USB media device is already selected -- leaving it in place "
+                         "and letting the #387 sweep take this one [#323]\n");
+        return;
+    }
     g_media_usb_be = be;
     /*
      * #340: registered under the serial usb_capture_identity() captured. When the stick
