@@ -11,9 +11,11 @@ justify a rule live in **`.learnings/`**. Both are indexed at the end.
 
 ## Before doing anything
 
-1. Find the board ticket covering the work. If none exists, create one (in **To
-   Do**) before starting — don't do undocumented work. Move the ticket you're
-   starting to **Doing**. Details: the **`task-board`** skill.
+1. Find the board ticket covering the work. If none exists, one must be created
+   (in **To Do**) before starting — don't do undocumented work. The ticket you
+   are starting must be moved to **Doing**. **All board operations are owned by
+   the `board-maintainer` agent — delegate to it rather than running `gh`
+   yourself.** See *Board work* below.
 2. Check that the ticket's **"is blocked by"** links are all **Done**. If they
    aren't, either do them first or stop and ask — do not skip ahead on the
    assumption a prerequisite "probably doesn't matter yet."
@@ -28,10 +30,32 @@ A **bugfix** (behavior doesn't match what `plan.md` or the ticket already
 specify) can go straight to a code change. Anything bigger — new capabilities,
 new config surface, new devices/drivers, any change beyond restoring the
 documented spec — **must go through `plan.md` first**, then become a board
-ticket. See the **`task-board`** skill.
+ticket (ask `board-maintainer` to raise it).
 
 Before changing code to fix a break, diagnose it on real evidence first — the
 **`diagnose-first`** skill.
+
+## Board work — delegate it
+
+The **GitHub Project board** is the single source of truth for task progress.
+**Every board operation belongs to the `board-maintainer` agent**: creating a
+ticket, moving a ticket between Status columns, triage, labels, milestones,
+progress and findings comments, closing or rejecting a ticket, and board audits
+or summaries. Hand it the facts; it owns the board state. Do not run `gh`
+against the board yourself, and do not carry board rules in your own head.
+
+What you still own:
+
+- routing the work (bugfix straight to code; anything bigger through `plan.md`
+  first);
+- checking the ticket's **"is blocked by"** links are all **Done** before
+  starting;
+- referencing the task ID in commit messages and PRs;
+- handing `board-maintainer` the evidence when work finishes, blocks, or
+  produces a finding — including the validation that justifies **Done**.
+
+The `task-board` skill is the short router. The agent loads the detailed
+`board-*` skills itself, on demand.
 
 ## Hard invariants — do not weaken any of these without updating plan.md §10 first
 
@@ -76,8 +100,11 @@ just the source project's overall stated license.
 
 Load these when the work matches; they hold the full process, not this file.
 
-- **`task-board`** — the GitHub Project board: tickets, Status columns,
-  milestones, labels, feature-vs-bugfix routing, plan/board sync, gh CLI limits.
+- **`task-board`** — router for board work: what to delegate to the
+  `board-maintainer` agent, and what the calling agent still owns. The agent's
+  own on-demand skills are `board-create`, `board-triage`, `board-status`,
+  `board-notes`, `board-report`, and `board-gh`; load those only if you are
+  acting as the board maintainer.
 - **`diagnose-first`** — diagnose-on-evidence discipline: root-cause from real
   output before changing code; measure, don't theorise.
 - **`toolchain`** — how `hype.efi` is built: freestanding C11 for
