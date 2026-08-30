@@ -34,11 +34,8 @@ them passes for the wrong reason.
 ## The sequence
 
 1. Boot. Stay on the dashboard.
-2. **Wait for the guest to reach a login prompt.** Do not skip ahead -- step 3 needs it there.
-3. **Press Right-Ctrl + Right-Alt + 1** to attach the console to vm0. The screen should switch
-   from the dashboard to the guest. Type a couple of characters and see them echo. **This is
-   the step the last run was missing**; without it the Pico types into hype's terminal and
-   #773 gets nothing.
+2. **Press Right-Ctrl + Right-Alt + 1 first** -- you cannot see the guest until you do, and
+   the dashboard will not tell you it has reached a login prompt.
 
    > **Both modifiers must be the RIGHT-hand ones.** The leader is Right-Ctrl + Right-Alt held
    > together; the left-hand keys do not form it. This is not pedantry -- #734 was a keyboard
@@ -51,6 +48,19 @@ them passes for the wrong reason.
    >
    > Once the view is on a VM, every key that is not a chord goes to that guest -- that is the
    > whole mechanism, and it is why the echo test in this step is worth the ten seconds.
+3. **Wait for `localhost login:` on that screen, then type `root` and Enter** to get a shell
+   prompt (`localhost:~#`). **This is the step the last run was missing** -- without a focused,
+   logged-in guest the Pico types into hype's own terminal and #773 gets nothing.
+
+   The input script already logged a shell in, but on **ttyS0**, the serial console -- a
+   different tty from the one the screen shows. That is why the screen still sits at a login
+   prompt with the heartbeat running: two consoles, two logins. The script cannot reach the
+   screen tty, so this one is yours.
+
+   The Pico must land at a **shell** prompt, not a login prompt: at a login prompt the alphabet
+   pass becomes a rejected username and never echoes, which is exactly the measurement #773
+   needs.
+
 4. **Press BOOTSEL once. Confirm the LED goes SOLID, not blinking, and that `a0001` appears in
    the guest.** If the LED is still blinking, press again and check.
 5. Leave the machine alone for **90 minutes**. Nothing else to do.
