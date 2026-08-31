@@ -77,3 +77,11 @@ disk-images/
 
 # #436: rig images -- large, rebuildable by tools/436/make-win-rig.sh
 rig/
+
+# Hardware-validation run logs. Captured output, not source: 97 files and 53 MB had
+# accumulated by 2026-08-31, and a single three-hour run now produces a 21.7 MB HYPE.LOG on
+# its own. They stay on disk under tools/hw-val-2026-08-25/logs/ and are still the evidence
+# tickets cite -- they are simply not the repository's to carry.
+tools/hw-val-*/logs/
+*.LOG
+*.LOG.gz
