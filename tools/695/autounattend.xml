@@ -1,0 +1,127 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  #695: unattended answer file for the reusable Windows guest image.
+
+  The ticket's own framing of the problem: installing Windows is "a GUI-driven,
+  interactive, no-answer-file, tens-of-minutes-per-attempt process with no
+  scripted/unattended path in this repo today". This is that path. It lives in the
+  repo rather than being typed once and forgotten, so the image can be rebuilt.
+
+  Windows Setup reads \autounattend.xml from the root of any attached volume,
+  which is why this is injected into the ISO root rather than presented as an
+  extra disk ; adding a disk would mean changing the guest's disk set in
+  hype.cfg, and the media is the one thing already guaranteed to be attached.
+-->
+<unattend xmlns="urn:schemas-microsoft-com:unattend">
+  <settings pass="windowsPE">
+    <component name="Microsoft-Windows-International-Core-WinPE"
+               processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <SetupUILanguage><UILanguage>en-GB</UILanguage></SetupUILanguage>
+      <InputLocale>en-GB</InputLocale>
+      <SystemLocale>en-GB</SystemLocale>
+      <UILanguage>en-GB</UILanguage>
+      <UserLocale>en-GB</UserLocale>
+    </component>
+    <component name="Microsoft-Windows-Setup"
+               processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <DiskConfiguration>
+        <WillShowUI>OnError</WillShowUI>
+        <!-- Disk 0 is the guest's only disk: the CD is not a disk and hype
+             presents exactly one AHCI target (see [disk.winsys] in the cfg). -->
+        <Disk wcm:action="add">
+          <DiskID>0</DiskID>
+          <WillWipeDisk>true</WillWipeDisk>
+          <CreatePartitions>
+            <!-- The standard UEFI/GPT layout. Anything else and the firmware has
+                 nothing to boot afterwards, which looks exactly like a hype bug. -->
+            <CreatePartition wcm:action="add">
+              <Order>1</Order><Type>EFI</Type><Size>260</Size>
+            </CreatePartition>
+            <CreatePartition wcm:action="add">
+              <Order>2</Order><Type>MSR</Type><Size>128</Size>
+            </CreatePartition>
+            <CreatePartition wcm:action="add">
+              <Order>3</Order><Type>Primary</Type><Extend>true</Extend>
+            </CreatePartition>
+          </CreatePartitions>
+          <ModifyPartitions>
+            <ModifyPartition wcm:action="add">
+              <Order>1</Order><PartitionID>1</PartitionID>
+              <Format>FAT32</Format><Label>System</Label>
+            </ModifyPartition>
+            <ModifyPartition wcm:action="add">
+              <Order>2</Order><PartitionID>2</PartitionID>
+            </ModifyPartition>
+            <ModifyPartition wcm:action="add">
+              <Order>3</Order><PartitionID>3</PartitionID>
+              <Format>NTFS</Format><Label>Windows</Label><Letter>C</Letter>
+            </ModifyPartition>
+          </ModifyPartitions>
+        </Disk>
+      </DiskConfiguration>
+      <ImageInstall>
+        <OSImage>
+          <InstallFrom>
+            <!-- By INDEX, not by name: the edition names differ between the
+                 consumer and business media and a wrong name stops Setup with a
+                 picker, which is the one outcome an unattended run cannot survive. -->
+            <MetaData wcm:action="add">
+              <Key>/IMAGE/INDEX</Key><Value>1</Value>
+            </MetaData>
+          </InstallFrom>
+          <InstallTo><DiskID>0</DiskID><PartitionID>3</PartitionID></InstallTo>
+          <WillShowUI>OnError</WillShowUI>
+        </OSImage>
+      </ImageInstall>
+      <UserData>
+        <AcceptEula>true</AcceptEula>
+        <FullName>hype</FullName>
+        <Organization>hype</Organization>
+      </UserData>
+    </component>
+  </settings>
+
+  <settings pass="oobeSystem">
+    <component name="Microsoft-Windows-Shell-Setup"
+               processorArchitecture="amd64" publicKeyToken="31bf3856ad364e35"
+               language="neutral" versionScope="nonSxS"
+               xmlns:wcm="http://schemas.microsoft.com/WMIConfig/2002/State">
+      <OOBE>
+        <!-- Every one of these is a screen that would otherwise wait for a human.
+             #442 is open against OOBE's CloudExperienceHost first-run flow failing
+             under hype; skipping the online flow keeps this fixture independent of
+             that ticket, which is #695's stated non-goal. -->
+        <HideEULAPage>true</HideEULAPage>
+        <HideLocalAccountScreen>true</HideLocalAccountScreen>
+        <HideOEMRegistrationScreen>true</HideOEMRegistrationScreen>
+        <HideOnlineAccountScreens>true</HideOnlineAccountScreens>
+        <HideWirelessSetupInOOBE>true</HideWirelessSetupInOOBE>
+        <ProtectYourPC>3</ProtectYourPC>
+      </OOBE>
+      <UserAccounts>
+        <LocalAccounts>
+          <LocalAccount wcm:action="add">
+            <Name>hype</Name>
+            <Group>Administrators</Group>
+            <Password><Value>hype</Value><PlainText>true</PlainText></Password>
+            <DisplayName>hype</DisplayName>
+          </LocalAccount>
+        </LocalAccounts>
+      </UserAccounts>
+      <AutoLogon>
+        <!-- Auto-logon so the fixture reaches a DESKTOP unattended. #634's bar is
+             only "Windows reaches its logon screen on its view", but a desktop is
+             strictly more useful and costs nothing here. -->
+        <Enabled>true</Enabled>
+        <Username>hype</Username>
+        <LogonCount>999</LogonCount>
+        <Password><Value>hype</Value><PlainText>true</PlainText></Password>
+      </AutoLogon>
+      <TimeZone>GMT Standard Time</TimeZone>
+    </component>
+  </settings>
+</unattend>
