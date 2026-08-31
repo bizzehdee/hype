@@ -3869,6 +3869,44 @@ isn't lost.
     confirmation. The first two are independent of each other; nothing else can be written
     honestly until they exist.
 
+76. **The guest LAPIC's IRR is a published VIEW of the VMM layer's pending-vector set, not a
+    register the LAPIC model owns -- decided (2026-08-31).**
+
+    `devices/guest_lapic.h` used to state that the IRR (0x200-0x270) was deliberately not
+    modelled, "because there is no point in this design where a vector is known to be
+    requested-but-not-delivered, so any value put there would be invented". That premise was
+    false when it was written and is what #789 cost. The VMCB/VMCS layer's per-vCPU
+    `pending_irr[8]` is exactly the requested-but-not-delivered set, it uses the architectural
+    IRR layout already, and it is not a rare state: a Windows 10 guest with two vCPUs left its
+    AP spinning with IF=0, polling its own IRR, while hype held two vectors it could not inject
+    and coalesced 16,777 further attempts away.
+
+    Measured on the #789 rig, one 300 s run each, same media and config, the AP:
+
+    | vCPU 1 | IRR reads 0 | IRR published |
+    |---|---|---|
+    | NPFs claimed by the LAPIC | 16,340,460 | 65,744 |
+    | last faulting address | 0xFEE00210 (IRR1) | 0xFEE000B0 (EOI) |
+    | interrupts injected | 2 | 18,643 |
+    | injections coalesced away | 16,777 | 20 |
+    | pending / IF at the end | 2 / IF=0 | 0 / IF=1 |
+
+    The guest went from never reaching its own CD driver to issuing the full `cdrom.sys`
+    command set, matching what one vCPU had always achieved.
+
+    **A view, not a copy.** The LAPIC model does not own this state and must not: a vector lives
+    in `pending_irr` from request to injection, and a second copy here would be a second thing to
+    keep in step -- the failure mode decision 51's shared-line rule already warns about one level
+    down. `hype_guest_lapic_set_requested()` refreshes the view, and the two places that serve an
+    IRR read (the MMIO NPF handler and the x2APIC MSR path, per backend) call it first. A stale
+    view is worse than none: a guest polling the IRR to decide whether to keep waiting must see
+    the queue as it stands now, not as it stood at the last injection attempt.
+
+    The honest limit is unchanged in shape and now stated the other way round: the ISR is marked
+    at commitment, so a bit can be set marginally before the guest takes the interrupt; the IRR
+    is read at fault time, so it is exact for the reader it exists for.
+
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what
@@ -4044,6 +4082,7 @@ ticket, a new ticket raised from this review (#599–#604), or
 deliberately-not-planned with the reason. This section records findings; it
 changes no existing decision. Where a finding contradicts a §10 decision,
 that is said explicitly rather than silently absorbed.
+
 
 ### 14.1 IOMMU / DMA remapping (AMD-Vi / VT-d)
 

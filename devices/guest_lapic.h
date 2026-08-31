@@ -57,6 +57,13 @@
  */
 #define HYPE_GUEST_LAPIC_REG_ISR_BASE 0x100u
 #define HYPE_GUEST_LAPIC_REG_ISR_LAST 0x170u
+/*
+ * #789: the Interrupt Request Register, the same eight-dword-at-16-byte-spacing shape as the
+ * ISR (IRR0 at 0x200 holds vectors 0-31 ... IRR7 at 0x270). See
+ * hype_guest_lapic_set_requested() for why this stopped reading a constant 0.
+ */
+#define HYPE_GUEST_LAPIC_REG_IRR_BASE 0x200u
+#define HYPE_GUEST_LAPIC_REG_IRR_LAST 0x270u
 #define HYPE_GUEST_LAPIC_REG_LDR 0x0D0u
 #define HYPE_GUEST_LAPIC_REG_DFR 0x0E0u
 #define HYPE_GUEST_LAPIC_REG_SVR 0x0F0u
@@ -209,6 +216,7 @@ typedef struct {
      */
     uint32_t apic_mode;
     uint32_t isr[8];
+    uint32_t irr[8]; /* #789: requested-but-not-yet-delivered, published by the VMM layer */
     uint32_t tpr; /* Task Priority Register (0x080); PPR (0x0A0) is derived from it and isr */
     uint32_t svr;
     uint32_t lvt_timer;
@@ -391,11 +399,28 @@ void hype_guest_lapic_post_vector(hype_guest_lapic_t *lapic, uint8_t vector);
  * actually takes the interrupt. That does not affect the readers this exists for: a guest
  * reads the ISR from *inside* its handler, which is strictly after delivery.
  *
- * For the same reason the IRR (0x200-0x270) is deliberately NOT modelled: there is no point
- * in this design where a vector is known to be requested-but-not-delivered, so any value put
- * there would be invented. Those offsets keep reading 0.
+ * The IRR (0x200-0x270) used to be left unmodelled on the reasoning that no point in this
+ * design knows a vector to be requested-but-not-delivered. That reasoning was wrong, and #789
+ * is what it cost: the VMM layer's per-vCPU `pending_irr` is exactly that set, and it is not
+ * rare -- a Windows AP spinning with IF=0 sat on 16,340,460 NPFs at 0xFEE00210 while hype held
+ * two undelivered vectors for it and coalesced 16,777 further injection attempts. A guest that
+ * polls its own IRR to find out what is waiting is entitled to see it. See
+ * hype_guest_lapic_set_requested().
  */
 void hype_guest_lapic_accept_vector(hype_guest_lapic_t *lapic, uint8_t vector);
+
+/*
+ * #789: publish the VMM layer's pending-vector bitmap as this LAPIC's IRR.
+ *
+ * The LAPIC model does not own this state and must not: a vector lives in the VMCB/VMCS
+ * layer's `pending_irr` from the moment it is requested until the moment it is injected, and
+ * duplicating that here would be a second copy to keep in step. This is a VIEW, refreshed by
+ * whoever serves an IRR read, so the guest always sees the one authoritative set.
+ *
+ * `irr8` is eight dwords, vector v at word v/32 bit v%32 -- the architectural IRR layout, and
+ * already the layout `pending_irr` uses.
+ */
+void hype_guest_lapic_set_requested(hype_guest_lapic_t *lapic, const uint32_t *irr8);
 
 /*
  * The highest vector currently marked in service, or -1 if none. This is the SDM's ISRV, and

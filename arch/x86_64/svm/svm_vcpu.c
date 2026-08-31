@@ -2347,6 +2347,8 @@ int hype_svm_vcpu_handle_msr(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lapic) {
             }
         } else {
             uint64_t value;
+            /* #789: the IRR is a view of the pending set here too -- see the MMIO twin. */
+            hype_guest_lapic_set_requested(lapic, real->pending_irr);
             if (hype_guest_lapic_x2apic_read(lapic, msr_number, &value) != 0) {
                 return 1;
             }
@@ -3689,6 +3691,16 @@ int hype_svm_vcpu_handle_lapic_npf(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lap
         return -1;
     }
     offset = (uint32_t)(npf.guest_phys_addr - lapic_base_phys);
+
+    /*
+     * #789: the IRR is a VIEW of this vCPU's pending-vector set, so refresh it from the one
+     * place that owns that set before anything can read it. Published here rather than at
+     * request time because this is the only point where both the vCPU context and its LAPIC
+     * model are in hand, and because a stale view is worse than none: a guest polling the IRR
+     * to decide whether to keep waiting must see the CURRENT queue, not the queue as it stood
+     * at the last injection attempt.
+     */
+    hype_guest_lapic_set_requested(lapic, real->pending_irr);
 
     if (guest_insn_bytes == 0 || hype_mmio_decode(guest_insn_bytes, HYPE_MMIO_MAX_INSTR_BYTES, &decoded) != 0) {
         return -1;

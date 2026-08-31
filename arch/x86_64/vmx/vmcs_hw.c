@@ -1994,6 +1994,8 @@ int hype_vmx_vcpu_handle_msr(hype_vcpu_ctx_t *ctx, int is_write, hype_guest_lapi
             }
         } else {
             uint64_t value;
+            /* #789: the IRR is a view of the pending set here too -- see the MMIO twin. */
+            hype_guest_lapic_set_requested(lapic, real->pending_irr);
             if (hype_guest_lapic_x2apic_read(lapic, msr_number, &value) != 0) {
                 return 1;
             }
@@ -4317,6 +4319,8 @@ int hype_vmx_vcpu_handle_lapic_npf(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *lap
     if (m.decoded.size_bytes != 4u) {
         return -1;
     }
+    /* #789: publish the pending-vector set as the IRR -- see the SVM twin for why here. */
+    hype_guest_lapic_set_requested(lapic, real->pending_irr);
     if (m.decoded.is_write) {
         uint32_t cur = 0;
         /* #307: a read-modify-write of this device register needs its CURRENT value, so the

@@ -18,6 +18,7 @@ void hype_guest_lapic_reset(hype_guest_lapic_t *lapic) {
     for (i = 0; i < 8u; i++) {
         lapic->self_ipi_pending[i] = 0;
         lapic->isr[i] = 0;
+        lapic->irr[i] = 0; /* #789 */
     }
     lapic->tpr = 0;
     lapic->self_ipi_count = 0;
@@ -84,6 +85,13 @@ void hype_guest_lapic_accept_vector(hype_guest_lapic_t *lapic, uint8_t vector) {
     lapic->isr[vector >> 5] |= 1u << (vector & 31u);
 }
 
+void hype_guest_lapic_set_requested(hype_guest_lapic_t *lapic, const uint32_t *irr8) {
+    unsigned int i;
+    for (i = 0; i < 8u; i++) {
+        lapic->irr[i] = (irr8 != 0) ? irr8[i] : 0u;
+    }
+}
+
 int hype_guest_lapic_isr_highest(const hype_guest_lapic_t *lapic) {
     unsigned int word = 8u;
 
@@ -145,6 +153,12 @@ int hype_guest_lapic_read(hype_guest_lapic_t *lapic, uint32_t offset, unsigned i
     if (offset >= HYPE_GUEST_LAPIC_REG_ISR_BASE && offset <= HYPE_GUEST_LAPIC_REG_ISR_LAST &&
         (offset & 0xFu) == 0u) {
         *out = lapic->isr[(offset - HYPE_GUEST_LAPIC_REG_ISR_BASE) >> 4];
+        return 0;
+    }
+    /* #789: the IRR block, same range shape and same alignment rule as the ISR above. */
+    if (offset >= HYPE_GUEST_LAPIC_REG_IRR_BASE && offset <= HYPE_GUEST_LAPIC_REG_IRR_LAST &&
+        (offset & 0xFu) == 0u) {
+        *out = lapic->irr[(offset - HYPE_GUEST_LAPIC_REG_IRR_BASE) >> 4];
         return 0;
     }
 

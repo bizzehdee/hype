@@ -5974,6 +5974,18 @@ static uint64_t (*g_ap_ahci_serves)[HYPE_MAX_VCPUS_PER_VM];
 static uint64_t (*g_ap_ecam_serves)[HYPE_MAX_VCPUS_PER_VM];
 static uint64_t (*g_ap_vblk_serves)[HYPE_MAX_VCPUS_PER_VM]; /* #511 */
 static uint64_t (*g_ap_ipi_drained)[HYPE_MAX_VCPUS_PER_VM]; /* #512 */
+/*
+ * #789: which MMIO the AP is actually faulting on, and who claimed it.
+ *
+ * A Windows guest with 2 vCPUs took 16,832,815 NPFs on vCPU 1 at one rip, and the counters that
+ * existed said `unhandled=0 unclaimed=0 ahci=0 ecam=0 vblk=0` -- every fault was claimed, by
+ * nothing with a counter. That is not enough to name the window. These three are: the last
+ * faulting guest-physical address, and the claim split between a shared device model and the
+ * vCPU's own LAPIC.
+ */
+static uint64_t (*g_ap_npf_gpa)[HYPE_MAX_VCPUS_PER_VM];
+static uint64_t (*g_ap_npf_dev)[HYPE_MAX_VCPUS_PER_VM];
+static uint64_t (*g_ap_npf_lapic)[HYPE_MAX_VCPUS_PER_VM];
 /* #484: total LAPIC base-frequency ticks this AP has been advanced, and the TSC span it was
  * advanced over. The RCU stall says CPU 1 gets ~5 timer IRQs/s where its init_count implies
  * ~1600, so the question is whether the ADVANCE is short or the IRQ delivery is. These two
@@ -13067,6 +13079,10 @@ wait_for_sipi:
             }
         } else if (vmm_reason_is_npf(kind, info.reason)) {
             const uint8_t *insn = fw_1_insn_bytes_via_ptwalk(vm, ctx, info.guest_rip);
+            /* #789: read the faulting address BEFORE any handler runs -- see g_ap_npf_gpa. */
+            hype_vmm_npf_t ap_seen;
+            vmm_get_last_npf(kind, ctx, &ap_seen);
+            g_ap_npf_gpa[vm_idx][vi] = ap_seen.guest_phys_addr;
             /*
              * SMP-6: PCI config space, served under the shared-device lock.
              *
@@ -13101,7 +13117,7 @@ wait_for_sipi:
                 g_ap_vblk_serves[vm_idx][vi]++;
             }
             if (ap_mmio_done) {
-                /* handled */
+                g_ap_npf_dev[vm_idx][vi]++; /* #789 */
             } else if (vmm_handle_lapic_npf(kind, ctx, lapic, HYPE_LAPIC_DEFAULT_BASE, insn) != 0) {
                 /*
                  * #749/#735: nothing claimed it. ABSORB it -- all-ones read, dropped write,
@@ -13198,6 +13214,8 @@ wait_for_sipi:
                         break;
                     }
                 }
+            } else {
+                g_ap_npf_lapic[vm_idx][vi]++; /* #789: the vCPU's own LAPIC claimed it. */
             }
         } else if (kind == HYPE_VMM_KIND_VMX &&
                    info.reason == HYPE_VMX_EXIT_REASON_APIC_WRITE) {
@@ -16552,8 +16570,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                             "fw-1 APVCPU vm%u/%u: live=%u exits=%llu unhandled=%llu "
                             "unclaimed=%llu "
                             "last=0x%llx@0x%llx timer_irqs=%llu init=%u cur=%u lvt=0x%x "
-                            "ahci=%llu ecam=%llu vblk=%llu lt=%llu span=%llu lockwait=%llu lockmax=%llu lockmaxsec=%u | held_max=%llu held_tot=%llu house_tot=%llu house_max=%llu "
-                            "[#190]\n", _vmi, _av,
+                            "ahci=%llu ecam=%llu vblk=%llu npfdev=%llu npflapic=%llu npfgpa=0x%llx lt=%llu span=%llu lockwait=%llu lockmax=%llu lockmaxsec=%u | held_max=%llu held_tot=%llu house_tot=%llu house_max=%llu "
+                            "[#190 #789]\n", _vmi, _av,
                             (unsigned)g_ap_vcpu_live[_vmi][_av],
                             g_ap_vcpu_exits[_vmi][_av], g_ap_vcpu_unhandled[_vmi][_av],
                             g_ap_vcpu_unclaimed[_vmi][_av], /* #749 */
@@ -16566,6 +16584,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                             (unsigned long long)g_ap_ahci_serves[_vmi][_av],
                             (unsigned long long)g_ap_ecam_serves[_vmi][_av],
                             (unsigned long long)g_ap_vblk_serves[_vmi][_av],
+                            (unsigned long long)g_ap_npf_dev[_vmi][_av],
+                            (unsigned long long)g_ap_npf_lapic[_vmi][_av],
+                            (unsigned long long)g_ap_npf_gpa[_vmi][_av],
                             (unsigned long long)g_ap_lapic_ticks[_vmi][_av],
                             (unsigned long long)g_ap_lapic_tsc_span[_vmi][_av],
                             (unsigned long long)g_ap_devlock_wait[_vmi][_av],
@@ -26914,6 +26935,9 @@ static void fw_alloc_vm_aux_arena(EFI_BOOT_SERVICES *bs) {
     g_ap_ecam_serves = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_ecam_serves);
     g_ap_vblk_serves = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_vblk_serves);
     g_ap_ipi_drained = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_ipi_drained);
+    g_ap_npf_gpa = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_npf_gpa);     /* #789 */
+    g_ap_npf_dev = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_npf_dev);     /* #789 */
+    g_ap_npf_lapic = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_npf_lapic); /* #789 */
     g_ap_lapic_ticks = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_lapic_ticks);
     g_ap_lapic_tsc_span = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_lapic_tsc_span);
     g_ap_devlock_wait = fw_aux_alloc(bs, (UINTN)n * sizeof *g_ap_devlock_wait);

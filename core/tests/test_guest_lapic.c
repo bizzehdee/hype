@@ -532,6 +532,92 @@ static void test_isr_bit_lands_in_the_right_dword_across_the_whole_range(void) {
     }
 }
 
+static void test_irr_publishes_the_pending_vector_set(void) {
+    /*
+     * #789: a Windows AP spinning with IF=0 polls its own IRR to find out what is waiting. While
+     * these offsets read a constant 0 it never saw the two vectors hype was holding for it and
+     * took 16,340,460 nested page faults at 0xFEE00210 making no progress. The IRR is a VIEW of
+     * the VMM layer's pending set, published by hype_guest_lapic_set_requested().
+     */
+    hype_guest_lapic_t l;
+    uint32_t pending[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    uint32_t v = 0xDEADBEEFu;
+    uint32_t off;
+
+    hype_guest_lapic_reset(&l);
+    for (off = HYPE_GUEST_LAPIC_REG_IRR_BASE; off <= HYPE_GUEST_LAPIC_REG_IRR_LAST; off += 0x10u) {
+        CHECK_HEX("IRR dword reads 0 at reset", 0, (hype_guest_lapic_read(&l, off, 4, &v), v));
+    }
+
+    /* Vector 0xD2 -- the one the Windows AP was actually waiting on -- is bit 18 of IRR6. */
+    pending[0xD2u >> 5] = 1u << (0xD2u & 31u);
+    hype_guest_lapic_set_requested(&l, pending);
+    CHECK_HEX("vector 0xD2 appears in IRR6", 1u << 18,
+              (hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_IRR_BASE + 6u * 0x10u, 4, &v), v));
+    CHECK_HEX("IRR0 undisturbed", 0,
+              (hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_IRR_BASE, 4, &v), v));
+    CHECK_HEX("the ISR is a separate register and stays clear", 0,
+              (hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_ISR_BASE + 6u * 0x10u, 4, &v), v));
+
+    /*
+     * Draining matters as much as filling: a vector that has been injected is no longer
+     * requested, and an IRR that keeps reporting it sends the guest back into the same wait.
+     */
+    pending[0xD2u >> 5] = 0;
+    hype_guest_lapic_set_requested(&l, pending);
+    CHECK_HEX("IRR6 clears once the vector is delivered", 0,
+              (hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_IRR_BASE + 6u * 0x10u, 4, &v), v));
+}
+
+static void test_irr_bit_lands_in_the_right_dword_across_the_whole_range(void) {
+    /* Same reasoning as the ISR twin: a guest reads one dword, so a vector one dword out is
+     * invisible to it. */
+    unsigned int word;
+
+    for (word = 0; word < 8u; word++) {
+        hype_guest_lapic_t l;
+        uint32_t pending[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        uint32_t v = 0;
+        unsigned int other;
+
+        hype_guest_lapic_reset(&l);
+        pending[word] = 1u << 5;
+        hype_guest_lapic_set_requested(&l, pending);
+        CHECK_HEX("bit 5 set in the vector's own dword", 1u << 5,
+                  (hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_IRR_BASE + word * 0x10u, 4, &v),
+                   v));
+        for (other = 0; other < 8u; other++) {
+            if (other == word) {
+                continue;
+            }
+            CHECK_HEX("no other IRR dword disturbed", 0,
+                      (hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_IRR_BASE + other * 0x10u, 4,
+                                             &v),
+                       v));
+        }
+    }
+}
+
+static void test_irr_range_ignores_unaligned_offsets_and_reset_clears_it(void) {
+    hype_guest_lapic_t l;
+    uint32_t pending[8] = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu,
+                           0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu};
+    uint32_t v = 0xDEADBEEFu;
+
+    hype_guest_lapic_reset(&l);
+    hype_guest_lapic_set_requested(&l, pending);
+    /* An offset inside the range that is not 16-byte aligned is not a register at all. */
+    CHECK_HEX("0x204 is not an IRR register", 0,
+              (hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_IRR_BASE + 4u, 4, &v), v));
+    /* The IRR is read-only: a write must not disturb what the VMM layer published. */
+    (void)hype_guest_lapic_write(&l, HYPE_GUEST_LAPIC_REG_IRR_BASE, 4u, 0u);
+    CHECK_HEX("a write to the IRR is ignored", 0xFFFFFFFFu,
+              (hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_IRR_BASE, 4, &v), v));
+    hype_guest_lapic_reset(&l);
+    CHECK_HEX("reset clears the IRR", 0,
+              (hype_guest_lapic_read(&l, HYPE_GUEST_LAPIC_REG_IRR_BASE, 4, &v), v));
+}
+
 static void test_eoi_retires_the_highest_in_service_vector(void) {
     /*
      * Nested delivery must unwind as a stack: the guest EOIs in reverse delivery order, so
@@ -1022,6 +1108,9 @@ int main(void) {
     test_eoi_still_clears_the_timer_in_service_flag();
     test_isr_range_ignores_unaligned_offsets();
     test_isr_is_read_only_and_reset_clears_it();
+    test_irr_publishes_the_pending_vector_set();
+    test_irr_bit_lands_in_the_right_dword_across_the_whole_range();
+    test_irr_range_ignores_unaligned_offsets_and_reset_clears_it();
     test_tpr_roundtrips_and_ppr_is_derived();
     test_divisor_decode();
     test_advance_honours_divide();
