@@ -77,6 +77,36 @@
           <WillShowUI>OnError</WillShowUI>
         </OSImage>
       </ImageInstall>
+      <RunSynchronous>
+        <!--
+          Windows 11 refuses to install without TPM 2.0 and Secure Boot, and stops with a
+          "This PC can't run Windows 11" dialog ; the one thing an unattended run cannot
+          survive. These are the documented LabConfig bypasses, written into WinPE's registry
+          before Setup evaluates the requirements.
+
+          Harmless on Windows 10, which never reads them, so one answer file serves both media.
+        -->
+        <RunSynchronousCommand wcm:action="add">
+          <Order>1</Order>
+          <Path>reg add HKLM\System\Setup\LabConfig /v BypassTPMCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>2</Order>
+          <Path>reg add HKLM\System\Setup\LabConfig /v BypassSecureBootCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>3</Order>
+          <Path>reg add HKLM\System\Setup\LabConfig /v BypassRAMCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>4</Order>
+          <Path>reg add HKLM\System\Setup\LabConfig /v BypassCPUCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+        <RunSynchronousCommand wcm:action="add">
+          <Order>5</Order>
+          <Path>reg add HKLM\System\Setup\LabConfig /v BypassStorageCheck /t REG_DWORD /d 1 /f</Path>
+        </RunSynchronousCommand>
+      </RunSynchronous>
       <UserData>
         <AcceptEula>true</AcceptEula>
         <FullName>hype</FullName>

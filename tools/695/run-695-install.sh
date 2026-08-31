@@ -23,6 +23,26 @@ if pidof qemu-system-x86_64 >/dev/null; then
     echo "a QEMU is still running -- refusing to start a second"; exit 1
 fi
 
+# Nothing of the host's may be attached to the image QEMU is about to open read-write.
+#
+# This cost three runs and a wrong conclusion on #789. Creating a loop device on media.img
+# makes udisks AUTO-MOUNT its partitions -- the ISO partition as UDF, the data partition as
+# exFAT -- so the kernel is caching and writing filesystem metadata into the same file the
+# guest is booting from. The symptom was "No bootable option or device was found", which reads
+# exactly like a firmware or media fault and is neither. `udisksctl loop-delete` then fails
+# silently while a partition is still mounted, so the loops accumulate run on run.
+if findmnt -n -o SOURCE | grep -q "^/dev/loop[0-9]*p"; then
+    echo "REFUSING: a loop partition is mounted on this host:"
+    findmnt -n -o SOURCE,TARGET | grep "^/dev/loop[0-9]*p"
+    echo "unmount it and delete the loop before running -- see the note above"
+    exit 1
+fi
+if losetup -a 2>/dev/null | grep -q "$RIG/media.img"; then
+    echo "REFUSING: rig/media.img is still loop-mapped:"
+    losetup -a | grep "$RIG/media.img"
+    exit 1
+fi
+
 # Refresh the mutable ESP files; the 6.1 GB media partition is left alone.
 mcopy -i "$RIG/media.img@@1M" -o "$REPO/build/hype.efi" ::/EFI/BOOT/BOOTX64.EFI
 mcopy -i "$RIG/media.img@@1M" -o "$REPO/tools/695/hype.cfg" ::/hype.cfg
