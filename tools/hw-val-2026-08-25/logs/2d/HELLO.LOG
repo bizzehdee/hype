@@ -1,5 +1,0 @@
-[0000044992] ttyS0| 
-[0000045295] ttyS0| micro/hello: entered long mode, rsi=0x0000000000007000
-[0000045419] ttyS0| micro/hello: cmdline (none -- cmd_line_ptr was 0)
-[0000045747] ttyS0| micro/hello: e820 entries=5, usable RAM=0 MiB
-[0000046012] ttyS0| MICRO PASS: hello

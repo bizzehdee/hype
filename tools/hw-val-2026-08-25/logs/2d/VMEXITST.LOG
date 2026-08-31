@@ -1,4 +1,0 @@
-[0000046046] ttyS0| 
-[0000046155] ttyS0| micro/vmexitstorm: alive. About to read guest-physical 0x0x00000000fed1c000 8192 times in a row from ONE instruction, to trip hype's #171 per-vCPU watchdog (plan.md Sec 6g, #538, #603 item 4) and force THIS VM off alone.
-[0000046392] ttyS0| micro/vmexitstorm: if this is the last line this VM's log ever shows, the watchdog worked -- check the host log for 'fw-1 WATCHDOG vm<N>: faulted: unhandled-exit storm at one RIP' naming this VM, and confirm the paired healthy VM in suite-603.cfg still re
-[0000046759] ttyS0| ached its own PASS.
