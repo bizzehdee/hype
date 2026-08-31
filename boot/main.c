@@ -2742,8 +2742,16 @@ static inline void host_reset_outb(uint16_t port, uint8_t val) {
  * chipset reset register, then the keyboard controller -- and if the machine is still
  * running after all three, says so and parks, which for `off` on a box with no usable
  * S5 path is also the honest terminal state ("power off the machine now"). */
+/*
+ * Why this action was requested. The line used to say "all guests down" whatever the reason,
+ * and boots 36 and 38 both ended with it printed while the guest was healthy and heartbeating
+ * -- it was the DEADMAN, and the log said something that was simply untrue. A terminal action
+ * is the last thing in a run's log; it does not get to misdescribe itself.
+ */
+static const char *g_host_action_reason = "all guests down";
+
 static void fw_1_host_power_act(unsigned action) {
-    hype_debug_print("fw-1 HOST: all guests down -- %s the host [#175]\n",
+    hype_debug_print("fw-1 HOST: %s -- %s the host [#175]\n", g_host_action_reason,
                      (action == HYPE_HOST_ACTION_OFF) ? "powering off" : "rebooting");
     /* Last-gasp flush, same as a panic: this line and everything behind it is the run's
      * tail, and if the sink died transiently this is the one write that can still save it.
@@ -2834,7 +2842,17 @@ static void fw_1_host_action_poll(void) {
             if (t175 == 0) {
                 t175 = hype_rdtsc() + (uint64_t)HYPE_175_AUTOTEST_SECS * hz175;
             } else if (hype_rdtsc() >= t175) {
+                g_host_action_reason = "the tag keyboard is dead and the log is failing";
                 (void)fw_1_host_action_begin(HYPE_HOST_ACTION_REBOOT);
+            } else if (quiet[k] == FW1_HID_DEAD_TICKS) {
+                hype_debug_print("fw-1 DEADMAN: the tag keyboard (%04x:%04x slot%u) is dead "
+                                 "after %llu revive(s) and %llu failed revive(s) -- NOT "
+                                 "rebooting, the log is healthy and the rest of the run is "
+                                 "worth more than the salvage [#175 #452]\n",
+                                 (unsigned)kb->vid, (unsigned)kb->pid, kb->slot,
+                                 hype_xhci_int_in_revives((hype_xhci_ctrl_t *)&kb->xc,
+                                                          kb->slot, kb->ep),
+                                 rfail);
             }
         }
     }
@@ -8538,8 +8556,27 @@ static void fw_1_hid_watch(uint64_t now_h, uint64_t hz) {
             unsigned long long rfail = 0, stopped = 0;
             hype_xhci_int_in_revive_health((hype_xhci_ctrl_t *)&kb->xc, kb->slot, kb->ep,
                                            &rfail, &stopped);
-            if (hype_xhci_int_in_revives((hype_xhci_ctrl_t *)&kb->xc, kb->slot, kb->ep) != 0ull ||
-                rfail != 0ull) {
+            /*
+             * Only when there is something to SALVAGE.
+             *
+             * This exists to warm-reboot into the RT-1b scan when the log is dying and the
+             * in-RAM buffer is the only copy. The log now survives whole runs -- boots 34 to
+             * 38 all kept it to the last byte -- so with a healthy sink the reboot saves
+             * nothing and costs everything: the Pico goes silent around five minutes in, and
+             * the DEADMAN then ends a ninety-minute run at ten, twice, taking #775, #780,
+             * #641 and #426 with it each time.
+             *
+             * A dead input path on a machine whose log is being written is worth reporting and
+             * running through, not rebooting away from.
+             */
+            /* Judged from the two numbers the health line already carries at this point: a
+             * failing flush, or a backlog past the dashboard's own alert threshold. A run with
+             * no sink at all shows up in the second of those, because nothing is draining and
+             * the backlog only grows. */
+            int log_worth_salvaging = (g_usb_log_flush_fail_streak != 0u ||
+                                       g_usb_log_behind_bytes > HYPE_USBLOG_BEHIND_ALERT);
+            if ((hype_xhci_int_in_revives((hype_xhci_ctrl_t *)&kb->xc, kb->slot, kb->ep) != 0ull ||
+                 rfail != 0ull) && log_worth_salvaging) {
                 hype_debug_print("fw-1 DEADMAN: the tag keyboard (%04x:%04x slot%u) delivered "
                                  "reports, then nothing for 5 minutes despite %llu revive(s) "
                                  "and %llu failed revive(s) -- the input path is dead. "
