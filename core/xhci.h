@@ -518,6 +518,17 @@ typedef struct {
      * lets a keyboard on one controller be polled while storage streams from another.
      */
     unsigned int hw_slot;
+    /*
+     * The number the REST of the log calls this controller.
+     *
+     * hw_slot is an internal pool index and is not that number -- boot 38 proved the
+     * difference matters: a wedge on the controller the enumeration log calls controller[2]
+     * was reported as "ctrl1 command ring stopped answering", which is precisely the
+     * confusion the label was added to remove. Set by the caller right after
+     * hype_xhci_host_init(), from the same counter that prints "controller[N] at bb:dd.f".
+     * Zero means nobody set it, and prints as ctrl? rather than as a wrong number.
+     */
+    unsigned int log_id;
 } hype_xhci_ctrl_t;
 
 /*

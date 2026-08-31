@@ -28514,6 +28514,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 hype_debug_print("host-xhci: controller[%u] bring-up FAILED\n", xhci_count);
                 continue; /* try the next controller */
             } else {
+                /* Give the controller the number the rest of the log calls it by, so a line
+                 * from inside the driver and a line from the enumeration agree. */
+                xc.log_id = xhci_count;
                 unsigned int rp;
                 unsigned int msc_found = 0;
                 hype_debug_print("host-xhci: up -- slots=%u ports=%u ctx=%uB\n",

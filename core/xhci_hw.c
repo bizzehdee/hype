@@ -847,7 +847,7 @@ static int cmd_ring_recover(hype_xhci_ctrl_t *c) {
     crcr = rd32(bar, hw->opreg + HYPE_XHCI_OP_CRCR);
     hype_debug_print("host-xhci: ctrl%u command ring stopped answering -- aborting it. "
                      "usbsts=0x%08x crcr=0x%08x (CRR=%u) after %llu timeout(s) [#775]\n",
-                     c->hw_slot, sts, crcr, (crcr & HYPE_XHCI_CRCR_CRR) ? 1u : 0u,
+                     c->log_id, sts, crcr, (crcr & HYPE_XHCI_CRCR_CRR) ? 1u : 0u,
                      (unsigned long long)hw->cmd_timeouts);
 
     /*
@@ -2199,7 +2199,7 @@ static int int_in_revive(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int dc
 
     hype_xhci_trb_stop_endpoint(cmd, slot, dci, (int)hw->cmd_cyc);
     if (cmd_submit_wait(c, cmd, evt) != 0) {
-        revive_report_failure(c->hw_slot, slot, dci, "Stop Endpoint did not complete", 0u);
+        revive_report_failure(c->log_id, slot, dci, "Stop Endpoint did not complete", 0u);
         return -1;
     }
 
@@ -2210,11 +2210,11 @@ static int int_in_revive(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int dc
     hype_xhci_trb_set_tr_dequeue(cmd, phys(iin->ring) | 1u /* DCS=1 */, slot, dci,
                                  (int)hw->cmd_cyc);
     if (cmd_submit_wait(c, cmd, evt) != 0) {
-        revive_report_failure(c->hw_slot, slot, dci, "Set TR Dequeue did not complete", 0u);
+        revive_report_failure(c->log_id, slot, dci, "Set TR Dequeue did not complete", 0u);
         return -1;
     }
     if (hype_xhci_event_cc(evt) != HYPE_XHCI_CC_SUCCESS) {
-        revive_report_failure(c->hw_slot, slot, dci, "Set TR Dequeue was REFUSED",
+        revive_report_failure(c->log_id, slot, dci, "Set TR Dequeue was REFUSED",
                               hype_xhci_event_cc(evt));
         return -1;
     }
@@ -2390,7 +2390,7 @@ static int int_in_poll_body(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int
                 hype_debug_print("host-xhci: REVIVE ctrl%u slot=%u ep=%u -- silent for %u "
                                  "polls (next at %u). Stop Endpoint + Set TR Dequeue, ring "
                                  "restarted (revive %llu, reports so far %llu) [#775]\n",
-                                 c->hw_slot, slot, dci, after, iin->revive_after, iin->revives,
+                                 c->log_id, slot, dci, after, iin->revive_after, iin->revives,
                                  iin->reports);
             }
         } else {
@@ -2406,7 +2406,7 @@ static int int_in_poll_body(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int
                                  "%u polls and the commands did not complete (failure %llu, "
                                  "reports so far %llu). This endpoint is deaf and hype "
                                  "cannot rebuild it [#775]\n",
-                                 c->hw_slot, slot, dci, after, iin->revive_fails, iin->reports);
+                                 c->log_id, slot, dci, after, iin->revive_fails, iin->reports);
             }
         }
         int_in_fill(c, iin, slot, dci, len);
