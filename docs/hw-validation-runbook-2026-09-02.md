@@ -30,7 +30,9 @@ two more legs. #599/#605 need a fifth boot with a different binary and are a dia
 
 **First attempt (2026-09-03, build 1daa028) closed #729 and #603's VMX leg; vm0 stalled on the
 CR0.CD fault fixed in f26b67c. Second attempt (build f26b67c) proved that fix and found the BSP
-starved by the PS/2 poll, fixed in 92c23a0 (#796). Re-run at 92c23a0 for #525, #698, #795, #796.**
+starved by the PS/2 poll, fixed in 92c23a0 (#796). Third attempt (build 92c23a0) met #796,
+served the 0xCF9 reset from vCPU 1 on VMX, and hung the second boot on a stale VM-entry
+interrupt, fixed in 478f6f8 (#797). Re-run at 478f6f8 for #797, #525's second half, #698.**
 
 One Alpine live guest (2 vCPUs, reboot pinned to CPU 1 by `input-2b/vm0.txt`) plus the three
 #603 microtests. Seven physical cores with the BSP. If admission refuses a VM, fall back to

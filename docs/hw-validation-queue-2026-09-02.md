@@ -231,3 +231,33 @@ healthy at that point (`USBFLUSH ... behind=1151B`). The last breadcrumb is `BSP
 
 Drive re-staged at 92c23a0, same card. Boot A is owed a third time; it still carries #525 and
 #698's VMX legs, and now #795 and #796.
+
+## Boot A3 result (Intel i5-13420H, 2026-09-03)
+
+Build `92c23a0-dirty` (CR0.CD and PS/2 fixes), same config, 154 s. Logs under
+`tools/hw-val-2026-08-25/logs/bootA3-intel/` (gitignored).
+
+**#796 met.** `BSPCOST input 20% total=30200ms hits=355134176 mean=0us` against 82% at 20 us
+before; `KBDIRQ ... ps2reads=554880 max=40us`, about 3,700 status reads a second with the
+slowest at 40 us. Flush 5%, dashboard responsive, no lock.
+
+**#525's VMX leg is half met.** The guest booted to login, the script pinned the reboot to CPU 1
+and `vm0 vCPU 1 guest reset via ACPI reset register (0xCF9) -> restart` fired on real VMX
+hardware. The second boot then hung inside OVMF before MP init: no console output after the
+restart, `GUESTPC vm0 ... rip=0xfffd44e3 rflags=0x2 cr0=0x80000033` spinning with only host-tick
+exits, no `SIPI received` line, every `TMRLATE vm0/N` frozen.
+
+The cause is VMX-only. `INTDIAG vm0/0 ... staged_eventinj=0xf8 IF=0` from the restart onward:
+0xf8 is Linux's REBOOT_VECTOR, the IPI `smp_send_stop()` sends to the other CPUs just before
+the reboot CPU writes 0xCF9. vCPU 0's loop had staged it into `VM_ENTRY_INTR_INFO` for the
+next entry when the restart landed; the VMCS rebuild never writes that field, so the new
+firmware's first VM entry delivered interrupt 0xf8 through a zeroed IVT. SVM's VMCB rebuild
+zeroes EVENTINJ, which is why the same config passes under nested SVM. Fixed in 478f6f8
+(#797): both VMX reset paths clear the staged event; SVM's reset also drops deferred vectors.
+
+The script's own `STALE-SHELL` fail-if fired one second before the reset because Alpine's
+`reboot` takes several seconds and the screen matcher satisfied `expect localhost login:`
+against stale text: a #728-class harness race, and the defence worked as designed.
+
+Drive re-staged at 478f6f8, same card. Boot A is owed a fourth time, for #797, #525's second
+half and #698.
