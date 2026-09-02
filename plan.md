@@ -28,8 +28,10 @@ virtualization in v1.
 kind. See §10 decision #23.**
 
 Non-goals (v1): live migration, GPU passthrough/SR-IOV, nested virtualization,
-nice management UI, nested-paging tricks beyond basic EPT/NPT, VM memory
-snapshotting (live RAM state), VirtIO ballooning.
+nested-paging tricks beyond basic EPT/NPT, VM memory snapshotting (live RAM
+state), VirtIO ballooning. (A remote management web API and web UI were a v1
+non-goal until 2026-09-03; decision #79 promoted them to v1, the MGMT
+milestone.)
 
 **Out of scope entirely**: making `hype.efi` the machine's default UEFI boot
 target (writing `BootOrder`/`Boot####` NVRAM variables, or otherwise
@@ -434,17 +436,18 @@ distinct from any guest's own console:
   endpoint for anything behind a hub) rather than a polled rescan, and the
   same mechanism covers USB mass storage arriving and departing, which is the
   harder half because hype boots from and logs to it (decision 28).
-- Explicitly **local-only for v1** — no serial or network exposure. This
-  keeps the feature inside the existing console-ownership model instead of
-  adding a network stack or serial protocol to the trusted hypervisor core.
-  Revisit serial/remote access as a stretch goal only if a real headless-host
-  use case shows up.
-  **Scope of this bullet, clarified (decision #36):** it means the *dashboard*
-  is not remotely administrable — no listening service in the hypervisor for
-  anything outside it to connect to. It is not a ban on hype owning a NIC:
-  §6e's host NIC drivers and NAT forwarding plane are separately required
-  (decision #9) and do not conflict with this. The rule that follows from
-  both is a listener, not a driver: hype never accepts an inbound connection.
+- **The GOP dashboard is the local surface; remote administration is served
+  over the network (decision #79, 2026-09-03).** Until that decision this
+  bullet read "explicitly local-only for v1 — no serial or network exposure",
+  and decision #36 sharpened it to "hype never accepts an inbound connection".
+  Both are superseded for one service only: the management API and web UI of
+  the MGMT milestone (#500-#504), a TLS-only HTTPS listener inside the
+  hypervisor core, disabled by default, authenticated before anything but a
+  bounded request parser runs. The dashboard itself is unchanged: it still
+  owns the physical framebuffer and keyboard, still takes the leader chord,
+  and the remote UI is a client of the same command table (#459), never a
+  second path into VM state. No serial protocol is added; serial stays a
+  log/console output. Every other listener remains forbidden (§6e).
 
 ## 6c. Interactive / GUI installs (non-headless OSes)
 
@@ -616,14 +619,18 @@ to fetch the base system, and any online-account/update flow does too.
   scope is hype acting as a network *peer*: no sockets API, no TCP state
   machine hype drives as an endpoint, no reassembly (over-large fragments are
   dropped, not reassembled), and **no listening socket of any kind** in the
-  hypervisor core. hype may rewrite a packet passing between a guest and the
-  wire; hype is never the address a packet is sent to. The single exception is
-  the uplink **DHCP client**, which NAPT needs to obtain hype's own uplink
-  address: outbound-initiated only, one transaction at a time, replies matched
-  against hype's own outstanding transaction ID, with a static-address setting
-  in `hype.cfg` for operators who prefer to disable it.
-- **Guests may listen; hype may not.** The rule above constrains the
-  hypervisor, not the guests. A guest running a server on its own virtual NIC
+  hypervisor core except the two named here. hype may rewrite a packet passing
+  between a guest and the wire; hype is otherwise never the address a packet
+  is sent to. The first exception is the uplink **DHCP client**, which NAPT
+  needs to obtain hype's own uplink address: outbound-initiated only, one
+  transaction at a time, replies matched against hype's own outstanding
+  transaction ID, with a static-address setting in `hype.cfg` for operators
+  who prefer to disable it. The second is the **management listener** of
+  decision #79: one TCP port, TLS-only, off by default, with its own TCP state
+  machine (MGMT-2) that serves that port and nothing else -- the forwarding
+  plane does not gain a sockets API, and no other component may bind a port.
+- **Guests may listen; hype may not, except on the management port.** The rule
+  above constrains the hypervisor, not the guests. A guest running a server on its own virtual NIC
   is expected and supported — it runs its own TCP/IP stack, and hype only
   moves frames. Guest-to-guest reachability works today through `net_peers`
   (decision #21) or an opt-in virtual switch (NET-6). Reaching a guest's
@@ -1785,6 +1792,15 @@ isn't lost.
     socket (#406 HNET-9) — is rejected for v1.** This settles the conflict
     #397 filed against decision #9 and §6b, and supersedes decision #9's
     single-NIC-family wording without disturbing its substance.
+
+    **Amended 2026-09-03 by decision #79 (#492 MGMT-1).** The "no listener"
+    conclusion is reversed for exactly one service, the management API/UI
+    (MGMT-2..6). Everything else in this decision stands: the NAT forwarding
+    plane still translates and never terminates, no sockets API exists for it,
+    and no component other than the management listener may bind a port. The
+    arguments the HNET-9 rejection below rests on are not withdrawn; decision
+    #79 turns them into requirements the listener must meet. #406 stays
+    Rejected -- the MGMT tickets supersede it rather than reopen it.
     - **First, the §6b "conflict" is a misreading, and the record should say
       so once so it is not re-litigated.** §6b's "explicitly local-only for
       v1 — no serial or network exposure" is a statement about the *status
@@ -3974,6 +3990,68 @@ isn't lost.
     PCIe path, not parity with it. Ticket #794. This extends decision #36 and does not
     reopen its endpoint/forwarding-plane boundary.
 
+79. **Remote management is a v1 goal: a web API and a web UI, served by a TLS-only
+    listener inside the hypervisor core -- decided (2026-09-03, #492 MGMT-1). The
+    management-VM-plus-control-channel alternative decision #36 proposed is rejected.**
+
+    **What was decided.** hype accepts inbound connections on one management port. Behind it
+    sit, in order: MGMT-2's TCP state machine and TLS termination (#500), MGMT-3's identity and
+    roles (#501: admin acts on every VM, viewer reads every VM, user reads only assigned VMs),
+    MGMT-4's versioned API derived from the dashboard's own command table (#502, `/api/v1`,
+    OpenAPI document in the repo, every input through the same validators the config and
+    command parsers already use), MGMT-5's web UI as a client of that API and nothing more
+    (#503), and MGMT-6, which discharges decision #36's argument in code (#504). The API
+    exposes what the local dashboard exposes -- VM list and state, start, stop, shutdown,
+    force off, config read and edit, create, delete, attach and detach -- and no more. If the
+    UI needs something the dashboard cannot do, the dashboard's command table grows first.
+
+    **Where the listener runs, and why not in a guest.** Decision #36 said that if remote
+    management ever came, it should be a service in a guest with a narrow host-side control
+    channel. That alternative was considered again and rejected for three reasons. First, it
+    needs a guest OS image to exist, boot and stay healthy before the host can be managed at
+    all -- the host cannot be reached precisely when it matters most, when no guest is
+    running. Second, the control channel is itself a parser in ring 0 reachable from a guest
+    that is, by construction, on the network; it moves the attack surface rather than
+    removing it, and adds a second trust tier (a VM allowed to command other VMs) that §6g's
+    isolation invariant has no place for. Third, the operator's requirement is a bare-metal
+    appliance managed from a browser with nothing else installed; a management VM is a
+    second machine to operate. The listener is therefore in the core, with the cost paid
+    openly, below.
+
+    **The requirements the reversal inherits.** Decision #36's objection was that a listener
+    puts pre-authentication, attacker-reachable parsing inside a ring-0 payload with no
+    process to lose. That is true and becomes the design bar:
+    - **Off by default.** One `hype.cfg` key enables remote management; absent, no port is
+      bound and the TCP code is never entered.
+    - **TLS only.** Plaintext to the port is refused -- not served, not redirected. One
+      TLS version, one cipher suite family, chosen in MGMT-2 with the freestanding crypto it
+      brings; the host key lives in the varstore.
+    - **Authentication before anything else.** The only bytes an unauthenticated peer can
+      make hype parse are the TLS handshake, the HTTP request line and headers, and the
+      login body. MGMT-6 enumerates that list, bounds every field (request line, header
+      count and size, body size, per-connection timeout -- exceeding a bound closes the
+      connection instead of allocating), fuzzes those parsers in the host test suite,
+      rate-limits and locks out failed logins, and audit-logs every authentication and
+      every state-changing call.
+    - **Default deny.** No request does anything until it is authenticated and authorised
+      against MGMT-3's roles. Credentials come from TERM-16's store and are never stored by
+      the API.
+    - **Blast radius, stated.** A fault in the listener is a fault in ring 0: there is no
+      privilege to drop and nothing to restart short of the DEADMAN warm reboot (§6h). The
+      mitigations are bounds, fuzzing and the off-by-default key; they do not change what a
+      successful exploit owns. An operator who does not accept that leaves the key unset and
+      has exactly the v1 hype this decision found.
+
+    **What is still refused.** Any second listener (§6e names the two allowed endpoints:
+    the DHCP client and this port). Any plaintext or unauthenticated endpoint. Any UI
+    capability that is not an API endpoint. Multi-hypervisor master/mesh linking stays in
+    §13. SSH (#179, V2-MGMT-1) stays v2 and is not covered by this decision.
+
+    **Records changed.** §1's non-goal removed; §6b rewritten; §6e's listener rule gains its
+    second named exception; decision #36 carries the amendment note; §13's two remote-
+    management bullets are stubs pointing here; §15's "board ahead of the plan" note is
+    closed. AGENTS.md carries no inbound-connection line, so nothing there changes.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what
@@ -4050,26 +4128,13 @@ own "keeping plan.md and the board in sync" rule).
   (§6i's admission-control math would also need to account for "ceiling,"
   not just a fixed size, when validating total host RAM commitment).
 
-- **Web API/UI for remote management, with multi-hypervisor
-  master/mesh linking** (noted 2026-07-14). v1 has no remote management
-  surface at all -- everything is local (hype.cfg on the host's own ESP,
-  local console/serial output). v2 would add a web API/UI allowing remote
-  management of a single hypervisor instance, plus a way to link multiple
-  "secondary" hypervisor instances under one "master" for centralized
-  management, or (an alternative topology to design between, not both by
-  default) have instances manage each other directly as a mesh with no
-  single master. Security and encryption are explicitly paramount for
-  this surface, not an afterthought -- this is a new, network-exposed
-  attack surface on a type-1 hypervisor, so authentication, transport
-  encryption (TLS at minimum), and authorization between instances all
-  need to be designed in from the start, not bolted on. The UI itself
-  should read as corporate-yet-modern, not a bare admin-panel aesthetic.
-  This is a large, separate subsystem (its own network stack usage
-  building on NET-*, a new API surface, a new UI, and a new inter-
-  instance trust/protocol model) -- deserves its own dedicated design
-  pass (auth model, wire protocol, master-vs-mesh topology choice) before
-  promotion to a real board milestone, not just an API bolted onto existing
-  per-VM management code.
+- ~~**Web API/UI for remote management, with multi-hypervisor master/mesh
+  linking**~~ (noted 2026-07-14) — **the web API and web UI were PROMOTED TO
+  v1 on 2026-09-03**, §10 decision #79, the MGMT milestone (#492, #500-#504).
+  Only the multi-hypervisor master/mesh linking part stays here as future
+  work: link several hypervisor instances under one master, or have them
+  manage each other as a mesh; a topology to design between, not both by
+  default.
 
 - **Dynamically-sizable (thin-provisioned) virtual disks, pooled across
   one or more physical disks, encrypted and isolated per VM** (noted
@@ -4099,27 +4164,12 @@ own "keeping plan.md and the board in sync" rule).
   before promotion to a board milestone, likely building on M5's
   `blk_backend` vtable rather than replacing it.
 
-- **Remote management of hype itself** (noted 2026-08-15, confirmed as a v2
-  goal alongside §10 decision #36). §6b keeps the v1 dashboard local-only and
-  decision #36 rejects any listening socket in the hypervisor core (#406), so
-  v1 has no remote administration of any kind. The intent to have it in v2 is
-  recorded here so the v2 design starts from a position rather than by
-  reopening the rejected ticket. Two constraints that decision #36's reasoning
-  already fixes, and which any v2 design must answer rather than sidestep:
-  (1) **the consumer comes first** — what is being managed remotely, by whom,
-  and authenticated how, before any transport is chosen; and (2) **the
-  hypervisor core is the worst available place to host the service**, because
-  it is ring-0 with the IOMMU, every guest's NPT/EPT and the physical disks,
-  and it has no process to lose (no privilege left to drop, nothing to
-  restart). The direction that follows is decision #9's own shape applied one
-  level up: run the management service **in a guest** — which already has its
-  own OS, hardened network stack and contained blast radius — and give it a
-  narrow, explicitly-modelled host-side hook (a small, versioned, strictly
-  validated control channel, in the spirit of §6j's device-emulation trust
-  boundary) rather than putting a parser and a listener in the trusted core.
-  A management VM privileged enough to control other VMs is itself a new
-  trust tier and needs its own §10 decision when promoted; it must not
-  silently become a hole in the §6g/§10 guest-isolation invariant.
+- ~~**Remote management of hype itself**~~ (noted 2026-08-15) — **PROMOTED TO
+  v1 on 2026-09-03**, §10 decision #79. The two constraints this bullet
+  recorded from decision #36 were answered there: the consumer is the operator
+  of a bare-metal appliance managing VMs from a browser (MGMT-3's three roles),
+  and the service runs in the core rather than in a management VM, with
+  decision #36's objections converted into MGMT-6's requirements.
 
 - **`size_gb` on a `backing = file` disk CREATES the image** (noted 2026-08-27,
   from #740). Today both size keys are declarations hype *validates*, never
@@ -4640,10 +4690,9 @@ tickets from this pass: **#606–#611**.
 - Lifecycle API: decision 11 + TERM-9..15, all closed. Serial console and the
   operator terminal: the TERM milestone. Disk snapshots: #131 (STRETCH).
   Save/restore and migration: §14.10. Metrics/tracing: §14.15.
-- **Remote management**: §13 v2 plus the MGMT epic — #492 (MGMT-1) is the
-  pending plan revision, and #500–#504 stand behind it; decision 36 stands
-  until MGMT-1 lands. The board is deliberately ahead of the plan here, and
-  MGMT-1 is the reconciliation.
+- **Remote management**: decision 79 (2026-09-03) promoted it to v1; the MGMT
+  epic #500–#504 is the implementation, decision 36 carries the amendment.
+  Plan and board agree.
 - **Live introspection**: none on demand — deep dumps fire only on faults
   (§14.15), and the terminal has no "where is this guest right now" command.
   **#611** — a decision-43-safe published-snapshot dump from the terminal.
