@@ -31,3 +31,13 @@ power-cycled because the Pico was on the wrong hub; it is `HYPE.1.LOG` there and
 | new | Typematic rate is lost on re-claim: guest set 250/33 ms at 71 s; held-key runs were 67-70 repeats before the first Pico drop and 23-28 after. Re-claim calls `hype_usb_hid_typematic_init` (defaults 500/92 ms) and the guest's F3 is never re-applied |
 
 The `.bcd` segment before every 6k+5 marker is what the Pico types; it is not a fault.
+
+## Boot 41 (AMD) -- the controller-silence probe
+
+Boot 40's death could not be attributed: no counter distinguished "ctrl[2] stopped delivering
+events" from "the hub behind root port 4 died". The next build reads the controller's own
+registers and issues a No-Op command 30 s after every keyboard on a controller falls silent
+(#781), and re-applies the guest's typematic rate to a re-claimed keyboard (#791).
+
+Run card: `tools/hw-val-2026-08-25/RUN-CARD-2026-09-02-boot41-amd-input.md`, set as
+`RUN_CARD` in `stage.sh`. One `CTRLSILENCE` line after the death is the whole point of the run.

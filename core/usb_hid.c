@@ -410,3 +410,10 @@ void hype_usb_hid_typematic_set_f3(hype_usb_hid_typematic_t *t, uint8_t param) {
     t->period_ms = (ticks * 417u) / 100u;
     if (t->period_ms == 0u) t->period_ms = 1u;
 }
+
+void hype_usb_hid_typematic_init_for_guest(hype_usb_hid_typematic_t *t,
+                                           const hype_usb_hid_typematic_guest_t *g) {
+    hype_usb_hid_typematic_init(t);
+    if (t == 0 || g == 0 || !g->valid) return;
+    hype_usb_hid_typematic_set_f3(t, g->param);
+}

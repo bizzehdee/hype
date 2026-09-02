@@ -679,7 +679,34 @@ void hype_xhci_cmd_ring_health(hype_xhci_ctrl_t *c, unsigned long long *timeouts
 void hype_xhci_int_in_losses(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int ep_addr,
                              unsigned long long *lost, unsigned long long *skipped);
 
-/* Controller-wide event health: Host Controller Events, Event Ring Full, parked evictions. */
+/*
+ * #781: what a controller whose every interrupt-IN endpoint has gone quiet looks like from
+ * its registers, plus the answer to the only question that settles it: does a No-Op command
+ * still complete. Every field is a raw register read except the last five.
+ */
+typedef struct {
+    uint32_t usbsts;
+    uint32_t usbcmd;
+    uint32_t crcr_lo;          /* CRR (bit 3) is the controller saying its command ring runs */
+    uint32_t iman;
+    uint32_t imod;
+    uint64_t erdp;             /* the controller's view of the event ring dequeue pointer */
+    uint64_t sw_deq;           /* software's: where the next event is expected to land */
+    unsigned int pending_event;/* 1 = the TRB at sw_deq already carries the consumer cycle,
+                                  so an event was delivered and nobody consumed it */
+    uint32_t portsc;           /* PORTSC of the root port asked for, 0 if none */
+    int noop_rc;               /* 0 = the No-Op completed, -1 = it did not */
+    uint32_t noop_cc;          /* its completion code when it did */
+    unsigned int noop_us;      /* how long the No-Op took, capped by the event timeout */
+    unsigned long long cmd_timeouts; /* the controller's running total AFTER the No-Op */
+} hype_xhci_silence_probe_t;
+
+/* Fill *out. `root_port` may be 0 to skip the PORTSC read. Costs one command round trip,
+ * at most the one-second event timeout. Returns -1 only if `c` is not an initialised
+ * controller. */
+int hype_xhci_probe_silence(hype_xhci_ctrl_t *c, unsigned int root_port,
+                            hype_xhci_silence_probe_t *out);
+
 void hype_xhci_event_health(hype_xhci_ctrl_t *c, unsigned long long *hc_events,
                             unsigned long long *ring_full, unsigned long long *evictions);
 

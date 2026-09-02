@@ -4058,6 +4058,50 @@ void hype_xhci_event_health(hype_xhci_ctrl_t *c, unsigned long long *hc_events,
     if (evictions) *evictions = hype_xhci_parked_evictions(&hw->parked);
 }
 
+int hype_xhci_probe_silence(hype_xhci_ctrl_t *c, unsigned int root_port,
+                            hype_xhci_silence_probe_t *out) {
+    xhci_hw_t *hw;
+    volatile uint8_t *bar;
+    uint32_t ir, cmd[4], evt[4];
+    uint64_t t0;
+
+    if (out == (hype_xhci_silence_probe_t *)0) return -1;
+    zero((uint8_t *)out, sizeof *out);
+    if (c == (hype_xhci_ctrl_t *)0 || !c->inited) return -1;
+    hw = HW(c);
+    bar = (volatile uint8_t *)(uintptr_t)c->bar;
+    ir = c->rtsoff + HYPE_XHCI_RT_IR0;
+
+    out->usbsts = rd32(bar, c->op + HYPE_XHCI_OP_USBSTS);
+    out->usbcmd = rd32(bar, c->op + HYPE_XHCI_OP_USBCMD);
+    out->crcr_lo = rd32(bar, c->op + HYPE_XHCI_OP_CRCR);
+    out->iman = rd32(bar, ir + HYPE_XHCI_IR_IMAN);
+    out->imod = rd32(bar, ir + HYPE_XHCI_IR_IMOD);
+    out->erdp = (uint64_t)rd32(bar, ir + HYPE_XHCI_IR_ERDP) |
+                ((uint64_t)rd32(bar, ir + HYPE_XHCI_IR_ERDP + 4u) << 32);
+    out->sw_deq = phys(hw->evt_ring) + (uint64_t)hw->evt_deq * HYPE_XHCI_TRB_BYTES;
+    out->pending_event = ((int)(trb_dw(hw->evt_ring, hw->evt_deq, 3) & 1u) == (int)hw->evt_cyc)
+                             ? 1u : 0u;
+    if (root_port != 0u) {
+        out->portsc = rd32(bar, c->op + hype_xhci_portsc_offset(root_port));
+    }
+
+    /*
+     * The No-Op goes through the same path every real command takes, so a timeout here is
+     * counted, recovered and latched exactly as one would be for a Stop Endpoint -- which is
+     * the point: this is the cheapest way to find out what a Stop Endpoint would have done.
+     */
+    hype_xhci_trb_noop_cmd(cmd, (int)hw->cmd_cyc);
+    t0 = rdtsc_now();
+    out->noop_rc = cmd_submit_wait(c, cmd, evt);
+    out->noop_us = g_tsc_hz != 0ull
+                       ? (unsigned int)((rdtsc_now() - t0) / (g_tsc_hz / 1000000ull))
+                       : 0u;
+    if (out->noop_rc == 0) out->noop_cc = hype_xhci_event_cc(evt);
+    out->cmd_timeouts = hw->cmd_timeouts;
+    return 0;
+}
+
 unsigned int hype_xhci_discard_port_changes(hype_xhci_ctrl_t *c) {
     xhci_hw_t *hw;
     unsigned int n = 0u, p;

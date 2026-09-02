@@ -607,6 +607,31 @@ static void test_typematic_honours_the_guest_f3_setting(void) {
     CHECK_HEX("ignored the fast rate the guest asked for", 1, (hype_usb_hid_typematic_tick(&t, 250 + 33, out, sizeof out) == 1) ? 1 : 0);
 }
 
+static void test_typematic_init_for_guest_reapplies_the_remembered_rate(void) {
+    /* #791: a keyboard claimed AFTER the guest set its rate must get that rate, not the
+     * power-on defaults -- boot 40's re-plugged Pico repeated at 500/92 instead of 250/33. */
+    hype_usb_hid_typematic_t t;
+    hype_usb_hid_typematic_guest_t g;
+    uint8_t r[8];
+
+    g.valid = 1; g.param = 0x00;
+    mk_report(r, 0, 0x04, 0, 0);
+    hype_usb_hid_typematic_note(&t, r, 0); /* stale hold state, must be cleared by the init */
+    hype_usb_hid_typematic_init_for_guest(&t, &g);
+    CHECK_HEX("delay is not the guest's 250ms", 250, t.delay_ms);
+    CHECK_HEX("period is not the guest's 33ms", 33, t.period_ms);
+    CHECK_HEX("init left a key repeating", 0, t.usage);
+
+    g.valid = 0;
+    hype_usb_hid_typematic_init_for_guest(&t, &g);
+    CHECK_HEX("no guest rate yet but delay is not the default", HYPE_USB_HID_TYPEMATIC_DELAY_MS, t.delay_ms);
+    CHECK_HEX("no guest rate yet but period is not the default", HYPE_USB_HID_TYPEMATIC_PERIOD_MS, t.period_ms);
+
+    hype_usb_hid_typematic_init_for_guest(&t, 0);
+    CHECK_HEX("NULL guest state is not the default delay", HYPE_USB_HID_TYPEMATIC_DELAY_MS, t.delay_ms);
+    hype_usb_hid_typematic_init_for_guest(0, &g); /* must not crash */
+}
+
 static void test_typematic_null_safe(void) {
     uint8_t out[8], r[8];
     hype_usb_hid_typematic_t t;
@@ -696,6 +721,7 @@ int main(void) {
     test_typematic_modifiers_alone_never_repeat();
     test_typematic_extended_key_repeats_with_its_prefix();
     test_typematic_honours_the_guest_f3_setting();
+    test_typematic_init_for_guest_reapplies_the_remembered_rate();
     test_typematic_null_safe();
     test_typematic_a_hold_cannot_repeat_forever();
     test_typematic_a_new_key_revives_it_after_a_bound();

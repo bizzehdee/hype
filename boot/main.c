@@ -404,6 +404,8 @@ typedef struct {
 
 static hype_host_kbd_t g_hid[HYPE_HOST_KBD_MAX];
 static unsigned int g_hid_count;
+/* #791: the guest's last 0xF3, re-applied to every keyboard claimed after it was set. */
+static hype_usb_hid_typematic_guest_t g_hid_guest_typematic;
 static unsigned int g_hid_skipped; /* boot keyboards found past the cap */
 /* "At least one keyboard is claimed" -- the question almost every caller actually asks. */
 #define g_hid_ready (g_hid_count != 0u)
@@ -2271,7 +2273,8 @@ static void fw_1_claim_boot_hid(hype_xhci_ctrl_t *xc, unsigned int ctrl_idx,
                      * `prev` report and diff the first real report against a stranger's. */
                     for (z = 0; z < HYPE_USB_HID_REPORT_LEN; z++) e->prev[z] = 0u;
                     e->have_prev = 0;
-                    hype_usb_hid_typematic_init(&e->typematic); /* #774 */
+                    hype_usb_hid_typematic_init_for_guest(&e->typematic,
+                                                          &g_hid_guest_typematic); /* #774 #791 */
                     e->polls = 0; e->reports = 0; e->errs = 0; e->mods_seen = 0u;
                     (*count)++;
                     hype_usb_inventory_claim(&g_usb_inv, hi, HYPE_USB_OWNER_HYPE);
@@ -2280,6 +2283,13 @@ static void fw_1_claim_boot_hid(hype_xhci_ctrl_t *xc, unsigned int ctrl_idx,
                                      "hype\n",
                                      what, (unsigned)d->vid, (unsigned)d->pid, d->root_port,
                                      d->slot, hid.int_in_ep, hid.mps, *count);
+                    if (g_hid_guest_typematic.valid) {
+                        hype_debug_print("host-hid: %04x:%04x claimed after the guest set "
+                                         "typematic 0x%02x -- re-applied: delay %ums period "
+                                         "%ums [#791]\n", (unsigned)d->vid, (unsigned)d->pid,
+                                         (unsigned)g_hid_guest_typematic.param,
+                                         e->typematic.delay_ms, e->typematic.period_ms);
+                    }
                 } else {
                     hype_debug_print("host-hid: %s %04x:%04x found but Configure Endpoint "
                                      "FAILED -- no host %s\n", what, (unsigned)d->vid,
@@ -8501,6 +8511,21 @@ static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_t
 #define FW1_PICO_VID 0xcafeu
 #define FW1_PICO_PID 0x4b44u
 #define FW1_HID_PROBE_MAX    64u /* an overnight run must not fill the log with these */
+/*
+ * #781: the controller-silence probe.
+ *
+ * Boot 40 (revive off) and boot 39 (revive on) both showed every interrupt-IN endpoint on
+ * one controller -- the Pico, the Logitech that reported twice a second all run, and the
+ * hubs' status endpoints -- stop completing within the same 30 seconds, with no port event,
+ * no transfer error, and nothing on the command ring because nothing was asking it anything.
+ * Every counter hype had stayed at zero, so the log could not say whether the controller's
+ * event delivery had died or the hub behind root port 4 had. This reads the registers that
+ * can, and issues the one command that costs nothing: a No-Op. A No-Op that completes means
+ * the command and event rings are alive and the fault is downstream of the root port; one
+ * that times out means the controller itself.
+ */
+#define FW1_CTRL_QUIET_TICKS (125u * 30u) /* 30 s: longer than a Pico bus drop and its re-claim */
+#define FW1_CTRL_PROBE_MAX   16u
 
 /* Defined further down with the log sink and the mouse counters; declared here because the
  * input tick reports their health and sits above both. */
@@ -8539,6 +8564,38 @@ static void fw_1_hid_probe_port(unsigned int k, const hype_host_kbd_t *kb) {
                      (unsigned)(st[0] & 0x01u), (unsigned)((st[0] >> 1) & 0x01u),
                      (unsigned)((st[0] >> 2) & 0x01u), (unsigned)((st[0] >> 4) & 0x01u),
                      kb->reports, kb->polls);
+}
+
+static void fw_1_ctrl_silence_probe(unsigned int ctrl, unsigned int nsilent,
+                                    const hype_host_kbd_t *kb) {
+    static unsigned int probes;
+    hype_xhci_silence_probe_t pr;
+
+    if (probes >= FW1_CTRL_PROBE_MAX) return;
+    probes++;
+    if (hype_xhci_probe_silence((hype_xhci_ctrl_t *)&kb->xc, kb->root_port, &pr) != 0) {
+        hype_debug_print("fw-1 CTRLSILENCE ctrl[%u]: %u keyboard(s) silent for %us -- probe "
+                         "refused, controller not initialised [#781]\n",
+                         ctrl, nsilent, FW1_CTRL_QUIET_TICKS / 125u);
+        return;
+    }
+    hype_debug_print("fw-1 CTRLSILENCE ctrl[%u]: %u keyboard(s) silent for %us | USBSTS=0x%08x "
+                     "HCH=%u HSE=%u EINT=%u PCD=%u HCE=%u | USBCMD=0x%08x CRCR.CRR=%u | "
+                     "IMAN=0x%08x IMOD=0x%08x ERDP=0x%llx sw_deq=0x%llx pending_event=%u | "
+                     "PORTSC[%u]=0x%08x CCS=%u PED=%u PLS=%u | No-Op %s cc=%u in %uus, "
+                     "cmd timeouts=%llu [#781]\n",
+                     ctrl, nsilent, FW1_CTRL_QUIET_TICKS / 125u, pr.usbsts,
+                     (pr.usbsts & HYPE_XHCI_USBSTS_HCH) ? 1u : 0u,
+                     (pr.usbsts & HYPE_XHCI_USBSTS_HSE) ? 1u : 0u,
+                     (pr.usbsts >> 3) & 1u, (pr.usbsts >> 4) & 1u,
+                     (pr.usbsts & HYPE_XHCI_USBSTS_HCE) ? 1u : 0u,
+                     pr.usbcmd, (pr.crcr_lo & HYPE_XHCI_CRCR_CRR) ? 1u : 0u,
+                     pr.iman, pr.imod, (unsigned long long)pr.erdp,
+                     (unsigned long long)pr.sw_deq, pr.pending_event,
+                     kb->root_port, pr.portsc, pr.portsc & 1u, (pr.portsc >> 1) & 1u,
+                     (pr.portsc >> 5) & 0xfu,
+                     pr.noop_rc == 0 ? "COMPLETED" : "FAILED", pr.noop_cc, pr.noop_us,
+                     pr.cmd_timeouts);
 }
 
 static void fw_1_hid_watch(uint64_t now_h, uint64_t hz) {
@@ -8600,6 +8657,38 @@ static void fw_1_hid_watch(uint64_t now_h, uint64_t hz) {
                                                           kb->slot, kb->ep),
                                  rfail);
                 (void)fw_1_host_action_begin(HYPE_HOST_ACTION_REBOOT);
+            }
+        }
+    }
+
+    /*
+     * #781: a whole controller gone quiet. Fires once per silence -- when the LAST keyboard
+     * on a controller that has ever reported crosses the quiet threshold -- and re-arms when
+     * any of them reports again. One idle human's keyboard alone can trip it; the line it
+     * prints then simply shows a healthy controller, and the count is bounded.
+     */
+    {
+        /* Controller indices are 1-based in the inventory (ctrl[1], ctrl[2] in the log), so
+         * the array is one longer than the pool and index 0 is never used. */
+        static unsigned int armed[HYPE_XHCI_MAX_CTRL + 1u];
+        unsigned int ci;
+        for (ci = 1; ci <= HYPE_XHCI_MAX_CTRL; ci++) {
+            unsigned int seen = 0, silent = 0;
+            const hype_host_kbd_t *first = (const hype_host_kbd_t *)0;
+            for (k = 0; k < g_hid_count && k < HYPE_HOST_KBD_MAX; k++) {
+                const hype_host_kbd_t *kb = &g_hid[k];
+                if (kb->ctrl_idx != ci || kb->reports == 0ull) continue;
+                seen++;
+                if (quiet[k] >= FW1_CTRL_QUIET_TICKS) {
+                    silent++;
+                    if (first == (const hype_host_kbd_t *)0) first = kb;
+                }
+            }
+            if (seen == 0u || silent != seen) {
+                armed[ci] = 1u;
+            } else if (armed[ci]) {
+                armed[ci] = 0u;
+                fw_1_ctrl_silence_probe(ci, silent, first);
             }
         }
     }
@@ -25017,6 +25106,8 @@ static unsigned int usb_hid_drain(void) {
         uint8_t f3;
         unsigned int fk;
         if (g_vm_count != 0u && hype_ps2_kbd_take_typematic(&g_vms[0].ps2, &f3)) {
+            g_hid_guest_typematic.valid = 1;
+            g_hid_guest_typematic.param = f3;
             for (fk = 0; fk < g_hid_count && fk < HYPE_HOST_KBD_MAX; fk++) {
                 hype_usb_hid_typematic_set_f3(&g_hid[fk].typematic, f3);
             }

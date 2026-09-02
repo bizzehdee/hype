@@ -114,6 +114,25 @@ unsigned int hype_usb_hid_typematic_tick(hype_usb_hid_typematic_t *t, uint64_t n
  */
 void hype_usb_hid_typematic_set_f3(hype_usb_hid_typematic_t *t, uint8_t param);
 
+/*
+ * #791: the guest's last Set Typematic Rate/Delay, kept outside any one keyboard.
+ *
+ * The rate is applied to the keyboards claimed at the moment the guest sets it, and a
+ * keyboard claimed later -- a re-plug, or boot 40's Pico coming back from its periodic bus
+ * drop -- was initialised to the power-on defaults and never told. Measured: the same
+ * 3-second hold repeated 68 times before the re-plug and 27 after. The guest sets the
+ * rate once, so it has to be remembered and re-applied at every claim.
+ */
+typedef struct {
+    int valid;     /* the guest has sent 0xF3 at least once */
+    uint8_t param; /* its last parameter byte */
+} hype_usb_hid_typematic_guest_t;
+
+/* Power-on defaults, then the guest's remembered rate if it has set one. Use this at every
+ * claim instead of hype_usb_hid_typematic_init(). `g` may be NULL. */
+void hype_usb_hid_typematic_init_for_guest(hype_usb_hid_typematic_t *t,
+                                           const hype_usb_hid_typematic_guest_t *g);
+
 /* The interrupt-IN endpoint a boot keyboard delivers its reports on. */
 typedef struct {
     int found;
