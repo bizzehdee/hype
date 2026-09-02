@@ -5115,6 +5115,20 @@ static void vmx_publish_debug_state(struct hype_vcpu_ctx *real) {
     hype_vmx_vcpu_get_debug_state((hype_vcpu_ctx_t *)real, &tmp);
 }
 
+/*
+ * #797: a rebuilt VMCS must carry no staged event. hype_vmx_vmcs_build_guest() rewrites the
+ * guest state but never touches VM_ENTRY_INTR_INFO, and the loop epilogue stages a vector
+ * there just before entry -- so a reset requested in that window (Intel boot A3: the old
+ * kernel's REBOOT_VECTOR 0xf8 IPI, staged on vCPU 0 the moment vCPU 1 wrote 0xCF9) was
+ * delivered as the first event of the NEW firmware, into a zeroed IVT. SVM has no such hole
+ * because hype_vmcb_build_realmode_guest() zeroes the whole VMCB, EVENTINJ included. A reset
+ * drops pending interrupts on real hardware too.
+ */
+static void vmx_drop_staged_event(void) {
+    vmwrite(HYPE_VMCS_VM_ENTRY_INTR_INFO_FIELD, 0);
+    vmwrite(HYPE_VMCS_VM_ENTRY_EXCEPTION_ERROR_CODE, 0);
+}
+
 void hype_vmx_vcpu_reset_realmode(hype_vcpu_ctx_t *ctx, uint64_t guest_rip, uint64_t guest_rsp,
                                   uint64_t ept_root) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
@@ -5153,6 +5167,7 @@ void hype_vmx_vcpu_reset_realmode(hype_vcpu_ctx_t *ctx, uint64_t guest_rip, uint
         return;
     }
     real->vmcs_region = g_vmcs_pool[slot]; /* #483 */
+    vmx_drop_staged_event(); /* #797 */
     for (i = 0; i < 16; i++) {
         real->gprs[i] = 0;
     }
@@ -5196,6 +5211,7 @@ void hype_vmx_vcpu_reset_longmode(hype_vcpu_ctx_t *ctx, uint64_t guest_rip, uint
         return;
     }
     real->vmcs_region = g_vmcs_pool[slot]; /* #483 */
+    vmx_drop_staged_event(); /* #797 */
     for (i = 0; i < 16; i++) {
         real->gprs[i] = 0;
     }

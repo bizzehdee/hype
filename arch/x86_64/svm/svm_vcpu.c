@@ -633,6 +633,17 @@ void hype_svm_vcpu_reset_realmode(hype_vcpu_ctx_t *ctx, uint64_t guest_rip, uint
         hype_vmcb_enable_nested_paging(vmcb, npt_root);
     }
     reset_gprs(ctx);
+    /* #797: the VMCB rebuild above already dropped any staged EVENTINJ; drop the deferred
+     * vectors with it, so a reset never carries the previous guest's interrupts into the
+     * next one. Real hardware forgets pending interrupts at INIT/reset as well. */
+    {
+        struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+        unsigned k;
+        for (k = 0; k < 8u; k++) {
+            real->pending_irr[k] = 0;
+            real->pending_pic[k] = 0;
+        }
+    }
 }
 
 /*
