@@ -789,6 +789,38 @@ int hype_xhci_cc_is_stopped(uint32_t cc) {
             cc == HYPE_XHCI_CC_STOPPED_SHORT) ? 1 : 0;
 }
 
+static unsigned int reset_budget_count(const hype_xhci_reset_budget_t *b, uint64_t now,
+                                       uint64_t window) {
+    unsigned int i, n = 0, have = b->total < HYPE_XHCI_RESET_BURST ? b->total : HYPE_XHCI_RESET_BURST;
+    for (i = 0; i < have; i++) {
+        if (now - b->at[i] < window) n++;
+    }
+    return n;
+}
+
+int hype_xhci_reset_within_budget(const hype_xhci_reset_budget_t *b, uint64_t now,
+                                  uint64_t window, unsigned int *in_window) {
+    unsigned int n;
+    if (b == (const hype_xhci_reset_budget_t *)0) {
+        if (in_window) *in_window = 0;
+        return 0;
+    }
+    n = reset_budget_count(b, now, window);
+    if (in_window) *in_window = n;
+    return n < HYPE_XHCI_RESET_BURST ? 1 : 0;
+}
+
+void hype_xhci_reset_record(hype_xhci_reset_budget_t *b, uint64_t now) {
+    if (b == (hype_xhci_reset_budget_t *)0) return;
+    b->at[b->total % HYPE_XHCI_RESET_BURST] = now;
+    b->total++;
+}
+
+uint64_t hype_xhci_reset_since_last(const hype_xhci_reset_budget_t *b, uint64_t now) {
+    if (b == (const hype_xhci_reset_budget_t *)0 || b->total == 0u) return 0;
+    return now - b->at[(b->total - 1u) % HYPE_XHCI_RESET_BURST];
+}
+
 int hype_xhci_may_reset(const hype_xhci_reset_policy_t *p, unsigned int ctrl_idx,
                         const char **reason) {
     int is_log, is_boot;

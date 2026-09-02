@@ -3859,10 +3859,14 @@ isn't lost.
     refusal, teardown, reset, re-enumeration, re-claim -- deterministic under QEMU, and leaves
     exactly ONE hardware run: the confirmation that a real wedge recovers.
 
-    **Bounded and counted.** A fixed number of resets per controller per run, then the controller
-    is left dead and said to be dead. A controller that needs resetting every few minutes is a
-    different bug, and a recovery good enough to hide it is a recovery that stops anyone finding
-    it.
+    **Rate-bounded and counted.** Three resets per controller inside a sliding ten-minute
+    window, then the controller is left dead and said to be dead until the window clears. A
+    controller that needs resetting every few minutes is a different bug, and a recovery good
+    enough to hide it is a recovery that stops anyone finding it. (Revised 2026-09-02, #792: the
+    first form was a fixed count per run, and boot 42 spent all three in 44 minutes on a stall
+    that recurs every 5-25 minutes; a fourth would have ended input for the rest of the run. The
+    stall is that controller's steady state, so the bound has to distinguish "every few minutes"
+    from "every half hour", which only a rate can.)
 
     Decomposed into five tickets rather than one: the injection harness, the ownership facts and
     the refusal, the teardown, the reset and re-enumeration, and the single hardware

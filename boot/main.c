@@ -26093,25 +26093,28 @@ static void fw_1_usb_rescan_controller(hype_xhci_ctrl_t *xc, unsigned int idx,
  * seconds (or the controller raised HSE/HCE).
  *
  * Refused for the controller carrying the log sink or the boot medium (#783): staying deaf
- * with the evidence intact beats recovering input and losing the record of why. Bounded and
- * counted: a controller that needs this every few minutes is a different bug, and a recovery
- * good enough to hide it is a recovery that stops anyone finding it.
+ * with the evidence intact beats recovering input and losing the record of why. Rate-bounded
+ * and counted (#792): HYPE_XHCI_RESET_BURST resets inside HYPE_XHCI_RESET_WINDOW_S, then the
+ * controller is left dead until the window slides past. A controller that needs this every few
+ * minutes is a different bug, and a recovery good enough to hide it is a recovery that stops
+ * anyone finding it; one that needs it every half hour (boot 42: 5-25 min apart, three in 44
+ * min) is kept alive for the whole run.
  *
  * This blocks the input tick for the whole of it -- HCRST, the 150 ms connect debounce, and
  * a dozen commands per device -- so the line says how long it took.
  */
-#define HYPE_XHCI_MAX_RESETS 3u
+#define HYPE_XHCI_RESET_WINDOW_S 600ull
 #define HYPE_XHCI_RESET_LOCK_SPINS 200000u
 
 static void fw_1_xhci_reset_controller(unsigned int k) {
-    static unsigned int resets[HYPE_LIVE_XHCI_MAX];
+    static hype_xhci_reset_budget_t budget[HYPE_LIVE_XHCI_MAX];
     static unsigned char said[HYPE_LIVE_XHCI_MAX];
     hype_xhci_ctrl_t *xc = &g_live_xc[k];
     unsigned int idx = g_live_xc_idx[k];
     const char *why = "";
     fw_1_ctrl_release_t rel;
-    unsigned int ports = 0, devices = 0, kbd_after = 0, j, spins;
-    uint64_t t0, hz = g_vms[0].host_tsc_hz;
+    unsigned int ports = 0, devices = 0, kbd_after = 0, j, spins, in_window = 0;
+    uint64_t t0, since, hz = g_vms[0].host_tsc_hz;
     int rc;
 
     if (!hype_xhci_may_reset(&g_xhci_reset_policy, idx, &why)) {
@@ -26123,12 +26126,15 @@ static void fw_1_xhci_reset_controller(unsigned int k) {
         }
         return;
     }
-    if (resets[k] >= HYPE_XHCI_MAX_RESETS) {
+    t0 = hype_rdtsc();
+    if (!hype_xhci_reset_within_budget(&budget[k], t0, hz * HYPE_XHCI_RESET_WINDOW_S, &in_window)) {
         if (!said[k]) {
             said[k] = 1;
-            hype_debug_print("fw-1 XHCIRESET ctrl[%u]: reset %u times already and wedged again "
-                             "-- left dead. A controller that needs this every few minutes is a "
-                             "different bug [#785]\n", idx, resets[k]);
+            hype_debug_print("fw-1 XHCIRESET ctrl[%u]: reset %u times in the last %llu min (%u in "
+                             "this run) and wedged again -- left dead until the window clears. A "
+                             "controller that needs this every few minutes is a different bug "
+                             "[#785 #792]\n", idx, in_window, HYPE_XHCI_RESET_WINDOW_S / 60ull,
+                             budget[k].total);
         }
         return;
     }
@@ -26138,10 +26144,20 @@ static void fw_1_xhci_reset_controller(unsigned int k) {
     for (spins = 0; hype_blk_usb_try_lock() != 0; spins++) {
         if (spins >= HYPE_XHCI_RESET_LOCK_SPINS) return;
     }
-    t0 = hype_rdtsc();
-    resets[k]++;
-    hype_debug_print("fw-1 XHCIRESET ctrl[%u]: reset #%u begins -- releasing everything on it, "
-                     "then HCRST [#784 #785]\n", idx, resets[k]);
+    since = hype_xhci_reset_since_last(&budget[k], t0);
+    hype_xhci_reset_record(&budget[k], t0);
+    said[k] = 0;
+    if (since != 0ull) {
+        hype_debug_print("fw-1 XHCIRESET ctrl[%u]: reset #%u begins (%u in the last %llu min, "
+                         "previous %llu s ago) -- releasing everything on it, then HCRST "
+                         "[#784 #785 #792]\n", idx, budget[k].total, in_window,
+                         HYPE_XHCI_RESET_WINDOW_S / 60ull,
+                         hz != 0ull ? (unsigned long long)(since / hz) : 0ull);
+    } else {
+        hype_debug_print("fw-1 XHCIRESET ctrl[%u]: reset #%u begins (the first on this controller) "
+                         "-- releasing everything on it, then HCRST [#784 #785 #792]\n",
+                         idx, budget[k].total);
+    }
     fw_1_usb_release_ctrl(k, &rel);
     hype_xhci_host_quiesce(xc);
     rc = hype_xhci_host_init(xc->bar, xc);
@@ -26150,7 +26166,7 @@ static void fw_1_xhci_reset_controller(unsigned int k) {
         hype_blk_usb_unlock();
         hype_debug_print("fw-1 XHCIRESET ctrl[%u]: reset #%u FAILED -- the controller did not "
                          "come back from HCRST (released kbd=%u mouse=%u media=%u inventory=%u "
-                         "hubs=%u); it stays dead [#785]\n", idx, resets[k], rel.kbd, rel.mouse,
+                         "hubs=%u); it stays dead [#785]\n", idx, budget[k].total, rel.kbd, rel.mouse,
                          rel.media, rel.inventory, rel.hubs);
         return;
     }
@@ -26162,7 +26178,7 @@ static void fw_1_xhci_reset_controller(unsigned int k) {
     hype_debug_print("fw-1 XHCIRESET ctrl[%u]: reset #%u done in %llu ms | released kbd=%u "
                      "mouse=%u media=%u inventory=%u hubs=%u retry-slots=%u | back: ports=%u "
                      "devices=%u keyboards=%u mouse=%u [#785]\n",
-                     idx, resets[k],
+                     idx, budget[k].total,
                      hz != 0ull ? (unsigned long long)((hype_rdtsc() - t0) / (hz / 1000ull)) : 0ull,
                      rel.kbd, rel.mouse, rel.media, rel.inventory, rel.hubs, rel.arrivals,
                      ports, devices, kbd_after,

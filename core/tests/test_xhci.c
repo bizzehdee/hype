@@ -1295,6 +1295,67 @@ static void test_783_unknown_controller_is_never_reset(void) {
     CHECK_INT("nothing recorded: any real index allowed", 1, hype_xhci_may_reset(&p, 3u, &why));
 }
 
+/* #792: the reset budget is a rate -- HYPE_XHCI_RESET_BURST inside one window, then refused
+ * until the window slides past. Ticks are arbitrary units; the window here is 600. */
+static void test_792_fresh_budget_allows_a_reset(void) {
+    hype_xhci_reset_budget_t b = { { 0, 0, 0 }, 0u };
+    unsigned int n = 99u;
+    CHECK_INT("fresh: allowed", 1, hype_xhci_reset_within_budget(&b, 1000u, 600u, &n));
+    CHECK_INT("fresh: none in window", 0, n);
+    CHECK_INT("fresh: nothing since", 0, hype_xhci_reset_since_last(&b, 1000u));
+}
+
+static void test_792_burst_inside_the_window_is_refused(void) {
+    hype_xhci_reset_budget_t b = { { 0, 0, 0 }, 0u };
+    unsigned int n = 0;
+    hype_xhci_reset_record(&b, 1000u);
+    hype_xhci_reset_record(&b, 1100u);
+    CHECK_INT("two in window: third allowed", 1, hype_xhci_reset_within_budget(&b, 1200u, 600u, &n));
+    CHECK_INT("two counted", 2, n);
+    hype_xhci_reset_record(&b, 1200u);
+    CHECK_INT("three in window: fourth refused", 0, hype_xhci_reset_within_budget(&b, 1300u, 600u, &n));
+    CHECK_INT("three counted", 3, n);
+    CHECK_INT("total counts every reset", 3, b.total);
+    CHECK_INT("since last", 100, hype_xhci_reset_since_last(&b, 1300u));
+}
+
+static void test_792_window_slides_and_the_budget_returns(void) {
+    hype_xhci_reset_budget_t b = { { 0, 0, 0 }, 0u };
+    unsigned int n = 0;
+    hype_xhci_reset_record(&b, 1000u);
+    hype_xhci_reset_record(&b, 1100u);
+    hype_xhci_reset_record(&b, 1200u);
+    CHECK_INT("refused at 1599", 0, hype_xhci_reset_within_budget(&b, 1599u, 600u, &n));
+    CHECK_INT("oldest ages out at 1600", 1, hype_xhci_reset_within_budget(&b, 1600u, 600u, &n));
+    CHECK_INT("two left in window", 2, n);
+    hype_xhci_reset_record(&b, 1600u);
+    CHECK_INT("ring overwrote the oldest, refused again", 0,
+              hype_xhci_reset_within_budget(&b, 1650u, 600u, &n));
+    CHECK_INT("since last after wrap", 50, hype_xhci_reset_since_last(&b, 1650u));
+    CHECK_INT("total keeps counting past the ring", 4, b.total);
+}
+
+static void test_792_boot42_spacing_never_refuses(void) {
+    /* boot 42: stalls at 537, 2328, 2632 s; a 10 min window must allow all three and a fourth. */
+    hype_xhci_reset_budget_t b = { { 0, 0, 0 }, 0u };
+    CHECK_INT("537 s", 1, hype_xhci_reset_within_budget(&b, 537u, 600u, (unsigned int *)0));
+    hype_xhci_reset_record(&b, 537u);
+    CHECK_INT("2328 s", 1, hype_xhci_reset_within_budget(&b, 2328u, 600u, (unsigned int *)0));
+    hype_xhci_reset_record(&b, 2328u);
+    CHECK_INT("2632 s", 1, hype_xhci_reset_within_budget(&b, 2632u, 600u, (unsigned int *)0));
+    hype_xhci_reset_record(&b, 2632u);
+    CHECK_INT("a fourth at 3000 s is still allowed", 1,
+              hype_xhci_reset_within_budget(&b, 3000u, 600u, (unsigned int *)0));
+}
+
+static void test_792_null_safe(void) {
+    unsigned int n = 7u;
+    CHECK_INT("null budget refused", 0, hype_xhci_reset_within_budget((const hype_xhci_reset_budget_t *)0, 1u, 600u, &n));
+    CHECK_INT("null budget reports 0 in window", 0, n);
+    CHECK_INT("null since = 0", 0, hype_xhci_reset_since_last((const hype_xhci_reset_budget_t *)0, 1u));
+    hype_xhci_reset_record((hype_xhci_reset_budget_t *)0, 1u);
+}
+
 int main(void) {
     test_744_note_departed_clears_slot_and_owner();
     test_744_note_departed_is_a_no_op_for_a_position_with_nothing_on_it();
@@ -1351,6 +1412,11 @@ int main(void) {
     test_783_refuses_the_boot_controller();
     test_783_names_both_roles_on_one_controller();
     test_783_unknown_controller_is_never_reset();
+    test_792_fresh_budget_allows_a_reset();
+    test_792_burst_inside_the_window_is_refused();
+    test_792_window_slides_and_the_budget_returns();
+    test_792_boot42_spacing_never_refuses();
+    test_792_null_safe();
     if (failures == 0) {
         printf("all tests passed\n");
         return 0;

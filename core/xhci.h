@@ -731,6 +731,28 @@ typedef struct {
 int hype_xhci_may_reset(const hype_xhci_reset_policy_t *p, unsigned int ctrl_idx,
                         const char **reason);
 
+/*
+ * #792: the reset budget is a RATE, not a count per run. Boot 42 (5950X) spent a cap of three
+ * in 44 minutes with the stall recurring every 5-25 minutes; a fourth would have left input
+ * dead for the rest of the run. A controller that wedges every few minutes is still refused --
+ * that is the "different bug" decision 75 wants visible -- but one that wedges every half hour
+ * is reset for as long as the run lasts. Pure logic, unit-tested; the caller supplies the clock.
+ */
+#define HYPE_XHCI_RESET_BURST 3u /* resets allowed inside one window */
+
+typedef struct {
+    uint64_t at[HYPE_XHCI_RESET_BURST]; /* the most recent reset times, a ring */
+    unsigned int total;                 /* resets ever on this controller */
+} hype_xhci_reset_budget_t;
+
+/* 1 = a reset at `now` is within budget (fewer than HYPE_XHCI_RESET_BURST resets in the last
+ * `window` ticks); 0 = refuse. *in_window (may be NULL) = how many fell inside the window. */
+int hype_xhci_reset_within_budget(const hype_xhci_reset_budget_t *b, uint64_t now,
+                                  uint64_t window, unsigned int *in_window);
+void hype_xhci_reset_record(hype_xhci_reset_budget_t *b, uint64_t now);
+/* Ticks from the most recent recorded reset to `now`; 0 when none has been recorded. */
+uint64_t hype_xhci_reset_since_last(const hype_xhci_reset_budget_t *b, uint64_t now);
+
 void hype_xhci_event_health(hype_xhci_ctrl_t *c, unsigned long long *hc_events,
                             unsigned long long *ring_full, unsigned long long *evictions);
 
