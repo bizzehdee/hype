@@ -4149,6 +4149,61 @@ isn't lost.
     AMD leg first), #793 (USB console, decision #77). #130 (STRETCH-3, passthrough NIC) is
     a consumer of the same framework and is not a separate design.
 
+81. **Host UAS transport (#598): streams are required, so #720 comes first; queue depth one
+    under the existing USB lock; BOT stays the default and the only transport for the boot
+    medium and the log sink; UAS is opt-in per device and falls back to BOT at bring-up only --
+    decided (2026-09-03, #718).**
+
+    **Streams versus stream-less.** UAS over a SuperSpeed link uses xHCI streams by
+    specification: the tag of a Command IU is the Stream ID on the Data-In, Data-Out and
+    Status pipes, and a SuperSpeed UAS device has no stream-less mode. Stream-less UAS exists
+    only for high-speed (USB 2) links, where UAS buys nothing over BOT that hype could
+    measure. So there is no "start stream-less and defer streams": a UAS transport that is
+    worth having needs Primary Stream Context Arrays, `MaxPStreams` in the Endpoint Context,
+    and one transfer ring per stream, which `core/xhci.c` has none of today
+    (`hype_xhci_ep_ctx` programs one flat TR Dequeue Pointer). #720 is therefore the first
+    code task under #598, and #719 (alternate-setting detection) and #721 (the IUs) build on
+    it. Streams are kept behind the same pure/hardware split the rest of the driver uses:
+    context composition and ring bookkeeping in `core/xhci.c` with unit tests, the
+    doorbell-with-stream-ID write in `core/xhci_hw.c`.
+
+    **Queue depth.** One outstanding command, for the first cut and until a measurement asks
+    for more. `core/blk_usb.c`'s ticket lock (#346, #362) serialises every host USB transfer
+    across cores because the BSP's log flush and an AP's media reads share controllers; that
+    lock stays exactly as it is. UAS structures are sized for 16 tags so the on-the-wire format
+    and the stream arrays do not need a second design when depth grows, but the driver issues
+    one Command IU and waits for its Status IU before the next, the way BOT waits for its CSW.
+    Relaxing the lock -- per-device queues, out-of-order completion -- is a separate decision
+    with a throughput number in front of it; nothing in this one prepares the ground for it
+    beyond the tag width.
+
+    **BOT-fallback policy.** BOT is the unconditional default: a device is driven by BOT
+    unless its `[disk.*]` block says `transport = uas`, and a device with no UAS alternate
+    setting ignores that key with one log line. UAS is refused, whatever the key says, for
+    the device carrying hype's boot medium or log sink (decision #75's role record, #783):
+    the log is how every transport fault is diagnosed, and it does not ride a transport under
+    test. "Bring-up fails" means exactly one of: `SET_INTERFACE` to the UAS alternate setting
+    rejected; endpoint or stream-context configuration rejected by the controller; the first
+    INQUIRY over UAS not completing within the standard command timeout; or a Status IU
+    whose tag matches no outstanding command. Any of those, before the first successful
+    command, falls the device back to BOT for the rest of the run, with the reason logged.
+    After the first successful command there is no automatic switch: a UAS device that fails
+    mid-run takes the existing USB error path (retry, then the device is marked failed), the
+    same as a BOT device, because a silent transport change mid-run would hide the fault the
+    operator opted in to find.
+
+    **Rejected.** Stream-less UAS as the first step (no SuperSpeed device accepts it, and the
+    high-speed case gains nothing). UAS by default (the boot and log medium is a UAS-capable
+    JMS561U bridge, and BOT is what every hardware run since 2026-07 has relied on). Relaxing
+    the USB lock alongside (no measurement asks for it; #362's counters are the place that
+    measurement would come from). Guest-facing UAS (guests get BOT through #591/#592; no
+    guest has asked).
+
+    **Board.** #720 (streams) first, then #719 (alt-setting detection and `transport = uas`),
+    then #721 (Command/Status IUs and the SCSI mapping over the four pipes), then #723
+    (hardware validation on the JMS561U, with the BOT-fallback failure forced once to prove
+    the policy). #598 stays Low priority: BOT is correct and adequate for every current use.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what
