@@ -100,3 +100,64 @@ refused with the refusal itself on the stick.
 Run card: `tools/hw-val-2026-08-25/RUN-CARD-2026-09-02-boot42-amd-reset.md`, set as
 `RUN_CARD` in `stage.sh`. The stall recurring and the keyboards coming back on their own is
 the whole point; the stall not recurring is a run with no result.
+
+## Boot 42 result (AMD 5950X, 2026-09-02)
+
+Build `5e696dd-dirty` (dirty = uncommitted `tools/` cfg edits only), `silence_revive=0`,
+`XHCIOWN: log sink on ctrl[1], boot medium on ctrl[1]`. Run 4262 s of guest uptime (71 min),
+stopped by the operator with the Pico and the Logitech both typing. Logs under
+`tools/hw-val-2026-08-25/logs/boot-42/` (gitignored). Times are guest uptime from the `HB-<uptime>`
+heartbeats in `RUN1A.LOG`.
+
+**The reset works on the real controller. The stall came three times; the controller was reset
+three times; every keyboard and the mouse came back every time; the log on ctrl[1] never
+stopped.** The bound is now the limit: all 3 resets were spent by 2636 s, so a fourth stall would
+have left input dead for the rest of the run. None came in the remaining 27 min.
+
+```
+[0001179373] fw-1 CTRLSILENCE ctrl[2]: 3 keyboard(s) silent for 30s | USBSTS=0x00000010 HCH=0 HSE=0 EINT=0 PCD=1 HCE=0 | USBCMD=0x00000001 CRCR.CRR=1 | ... pending_event=0 | PORTSC[4]=0x00000e03 CCS=1 PED=1 PLS=0 | No-Op FAILED cc=0 in 6041256us, cmd timeouts=1 [#781]
+[0001182983] fw-1 XHCIRESET ctrl[2]: reset #1 begins -- releasing everything on it, then HCRST [#784 #785]
+[0001189814] fw-1 XHCIRESET ctrl[2]: reset #1 done in 2004 ms | released kbd=3 mouse=1 media=0 inventory=8 hubs=3 retry-slots=2 | back: ports=6 devices=8 keyboards=3 mouse=1 [#785]
+[0004627932] fw-1 XHCIRESET ctrl[2]: reset #2 done in 2036 ms | released kbd=3 mouse=1 media=0 inventory=8 hubs=4 retry-slots=0 | back: ports=6 devices=8 keyboards=3 mouse=1 [#785]
+[0005223426] fw-1 XHCIRESET ctrl[2]: reset #3 done in 1972 ms | released kbd=3 mouse=1 media=0 inventory=8 hubs=4 retry-slots=0 | back: ports=6 devices=8 keyboards=3 mouse=1 [#785]
+```
+
+Every stall had the boot 41 signature: all registers healthy, `CRCR.CRR=1`, `ERDP == sw_deq`,
+`pending_event=0`, No-Op failed at 6.04 s, Command Abort left CRR set after 5 s. Stalls 2 and 3
+say `2 keyboard(s) silent` because the Keychron had 0 reports since reset 1 and so had no
+silence to measure.
+
+| Stall | Last report before (Pico / Logitech) | `CTRLSILENCE` | Reset done | First report after | Dead for | Pico re-arrival before it |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 491 s / 499 s | 537 s | 542 s (2004 ms) | 545 s / 545 s | 46 s | 408 s (129 s earlier) |
+| 2 | 2282 s / 2287 s | 2328 s | 2331 s (2036 ms) | 2335 s / 2336 s | 49 s | 1987 s (341 s earlier) |
+| 3 | 2593 s / 2594 s | 2632 s | 2636 s (1972 ms) | 2638 s / 2638 s | 44 s | 2411 s (221 s earlier) |
+
+The dead time is the detector, not the reset: 30 s of silence, a 6 s No-Op, a 5 s abort, then a
+2 s reset. The reset itself is 2 s.
+
+| Time | Event |
+| --- | --- |
+| 46 s | 3 keyboards + mouse claimed on ctrl[2], `INVENTORY -- 14 device(s) across 2 controller(s)` |
+| 405, 828, 1194, 1600, 1984, 2407, 2826, 3210, 3594, 3978 s | the Pico left the bus (10 drops; 8 `cc=4` errors in total, 3+3+1+1 on the first four, none on the last six), re-claimed in 1-6 s each time; intervals 366-423 s, median 384 s |
+| 537, 2328, 2632 s | controller stall, reset, recovered (table above) |
+| 3992-3993 s | operator hot-plug: Keychron `3434:0da4 behind hub slot 2 port 2 DEPARTED`, re-claimed 1 s later, 18 reports typed on it afterwards |
+| 4262 s | operator power-off |
+
+Keystrokes: 20,938 handed to the guest, reconstructed from `KBDCHARS` with 0 gaps; Pico markers
+`a0001`..`a0312`, 305 of 312 present. The 7 missing markers fall in the three dead windows (the
+Pico types through them). 412 alphabet passes: 372 exact, 40 with one doubled character, 0 with a
+missing character.
+
+| Ticket | Result |
+| --- | --- |
+| **#786** | Met. Three real stalls, three resets, `keyboards=3 mouse=1` back each time, the Pico and the Logitech reporting within 3 s of each reset, the operator typing at 71 min. `fw-1` lines continue through all three resets: the log on ctrl[1] survived |
+| **#785** | Works, and the bound is now the open question: 3 resets were used in 44 min (stalls 25 min, 5 min and 27+ min apart). A fourth stall would have been `left dead`. The stall is the controller's steady state on this machine, not a one-off, so "3 per run" is the wrong shape; a follow-up should make it a rate (N within a window) or drop it and keep the count in the line |
+| **#783** | Not exercised (correct): no `REFUSED` line, ctrl[1] never stalled, `XHCIOWN` named ctrl[1] for both roles as predicted |
+| **#784** | `released kbd=3 mouse=1 media=0 inventory=8 hubs=3/4 retry-slots=2/0` on every reset; no leaked slot: the re-claims reuse slots 4-6 each time |
+| **#781** | Trigger confirmed three times, same signature as boot 41 |
+| **#787** | Unchanged: 10 drops at a 384 s median period. The stalls came 129, 341 and 221 s after a re-arrival, and 7 re-arrivals had no stall at all. Boot 40/41's "40-109 s after re-enumeration" lead is dead |
+| **#788** | 40 doubled characters in 14,832 alphabet characters (2.7 per 1,000); boot 41 was 3.0, boot 40 0.35. Not fixed, not worse |
+| **#790** | Held: 0 `REVIVE`, 0 `DEADMAN`; the 3 `cmdring timeout`s are the probe's No-Ops |
+| **#734 / #746** | Hot-plug of a keyboard on the reset controller at 66 min: departed and re-claimed in 1 s, typing resumed |
+| **#426** | 71 min with input working at the end. First run since boot 30 to end with a live keyboard |
