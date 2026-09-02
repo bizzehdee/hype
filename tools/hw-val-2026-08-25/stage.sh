@@ -32,8 +32,10 @@ set -u
 # for the first seven stagings, which is why boot 7 went out with boot 6's card still on the
 # drive. The active script and the card that describes it must move together or the operator
 # is reading instructions for a different run.
-BOOT_INPUT=input-1a-hotplug
-RUN_CARD=RUN-CARD-2026-09-02-boot42-amd-reset.md
+BOOT_INPUT=input-2b
+RUN_CARD=RUN-CARD-2026-09-02-bootA-intel-vmx.md
+# The config that becomes \hype.cfg. The others are staged beside it as fallbacks.
+ACTIVE_CFG=hype2g.cfg
 
 BOOTLABEL=HYPEBOOT
 # The data partition has NO label. `EADE-CA36` is its exFAT volume UUID, which is what
@@ -92,6 +94,11 @@ if [ "$BUILD" = 1 ]; then
   make clean >/dev/null 2>&1
   EXTRA_CFLAGS="-DHYPE_ENABLE_AVIC=1" make all CC=clang LD=ld.lld >/dev/null 2>&1 || die "AVIC build failed"
   cp build/hype.efi "$STAGEDIR/hype-avic.efi"
+  # The microtest kernels ride along: hype2d/hype2g run them, and a stale .bin proves nothing
+  # about the hype it is staged with.
+  make micro >/dev/null 2>&1 || die "make micro failed"
+  mkdir -p "$STAGEDIR/micro"
+  for m in vmexit vmexitstorm hello; do cp "build/micro/$m.bin" "$STAGEDIR/micro/"; done
   # The two must actually differ, and in the flag rather than only in ld.lld's timestamp.
   grep -aqc 'ENABLING (HYPE_ENABLE_AVIC set)' "$STAGEDIR/hype-avic.efi" >/dev/null 2>&1 || true
   if strings -a "$STAGEDIR/hype-default.efi" | grep -q 'ENABLING (HYPE_ENABLE_AVIC set)'; then
@@ -127,6 +134,7 @@ mk_image() {
 echo "scratch images (#738):"
 IMG_RC=0
 mk_image "hype/disks/run1a-scratch.img" $((2 * 1024 * 1024 * 1024)) || IMG_RC=1
+mk_image "hype/disks/run2b-scratch.img" $((2 * 1024 * 1024 * 1024)) || IMG_RC=1
 
 # ---------------------------------------------------------------- copy
 if [ "$CHECK" = 0 ]; then
@@ -135,6 +143,12 @@ if [ "$CHECK" = 0 ]; then
   cp "$STAGEDIR/hype-avic.efi"    "$BOOTMP/EFI/hype/hype-avic.efi"    || die "copy avic"
   cp "$STAGEDIR/hype-default.efi" "$BOOTMP/EFI/BOOT/BOOTX64.EFI"      || die "copy active"
   cp $HERE/hype*.cfg "$BOOTMP/" || die "copy configs"
+  [ -f "$HERE/$ACTIVE_CFG" ] || die "active config $ACTIVE_CFG not found"
+  cp "$HERE/$ACTIVE_CFG" "$BOOTMP/hype.cfg" || die "copy active config"
+  if [ -d "$STAGEDIR/micro" ]; then
+    mkdir -p "$BOOTMP/EFI/hype/micro"
+    cp "$STAGEDIR"/micro/*.bin "$BOOTMP/EFI/hype/micro/" || die "copy micro kernels"
+  fi
   [ -f "$HERE/$RUN_CARD" ] || die "run card $RUN_CARD not found"
   cp "$HERE/$RUN_CARD" "$BOOTMP/RUN-CARD.md" || die "copy run card"
   # The active input script. Kept under its own name on the drive as well, so which run a
@@ -143,7 +157,7 @@ if [ "$CHECK" = 0 ]; then
   mkdir -p "$BOOTMP/input" "$BOOTMP/$BOOT_INPUT"
   cp "$HERE/$BOOT_INPUT/vm0.txt" "$BOOTMP/input/vm0.txt"      || die "copy input script"
   cp "$HERE/$BOOT_INPUT/vm0.txt" "$BOOTMP/$BOOT_INPUT/vm0.txt" || die "copy input archive"
-  cp docs/hw-validation-queue-2026-08-30.md "$BOOTMP/QUEUE.md" 2>/dev/null || true
+  cp docs/hw-validation-runbook-2026-09-02.md "$BOOTMP/QUEUE.md" 2>/dev/null || true
   cp docs/qemu-vs-hardware.md "$BOOTMP/QEMU-VS-HARDWARE.md" 2>/dev/null || true
   # Logs cleared so the next boot starts from a clean rotation. Archive them FIRST --
   # this script does not, deliberately: losing a boot's evidence is worse than an
@@ -178,6 +192,10 @@ fi
 for c in $HERE/hype*.cfg; do
   verify "$c" "$BOOTMP/$(basename "$c")" "$(basename "$c")"
 done
+verify "$HERE/$ACTIVE_CFG" "$BOOTMP/hype.cfg" "hype.cfg (= $ACTIVE_CFG)"
+if [ -d "$STAGEDIR/micro" ]; then
+  for m in "$STAGEDIR"/micro/*.bin; do verify "$m" "$BOOTMP/EFI/hype/micro/$(basename "$m")" "micro/$(basename "$m")"; done
+fi
 if [ "$CHECK" = 0 ]; then
   verify "$HERE/$BOOT_INPUT/vm0.txt" "$BOOTMP/input/vm0.txt" "input/vm0.txt"
   verify "$HERE/$RUN_CARD" "$BOOTMP/RUN-CARD.md" "RUN-CARD.md"
