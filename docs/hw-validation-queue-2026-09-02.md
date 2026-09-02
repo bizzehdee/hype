@@ -41,3 +41,48 @@ registers and issues a No-Op command 30 s after every keyboard on a controller f
 
 Run card: `tools/hw-val-2026-08-25/RUN-CARD-2026-09-02-boot41-amd-input.md`, set as
 `RUN_CARD` in `stage.sh`. One `CTRLSILENCE` line after the death is the whole point of the run.
+
+## Boot 41 result (AMD 5950X, 2026-09-02)
+
+Build `67a2afd-dirty` (dirty = uncommitted `tools/` cfg edits only), `silence_revive=0`. Run
+2505 s of guest uptime (42 min), stopped by the operator once the Pico and the keyboard were both
+dead. Logs under `tools/hw-val-2026-08-25/logs/boot-41/` (gitignored). Times below are guest
+uptime, taken from the `HB-<uptime>` heartbeats in `RUN1A.LOG`; the `[NNNNNNNNNN]` log stamp is a
+byte count of the log, not a clock.
+
+The probe fired, and it answered boot 40's question: **the controller itself stopped, not the hub.**
+
+```
+CTRLSILENCE ctrl[2]: 3 keyboard(s) silent for 30s
+  USBSTS=0x00000010 HCH=0 HSE=0 EINT=0 PCD=1 HCE=0 | USBCMD=0x00000001 CRCR.CRR=1
+  IMAN=0x00000000 IMOD=0x00000fa0 ERDP=0x141adb840 sw_deq=0x141adb840 pending_event=0
+  PORTSC[4]=0x00000e03 CCS=1 PED=1 PLS=0
+  No-Op FAILED cc=0 in 6043295us, cmd timeouts=1
+command ring still RUNNING 5000 ms after Command Abort (crcr=0x00000008 usbsts=0x00000010)
+```
+
+Every register says healthy: not halted, no host system error, no host controller error, command
+ring Running, root port 4 connected and enabled with its link in U0, the event ring fully consumed
+(hardware ERDP equals the software dequeue, no unconsumed event). Yet a No-Op, which touches no
+device and no hub, produced no completion in 6 s, and Command Abort left CRR set. A hub failure
+cannot do that; a software dequeue fault would show `pending_event=1`. The controller has stopped
+producing events of every kind while reporting that it is running. `PCD=1` is the normal resting
+state of this controller under hype (hype never clears it) and carries no information.
+
+| Time | Event |
+| --- | --- |
+| 458, 845, 1230 s | the Pico left the bus (3, 3 and 2 `cc=4` errors first), period 387 s; re-claimed in 1-5 s each time |
+| 1235 s | first report from the re-claimed Pico |
+| 1262-1271 s | the Pico's last report (1262 s or earlier), the Logitech c547's last report (1269-1271 s), and the hub status polls' last completion (1251-1281 s) |
+| 1306 s | the probe: No-Op issued at silence + 30 s, failed 6 s later, abort ineffective |
+| 2505 s | operator power-off |
+
+| Ticket | Result |
+| --- | --- |
+| **#781** | Answered. The fault is the controller ceasing to process both its command ring and every transfer ring at once, with no error bit raised. Software cannot restart it: Command Abort does nothing. The only recovery is a host controller reset, so **#782-#786 move from "defence in depth" to "required for input to survive a run"** |
+| **#775** | Confirmed as a symptom of the same fault: the endpoints did not lose a completion, the controller stopped issuing them |
+| **#791** | Fixed on hardware. `re-applied: delay 250ms period 33ms` at every Pico re-claim (458, 845, 1230 s); held-key runs 69,69,69,60 before the first drop and 62,66,66,69,61,45,66,68,69,69,61 after. Boot 40 was 68 before, 27 after. The 45 at 837 s ended 8 s before the second bus drop |
+| **#788** | Worse this boot: 13 doubled characters in 120 alphabet passes (4,320 characters, 3.0 per 1,000); boot 40 was 4 in 11,542 (0.35 per 1,000), boot 38 was 1 in 1,395. The first 16 passes (to 371 s) were clean, the 13 fall between 386 s and 1152 s. 0 missing characters |
+| **#787** | Unchanged: 3 drops at a 387 s period, each preceded by `cc=4` transaction errors. The death came 40 s after the third re-arrival; boot 40's came 109 s after its sixth. Two points are not a pattern, but the re-enumeration is the only host-side activity on this controller in the minutes before either death |
+| **#790** | Held: 0 `REVIVE`, 0 `DEADMAN`; the one `cmdring timeout` is the probe's own No-Op |
+| **#426** | Not met: 42 min, input dead from 21 min |
