@@ -80,7 +80,7 @@ document in `.learnings/`. Read the document before touching anything near it.
   [`.learnings/invariant-guest-ram-zeroed.md`](.learnings/invariant-guest-ram-zeroed.md)
 - **No guest gets UNAUTHORIZED direct hardware access** — by default, always
   host-driver + emulated frontend, never passthrough/guest DMA. The one
-  narrow exception (PCI-e passthrough, #699, in design) requires explicit
+  narrow exception (PCI-e passthrough, #699, `plan.md` §10 decision #80) requires explicit
   per-VM identity-based authorization plus IOMMU-enforced DMA/interrupt
   containment — never a default, never positional.
   [`.learnings/invariant-authorized-hw-access.md`](.learnings/invariant-authorized-hw-access.md)

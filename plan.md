@@ -27,9 +27,11 @@ virtualization in v1.
 64-bit distribution), and BSD (any 64-bit variant) — no 32-bit guests of any
 kind. See §10 decision #23.**
 
-Non-goals (v1): live migration, GPU passthrough/SR-IOV, nested virtualization,
-nested-paging tricks beyond basic EPT/NPT, VM memory snapshotting (live RAM
-state), VirtIO ballooning. (A remote management web API and web UI were a v1
+Non-goals (v1): live migration, SR-IOV, nested virtualization, nested-paging
+tricks beyond basic EPT/NPT, VM memory snapshotting (live RAM state), VirtIO
+ballooning. (PCI-e device passthrough, GPU included, was a flat non-goal until
+2026-09-03; decision #80 made it STRETCH-track work in progress, #699, behind
+the authorization boundary that decision states. SR-IOV stays out.) (A remote management web API and web UI were a v1
 non-goal until 2026-09-03; decision #79 promoted them to v1, the MGMT
 milestone.)
 
@@ -186,8 +188,10 @@ on firmware runtime except UEFI Runtime Services we explicitly keep mapped
 - Require: VT-x/AMD-V + EPT/NPT + unrestricted guest (Intel) or equivalent
   (AMD always has this). No support for ancient CPUs lacking EPT/NPT — shadow
   paging is out of scope for a "thin" hypervisor.
-- IOMMU (VT-d/AMD-Vi) required only if we ever add passthrough — out of scope
-  for v1, but reserve the design space.
+- IOMMU (VT-d/AMD-Vi) required only on a host that assigns a device to a
+  guest (decision #80, #699): AMD-Vi first, VT-d after, behind one driver
+  interface. A host with no `backing = passthrough` device in `hype.cfg`
+  needs no IOMMU and never touches it.
 
 ## 5. Multi-guest / multi-OS-family model
 
@@ -926,16 +930,17 @@ checking them:
 - **Not covered by the fault-isolation watchdog (§6g)**: that watchdog
   detects hangs and exit-reason anomalies, not memory-safety violations —
   it's a liveness mechanism, not a substitute for input validation here.
-- **No guest gets direct hardware access in v1**: physical disk (§6d) and
-  physical NIC (§6e) access are always mediated through the hypervisor's
-  own host-side driver plus an emulated guest-facing frontend
-  (virtio-blk/AHCI, virtio-net/e1000-class) — never PCI passthrough or
-  direct DMA from a guest to real hardware. This is why no IOMMU (VT-d/
-  AMD-Vi) is required for v1 (§4); it also means the validation above is
-  the *only* thing standing between a guest and the host for storage/
-  network I/O, since there's no hardware-enforced DMA remapping backing it
-  up. If passthrough is ever added later (explicitly out of scope for v1),
-  this invariant must be revisited alongside an IOMMU requirement.
+- **No guest gets UNAUTHORIZED direct hardware access** (amended 2026-08-23,
+  decision #80 on 2026-09-03): physical disk (§6d) and physical NIC (§6e)
+  access are always mediated through the hypervisor's own host-side driver
+  plus an emulated guest-facing frontend (virtio-blk/AHCI, virtio-net/
+  e1000-class). The one exception is a PCI function an operator has
+  explicitly assigned to one VM by durable identity, with its DMA confined to
+  that VM's GPA range by the IOMMU and its interrupts remapped to that VM's
+  vCPUs (decision #80). For every other device, the validation above is the
+  *only* thing standing between a guest and the host for storage/network I/O,
+  exactly as before: the IOMMU is required only on a host that assigns a
+  device, and its presence does not relax any software check.
 
 ## 6k. Scripted guest input (headless validation)
 
@@ -4052,6 +4057,98 @@ isn't lost.
     management bullets are stubs pointing here; §15's "board ahead of the plan" note is
     closed. AGENTS.md carries no inbound-connection line, so nothing there changes.
 
+80. **PCI-e device passthrough: the authorization boundary -- decided (2026-09-03, #700
+    PASSTHRU-1). The invariant becomes "no guest gets UNAUTHORIZED direct hardware access";
+    AMD-Vi lands first; assignment is by durable identity with a ceremony at least as strict
+    as decision #8's; hype owns every reset; nothing else moves.**
+
+    **1. The invariant.** Amended on 2026-08-23 and ratified here: *no guest gets
+    unauthorized direct hardware access.* Authorized means all of: the PCI function is named
+    in that VM's own `hype.cfg` by durable identity; its DMA is confined by the IOMMU to that
+    VM's GPA range; its interrupts are remapped so they can target only that VM's vCPUs.
+    Every function not so named stays exactly as absolute as before: host driver plus emulated
+    frontend, never guest DMA. This is one narrow exception, not a loosening; §6j, §14.1,
+    §14.2, §14.8, `.learnings/invariant-authorized-hw-access.md` and AGENTS.md carry the same
+    words.
+
+    **2. AMD-Vi first, VT-d second, one interface.** The 5950X desktop is the only validation
+    machine with PCIe slots and a discrete GPU to assign; both Intel machines are laptops
+    with an integrated GPU and a BitLocker system disk, and the Intel nested box is a VM.
+    The SVM backend is also the more proven one (this week's VMX runs found two host-level
+    faults, decisions #795/#796). So #701 is the AMD-Vi driver, written behind an IOMMU
+    vtable of decision #34's shape (attach/detach a function to a domain, map/unmap a GPA
+    range, remap an interrupt), and the VT-d driver is a second implementation of that
+    interface, not a parallel design. No VT-d code is written until AMD-Vi carries a device
+    on hardware (#707's AMD leg).
+
+    **3. What "assigned" means in `hype.cfg`.** A device block, in the shape `[disk.*]`
+    already uses:
+
+    ```
+    [device.gpu0]
+    type = pci
+    backing = passthrough
+    id_match = 10de:2484           ; vendor:device, mandatory
+    bdf = 0000:01:00.0             ; mandatory, must agree with id_match
+    serial = <DSN or subsystem id> ; mandatory when the function exposes a DSN capability
+    allow_passthrough = true       ; the explicit per-device flag, like allow_overwrite
+    ```
+
+    and `devices = gpu0` in one `[vm.*]` section. Both `id_match` and `bdf` must match the
+    enumerated function or the device is refused with both values printed; a function named
+    by BDF alone, by slot order, or by "the GPU" is never assigned. **Whole IOMMU groups
+    only:** every function that shares the group (a GPU and its HDMI audio function) is
+    assigned to the same VM or none is. One VM per group, ever; two VMs naming the same
+    group is a config error at admission (§6i).
+
+    **4. The ceremony.** At least decision #8's, because a wrong assignment hands a DMA
+    engine to a guest:
+    - identity match as above, at every boot, against what the bus enumerates now;
+    - an interactive confirmation on the local dashboard naming vendor, device, BDF and the
+      VM, before the function is detached from the host, every boot, not scriptable
+      (the same rule #125 applies to physical writes);
+    - **refusals that no flag overrides:** any function in the IOMMU group of the controller
+      carrying hype's boot medium or log sink (decision #75's role record, #783), the xHCI
+      carrying the operator's keyboard, the NIC that is hype's NAT uplink, the IOMMU itself,
+      any host bridge, and the GOP device unless a decision #77 USB console is bound first;
+    - refusal when the host has no IOMMU, or the IOMMU does not cover the function, or the
+      function is not in a group of its own or of functions all assigned to the same VM.
+    A refused assignment stops that VM at admission and says why; it never falls back to an
+    emulated device silently.
+
+    **5. Reset and failure ownership: hype, always.** Before the function is handed over:
+    bus-master disable, FLR (or #706's vendor quirk path for a GPU that has none), IOMMU
+    domain created and the VM's GPA range mapped, interrupts remapped, then the guest sees
+    the function. On every teardown -- Stop, Shutdown, Force off, a guest crash, the DEADMAN
+    path -- in this order: bus-master disable, wait for DMA to quiesce, FLR, IOMMU domain
+    destroyed, and only then §6h's RAM zeroing and reuse. A function that fails its reset is
+    **quarantined** for the rest of the run: never returned to host use, never reassigned,
+    named in the log, the same "left dead and said so" rule decision #75 uses for a
+    controller. Handing the function back to a host driver is not planned: hype has no
+    driver for a GPU, and a NIC assigned to a guest is not the uplink (refusal above).
+
+    **6. What does not change.** Guest isolation (§6g): re-derived with a real device by #705
+    before any assignment is called validated; until #705 passes, passthrough is a
+    diagnostic build. CPU-time isolation (§3, decision #39): untouched. Guest RAM zeroing
+    (§6h): untouched in substance, ordered after DMA quiescence above. The physical-write
+    guard (decision #8): untouched; a passthrough disk controller is refused if it carries
+    any `physical:` target. §6j software validation for every device hype drives: untouched,
+    and the IOMMU's incidental cover of hype's own rings is not relied on. Decision #51's
+    shared-line rule for emulated devices: untouched; remapped MSI/MSI-X exists for assigned
+    functions only. Nested virtualization and SR-IOV: still out.
+
+    **Rejected.** Assignment by BDF alone (moves when a card is added); a global
+    `passthrough = on` switch (authorization is per device, per VM); handing a device back
+    to the host after a guest (no consumer, and a failed reset would be invisible);
+    starting with VT-d (no machine to validate on); allowing a partial IOMMU group (the
+    other function's DMA would be unconfined).
+
+    **Board.** #699's sub-issues are unblocked in the order this decision implies: #701
+    (AMD-Vi), #702 (interrupt remapping), #703 (assignment framework and the `[device.*]`
+    block), #704 (reset), #705 (isolation re-derivation), #706 (GPU quirks), #707 (hardware,
+    AMD leg first), #793 (USB console, decision #77). #130 (STRETCH-3, passthrough NIC) is
+    a consumer of the same framework and is not a separate design.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what
@@ -4214,11 +4311,12 @@ before any controller is programmed.
 Gap: hype's own memory has no hardware backstop against a misprogrammed or
 malicious device — software validation is the only line.
 
-Disposition: **deliberately not planned for v1.** The plan's own boundary is
-§6j software validation; an IOMMU adds hardware defense-in-depth only, at the
-cost of a full AMD-Vi/VT-d driver pair. If passthrough ever lands (#130,
-STRETCH), the IOMMU becomes mandatory and must ship with it — §6j already
-says so.
+Disposition: **promoted by decision #80 (2026-09-03), for assigned devices
+only.** #701 (PASSTHRU-2) is the AMD-Vi driver, VT-d follows behind the same
+interface; the IOMMU ships with the first assigned device and is mandatory for
+it. For every device hype drives itself, §6j software validation stays the
+boundary; the IOMMU's coverage of hype's own rings is defense-in-depth that
+nothing relies on.
 
 ### 14.2 Interrupt remapping and MSI/MSI-X virtualization
 
@@ -4232,9 +4330,11 @@ cycles from AP vCPUs).
 
 Gap: none beyond what decision 51 already defers.
 
-Disposition: **deliberately deferred by decision 51.** No ticket; raising one
-now would contradict that decision. The trigger for revisiting is written in
-decision 51: a device that cannot share a line.
+Disposition: **deferred by decision 51 for emulated devices; met for assigned
+ones.** A passthrough device cannot share an IO-APIC line, which is exactly
+decision 51's stated trigger, so #702 (PASSTHRU-3) remaps its MSI/MSI-X to the
+owning VM's vCPUs through the IOMMU (decision #80). Emulated devices are
+unchanged: NO_VECTOR, shared lines.
 
 ### 14.3 APIC / x2APIC virtualization
 
@@ -4347,8 +4447,9 @@ their own contracts (virtio device_status=0 path is modeled and tested).
 
 Gap: none — FLR is a passthrough concept.
 
-Disposition: **not applicable under the no-passthrough architecture.** If
-#130 ever promotes, FLR arrives with it, alongside 14.1's IOMMU.
+Disposition: **promoted by decision #80.** #704 (PASSTHRU-5) is the FLR path;
+decision #80 fixes who resets when (hype, before assignment and after every
+teardown, with a failed reset quarantining the device for the run).
 
 ### 14.9 virtio completion and error paths
 

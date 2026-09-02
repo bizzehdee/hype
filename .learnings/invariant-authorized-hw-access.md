@@ -33,3 +33,13 @@ PCI passthrough — it still goes host-driver → emulated frontend.)
 
 This is why v1 needed no IOMMU; passthrough is the one thing that changes
 that, and only for a device an operator explicitly assigned.
+
+**Ratified as `plan.md` §10 decision #80 (2026-09-03, #700).** That decision
+fixes what this note leaves open: AMD-Vi first behind one IOMMU interface,
+the `[device.*]` config block (`id_match` AND `bdf` both mandatory, whole
+IOMMU groups only, `allow_passthrough = true`), the boot-time dashboard
+confirmation and the refusal list (never the controller carrying the boot
+medium or log sink, the input xHCI, the uplink NIC, the IOMMU, a host bridge,
+or the GOP device without a USB console), and reset ownership (hype resets
+before assignment and after every teardown; a failed reset quarantines the
+function for the run). Read decision #80 before touching any of it.
