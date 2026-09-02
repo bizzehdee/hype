@@ -17,7 +17,7 @@ it.
 
 | Boot | Machine | Config | Closes | Legs | Records |
 | --- | --- | --- | --- | --- | --- |
-| Intel-A | Intel box | `hype2g.cfg` | #698 #729 | #525 #603 | |
+| Intel-A (re-run) | i5-13420H | `hype2g.cfg` | #698 | #525 | |
 | AMD-1 | 5950X | `hype1g.cfg` | #426 #775 #790 | #525 #603 | #641 #788 |
 | AMD-2 | 5950X | `hype3g.cfg` (to write) | #388 #715 | | #660 #713 |
 | AMD-3 | 5950X | drive rebuild, `hype3b.cfg` | #687 #688 #689 #653 #754 | | |
@@ -27,6 +27,9 @@ two more legs. #599/#605 need a fifth boot with a different binary and are a dia
 #708 is fixed (below).
 
 ## Boot Intel-A -- staged, `RUN-CARD-2026-09-02-bootA-intel-vmx.md`
+
+**First attempt (2026-09-03, build 1daa028) closed #729 and #603's VMX leg; vm0 stalled on the
+CR0.CD fault fixed in f26b67c (see the queue doc). Re-run at f26b67c for #525 and #698.**
 
 One Alpine live guest (2 vCPUs, reboot pinned to CPU 1 by `input-2b/vm0.txt`) plus the three
 #603 microtests. Seven physical cores with the BSP. If admission refuses a VM, fall back to

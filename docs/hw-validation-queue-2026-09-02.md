@@ -161,3 +161,41 @@ missing character.
 | **#790** | Held: 0 `REVIVE`, 0 `DEADMAN`; the 3 `cmdring timeout`s are the probe's No-Ops |
 | **#734 / #746** | Hot-plug of a keyboard on the reset controller at 66 min: departed and re-claimed in 1 s, typing resumed |
 | **#426** | 71 min with input working at the end. First run since boot 30 to end with a live keyboard |
+
+## Boot A result (Intel i5-13420H, 2026-09-03)
+
+Build `1daa028-dirty`, config `hype2g.cfg` (Alpine reboot-pin guest, 2 vCPUs granted as 4 logical
+CPUs, plus the three #603 microtests). Run 190 s, operator-stopped: the Alpine guest took a
+minute to leave firmware, reached GRUB, loaded the kernel and then stopped making visible
+progress. Logs under `tools/hw-val-2026-08-25/logs/bootA-intel/` (gitignored).
+
+**The microtests passed; the Alpine guest was starved by hype's own loop.**
+
+| Ticket | Result |
+| --- | --- |
+| **#729** | Met: `micro/vmexit: MSR round-trip (MTRR var0 base) wrote 0x123456000, read back 0x0000000123456000`, `0 probe(s) failed out of the non-fatal set` |
+| **#603** (VMX leg) | Met: every probe ok, `vmexit` triple-faulted on purpose and `vm1 'micro/vmexit' STOPPED`, `WATCHDOG vm2: faulted: unhandled-exit storm ... forcing THIS vm off; others keep running`, `MICRO PASS: hello`, vm0 kept running. SVM leg = boot AMD-1 |
+| **#525 #698** (VMX legs) | No result: vm0 never reached the restart |
+
+Why vm0 stalled, from its own counters:
+
+```
+fw-1 COSTHIST: mean_per_exit vmrun=25271ns body=741965ns (vmrun_tot=6000ms body_tot=181000ms)
+fw-1 LOOPPHASE: diag=3716ms persist=11ms house=176710ms dispatch=923ms [#365]
+fw-1 BSPPROBE vm0: exits=244434 last=0x1f@0xffffffffac09b1c7 IN-HOST for 7812ms section=5 [#483]
+fw-1 GUESTPC vm0: exits=244435 ... cr0=0xc0050033 cr3=0x113a4000 cr4=0x2070 ...
+```
+
+The guest executed for 6 s of the 190 s. The other 176 s were hype's housekeeping between two
+exits, 1-13 s per exit. Every stalled sample shows the guest's CR0 with CD (bit 30) and NW
+(bit 29) set: 0xc0000033 while OVMF programmed its MTRRs, 0xc0050033 while Linux's mtrr code
+did the same. The only two samples with CD clear (0x80000033) sit exactly where the exit count
+jumped 836 to 937 and 939 to 69634, the two fast bursts. Boot 2a on this machine (build 976e71a)
+never showed CD set in 140 samples and spent 148 us per MSR exit against 34,990 us here. The
+difference is #729's MTRR model: with round-tripping MTRRs, Linux runs its full cache-disable
+programming sequence, and hype let that CD reach the physical CR0. The same config under nested
+SVM (`tools/698/run-2g.sh`) passed the whole script in 66 s.
+
+Fix: f26b67c owns CR0.CD and CR0.NW in the VMX CR0 guest/host mask, strips them from the hardware
+guest CR0 and keeps them in the read shadow, as KVM does. Drive re-staged at f26b67c with the
+same card; boot A is owed again.
