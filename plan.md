@@ -387,6 +387,14 @@ distinct from any guest's own console:
   same bare-metal-friendly shape rather than falling back to a plain text
   console by default. This decision needs revisiting when M8-1 is
   actually scoped/started, not decided in the abstract now.
+- **Console output device**: the dashboard draws on the GOP framebuffer that
+  UEFI hands hype, and that is the only display path in v1. When a PCIe GPU is
+  passed through to a guest (#699, gated on #700), that framebuffer belongs to
+  the guest and hype loses its screen. Decision #77 names the replacement: a
+  USB display adapter, driven by hype's own xHCI stack, becomes the host
+  console's display target, chosen at boot when the GOP device is a
+  passthrough GPU. The dashboard's drawing code targets a linear framebuffer
+  either way; only the sink changes. Ticket #793.
 - **Navigation**: arrow keys / number keys to select a VM from the list and
   switch the framebuffer + keyboard focus to that guest's own console;
   another hotkey press returns to the dashboard. **Input exclusivity while
@@ -595,7 +603,12 @@ to fetch the base system, and any online-account/update flow does too.
   vtable of decision #34, sitting on the shared host-PCI bind + DMA-ring +
   IRQ/poll facility that decision grows from this work — same isolation
   principle as `blk_backend`, and no second PCI enumerator alongside
-  `core/host_pci.c`.
+  `core/host_pci.c`. **USB Ethernet adapters are a second host-NIC source**
+  (decision #78): the USB CDC-ECM/NCM class driver first, vendor chips
+  (ASIX AX88179, Realtek RTL8153) after, each a driver behind the same NIC
+  vtable, transported by hype's xHCI stack instead of a PCI DMA ring. A
+  machine whose PCIe NIC is passed through to a guest, or that has none to
+  spare, still gets an uplink. Ticket #794.
 - **Forwarding plane, never an endpoint** (decision #36): host NAT genuinely
   requires protocol code — Ethernet framing, ARP for the uplink, IPv4 header
   parsing, UDP/TCP address/port rewriting with checksum fixup, and a
@@ -3910,6 +3923,56 @@ isn't lost.
     at commitment, so a bit can be set marginally before the guest takes the interrupt; the IRR
     is read at fault time, so it is exact for the reader it exists for.
 
+
+77. **A USB display adapter is the host console's display when the GOP device is passed
+    through to a guest -- decided in principle (2026-09-03), gated on #700.**
+
+    GPU passthrough is still a v1 non-goal (§1) until PASSTHRU-1 (#700) lands its own
+    decision; this one records what that decision must include so it is not discovered on
+    the machine. Passing the only GPU to a guest takes the framebuffer hype draws its
+    dashboard on. Without a second display the operator loses the host view exactly when it
+    matters most: during the bring-up of a device hype has just given away. A USB display
+    adapter plugged into the host is that second display, driven by hype's own xHCI stack
+    (§6b, #793).
+
+    **Selection is at boot, not on the fly.** If `hype.cfg` assigns the GOP's PCI device to a
+    guest, hype must find a supported USB display adapter before it starts that guest, bind
+    the dashboard to it, and refuse the passthrough if none is present -- the same
+    "refuse loudly rather than run blind" rule §6i's admission control applies to storage.
+    Hot-plugging the adapter later is not required; hot-unplugging it is handled like any
+    other USB departure (decision #73) and leaves the dashboard headless, which the log
+    records.
+
+    **The protocol question comes first.** DisplayLink's DL-3xxx/6xxx protocol is
+    proprietary and undocumented; the class-standard candidates and any adapter with an
+    open or reverse-engineered protocol must be surveyed (research-provenance skill) before
+    hardware is bought. #793's first task is that survey; nothing else in it starts until
+    an adapter with a workable protocol is named. The dashboard code is unaffected: it draws
+    into a linear framebuffer today and keeps doing so; the adapter driver's job is to move
+    that framebuffer to the device at a rate the dashboard's refresh (§6b) already tolerates.
+
+78. **USB Ethernet adapters are a supported host-NIC source, class driver first -- decided
+    (2026-09-03).**
+
+    Decision #36's family list is PCI-only. A machine that hands its PCIe NIC to a guest
+    (#699), or a laptop with no second NIC, has no uplink for §6e's NAT. USB Ethernet is the
+    ordinary answer on real machines and hype already owns the transport: every USB
+    adapter sits behind the xHCI stack that carries the log sink and the boot medium.
+
+    **CDC-ECM/NCM first, vendor chips after.** The USB Communications Device Class is
+    documented by the USB-IF and needs no vendor knowledge; many adapters and every phone
+    tether speak it. ASIX AX88179 and Realtek RTL8153 are the two vendor families worth a
+    driver, in that order, only once the class driver carries traffic on real hardware.
+
+    **Same vtable, different transport.** A USB NIC is one more driver behind decision #34's
+    NIC vtable; the forwarding plane (decision #36) does not learn what carries the frames.
+    What differs is the data path: bulk transfers on the xHCI stack instead of a PCI DMA
+    ring, so this driver shares decision #75's rule that the controller carrying the log
+    sink is never reset, and adds a new consumer to the USB transfer lock the input tick
+    and the log flush already share (#484). Throughput is bounded by that lock and by
+    USB 3 bulk, not by the NIC; the bar is "an uplink that works", measured against the
+    PCIe path, not parity with it. Ticket #794. This extends decision #36 and does not
+    reopen its endpoint/forwarding-plane boundary.
 
 ## 11. Pre-M0 readiness checklist
 
