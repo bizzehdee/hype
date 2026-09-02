@@ -199,3 +199,35 @@ SVM (`tools/698/run-2g.sh`) passed the whole script in 66 s.
 Fix: f26b67c owns CR0.CD and CR0.NW in the VMX CR0 guest/host mask, strips them from the hardware
 guest CR0 and keeps them in the read shadow, as KVM does. Drive re-staged at f26b67c with the
 same card; boot A is owed again.
+
+## Boot A2 result (Intel i5-13420H, 2026-09-03)
+
+Build `f26b67c-dirty` (the CR0.CD fix), same config. The stick's `HYPE.LOG` ends at t=69 s;
+the machine ran on for some minutes with the dashboard freezing and stuttering, VM switching
+struggling and the dashboard's log counter reaching 139 KB behind, then hype locked completely.
+Logs under `tools/hw-val-2026-08-25/logs/bootA2-intel/` (gitignored).
+
+**The CR0.CD fix held.** Every `GUESTPC vm0` sample reads `cr0=0x80050033`; the guest booted
+through GRUB into the kernel, brought its APs up (`TMRLATE vm0/1 deliveries=1043 -> 2015`) and
+reached "verifying modloop" on screen. #795's mechanism is gone.
+
+**The BSP is starved by the PS/2 poll.** Same number in both Intel runs, absent on the 5950X:
+
+```
+fw-1 BSPCOST input 82% total=49766ms hits=2475422 mean=20us [#773]        (A2, i5-13420H)
+fw-1 BSPCOST input 81% total=1911145ms hits=1052720529 mean=1us [#773]    (boot 42, 5950X)
+```
+
+`fw_1_host_input_poll()` reads the i8042 status port once per BSP loop iteration. On this
+laptop the i8042 is behind the embedded controller and one read costs 20 us; at 42,000
+iterations a second that is 84% of the BSP, leaving the dashboard, the leader chord and the log
+flush the rest. Fixed in 92c23a0: the polled read is gated to 4 kHz (a PS/2 byte takes ~1 ms on
+the wire), the IRQ path is untouched, and `KBDIRQ` now prints `ps2reads=` and the slowest read.
+Ticket #796.
+
+**The final lock is unrecorded.** Nothing after t=69 s reached the stick, although the flush was
+healthy at that point (`USBFLUSH ... behind=1151B`). The last breadcrumb is `BSPALIVE phase=2`
+(input). Whether the rate limit also removes the lock is the first thing the re-run answers.
+
+Drive re-staged at 92c23a0, same card. Boot A is owed a third time; it still carries #525 and
+#698's VMX legs, and now #795 and #796.
