@@ -1185,7 +1185,7 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
      *              EFER = LME|LMA (loaded via the entry control set above). */
     uint64_t guest_cr0 = long_mode ? 0x80000031ull /* PG|NE|ET|PE */ : 0x00000030ull /* ET|NE */;
     uint64_t guest_cr4 = long_mode ? 0x00002020ull /* PAE|VMXE */ : 0x00002000ull /* VMXE */;
-    rc |= vmwrite(HYPE_VMCS_GUEST_CR0, guest_cr0);
+    rc |= vmwrite(HYPE_VMCS_GUEST_CR0, guest_cr0 & ~(HYPE_VMX_CR0_CD | HYPE_VMX_CR0_NW));
     rc |= vmwrite(HYPE_VMCS_GUEST_CR3, long_mode ? guest_cr3 : 0);
     rc |= vmwrite(HYPE_VMCS_GUEST_CR4, guest_cr4);
     /* #248: write GUEST_IA32_EFER in BOTH cases now that load-IA32_EFER is always
@@ -1267,8 +1267,18 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
      * (#248). An unowned PG loads silently and hype would never know. PG is NOT
      * masked out of the read shadow below -- unlike VMXE and NE it is the guest's
      * own bit, so it must read back exactly as the guest set it.
+     *
+     * CR0.CD and CR0.NW are owned for a third reason: they must never reach the hardware.
+     * In VMX non-root operation a guest CR0.CD=1 disables the physical core's caches, and
+     * the slowdown outlives the exit -- Intel boot A (i5-13420H, 2026-09-03) measured hype's
+     * own housekeeping between two exits at 1-13 SECONDS whenever the guest's CR0 read
+     * 0xc0050033 (Linux's mtrr cache_disable() window), and normal speed the moment it read
+     * 0x80000033. The guest still sees the value it wrote (the read shadow keeps CD/NW), and
+     * its memory stays cached, which is what KVM does too (KVM_VM_CR0_ALWAYS_OFF). A guest
+     * that needs UC memory says so through the MTRRs/PAT hype models, not through CD.
      */
-    rc |= vmwrite(HYPE_VMCS_CR0_GUEST_HOST_MASK, HYPE_VMX_CR0_NE | HYPE_VMX_CR0_PG);
+    rc |= vmwrite(HYPE_VMCS_CR0_GUEST_HOST_MASK,
+                  HYPE_VMX_CR0_NE | HYPE_VMX_CR0_PG | HYPE_VMX_CR0_CD | HYPE_VMX_CR0_NW);
     rc |= vmwrite(HYPE_VMCS_CR4_GUEST_HOST_MASK, HYPE_VMX_CR4_VMXE);
     rc |= vmwrite(HYPE_VMCS_CR0_READ_SHADOW, guest_cr0 & ~HYPE_VMX_CR0_NE);
     rc |= vmwrite(HYPE_VMCS_CR4_READ_SHADOW, guest_cr4 & ~HYPE_VMX_CR4_VMXE);
@@ -5221,7 +5231,14 @@ void hype_vmx_vcpu_get_debug_state(hype_vcpu_ctx_t *ctx, hype_svm_debug_state_t 
 
     out->cs_selector = (uint16_t)vmread(HYPE_VMCS_GUEST_CS_SELECTOR, &ok);
     out->cs_base = vmread(HYPE_VMCS_GUEST_CS_BASE, &ok);
-    out->cr0 = vmread(HYPE_VMCS_GUEST_CR0, &ok);
+    {   /* The GUEST's view: host-owned bits (NE, PG, CD, NW) come from the read shadow. This
+         * is how boot A's GUESTPC showed cr0=0xc0050033 -- the diagnostic must keep saying
+         * what the guest set even now that CD/NW never reach the hardware field. */
+        uint64_t hw = vmread(HYPE_VMCS_GUEST_CR0, &ok);
+        uint64_t mask = vmread(HYPE_VMCS_CR0_GUEST_HOST_MASK, &ok);
+        uint64_t shadow = vmread(HYPE_VMCS_CR0_READ_SHADOW, &ok);
+        out->cr0 = (hw & ~mask) | (shadow & mask);
+    }
     out->cr3 = vmread(HYPE_VMCS_GUEST_CR3, &ok);
     out->cr4 = vmread(HYPE_VMCS_GUEST_CR4, &ok);
     out->rip = vmread(HYPE_VMCS_GUEST_RIP, &ok);
@@ -5376,7 +5393,9 @@ int hype_vmx_vcpu_handle_cr_access(hype_vcpu_ctx_t *ctx) {
         (void)vmwrite(HYPE_VMCS_GUEST_CR4, value | HYPE_VMX_CR4_VMXE);
         (void)vmwrite(HYPE_VMCS_CR4_READ_SHADOW, value);
     } else if (crn == 0u) {
-        (void)vmwrite(HYPE_VMCS_GUEST_CR0, value | HYPE_VMX_CR0_NE);
+        /* NE forced on, CD/NW forced off in hardware; the shadow shows the guest its own value. */
+        (void)vmwrite(HYPE_VMCS_GUEST_CR0,
+                      (value | HYPE_VMX_CR0_NE) & ~(HYPE_VMX_CR0_CD | HYPE_VMX_CR0_NW));
         (void)vmwrite(HYPE_VMCS_CR0_READ_SHADOW, value);
         /* PG may just have changed: re-derive long-mode state before the next
          * entry, or entry fails its guest-state checks (#248). */

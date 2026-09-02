@@ -282,6 +282,13 @@
 /* CR0.PG. Host-owned (#248) so hype sees the guest enabling/disabling paging and
  * can keep EFER.LMA and the IA-32e-mode-guest entry control in step with it. */
 #define HYPE_VMX_CR0_PG (1ull << 31)
+/* Cache Disable / Not Write-through. Never allowed into the hardware guest CR0 (see the CR0
+ * guest/host mask in hype_vmx_vcpu_init): a guest running with CD=1 in VMX non-root operation
+ * turns the physical core's caches off, and on the i5-13420H that made hype's own loop 1000x
+ * slower for as long as Linux's mtrr code held CD set. KVM masks the same two bits
+ * (KVM_VM_CR0_ALWAYS_OFF). */
+#define HYPE_VMX_CR0_CD (1ull << 30)
+#define HYPE_VMX_CR0_NW (1ull << 29)
 /*
  * A usable flat data-segment AR byte (#251): P=1, DPL=0, S=1, type=3
  * (data, read/write, accessed), D/B=1, G=1 -- and crucially WITHOUT bit 16, the
