@@ -4104,6 +4104,23 @@ void hype_vmx_vcpu_wake_hlt(hype_vcpu_ctx_t *ctx) {
 }
 
 /*
+ * #750/#698: clear ONLY the STI blocking bit, leaving RIP and the activity state alone -- the
+ * VMX twin of hype_svm_vcpu_clear_intr_shadow(). A HLT exit is fault-like: RIP still names the
+ * HLT and the hardware re-saves blocking-by-STI as set, because the instruction after the STI
+ * has not "executed". Left set, vmx_can_accept_interrupt() refuses every delivery, the vector
+ * waits in the IRR, and the only path that clears the bit (wake_hlt) needs a delivery to have
+ * happened -- the same deadlock #750 measured on SVM. KVM's handle_halt clears the shadow for
+ * the same reason.
+ */
+void hype_vmx_vcpu_clear_intr_shadow(hype_vcpu_ctx_t *ctx) {
+    vmx_ensure_current(ctx);
+    int ok;
+    uint64_t block = vmread(HYPE_VMCS_GUEST_INTERRUPTIBILITY_STATE, &ok);
+    vmwrite(HYPE_VMCS_GUEST_INTERRUPTIBILITY_STATE,
+            block & ~(uint64_t)HYPE_VMX_INTERRUPTIBILITY_BLOCKING_BY_STI);
+}
+
+/*
  * #523: fill the four VMCS-derived fields of the snapshot. Owner-only -- the caller must
  * already hold this vCPU's VMCS current, which is true at every VM exit.
  */

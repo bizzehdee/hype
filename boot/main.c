@@ -5154,6 +5154,14 @@ static void vmm_wake_hlt(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
         hype_svm_vcpu_wake_hlt(ctx);
     }
 }
+/* #750/#698: the spent STI shadow at a HLT exit, on either backend. */
+static void vmm_clear_intr_shadow(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_vcpu_clear_intr_shadow(ctx);
+    } else {
+        hype_svm_vcpu_clear_intr_shadow(ctx);
+    }
+}
 /*
  * #455: a vector queued in pending_irr (via request_interrupt(), while the guest
  * couldn't yet accept it) is never re-checked against the PIC's CURRENT mask state
@@ -13411,10 +13419,15 @@ wait_for_sipi:
              *
              * Measured: a vCPU entered every ~410ms with a LAPIC timer pending in its IRR
              * for 284 seconds, and the guest reporting `swapper/2 stuck for 265s`.
+             *
+             * #698: on BOTH backends. The #750 fix was SVM-only, and VMX has the identical
+             * gate -- vmx_can_accept_interrupt() reads blocking-by-STI from the VMCS, and a
+             * fault-like HLT exit re-saves it set every time the vCPU re-enters at the HLT.
+             * #698's frozen AP timer on bare-metal Intel (deliveries fixed at 2275 for 22
+             * minutes after a restart, the vCPU executing throughout) is this deadlock's VMX
+             * face; the restart is just the moment the AP first idles with nothing pending.
              */
-            if (kind == HYPE_VMM_KIND_SVM) {
-                hype_svm_vcpu_clear_intr_shadow(ctx);
-            }
+            vmm_clear_intr_shadow(kind, ctx);
             ap_at_hlt = 1;
         } else if (vmm_reason_is_intr_window(kind, info.reason)) {
             vmm_handle_intr_window(kind, ctx, lapic);
