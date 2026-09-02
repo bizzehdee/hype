@@ -663,6 +663,11 @@ void hype_xhci_int_in_revive_health(hype_xhci_ctrl_t *c, unsigned int slot,
                                     unsigned int ep_addr, unsigned long long *fails,
                                     unsigned long long *stopped);
 
+/* 1 if the build revives an interrupt-IN endpoint on silence alone (HYPE_INT_IN_SILENCE_REVIVE),
+ * 0 if only a halted endpoint is rebuilt. Printed on every HIDTICK line so a hardware log
+ * states which policy produced it. */
+unsigned int hype_xhci_silence_revive_enabled(void);
+
 /* Command-ring health: timeouts seen, abort/restart recoveries performed, and whether the
  * ring has been given up on. `dead` non-zero means every device on this controller is
  * unreachable. */

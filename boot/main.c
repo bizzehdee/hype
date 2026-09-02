@@ -43,6 +43,7 @@
 #include "../core/nat.h"            /* NET-4 (#83) */
 #include "../core/arp.h"
 #include "../core/xhci.h"
+#include "../core/int_in_queue.h"
 #include "../core/usb_hid.h" /* USB-5 (#217): HID boot-keyboard host input */
 #include "../core/scancode.h"  /* INPUT-11 (#284): ASCII -> PS/2 Set-1 for `sendkey` */
 #include "../core/scancode_queue.h" /* #375: BSP -> focused guest keyboard */
@@ -8642,14 +8643,15 @@ static void fw_1_hid_watch(uint64_t now_h, uint64_t hz) {
         hype_debug_print("fw-1 HIDTICK[%u]: %04x:%04x slot%u ep=0x%02x polls=%llu reports=%llu "
                          "arms=%llu lost=%llu skipped=%llu hcevt=%llu ringfull=%llu evict=%llu "
                          "revives=%llu revive_fail=%llu stopped=%llu | cmdring timeouts=%llu "
-                         "guard=%llu recoveries=%llu%s | mouse polls=%llu reports=%llu [#775]\n",
+                         "guard=%llu recoveries=%llu%s silence_revive=%u | mouse polls=%llu "
+                         "reports=%llu [#775]\n",
                          k, (unsigned)kb->vid, (unsigned)kb->pid, kb->slot, kb->ep,
                          kb->polls, kb->reports,
                          hype_xhci_int_in_arms((hype_xhci_ctrl_t *)&kb->xc, kb->slot, kb->ep),
                          lost, skipped, hce, rfull, evict,
                          hype_xhci_int_in_revives((hype_xhci_ctrl_t *)&kb->xc, kb->slot, kb->ep),
                          rfail, stopped, cmdto, cmdguard, cmdrec, cmddead ? " DEAD" : "",
-                         g_mouse_polls, g_mouse_reports);
+                         hype_xhci_silence_revive_enabled(), g_mouse_polls, g_mouse_reports);
     }
 }
 
@@ -24986,10 +24988,13 @@ static hype_xhci_ctrl_t g_mouse_xc; /* #219: may be a DIFFERENT controller from 
  * Called from wherever hype already drains host keystrokes; a no-op until a keyboard
  * has been claimed, so machines without one are unaffected.
  */
+static void hid_handle_report(hype_host_kbd_t *kb, const uint8_t *report, uint8_t *codes,
+                              unsigned int codes_cap, unsigned int *injected);
+
 static unsigned int usb_hid_drain(void) {
     uint8_t report[HYPE_USB_HID_REPORT_LEN];
     uint8_t codes[HYPE_USB_HID_MAX_SCANCODES];
-    unsigned int n, i, k;
+    unsigned int k, drained;
     unsigned int injected = 0;
     int r;
 
@@ -25058,44 +25063,66 @@ static unsigned int usb_hid_drain(void) {
             g_hid_lock_missed++;
             continue;
         }
-        r = hype_xhci_int_in_poll(&kb->xc, kb->slot, kb->ep, report, HYPE_USB_HID_REPORT_LEN);
+        /*
+         * #788: take EVERY completed report this tick, not one.
+         *
+         * The endpoint keeps HYPE_INT_IN_DEPTH transfers outstanding, so between two ticks
+         * the controller can retire several -- a press and its release are 8 ms apart on
+         * the Pico, the tick is 8-10 ms. Taking one per tick left the release queued behind
+         * the press, and the typematic clock (#774) runs on tick time: any stall of a
+         * quarter second between those two ticks -- a log flush burst, a diagnostic dump --
+         * made the held key repeat once before its release was read. One doubled character
+         * in about thirty passes, never a dropped one, is #788's report. Bounded by the
+         * queue depth plus one, so a device that never stops talking cannot hold the tick.
+         */
+        for (drained = 0; drained <= HYPE_INT_IN_DEPTH; drained++) {
+            r = hype_xhci_int_in_poll(&kb->xc, kb->slot, kb->ep, report,
+                                      HYPE_USB_HID_REPORT_LEN);
+            if (r <= 0) {
+                break;
+            }
+            kb->reports++;
+            kb->mods_seen |= report[0];
+            hid_handle_report(kb, report, codes, (unsigned)sizeof(codes), &injected);
+        }
         hype_blk_usb_unlock();
+        /* 0 = idle, the normal case. -1 = a transfer error; #734 recovers the halted
+         * endpoint down in the poll and re-arms it, so a single failed transfer costs
+         * one report rather than the keyboard. Either way the OTHER keyboards are
+         * still polled -- one dead board must not silence the rest, which is half of
+         * why claiming them all is worth doing. */
         if (r < 0) {
             kb->errs++;
         }
-        if (r <= 0) {
-            /* 0 = idle, the normal case. -1 = a transfer error; #734 recovers the halted
-             * endpoint down in the poll and re-arms it, so a single failed transfer costs
-             * one report rather than the keyboard. Either way the OTHER keyboards are
-             * still polled -- one dead board must not silence the rest, which is half of
-             * why claiming them all is worth doing. */
-            continue;
-        }
-        kb->reports++;
-        kb->mods_seen |= report[0];
-        if (kb->reports == 1u) {
-            /* Say it ONCE PER KEYBOARD. "Endpoint configured" and "reports actually
-             * arrive" are different claims, and only the second means the operator can
-             * type -- without this line a keyboard that enumerates but never reports looks
-             * identical to a working one in the log, on machines where the log is all
-             * there is. */
-            hype_debug_print("host-hid: FIRST report received from %04x:%04x slot%u -- that "
-                             "USB keyboard is live [#217 #742]\n",
-                             (unsigned)kb->vid, (unsigned)kb->pid, kb->slot);
-        }
-        hype_usb_hid_typematic_note(&kb->typematic, report, fw_1_now_ms()); /* #774 */
-        n = hype_usb_hid_report_to_scancodes(kb->have_prev ? kb->prev : 0, report, codes,
-                                             (unsigned)sizeof(codes));
-        for (i = 0; i < HYPE_USB_HID_REPORT_LEN; i++) {
-            kb->prev[i] = report[i];
-        }
-        kb->have_prev = 1;
-        for (i = 0; i < n; i++) {
-            hype_host_kbd_inject_scancode(codes[i]);
-        }
-        injected += n;
     }
     return injected;
+}
+
+static void hid_handle_report(hype_host_kbd_t *kb, const uint8_t *report, uint8_t *codes,
+                              unsigned int codes_cap, unsigned int *injected) {
+    unsigned int n, i;
+
+    if (kb->reports == 1u) {
+        /* Say it ONCE PER KEYBOARD. "Endpoint configured" and "reports actually
+         * arrive" are different claims, and only the second means the operator can
+         * type -- without this line a keyboard that enumerates but never reports looks
+         * identical to a working one in the log, on machines where the log is all
+         * there is. */
+        hype_debug_print("host-hid: FIRST report received from %04x:%04x slot%u -- that "
+                         "USB keyboard is live [#217 #742]\n",
+                         (unsigned)kb->vid, (unsigned)kb->pid, kb->slot);
+    }
+    hype_usb_hid_typematic_note(&kb->typematic, report, fw_1_now_ms()); /* #774 */
+    n = hype_usb_hid_report_to_scancodes(kb->have_prev ? kb->prev : 0, report, codes,
+                                         codes_cap);
+    for (i = 0; i < HYPE_USB_HID_REPORT_LEN; i++) {
+        kb->prev[i] = report[i];
+    }
+    kb->have_prev = 1;
+    for (i = 0; i < n; i++) {
+        hype_host_kbd_inject_scancode(codes[i]);
+    }
+    *injected += n;
 }
 
 /*

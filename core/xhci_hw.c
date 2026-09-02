@@ -86,6 +86,26 @@
 #define XHCI_POLL_PEEK 1u
 /* #764: polls an interrupt-IN endpoint may sit armed and silent before hype re-arms it. */
 #define HYPE_INT_IN_SILENT_MAX 4000u
+/*
+ * The silence-triggered revive is OFF by default.
+ *
+ * Boots 8-26 (no revive path) had zero command-ring wedges. Boots 27-39 (revive path present)
+ * had ten in thirteen, and in every one the command that never completed was the revive's
+ * Stop Endpoint -- the first line after each `#266 command TIMEOUT` is `REVIVE FAILED ...
+ * Stop Endpoint did not complete`. Boot 38 wedged ctrl1, boot 39 ctrl2, so it is the command,
+ * not a controller. 174 of the 264 revives issued targeted endpoints with zero reports so far:
+ * hub status-change endpoints and an unused mouse endpoint, idle rather than deaf. Silence
+ * cannot tell those apart, and the false positive is not free -- it is a Stop Endpoint, and
+ * that is what stops the ring.
+ *
+ * The condition the revive guarded against (boot 18, a lost first completion) had its causes
+ * fixed by #761/#766/#773, and HYPE_INT_IN_DEPTH outstanding transfers make a single lost
+ * completion cost one report. Build with -DHYPE_INT_IN_SILENCE_REVIVE=1 to A/B the old
+ * behaviour on hardware; the halted-endpoint recovery path is unaffected either way.
+ */
+#ifndef HYPE_INT_IN_SILENCE_REVIVE
+#define HYPE_INT_IN_SILENCE_REVIVE 0
+#endif
 /* #764 capture: how often to compare the controller's dequeue against ours while armed. */
 /* #775: polls an endpoint may be armed with NOTHING ever reported before it is reset.
  * ~16 s at 125 Hz -- far longer than any device takes to say something for the first time. */
@@ -2379,7 +2399,8 @@ static int int_in_poll_body(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int
      * ring busy enough that the Pico's condition was almost never tested. Counting silence
      * correctly is useless if the test only runs when the bus is quiet.
      */
-    if (iin->q.inflight != 0u && iin->silent_polls >= iin->revive_after) {
+    if (HYPE_INT_IN_SILENCE_REVIVE && iin->q.inflight != 0u &&
+        iin->silent_polls >= iin->revive_after) {
         unsigned int after = iin->revive_after;
         iin->silent_polls = 0;
         if (int_in_revive(c, slot, dci, iin) == 0) {
@@ -3987,6 +4008,10 @@ void hype_xhci_int_in_revive_health(hype_xhci_ctrl_t *c, unsigned int slot,
  * reported HSE/HCE, or the ring could not be restarted. Every device on this controller is
  * unreachable at that point, and saying so is the whole reason this exists.
  */
+unsigned int hype_xhci_silence_revive_enabled(void) {
+    return HYPE_INT_IN_SILENCE_REVIVE ? 1u : 0u;
+}
+
 void hype_xhci_cmd_ring_health(hype_xhci_ctrl_t *c, unsigned long long *timeouts,
                                unsigned long long *guard, unsigned long long *recoveries,
                                int *dead) {
