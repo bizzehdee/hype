@@ -788,3 +788,25 @@ int hype_xhci_cc_is_stopped(uint32_t cc) {
     return (cc == HYPE_XHCI_CC_STOPPED || cc == HYPE_XHCI_CC_STOPPED_LENGTH ||
             cc == HYPE_XHCI_CC_STOPPED_SHORT) ? 1 : 0;
 }
+
+int hype_xhci_may_reset(const hype_xhci_reset_policy_t *p, unsigned int ctrl_idx,
+                        const char **reason) {
+    int is_log, is_boot;
+    const char *why = "";
+
+    if (p == (const hype_xhci_reset_policy_t *)0 || ctrl_idx == 0u) {
+        if (reason) *reason = "controller not identified";
+        return 0;
+    }
+    is_log = (p->log_ctrl != 0u && p->log_ctrl == ctrl_idx);
+    is_boot = (p->boot_ctrl != 0u && p->boot_ctrl == ctrl_idx);
+    if (is_log && is_boot) {
+        why = "carries the log sink and the boot medium";
+    } else if (is_log) {
+        why = "carries the log sink";
+    } else if (is_boot) {
+        why = "carries the boot medium";
+    }
+    if (reason) *reason = why;
+    return (is_log || is_boot) ? 0 : 1;
+}

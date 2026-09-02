@@ -1251,6 +1251,50 @@ static void test_744_release_slot_null_and_zero_safe(void) {
     CHECK_INT("slot 0 released nothing", 1, (int)keys[0].used);
 }
 
+
+/* #783: the reset refusal is pure logic over two recorded controller indices. */
+static void test_783_may_reset_a_controller_carrying_nothing(void) {
+    hype_xhci_reset_policy_t p = { 1u, 1u };
+    const char *why = (const char *)0;
+    CHECK_INT("ctrl 2 carries nothing", 1, hype_xhci_may_reset(&p, 2u, &why));
+    CHECK_INT("no reason when allowed", 0, why[0] != '\0');
+}
+
+static void test_783_refuses_the_log_controller(void) {
+    hype_xhci_reset_policy_t p = { 2u, 0u };
+    const char *why = (const char *)0;
+    CHECK_INT("log ctrl refused", 0, hype_xhci_may_reset(&p, 2u, &why));
+    CHECK_INT("reason names the log", 0, why == (const char *)0 || why[0] == '\0');
+    CHECK_INT("other ctrl allowed", 1, hype_xhci_may_reset(&p, 1u, &why));
+}
+
+static void test_783_refuses_the_boot_controller(void) {
+    hype_xhci_reset_policy_t p = { 0u, 1u };
+    const char *why = (const char *)0;
+    CHECK_INT("boot ctrl refused", 0, hype_xhci_may_reset(&p, 1u, &why));
+    CHECK_INT("reason set", 0, why == (const char *)0 || why[0] == '\0');
+    CHECK_INT("ctrl 2 allowed", 1, hype_xhci_may_reset(&p, 2u, &why));
+}
+
+static void test_783_names_both_roles_on_one_controller(void) {
+    hype_xhci_reset_policy_t p = { 1u, 1u };
+    const char *why = (const char *)0;
+    CHECK_INT("refused", 0, hype_xhci_may_reset(&p, 1u, &why));
+    /* The reason must mention both, or the operator reads half the truth. */
+    CHECK_INT("mentions log", 1, why != (const char *)0 &&
+              why[0] == 'c' && why[12] == 'l'); /* "carries the log sink and ..." */
+}
+
+static void test_783_unknown_controller_is_never_reset(void) {
+    hype_xhci_reset_policy_t p = { 0u, 0u };
+    const char *why = (const char *)0;
+    CHECK_INT("index 0 refused", 0, hype_xhci_may_reset(&p, 0u, &why));
+    CHECK_INT("reason set", 0, why == (const char *)0 || why[0] == '\0');
+    CHECK_INT("null policy refused", 0, hype_xhci_may_reset((const hype_xhci_reset_policy_t *)0, 2u, &why));
+    CHECK_INT("null reason tolerated", 0, hype_xhci_may_reset(&p, 0u, (const char **)0));
+    CHECK_INT("nothing recorded: any real index allowed", 1, hype_xhci_may_reset(&p, 3u, &why));
+}
+
 int main(void) {
     test_744_note_departed_clears_slot_and_owner();
     test_744_note_departed_is_a_no_op_for_a_position_with_nothing_on_it();
@@ -1302,6 +1346,11 @@ int main(void) {
     test_parked_drop_slot();
     test_int_in_pool();
 
+    test_783_may_reset_a_controller_carrying_nothing();
+    test_783_refuses_the_log_controller();
+    test_783_refuses_the_boot_controller();
+    test_783_names_both_roles_on_one_controller();
+    test_783_unknown_controller_is_never_reset();
     if (failures == 0) {
         printf("all tests passed\n");
         return 0;

@@ -352,6 +352,14 @@ static void fw_1_usb_storage_departed(hype_xhci_ctrl_t *xc, unsigned int ctrl_id
 static hype_xhci_ctrl_t g_live_xc[HYPE_LIVE_XHCI_MAX];
 static unsigned int g_live_xc_idx[HYPE_LIVE_XHCI_MAX];
 static unsigned int g_live_xc_count;
+static void fw_1_xhci_reset_controller(unsigned int k); /* #785 */
+/*
+ * #783 (decision 75): which controllers carry the log sink and the boot medium, in the
+ * enumeration log's 1-based numbers. Recorded at the moment each role is taken, reported once
+ * after the sweep, and consulted before any controller reset. 0 = no controller has that role.
+ */
+static hype_xhci_reset_policy_t g_xhci_reset_policy;
+static unsigned int g_fw1_sweep_ctrl_idx; /* the controller the boot sweep is on; 0 outside it */
 /*
  * #742: EVERY claimed keyboard, not the first one.
  *
@@ -21133,6 +21141,34 @@ static void media_add_dev(int (*rd)(void *, uint64_t, uint32_t, void *),
 }
 
 /*
+ * #784: the removal path media_add_dev() never had. Same identity it deduplicates on, (read
+ * fn, ctx). The table is compacted and the serial pointers re-aimed at their moved buffers,
+ * so a `media_disk` lookup by serial cannot land on a name whose backend is gone -- #780 is
+ * what a half-tracked identity costs. Returns 1 if an entry was removed.
+ */
+static int media_remove_dev(int (*rd)(void *, uint64_t, uint32_t, void *), void *ctx) {
+    unsigned i, m;
+    for (i = 0; i < g_media_dev_count; i++) {
+        if (g_media_devs[i].read == rd && g_media_devs[i].ctx == ctx) {
+            break;
+        }
+    }
+    if (i >= g_media_dev_count) {
+        return 0;
+    }
+    for (m = i; m + 1u < g_media_dev_count; m++) {
+        g_media_devs[m] = g_media_devs[m + 1u];
+        (void)hype_strlcpy(g_media_dev_serial_buf[m], g_media_dev_serial_buf[m + 1u],
+                           sizeof(g_media_dev_serial_buf[m]));
+    }
+    g_media_dev_count--;
+    for (m = 0; m < g_media_dev_count; m++) {
+        g_media_dev_serial[m] = g_media_dev_serial_buf[m];
+    }
+    return 1;
+}
+
+/*
  * #323: which host device VM `vi`'s media must come from -- a drive index,
  * HYPE_ADM_MEDIA_AUTO (no drive named; the caller iterates every candidate, the pre-#323
  * behaviour), or HYPE_ADM_MEDIA_ABSENT (a drive WAS named and is not present; refuse).
@@ -25497,6 +25533,34 @@ static int fw_1_usb_enumerate_behind_hub(hype_xhci_ctrl_t *xc, unsigned int ctrl
 }
 
 /* #746: release every claimed HID whose route says it sits behind `hub_slot` on `port`. */
+/*
+ * Drop g_hid[j] and close the gap. The drain walks 0..count, so a hole would either be polled
+ * as a dead device forever or need a per-entry live flag every reader would have to check.
+ * Field by field: this is a freestanding build and a struct with an array inside assigns
+ * through memcpy, which does not exist here. The typematic state travels too (#791: a
+ * keyboard's repeat rate is the guest's setting, and losing it on a neighbour's departure
+ * would be the same bug by another route).
+ */
+static void fw_1_hid_forget(unsigned int j) {
+    unsigned int m;
+    for (m = j; m + 1u < g_hid_count; m++) {
+        hype_host_kbd_t *dst = &g_hid[m];
+        const hype_host_kbd_t *src = &g_hid[m + 1u];
+        unsigned int z;
+        dst->xc = src->xc;
+        dst->slot = src->slot; dst->ep = src->ep; dst->mps = src->mps;
+        dst->root_port = src->root_port;
+        dst->ctrl_idx = src->ctrl_idx; dst->route = src->route;
+        dst->vid = src->vid; dst->pid = src->pid;
+        for (z = 0; z < HYPE_USB_HID_REPORT_LEN; z++) dst->prev[z] = src->prev[z];
+        dst->have_prev = src->have_prev;
+        dst->polls = src->polls; dst->reports = src->reports;
+        dst->errs = src->errs; dst->mods_seen = src->mods_seen;
+        dst->typematic = src->typematic;
+    }
+    g_hid_count--;
+}
+
 static void fw_1_usb_release_behind_hub(hype_xhci_ctrl_t *xc, unsigned int hub_slot,
                                         unsigned int port) {
     unsigned int j;
@@ -25529,25 +25593,8 @@ static void fw_1_usb_release_behind_hub(hype_xhci_ctrl_t *xc, unsigned int hub_s
         (void)hype_xhci_release_device(xc, g_hid[j].slot);
         (void)hype_usb_inventory_note_departed(&g_usb_inv, g_hid[j].ctrl_idx,
                                                g_hid[j].root_port, g_hid[j].route);
-        {
-            unsigned int m;
-            for (m = j; m + 1u < g_hid_count; m++) {
-                hype_host_kbd_t *dst = &g_hid[m];
-                const hype_host_kbd_t *src = &g_hid[m + 1u];
-                unsigned int z;
-                dst->xc = src->xc;
-                dst->slot = src->slot; dst->ep = src->ep; dst->mps = src->mps;
-                dst->root_port = src->root_port;
-                dst->ctrl_idx = src->ctrl_idx; dst->route = src->route;
-                dst->vid = src->vid; dst->pid = src->pid;
-                for (z = 0; z < HYPE_USB_HID_REPORT_LEN; z++) dst->prev[z] = src->prev[z];
-                dst->have_prev = src->have_prev;
-                dst->polls = src->polls; dst->reports = src->reports;
-                dst->errs = src->errs; dst->mods_seen = src->mods_seen;
-            }
-            g_hid_count--;
-            j--;
-        }
+        fw_1_hid_forget(j);
+        j--;
     }
     if (g_mouse_ready && g_mouse_xc.bar == xc->bar) {
         int mi = hype_usb_inventory_find(&g_usb_inv, 0u, g_mouse_root_port, route_bits);
@@ -25576,6 +25623,15 @@ static void fw_1_usb_hotplug_poll(void) {
         hype_xhci_ctrl_t *xc = &g_live_xc[k];
         unsigned int port;
 
+        /*
+         * #785: a controller whose command ring has been given up on gets reset here -- the
+         * same place its devices would be enumerated, under the same lock discipline --
+         * rather than in the driver that noticed, which cannot know what is on it.
+         */
+        if (hype_xhci_reset_wanted(xc)) {
+            fw_1_xhci_reset_controller(k);
+            continue;
+        }
         /*
          * #769: drain this controller's event ring first. Port-change events are banked
          * where events are dequeued, and nothing dequeues a controller that has no claimed
@@ -25634,30 +25690,8 @@ static void fw_1_usb_hotplug_poll(void) {
                  * that is not there. */
                 (void)hype_usb_inventory_note_departed(&g_usb_inv, g_hid[j].ctrl_idx,
                                                        g_hid[j].root_port, g_hid[j].route);
-                /*
-                 * Compact the array rather than leaving a hole. The drain walks 0..count,
-                 * and a hole would either be polled as a dead device forever or need a
-                 * per-entry live flag that every reader would have to remember to check.
-                 */
-                {
-                    unsigned int m;
-                    for (m = j; m + 1u < g_hid_count; m++) {
-                        hype_host_kbd_t *dst = &g_hid[m];
-                        const hype_host_kbd_t *src = &g_hid[m + 1u];
-                        unsigned int z;
-                        dst->xc = src->xc;
-                        dst->slot = src->slot; dst->ep = src->ep; dst->mps = src->mps;
-                        dst->root_port = src->root_port;
-                        dst->ctrl_idx = src->ctrl_idx; dst->route = src->route;
-                        dst->vid = src->vid; dst->pid = src->pid;
-                        for (z = 0; z < HYPE_USB_HID_REPORT_LEN; z++) dst->prev[z] = src->prev[z];
-                        dst->have_prev = src->have_prev;
-                        dst->polls = src->polls; dst->reports = src->reports;
-                        dst->errs = src->errs; dst->mods_seen = src->mods_seen;
-                    }
-                    g_hid_count--;
-                    j--; /* re-test this index, it now holds the next device */
-                }
+                fw_1_hid_forget(j);
+                j--; /* re-test this index, it now holds the next device */
             }
             if (g_mouse_ready && g_mouse_xc.bar == xc->bar && g_mouse_root_port == port) {
                 hype_debug_print("host-hid: mouse on port %u slot%u DEPARTED -- releasing its "
@@ -25890,6 +25924,250 @@ static void fw_1_usb_storage_departed(hype_xhci_ctrl_t *xc, unsigned int ctrl_id
     }
 }
 
+
+/*
+ * #784 (decision 75): release everything controller `k` owns, in an order that leaves no
+ * dangling pointer at any step. Storage first, so a medium stops accepting I/O before
+ * anything else runs; then the claimed HIDs and the mouse; then the inventory rows. The
+ * driver-side state -- interrupt-IN blocks, hub table rows, MSC bulk blocks, device
+ * contexts -- is released by hype_xhci_host_init() when it re-claims the ring block, which
+ * is what the reset that follows this does. Nothing here issues a command to the controller:
+ * it is being torn down because commands do not complete.
+ */
+typedef struct {
+    unsigned int kbd, mouse, media, inventory, hubs, arrivals;
+} fw_1_ctrl_release_t;
+
+static void fw_1_usb_release_ctrl(unsigned int k, fw_1_ctrl_release_t *n) {
+    hype_xhci_ctrl_t *xc = &g_live_xc[k];
+    unsigned int idx = g_live_xc_idx[k];
+    unsigned int i, j;
+
+    n->kbd = n->mouse = n->media = n->inventory = n->hubs = n->arrivals = 0u;
+
+    /* Storage: every inventory row on this controller that still has a slot is offered to the
+     * departure path, which marks the phys backend gone if it is one of hype's media. */
+    for (i = 0; i < g_usb_inv.count; i++) {
+        const hype_usb_devinfo_t *d = &g_usb_inv.dev[i];
+        if (d->controller == idx && d->slot != 0u) {
+            fw_1_usb_storage_departed(xc, idx, d->root_port, d->route);
+        }
+    }
+    for (i = 0; i < HYPE_MEDIA_USBX && i < g_musbx_count; i++) {
+        if (g_musbx_hw[i].ctrl != 0 && g_musbx_hw[i].ctrl->bar == xc->bar &&
+            media_remove_dev(g_musbx_rd[i], 0)) {
+            n->media++;
+        }
+    }
+    for (j = 0; j < g_hid_count && j < HYPE_HOST_KBD_MAX; j++) {
+        if (g_hid[j].xc.bar != xc->bar) continue;
+        fw_1_hid_forget(j);
+        j--;
+        n->kbd++;
+    }
+    if (g_mouse_ready && g_mouse_xc.bar == xc->bar) {
+        g_mouse_ready = 0;
+        g_mouse_slot = 0;
+        n->mouse++;
+    }
+    for (i = 0; i < g_usb_inv.count; i++) {
+        hype_usb_devinfo_t *d = &g_usb_inv.dev[i];
+        if (d->controller == idx && d->slot != 0u) {
+            d->slot = 0u;
+            d->owner = (uint8_t)HYPE_USB_OWNER_NONE;
+            n->inventory++;
+        }
+    }
+    for (i = 0; i < hype_xhci_hub_count(); i++) {
+        unsigned int hctrl = 0;
+        if (hype_xhci_hub_at(i, &hctrl, 0, 0, 0) == 0 && hctrl == xc->hw_slot) n->hubs++;
+    }
+    /* A port hype gave up on gets a fresh set of attempts: the device behind it is being
+     * re-enumerated from nothing, exactly as if it had been unplugged. */
+    for (i = 0; i < HYPE_ARRIVAL_FAIL_SLOTS; i++) {
+        if (g_arrival_fail[i].used && g_arrival_fail[i].ctrl_idx == idx) {
+            g_arrival_fail[i].used = 0;
+            n->arrivals++;
+        }
+    }
+}
+
+/*
+ * #785: the root-port sweep the boot path runs, for a controller that has just come back from
+ * a reset. Everything on it is enumerated from nothing: hubs are configured and walked, boot
+ * HIDs are re-claimed through the same fw_1_claim_boot_hid() an arrival uses (#745's rule for
+ * a whole controller). Mass storage is inventoried and released, not registered: a medium on a
+ * reset controller was torn down by #784 and is an operator's decision to re-attach, not a
+ * side effect of input recovering.
+ */
+static void fw_1_usb_rescan_controller(hype_xhci_ctrl_t *xc, unsigned int idx,
+                                       unsigned int *out_ports, unsigned int *out_devices) {
+    static uint8_t cfgbuf[512];
+    uint8_t desc[18];
+    unsigned int rp;
+    unsigned int keep_budget = 3u; /* as the boot sweep's */
+    unsigned int mcount_before = g_mouse_ready ? 1u : 0u;
+
+    *out_ports = 0u;
+    *out_devices = 0u;
+    for (rp = 1u; rp <= xc->max_ports; rp++) {
+        unsigned int speed = 0, slot = 0, cfglen = 0;
+        hype_xhci_devpath_t path;
+        uint8_t cls;
+
+        if (!hype_xhci_reset_port(xc, rp, &speed)) continue;
+        (*out_ports)++;
+        if (hype_xhci_enable_slot(xc, &slot) != 0 || slot == 0u) continue;
+        path.root_port = rp;
+        path.route = 0u;
+        path.speed = speed;
+        path.tt_hub_slot = 0u;
+        path.tt_port = 0u;
+        if (hype_xhci_address_device(xc, slot, &path) != 0 ||
+            hype_xhci_get_device_descriptor(xc, slot, desc) != 0) {
+            hype_debug_print("host-usb: port %u did not address after the reset [#785]\n", rp);
+            (void)hype_xhci_release_device(xc, slot);
+            continue;
+        }
+        (void)hype_xhci_get_config_descriptor(xc, slot, cfgbuf, sizeof(cfgbuf), &cfglen);
+        cls = fw_1_usb_record(&g_usb_inv, idx, &path, slot, desc, cfgbuf, cfglen);
+        (*out_devices)++;
+        if (hype_xhci_dev_is_hub(desc)) {
+            if (cfglen >= 6u && hype_xhci_set_configuration(xc, slot, cfgbuf[5]) == 0) {
+                fw_1_hub_visit_ctx_t vctx;
+                unsigned int no_slot = 0;
+                hype_xhci_devpath_t no_path;
+                hype_xhci_msc_eps_t no_eps;
+                vctx.controller = idx;
+                vctx.msc_slot = &no_slot;
+                vctx.msc_path = &no_path;
+                vctx.msc_eps = &no_eps;
+                vctx.msc_wanted = 0;
+                vctx.keep_budget = &keep_budget;
+                if (hype_xhci_hub_walk(xc, slot, &path, 1u, fw_1_hub_visit, &vctx) ==
+                    HYPE_XHCI_HUB_NOT_WALKED) {
+                    hype_debug_print("host-usb: hub on port %u was NOT walked after the reset "
+                                     "[#785 #739]\n", rp);
+                }
+            }
+            continue; /* the hub's slot stays: it is the parent of what the walk recorded */
+        }
+        if (cls != HYPE_USB_CLASS_HID) {
+            int ii = hype_usb_inventory_find(&g_usb_inv, idx, rp, 0u);
+            if (ii >= 0) g_usb_inv.dev[ii].slot = 0u;
+            (void)hype_xhci_release_device(xc, slot);
+        }
+    }
+    /* Devices behind hubs are counted by the walk's own recording; this is the total the
+     * inventory now holds for the controller, which is what the operator wants to compare
+     * against the pre-reset count. */
+    {
+        unsigned int i, tot = 0;
+        for (i = 0; i < g_usb_inv.count; i++) {
+            if (g_usb_inv.dev[i].controller == idx && g_usb_inv.dev[i].slot != 0u) tot++;
+        }
+        *out_devices = tot;
+    }
+    fw_1_claim_boot_hid(xc, idx, HYPE_USB_PROTO_KEYBOARD, "keyboard", g_hid, &g_hid_count,
+                        HYPE_HOST_KBD_MAX, &g_hid_skipped);
+    if (!g_mouse_ready) {
+        static hype_host_kbd_t mouse_rescan;
+        unsigned int mcount = mcount_before, mskip = 0;
+        fw_1_claim_boot_hid(xc, idx, HYPE_USB_PROTO_MOUSE, "mouse", &mouse_rescan, &mcount, 1u,
+                            &mskip);
+        if (mcount != 0u) {
+            g_mouse_xc = mouse_rescan.xc;
+            g_mouse_slot = mouse_rescan.slot;
+            g_mouse_ep = mouse_rescan.ep;
+            g_mouse_mps = mouse_rescan.mps;
+            g_mouse_root_port = mouse_rescan.root_port;
+            g_mouse_ready = 1;
+        }
+    }
+}
+
+/*
+ * #785 (decision 75): reset a controller whose command ring cannot be restarted, and bring
+ * everything on it back. Entered only where cmd_dead is latched: a command timed out, the
+ * abort was a full 64-bit CRCR write, and CRR was still set after xHCI 4.6.1.2's five
+ * seconds (or the controller raised HSE/HCE).
+ *
+ * Refused for the controller carrying the log sink or the boot medium (#783): staying deaf
+ * with the evidence intact beats recovering input and losing the record of why. Bounded and
+ * counted: a controller that needs this every few minutes is a different bug, and a recovery
+ * good enough to hide it is a recovery that stops anyone finding it.
+ *
+ * This blocks the input tick for the whole of it -- HCRST, the 150 ms connect debounce, and
+ * a dozen commands per device -- so the line says how long it took.
+ */
+#define HYPE_XHCI_MAX_RESETS 3u
+#define HYPE_XHCI_RESET_LOCK_SPINS 200000u
+
+static void fw_1_xhci_reset_controller(unsigned int k) {
+    static unsigned int resets[HYPE_LIVE_XHCI_MAX];
+    static unsigned char said[HYPE_LIVE_XHCI_MAX];
+    hype_xhci_ctrl_t *xc = &g_live_xc[k];
+    unsigned int idx = g_live_xc_idx[k];
+    const char *why = "";
+    fw_1_ctrl_release_t rel;
+    unsigned int ports = 0, devices = 0, kbd_after = 0, j, spins;
+    uint64_t t0, hz = g_vms[0].host_tsc_hz;
+    int rc;
+
+    if (!hype_xhci_may_reset(&g_xhci_reset_policy, idx, &why)) {
+        if (!said[k]) {
+            said[k] = 1;
+            hype_debug_print("fw-1 XHCIRESET ctrl[%u]: REFUSED -- it %s; staying dead with the "
+                             "evidence intact rather than resetting the controller the log is "
+                             "written through [#783]\n", idx, why);
+        }
+        return;
+    }
+    if (resets[k] >= HYPE_XHCI_MAX_RESETS) {
+        if (!said[k]) {
+            said[k] = 1;
+            hype_debug_print("fw-1 XHCIRESET ctrl[%u]: reset %u times already and wedged again "
+                             "-- left dead. A controller that needs this every few minutes is a "
+                             "different bug [#785]\n", idx, resets[k]);
+        }
+        return;
+    }
+    /* The whole reset runs under the USB transfer lock: an AP streaming media from the OTHER
+     * controller must not see this one's rings rebuilt under it. Bounded, as every BSP
+     * acquisition is; a miss is retried on the next tick. */
+    for (spins = 0; hype_blk_usb_try_lock() != 0; spins++) {
+        if (spins >= HYPE_XHCI_RESET_LOCK_SPINS) return;
+    }
+    t0 = hype_rdtsc();
+    resets[k]++;
+    hype_debug_print("fw-1 XHCIRESET ctrl[%u]: reset #%u begins -- releasing everything on it, "
+                     "then HCRST [#784 #785]\n", idx, resets[k]);
+    fw_1_usb_release_ctrl(k, &rel);
+    hype_xhci_host_quiesce(xc);
+    rc = hype_xhci_host_init(xc->bar, xc);
+    xc->log_id = idx;
+    if (rc != 0) {
+        hype_blk_usb_unlock();
+        hype_debug_print("fw-1 XHCIRESET ctrl[%u]: reset #%u FAILED -- the controller did not "
+                         "come back from HCRST (released kbd=%u mouse=%u media=%u inventory=%u "
+                         "hubs=%u); it stays dead [#785]\n", idx, resets[k], rel.kbd, rel.mouse,
+                         rel.media, rel.inventory, rel.hubs);
+        return;
+    }
+    fw_1_usb_rescan_controller(xc, idx, &ports, &devices);
+    hype_blk_usb_unlock();
+    for (j = 0; j < g_hid_count && j < HYPE_HOST_KBD_MAX; j++) {
+        if (g_hid[j].xc.bar == xc->bar) kbd_after++;
+    }
+    hype_debug_print("fw-1 XHCIRESET ctrl[%u]: reset #%u done in %llu ms | released kbd=%u "
+                     "mouse=%u media=%u inventory=%u hubs=%u retry-slots=%u | back: ports=%u "
+                     "devices=%u keyboards=%u mouse=%u [#785]\n",
+                     idx, resets[k],
+                     hz != 0ull ? (unsigned long long)((hype_rdtsc() - t0) / (hz / 1000ull)) : 0ull,
+                     rel.kbd, rel.mouse, rel.media, rel.inventory, rel.hubs, rel.arrivals,
+                     ports, devices, kbd_after,
+                     (g_mouse_ready && g_mouse_xc.bar == xc->bar) ? 1u : 0u);
+}
 
 /* Try to mount a FAT32 volume on the stick and open the log file on it. The FAT
  * can live at LBA 0 (superfloppy), inside an MBR partition (LBA 0 is a Master
@@ -26513,6 +26791,9 @@ static int usb_log_setup(const hype_blk_backend_t *be) {
         if (rc == HYPE_LOG_SINK_OK) {
             unsigned long long boot_n;
             g_hype_log_ready = 1;
+            if (g_xhci_reset_policy.log_ctrl == 0u) {
+                g_xhci_reset_policy.log_ctrl = g_fw1_sweep_ctrl_idx; /* #783 */
+            }
             g_usb_log_ready = 1; /* "a log sink is up", the gate the flush path uses */
             hype_fatal_set_flush_hook(usb_log_fatal_flush); /* #513: a panic must reach the stick */
             /* #643: as close to this generation's first line as the boot order allows -- the
@@ -28696,6 +28977,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 /* Give the controller the number the rest of the log calls it by, so a line
                  * from inside the driver and a line from the enumeration agree. */
                 xc.log_id = xhci_count;
+                g_fw1_sweep_ctrl_idx = xhci_count; /* #783: usb_log_setup() records it */
                 unsigned int rp;
                 unsigned int msc_found = 0;
                 hype_debug_print("host-xhci: up -- slots=%u ports=%u ctx=%uB\n",
@@ -29065,6 +29347,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                 if (!msc_found_any) {
                                     g_usb_xc = xc;
                                     g_usb_msc = msc;
+                                    g_xhci_reset_policy.boot_ctrl = xhci_count; /* #783 */
                                     hype_blk_usb_init(&g_usb_ubk, &g_usb_uphys, &g_usb_ube,
                                                       &g_usb_xc, msc_slot, &g_usb_msc, 512u,
                                                       (uint64_t)last_lba + 1u);
@@ -29192,6 +29475,24 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 }
             }
         } /* while (each xHCI controller) */
+        g_fw1_sweep_ctrl_idx = 0u;
+        /*
+         * #783: ONE line for what boot 35 needed three greps and a port scan to establish. A
+         * controller named here is never reset (#785); the operator reading a later
+         * XHCIRESET line can check the refusal against this without reconstructing the bus.
+         */
+        hype_debug_print("fw-1 XHCIOWN: log sink on ctrl[%u], boot medium on ctrl[%u] (0 = none "
+                         "on USB) -- those controllers are never reset [#783]\n",
+                         g_xhci_reset_policy.log_ctrl, g_xhci_reset_policy.boot_ctrl);
+        {
+            unsigned int wctrl = 0;
+            unsigned int wms = hype_xhci_wedge_injection_ms(&wctrl);
+            if (wms != 0u) {
+                hype_debug_print("fw-1 XHCIOWN: #782 WEDGE INJECTION ARMED -- ctrl[%u]'s first "
+                                 "command after %u ms will wedge; this is a diagnostic build\n",
+                                 wctrl, wms);
+            }
+        }
         /*
          * USB-7 (#241): the inventory dump. One line per device, so the topology is
          * observable rather than inferred from a failure trace -- which is what the

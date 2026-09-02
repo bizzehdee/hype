@@ -106,6 +106,25 @@
 #ifndef HYPE_INT_IN_SILENCE_REVIVE
 #define HYPE_INT_IN_SILENCE_REVIVE 0
 #endif
+
+/*
+ * #782 (decision 75): the command-ring wedge, ON DEMAND.
+ *
+ * The real wedge has shown up in three boots out of eleven, and every observation cost a
+ * cold boot. -DHYPE_781_WEDGE_MS=<n> makes the first command submitted on controller
+ * HYPE_781_WEDGE_CTRL (the enumeration log's 1-based number) more than n ms after its
+ * bring-up behave exactly as boot 35's did: the TRB is enqueued, the doorbell is never rung,
+ * no event arrives, the Command Abort is issued and CRR reads as still set for the whole
+ * five-second bound. Every later command on that controller fails the same way until the
+ * controller is reset, after which the injection is spent and the controller works -- which
+ * is what lets the recovery be seen recovering. Default OFF: nothing below compiles in.
+ */
+#ifndef HYPE_781_WEDGE_MS
+#define HYPE_781_WEDGE_MS 0u
+#endif
+#ifndef HYPE_781_WEDGE_CTRL
+#define HYPE_781_WEDGE_CTRL 2u
+#endif
 /* #764 capture: how often to compare the controller's dequeue against ours while armed. */
 /* #775: polls an endpoint may be armed with NOTHING ever reported before it is reset.
  * ~16 s at 125 Hz -- far longer than any device takes to say something for the first time. */
@@ -173,6 +192,16 @@ typedef struct {
     unsigned long long cmd_recoveries;
     unsigned long long cmd_recovery_fails;
     int cmd_dead;
+    /*
+     * #785: set alongside cmd_dead wherever software has run out of moves -- the abort did
+     * not clear CRR, or the controller raised HSE/HCE. The owner of this controller (boot/
+     * main.c, which knows what is on it) reads it and decides whether a controller reset is
+     * allowed; xhci_hw.c only knows that nothing short of one will help.
+     */
+    int reset_wanted;
+    uint64_t up_tsc;        /* TSC at the end of the last bring-up: the #782 injection's clock */
+    int wedged;             /* #782: the injected wedge is live on this controller */
+    int wedge_spent;        /* #782: it has fired once; a reset makes the controller honest */
 
     /* #734: the interrupt-IN rings moved to the per-ENDPOINT pool below (g_iin_hw). One
      * set per controller could not carry a keyboard and a mouse at once -- see
@@ -846,6 +875,7 @@ static int cmd_ring_recover(hype_xhci_ctrl_t *c) {
     if ((sts & (HYPE_XHCI_USBSTS_HSE | HYPE_XHCI_USBSTS_HCE)) != 0u) {
         hw->cmd_dead = 1;
         hw->cmd_recovery_fails++;
+        hw->reset_wanted = 1; /* xHCI 4.24.1: HCE clears only with HCRST */
         hype_debug_print("host-xhci: the CONTROLLER has failed, not just a command: "
                          "usbsts=0x%08x (%s%s). Aborting the command ring cannot fix this; "
                          "every device on this controller is now unreachable [#775]\n",
@@ -857,6 +887,7 @@ static int cmd_ring_recover(hype_xhci_ctrl_t *c) {
     if (hw->cmd_recoveries >= (unsigned long long)XHCI_CMD_MAX_RECOVERIES) {
         hw->cmd_dead = 1;
         hw->cmd_recovery_fails++;
+        hw->reset_wanted = 1;
         hype_debug_print("host-xhci: command ring recovered %u times and stopped answering "
                          "again -- giving up on it. usbsts=0x%08x crcr=0x%08x [#775]\n",
                          (unsigned)XHCI_CMD_MAX_RECOVERIES, sts,
@@ -865,6 +896,7 @@ static int cmd_ring_recover(hype_xhci_ctrl_t *c) {
     }
 
     crcr = rd32(bar, hw->opreg + HYPE_XHCI_OP_CRCR);
+    if (hw->wedged) crcr |= HYPE_XHCI_CRCR_CRR; /* #782: the injected wedge never lets go */
     hype_debug_print("host-xhci: ctrl%u command ring stopped answering -- aborting it. "
                      "usbsts=0x%08x crcr=0x%08x (CRR=%u) after %llu timeout(s) [#775]\n",
                      c->log_id, sts, crcr, (crcr & HYPE_XHCI_CRCR_CRR) ? 1u : 0u,
@@ -883,6 +915,7 @@ static int cmd_ring_recover(hype_xhci_ctrl_t *c) {
     wr64(bar, hw->opreg + HYPE_XHCI_OP_CRCR, (uint64_t)HYPE_XHCI_CRCR_CA);
     for (ms = 0; ms < XHCI_CMD_ABORT_WAIT_MS; ms++) {
         crcr = rd32(bar, hw->opreg + HYPE_XHCI_OP_CRCR);
+        if (hw->wedged) crcr |= HYPE_XHCI_CRCR_CRR;
         if ((crcr & HYPE_XHCI_CRCR_CRR) == 0u) {
             break;
         }
@@ -894,13 +927,14 @@ static int cmd_ring_recover(hype_xhci_ctrl_t *c) {
         /*
          * Past this point software has run out of moves that leave the controller's devices
          * addressed. The remaining option is a controller RESET, which re-enumerates
-         * everything on it -- viable when the wedged controller is not the one carrying the
-         * boot medium and the log, which is why the message says which one it is.
+         * everything on it (#785) -- asked for here, granted or refused by the owner, which
+         * knows whether this controller carries the boot medium or the log (#783).
          */
+        hw->reset_wanted = 1;
         hype_debug_print("host-xhci: command ring still RUNNING %u ms after Command Abort "
                          "(crcr=0x%08x usbsts=0x%08x) -- it cannot be restarted from software. "
-                         "Every device on this controller stays unreachable; only a controller "
-                         "reset would recover them [#775]\n",
+                         "Every device on this controller stays unreachable; asking for a "
+                         "controller reset [#775 #785]\n",
                          XHCI_CMD_ABORT_WAIT_MS, crcr,
                          rd32(bar, hw->opreg + HYPE_XHCI_OP_USBSTS));
         return -1;
@@ -944,9 +978,24 @@ static int cmd_submit_wait(hype_xhci_ctrl_t *c, uint32_t cmd[4], uint32_t evt[4]
         return -1;
     }
     cmd_enqueue(hw, cmd);
-    wr32(bar, hype_xhci_doorbell_offset(c->dboff, 0), 0u); /* command doorbell, target 0 */
+#if HYPE_781_WEDGE_MS
+    if (!hw->wedged && !hw->wedge_spent && c->log_id == HYPE_781_WEDGE_CTRL &&
+        g_tsc_hz != 0ull &&
+        rdtsc_now() - hw->up_tsc >= (g_tsc_hz / 1000ull) * (uint64_t)HYPE_781_WEDGE_MS) {
+        hw->wedged = 1;
+        hw->wedge_spent = 1;
+        hype_debug_print("host-xhci: #782 INJECTED WEDGE on ctrl%u -- this and every later "
+                         "command on it will see no completion, and the abort will not take "
+                         "(-DHYPE_781_WEDGE_MS=%u)\n", c->log_id, (unsigned)HYPE_781_WEDGE_MS);
+    }
+#endif
+    /* A wedged ring does not get its doorbell rung: the TRB sits there unanswered, which is
+     * exactly what the controller does to it in the real case. */
+    if (!hw->wedged) {
+        wr32(bar, hype_xhci_doorbell_offset(c->dboff, 0), 0u); /* command doorbell, target 0 */
+    }
     while (guard-- != 0u) {
-        if (next_event(hw, bar, c->rtsoff, evt) != 0) {
+        if (hw->wedged || next_event(hw, bar, c->rtsoff, evt) != 0) {
             /* #266: distinguish "nothing arrived" from "things arrived, none ours". */
             hw->cmd_timeouts++;
             if (hw->cmd_timeouts <= 8ull || !hw->cmd_dead) {
@@ -3361,6 +3410,16 @@ int hype_xhci_host_init(uint64_t bar_phys, hype_xhci_ctrl_t *out) {
             }
         }
         hype_xhci_parked_reset(&hw->parked);
+        /*
+         * #785: a re-claimed block starts its new life honest. The cumulative diagnostic
+         * counters (timeouts, guard exhaustions) stay, so a run's HIDTICK still shows how
+         * often the ring has failed; the latches that say "give up" do not, or the freshly
+         * reset controller would refuse its first command.
+         */
+        hw->cmd_dead = 0;
+        hw->reset_wanted = 0;
+        hw->cmd_recoveries = 0;
+        hw->wedged = 0;
     }
 
     out->bar = bar_phys;
@@ -3466,6 +3525,7 @@ int hype_xhci_host_init(uint64_t bar_phys, hype_xhci_ctrl_t *out) {
     delay_ms(HYPE_XHCI_CONNECT_DEBOUNCE_MS);
 
     ring_state_reset(hw);
+    hw->up_tsc = rdtsc_now();
     out->inited = 1;
     return 0;
 }
@@ -4026,6 +4086,16 @@ void hype_xhci_cmd_ring_health(hype_xhci_ctrl_t *c, unsigned long long *timeouts
     if (guard) *guard = hw->cmd_guard_exhausted;
     if (recoveries) *recoveries = hw->cmd_recoveries;
     if (dead) *dead = hw->cmd_dead;
+}
+
+int hype_xhci_reset_wanted(const hype_xhci_ctrl_t *c) {
+    if (c == (const hype_xhci_ctrl_t *)0 || !c->inited) return 0;
+    return HW(c)->reset_wanted;
+}
+
+unsigned int hype_xhci_wedge_injection_ms(unsigned int *ctrl) {
+    if (ctrl) *ctrl = (unsigned int)HYPE_781_WEDGE_CTRL;
+    return (unsigned int)HYPE_781_WEDGE_MS;
 }
 
 void hype_xhci_int_in_losses(hype_xhci_ctrl_t *c, unsigned int slot, unsigned int ep_addr,

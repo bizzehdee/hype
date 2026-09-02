@@ -86,3 +86,17 @@ state of this controller under hype (hype never clears it) and carries no inform
 | **#787** | Unchanged: 3 drops at a 387 s period, each preceded by `cc=4` transaction errors. The death came 40 s after the third re-arrival; boot 40's came 109 s after its sixth. Two points are not a pattern, but the re-enumeration is the only host-side activity on this controller in the minutes before either death |
 | **#790** | Held: 0 `REVIVE`, 0 `DEADMAN`; the one `cmdring timeout` is the probe's own No-Op |
 | **#426** | Not met: 42 min, input dead from 21 min |
+
+## Boot 42 (AMD) -- the reset series, first hardware run (#786)
+
+Boot 41 left one recovery: a host-controller reset. The #781 series lands it: #782 injects
+the wedge under QEMU (`-DHYPE_781_WEDGE_MS`, absent from a default build), #783 records which
+controller carries the log sink and the boot medium and refuses to reset it, #784 releases
+everything a controller owns, #785 resets it and re-enumerates through the arrival path.
+`tools/781/run-781-wedge.sh 2` shows the input controller wedged on demand and back in 1.2 s
+with its hub, keyboard and mouse reporting; `run-781-wedge.sh 1` shows the log controller
+refused with the refusal itself on the stick.
+
+Run card: `tools/hw-val-2026-08-25/RUN-CARD-2026-09-02-boot42-amd-reset.md`, set as
+`RUN_CARD` in `stage.sh`. The stall recurring and the keyboards coming back on their own is
+the whole point; the stall not recurring is a run with no result.

@@ -707,6 +707,30 @@ typedef struct {
 int hype_xhci_probe_silence(hype_xhci_ctrl_t *c, unsigned int root_port,
                             hype_xhci_silence_probe_t *out);
 
+/*
+ * #785: non-zero once this controller's command ring has been given up on (cmd_dead) and
+ * only a host-controller reset can bring its devices back. Cleared by hype_xhci_host_init().
+ */
+int hype_xhci_reset_wanted(const hype_xhci_ctrl_t *c);
+
+/* #782: the compiled-in wedge injection -- 0 in a normal build; else the delay in ms, with
+ * the 1-based log number of the controller it targets in *ctrl. */
+unsigned int hype_xhci_wedge_injection_ms(unsigned int *ctrl);
+
+/*
+ * #783 (decision 75): which controllers hype must never reset. Indices are the enumeration
+ * log's 1-based numbers; 0 means "no such controller recorded". Pure logic, so the refusal
+ * is unit-tested rather than discovered on the machine whose log it would have cut off.
+ */
+typedef struct {
+    unsigned int log_ctrl;  /* the controller the log sink writes through */
+    unsigned int boot_ctrl; /* the controller hype's boot/media medium is on */
+} hype_xhci_reset_policy_t;
+
+/* 1 = may reset; 0 = refuse, with *reason naming why (static string). */
+int hype_xhci_may_reset(const hype_xhci_reset_policy_t *p, unsigned int ctrl_idx,
+                        const char **reason);
+
 void hype_xhci_event_health(hype_xhci_ctrl_t *c, unsigned long long *hc_events,
                             unsigned long long *ring_full, unsigned long long *evictions);
 
