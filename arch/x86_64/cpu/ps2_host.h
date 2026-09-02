@@ -97,6 +97,12 @@ int hype_host_kbd_poll_scancode(uint8_t *out_scancode);
 /* #218: how many bytes the IRQ-independent polling fallback has taken from the i8042. */
 uint64_t hype_host_kbd_polled_bytes(void);
 
+/* #796: gate the polled i8042 status read to one per `tsc_ticks` (0 = every call). The IRQ
+ * path is unaffected. Set by the BSP once the TSC rate is known. */
+void hype_host_kbd_set_poll_interval(uint64_t tsc_ticks);
+/* #796: status reads issued and the slowest single read, in TSC ticks. */
+void hype_host_kbd_poll_stats(unsigned long long *status_reads, uint64_t *max_read_ticks);
+
 /*
  * USB-5 (#217): push a scancode into the SAME host queue the PS/2 ISR feeds.
  *

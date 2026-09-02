@@ -9,6 +9,31 @@
 #define HYPE_PS2_HOST_STATUS_AUX 0x20u
 
 static hype_host_kbd_buffer_t g_host_kbd_buffer;
+/*
+ * #796: the polled drain is rate-limited. One inb(0x64) per BSP loop iteration cost 20 us on
+ * the i5-13420H (the i8042 lives behind the embedded controller there) at 42,000 iterations
+ * a second -- 84% of the BSP, measured as `BSPCOST input 82% mean=20us`. The desktop's i8042
+ * answers in 1 us, which is why the same loop was harmless on the 5950X. A PS/2 byte takes
+ * about 1 ms on the wire, so 4 kHz polling cannot miss one; the IRQ path fills the buffer
+ * regardless of this gate. Ticks are TSC; 0 = no gate (bring-up callers before hz is known).
+ */
+static uint64_t g_kbd_poll_interval_ticks;
+static uint64_t g_kbd_poll_last_tsc;
+static unsigned long long g_kbd_status_reads;
+static uint64_t g_kbd_status_read_max_ticks;
+
+static inline uint64_t kbd_rdtsc(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+void hype_host_kbd_set_poll_interval(uint64_t tsc_ticks) { g_kbd_poll_interval_ticks = tsc_ticks; }
+
+void hype_host_kbd_poll_stats(unsigned long long *status_reads, uint64_t *max_read_ticks) {
+    if (status_reads) *status_reads = g_kbd_status_reads;
+    if (max_read_ticks) *max_read_ticks = g_kbd_status_read_max_ticks;
+}
 
 /*
  * #363: is the host keyboard interrupt still being SERVICED, and on which core?
@@ -117,8 +142,15 @@ static void host_kbd_drain_polled(void) {
          * around the two port reads.
          */
         unsigned long long flags;
+        uint64_t t0;
         __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags)::"memory");
+        t0 = kbd_rdtsc();
         st = inb(HYPE_PS2_HOST_PORT_STATUS);
+        {   /* #796: how long one status read takes on THIS machine, so the cost is a number */
+            uint64_t dt = kbd_rdtsc() - t0;
+            g_kbd_status_reads++;
+            if (dt > g_kbd_status_read_max_ticks) g_kbd_status_read_max_ticks = dt;
+        }
         /*
          * 0xFF is the floating bus -- no i8042 is answering at all. Bit 0 of 0xFF is SET, so a
          * naive OBF test reads "data is waiting" forever and returns 0xFF as a scancode every
@@ -191,6 +223,13 @@ int hype_host_kbd_poll_scancode(uint8_t *out_scancode) {
      */
     if (g_kbd_drain_busy) {
         return 0; /* re-entered from within the caller's own drain loop */
+    }
+    if (g_kbd_poll_interval_ticks != 0ull) { /* #796 */
+        uint64_t now = kbd_rdtsc();
+        if (now - g_kbd_poll_last_tsc < g_kbd_poll_interval_ticks) {
+            return 0;
+        }
+        g_kbd_poll_last_tsc = now;
     }
     g_kbd_drain_busy = 1u;
     host_kbd_drain_polled();

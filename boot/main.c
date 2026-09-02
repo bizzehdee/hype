@@ -8839,6 +8839,10 @@ static void fw_1_host_input_poll(void) {
             }
         }
     }
+    /* #796: one i8042 status read per 250 us, not per iteration -- see ps2_host_hw.c. */
+    if (g_vms[0].host_tsc_hz != 0ull) {
+        hype_host_kbd_set_poll_interval(g_vms[0].host_tsc_hz / 4000ull);
+    }
     while (hype_host_kbd_poll_scancode(&sc)) {
         uint8_t kb[HYPE_KBD_DECODE_MAX_OUT];
         uint8_t ps2_bytes[2];
@@ -30514,15 +30518,23 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                              g_fbprobe_entries, g_fbprobe_ran, g_fbprobe_skip_null,
                                              g_fbprobe_skip_rate);
                         }
+                        unsigned long long ps2_reads = 0; /* #796 */
+                        uint64_t ps2_max = 0;
+                        hype_host_kbd_poll_stats(&ps2_reads, &ps2_max);
                         hype_debug_print("fw-1 KBDIRQ: isr_entries=%llu (+%llu since last) eois=%llu "
-                                         "last_apic=%u | polled=%llu chords=%llu ps2polled=%llu | "
+                                         "last_apic=%u | polled=%llu chords=%llu ps2polled=%llu "
+                                         "ps2reads=%llu max=%lluus | "
                                          "bsp_usb_timeouts=%llu bsp_ahci_timeouts=%llu "
                                          "bsp_nvme_timeouts=%llu nvme_lock_contended=%llu "
-                                         "[#363 #658 #660]\n",
+                                         "[#363 #658 #660 #796]\n",
                                          e, e - kbd_prev_entries, eo, ap,
                                          (unsigned long long)g_hostkbd_scancodes,
                                          (unsigned long long)g_hostkbd_chords,
                                          (unsigned long long)hype_host_kbd_polled_bytes(),
+                                         ps2_reads,
+                                         (g_vms[0].host_tsc_hz != 0ull)
+                                             ? (unsigned long long)(ps2_max * 1000000ull / g_vms[0].host_tsc_hz)
+                                             : 0ull,
                                          hype_blk_usb_bsp_lock_timeouts(),
                                          hype_ahci_host_bsp_lock_timeouts(),
                                          hype_nvme_host_bsp_lock_timeouts(),
