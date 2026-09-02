@@ -50,6 +50,11 @@ send echo 1 > /sys/kernel/reboot/cpu && echo CPU-PINNED-$(cat /sys/kernel/reboot
 expect CPU-PINNED-1
 send clear\n
 send reboot\n
+# Alpine's `reboot` runs its shutdown scripts for several seconds before the 0xCF9 write. Intel
+# boot A3 matched the SECOND `expect localhost login:` against stale screen text in that window
+# and tripped STALE-SHELL one second before the reset fired. Wait it out; the new firmware clears
+# the screen, so nothing stale can be matched afterwards.
+delay 20000
 
 # The SECOND login prompt is the restart gate, but it is only believed once
 # the marker check below confirms this is not the same shell. A guest that
