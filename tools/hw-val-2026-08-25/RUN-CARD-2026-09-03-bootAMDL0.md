@@ -183,3 +183,80 @@ same one line to read. Do not change anything: run 1 is the baseline and only th
 
 If the guest still stops at `Booting \`Linux lts'`, section 5 was a large amplifier but not the
 whole cause, and the next suspect is the bimodal clock rather than anything in hype's loop.
+
+
+## Result -- run 2, 2026-09-03, build `a835bc6-dirty` (logs in `logs/bootAMDL0-2/`)
+
+**The fix works on its target and does not fix the boot.** Both halves matter.
+
+### Section 5 is gone
+
+| | run 1 (`17785e9`) | run 2 (`a835bc6`) | |
+| --- | --- | --- | --- |
+| `HOUSECOST s5=` | 47,544 ms | **377 ms** | 126x less |
+| `LOOPPHASE house=` | 50,005 ms | **4,876 ms** | |
+| `DRAIN iters=` | 283,259 | 444,140 | |
+| housekeeping per iteration | **176 us** | **11 us** | 16x less |
+
+So this ticket's headline measurement -- 235 us per exit in vCPU-0 loop housekeeping -- is
+answered. It is now 11 us.
+
+### The guest is still stuck, and the exit rate barely moved
+
+`Booting \`Linux lts'` and nothing after, exactly as run 1. `GUESTPC vm0: lastreason=0x6e
+lastrip=0xffffffff9ac81d7e ... rflags=0x2` -- still SVM `VMEXIT_RDTSC` at a single RIP with
+interrupts off, `ioio` frozen at 83,881, `hlt=0`.
+
+| | run 1 | run 2 |
+| --- | --- | --- |
+| wall time | 123 s | 220 s |
+| vCPU 0 exits | 275,225 | 444,140 |
+| **per exit, total** | **447 us** | **496 us** |
+| of which housekeeping | 176 us | 11 us |
+| of which `s75` | 252 us | 460 us |
+
+**Removing 165 us per iteration of real work did not reduce the per-exit cost.** It moved into
+`s75`. So `s75` is not work, it is a wait -- something in that span is elastic and soaks up
+whatever slack appears in front of it. That is the next thing to find, and section 5 was an
+amplifier sitting inside it, not the limit.
+
+### The comparison that localises it
+
+vCPU 0 and vCPU 1 both have a dedicated physical core --
+`AP[vm0 vCPU 0]-SMOKETEST: apic_id=2`, and `SMP: vm0 granted 2 whole physical core(s)`. They run
+**different loops**: vCPU 0 runs the full `fw-1` loop, vCPU 1 the lighter AP vCPU loop. In the
+same run:
+
+| vCPU | loop | exits | per exit |
+| --- | --- | --- | --- |
+| vm0/0 | `fw-1` | 444,140 | **496 us** |
+| vm0/1 | AP vCPU | 37,195,936 | **5.4 us** |
+
+**92x, on the same machine, both on dedicated cores.** The cost is a property of the `fw-1` loop.
+
+`s75` is also the one section that has never been split: the sub-markers 761 and 768 exist
+(`boot/main.c:19288`, `:19308`) but are **not in `g_housecost_codes`**, so `fw_1_loop_section`
+finds no slot and silently drops their time -- 11 s of this run's 220 s is unaccounted for that
+reason (sections sum to 209,153 ms of 220,505 ms).
+
+### Do not misread the BSP's own numbers
+
+`BSPCOST` sums to ~220 s of a 220 s run (render 26%, idle 24%, input 15%, kbddiag 14%, fbprobe
+8%). That is the **BSP's** console loop on APIC 0, and vCPU 0 is on APIC 2, so it is not what
+starves the guest. Recorded to stop the next reader chasing it.
+
+### The clock oscillation is unchanged, as predicted
+
+33% of samples in the slow state in run 2 against 34% in run 1 -- `FBCLOCK` 74/221 and 44/130 at
+exactly 190/1000, `FBSPEED ram=` identically split. Host `cr0=0x80000011` throughout. This fix
+does not touch it and did not.
+
+### Standing lead worth acting on independently
+
+`arch/x86_64/svm/vmcb.h:185` says it plainly: *"RDTSC is normally allowed to run directly, but
+nested KVM can expose a stopped L2 counter. Intercept it so hype can return the advancing L1 TSC
+plus the guest's configured offset (#438)."* The intercept is in the unconditional baseline set
+(`vmcb.c:59` and `:165`), so **bare metal pays a dev-rig workaround.** This guest is doing nothing
+but RDTSC. hype has no "am I running under a hypervisor" probe today (`hype_cpu_detect_vmm_kind`
+distinguishes Intel from AMD, not nesting), so this needs CPUID leaf 1 ECX bit 31 and a
+conditional intercept.
