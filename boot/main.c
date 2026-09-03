@@ -1848,6 +1848,40 @@ static void fw_1_phase_checkpoint(hype_fw_vm_t *vm, unsigned phase) {
     g_fw_phase_mark_tsc[vi] = now;
 }
 #define g_fw_1_prev_post_tsc (vm->prev_post_tsc)
+/*
+ * #799: where the vCPU-0 loop's HOUSEKEEP phase spends its time, by section breadcrumb. The
+ * AMD laptop run of 2026-09-03 showed house=77.9 s of a 180 s run (235 us per exit against
+ * ~1 us on the 5950X) with nothing in the log to say which step; LOOPPHASE names the phase,
+ * this names the section inside it. Time between two markers is charged to the section the
+ * FIRST marker opened. Codes are the existing g_436_loop_section values.
+ */
+extern volatile uint16_t *g_436_loop_section; /* defined with the #436 breadcrumbs below */
+#define HYPE_HOUSECOST_VMS 8u
+#define HYPE_HOUSECOST_SLOTS 12u
+static const uint16_t g_housecost_codes[HYPE_HOUSECOST_SLOTS] = {2, 21, 22, 23, 5, 6, 7, 72, 73, 74, 75, 0};
+static uint64_t g_housecost_tsc[HYPE_HOUSECOST_VMS][HYPE_HOUSECOST_SLOTS];
+static uint64_t g_housecost_mark[HYPE_HOUSECOST_VMS];
+static uint16_t g_housecost_prev[HYPE_HOUSECOST_VMS];
+
+static void fw_1_loop_section(hype_fw_vm_t *vm, uint16_t code) {
+    unsigned vi = (unsigned)(vm - g_vms);
+    uint64_t now;
+    g_436_loop_section[vi] = code;
+    if (vi >= HYPE_HOUSECOST_VMS) return;
+    now = hype_rdtsc();
+    if (g_housecost_prev[vi] != 0u && g_housecost_mark[vi] != 0ull) {
+        unsigned k;
+        for (k = 0; k < HYPE_HOUSECOST_SLOTS; k++) {
+            if (g_housecost_codes[k] == g_housecost_prev[vi]) {
+                g_housecost_tsc[vi][k] += now - g_housecost_mark[vi];
+                break;
+            }
+        }
+    }
+    g_housecost_mark[vi] = now;
+    g_housecost_prev[vi] = code;
+}
+
 #define g_fw_1_irq0_recoverable_tsc (vm->irq0_recoverable_tsc)
 #define g_fw_1_irq0_pending_tsc (vm->irq0_pending_tsc)
 #define g_fw_1_stall_prev_tsc (vm->stall_prev_tsc)
@@ -17077,6 +17111,17 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     {
                         unsigned vi = (unsigned)(vm - g_vms);
                         if (vi < g_vm_count) {
+                            if (vi < HYPE_HOUSECOST_VMS) {
+                                char hl[300];
+                                int ho = hype_snprintf(hl, sizeof(hl), "fw-1 HOUSECOST vm%u:", vi);
+                                unsigned hk;
+                                for (hk = 0; hk < HYPE_HOUSECOST_SLOTS && g_housecost_codes[hk] != 0u; hk++) {
+                                    ho += hype_snprintf(hl + ho, sizeof(hl) - (unsigned)ho, " s%u=%llums",
+                                                        (unsigned)g_housecost_codes[hk],
+                                                        (g_housecost_tsc[vi][hk] * 1000ULL) / g_fw_1_host_tsc_hz);
+                                }
+                                hype_debug_print("%s [#799]\n", hl);
+                            }
                             hype_debug_print(
                                 "fw-1 LOOPPHASE: diag=%llums persist=%llums house=%llums "
                                 "dispatch=%llums [#365]\n",
@@ -17814,9 +17859,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             }
         }
 
-        g_436_loop_section[(unsigned)(vm - g_vms)] = 23; /* #484 */
+        fw_1_loop_section(vm, 23u); /* #484 */
         fw_1_phase_checkpoint(vm, HYPE_FW_PHASE_DIAG);
-        g_436_loop_section[(unsigned)(vm - g_vms)] = 2;
+        fw_1_loop_section(vm, 2u);
 
         /* RT-2a: the periodic in-loop \hype-log.txt flush is retired. This
          * loop now runs post-ExitBootServices, where Boot-Services file I/O
@@ -17837,7 +17882,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     vm->diag.usblog_last_tsc = now_u;
                     /* #484: distinct marker so a long lock hold can be attributed to the USB
                      * log flush rather than to "somewhere in the BSP's housekeeping". */
-                    g_436_loop_section[(unsigned)(vm - g_vms)] = 21;
+                    fw_1_loop_section(vm, 21u);
                     usb_log_flush(); /* no-op when no USB sink is open */
                     g_436_loop_section[(unsigned)(vm - g_vms)] = sec_prev;
                 }
@@ -17846,9 +17891,14 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
 
         /* #484: the varstore persist writes hundreds of KB to a host volume. Marked so a long
          * hold shows up as this rather than as the loop-top default. */
-        g_436_loop_section[(unsigned)(vm - g_vms)] = 22;
+        fw_1_loop_section(vm, 22u);
         fw_1_phase_checkpoint(vm, HYPE_FW_PHASE_PERSIST);
-        g_436_loop_section[(unsigned)(vm - g_vms)] = 2;
+        {   /* #799: the previous iteration ended at section 75; nothing between then and here
+             * (dispatch + guest run) belongs to housekeeping, so restart the clock. */
+            unsigned hv_ = (unsigned)(vm - g_vms);
+            if (hv_ < HYPE_HOUSECOST_VMS) { g_housecost_prev[hv_] = 0u; g_housecost_mark[hv_] = 0ull; }
+        }
+        fw_1_loop_section(vm, 2u);
 
         /* M4-6b1: advance the guest PIT + LAPIC timer by the number of
          * 1.193182 MHz ticks that really elapsed since the last exit
@@ -18962,7 +19012,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             g_bsp_disp_bucket[vd_] = b_;
             g_bsp_disp_start[vd_] = hype_rdtsc();
         }
-        g_436_loop_section[(unsigned)(vm-g_vms)]=5;
+        fw_1_loop_section(vm, 5u);
         if (!vmm_reason_is_intr(kind, info.reason)) {
             console_chars += fw_1_drain_uart_console(&g_fw_1_uart, &uart_filter, uart_line,
                                                      &uart_line_len, FW_1_LINE_BUF,
@@ -19012,7 +19062,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 hype_input_runner_scan(&vm->in_runner, vm->diag.snap, n);
             }
         }
-        g_436_loop_section[(unsigned)(vm-g_vms)]=6;
+        fw_1_loop_section(vm, 6u);
         fw_1_script_step(vm, (unsigned)(vm - g_vms), &g_fw_1_uart,
                          fw_1_script_now_ms(vm, hype_rdtsc()));
         /*
@@ -19033,7 +19083,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             }
 #endif
         }
-        g_436_loop_section[(unsigned)(vm-g_vms)]=7;
+        fw_1_loop_section(vm, 7u);
         if (hype_ps2_kbd_guest_initialized(&g_fw_1_ps2) &&
             !hype_ps2_kbd_has_pending_byte(&g_fw_1_ps2)) {
             /* #436: hold host keys until the guest's keyboard driver is alive.
@@ -19057,7 +19107,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * the #375 host-input drain shut (#389). IO-APIC first with a PIC fallback, the
          * same shape the SYSRQ injector and every other guest IRQ here use.
          */
-        g_436_loop_section[(unsigned)(vm-g_vms)]=72;
+        fw_1_loop_section(vm, 72u);
         {
             /* The controller's output buffer can already hold a firmware
              * reply when Windows takes ownership. A new scancode appended to
@@ -19138,14 +19188,14 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * push has accumulated in the shadow buffer (and RT-1c's dirty range);
          * this is the ONE framebuffer memcpy that pays the uncached-VRAM cost,
          * instead of one per printed line. */
-        g_436_loop_section[(unsigned)(vm-g_vms)]=73;
+        fw_1_loop_section(vm, 73u);
         {
             hype_fw_exit_buckets_t eb = {ex_npf, ex_ioio, ex_msr, ex_cpuid, ex_vintr, ex_pause,
                                           ex_intr, ex_other};
             fw_1_publish_and_render(vm, &last_gop_flush_tsc,
                                 perf_boot_start_tsc, perf_hlt_wait_tsc, total_exits, ex_hlt, &eb);
         }
-        g_436_loop_section[(unsigned)(vm-g_vms)]=74;
+        fw_1_loop_section(vm, 74u);
 
         /* M4-6d3: flush a buffered partial line that looks like an
          * interactive prompt (ends in ": ", "# ", "$ ", "> ") when the
@@ -19174,6 +19224,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             }
         }
 
+        fw_1_loop_section(vm, 75u); /* #799: close section 74 */
         fw_1_phase_checkpoint(vm, HYPE_FW_PHASE_HOUSEKEEP);
 
         /* FW-1g: "reacted" = the guest emitted new CONSOLE output after
@@ -19206,7 +19257,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             vmm_reinject_exception(kind, ctx, 6u, 0, 0u); /* #UD pushes no error code */
             continue;
         }
-        g_436_loop_section[(unsigned)(vm-g_vms)]=75;
+        fw_1_loop_section(vm, 75u);
         if (vmm_reason_is_xsetbv(kind, info.reason)) {
             /* #251: guest enabling XSAVE state. Same fall-through discipline as
              * the CR-access exit -- if the form is not modelled, do NOT continue,
@@ -19227,7 +19278,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * own value. If the access is one this does not model, fall through
              * WITHOUT continuing -- RIP was not advanced, so silently resuming
              * would re-execute the same instruction forever. */
-            g_436_loop_section[(unsigned)(vm-g_vms)]=761;
+            fw_1_loop_section(vm, 761u);
             if (vmm_handle_cr_access(kind, ctx)) {
                 continue;
             }
@@ -19247,7 +19298,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             continue;
         }
         if (vmm_reason_is_intr(kind, info.reason)) {
-            g_436_loop_section[(unsigned)(vm-g_vms)]=768;
+            fw_1_loop_section(vm, 768u);
             /* RT-2b: hype's periodic host timer tick preempted the guest. The
              * pending tick was already taken by hype_timer_isr at the loop's
              * STGI, and the loop-top timebase advance already staged any due
