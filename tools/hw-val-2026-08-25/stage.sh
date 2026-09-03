@@ -25,6 +25,7 @@
 # Usage:
 #   ./stage.sh                 stage the default, AVIC and APICv builds; boot set amd1
 #   ./stage.sh --boot intelb   the same, for the Intel APICv boot (APICv build active)
+#   ./stage.sh --boot amdl0    the AMD LAPTOP #799 boot: hype1a.cfg, default build, 5 minutes
 #   ./stage.sh --no-build      stage whatever is already in rig/stage-current/
 #   ./stage.sh --check         verify the staged drive and change nothing
 set -u
@@ -44,7 +45,13 @@ select_boot() {
             ACTIVE_CFG=hype1g.cfg; ACTIVE_BUILD=default ;;
     intelb) BOOT_INPUT=input-2c; RUN_CARD=RUN-CARD-2026-09-03-bootIntelB.md
             ACTIVE_CFG=hype2c.cfg; ACTIVE_BUILD=apicv ;;
-    *) echo "unknown boot set: $1 (amd1|intelb)" >&2; exit 2 ;;
+    # L0 on the AMD LAPTOP, not the 5950X: five minutes to read one HOUSECOST line for #799.
+    # Deliberately the same config and input script as the 2026-09-03 laptop attempt that
+    # measured 235 us/exit, so the two runs are comparable. The laptop is serial-less and
+    # cold-boot only, so HYPE.LOG on the drive is the whole record.
+    amdl0)  BOOT_INPUT=input-1a; RUN_CARD=RUN-CARD-2026-09-03-bootAMDL0.md
+            ACTIVE_CFG=hype1a.cfg; ACTIVE_BUILD=default ;;
+    *) echo "unknown boot set: $1 (amd1|intelb|amdl0)" >&2; exit 2 ;;
   esac
 }
 
