@@ -284,3 +284,33 @@ da3e93d.
 
 Drive re-staged at da3e93d. Boot A is owed a fifth time, now for #798, #797, #525's second half
 and #698.
+
+## Boot A5 result (Intel i5-13420H, 2026-09-03) -- PASS
+
+Build `da3e93d-dirty` (#798's fix), same config, 224 s. Logs under
+`tools/hw-val-2026-08-25/logs/bootA5-intel/` (gitignored).
+
+```
+[0000279580] fw-1: vm0 vCPU 1 guest reset via ACPI reset register (0xCF9) -> restart [#94 #525]
+[0000280659] fw-1: vm0 restarted (M8-4): pristine firmware restored, RAM zeroed, vcpu reset
+[0000281309] fw-1 vm0 vCPU 1: SIPI received, entering guest [#190]
+[0000465423] fw-1 SCRIPT vm0: PASS pass (21 directive(s), 138864ms)
+[0000465478] fw-1 SCRIPT vm0:   at line 69: reboot-pin-nonbsp
+```
+
+The second OVMF ran MP init within a second of the restart and reached `BdsDxe` seconds later
+(boots A3 and A4 never got there); the guest came back to a fresh login. `TMRLATE vm0/1`
+climbed every sample after the restart (5093, 5430, 10323, 10659, 10928), no `TIMERSTALL`,
+`INTDIAG vm0/1 ... IF=1 shadow=0x0` with nothing pending. `BSPCOST input 20%`.
+
+| Ticket | Result |
+| --- | --- |
+| **#798** | Met: the only change from A4 is the restart root, and the second boot took seconds instead of never |
+| **#797** | Met: the restart completes with a clean staged-event field |
+| **#698** | VMX leg met; with the SVM bisect (2/2 frozen before #750, 3/3 climbing after) both legs are done |
+| **#525** | VMX leg met (reset from vCPU 1 and a clean restart to login); SVM leg was boot B2 (2026-08-21) plus the QEMU regressions at HEAD |
+
+Five Intel boots in one night, each finding one VMX-only host fault: guest CR0.CD reaching the
+physical CR0 (#795), the 20 us i8042 poll (#796), a stale VM-entry event across the VMCS rebuild
+(#797), and the NPT root handed to VMX on restart (#798). The Intel side of the runbook is now
+down to #599/#605 (APICv), which wait on #708.

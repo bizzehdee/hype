@@ -17,7 +17,7 @@ it.
 
 | Boot | Machine | Config | Closes | Legs | Records |
 | --- | --- | --- | --- | --- | --- |
-| Intel-A (re-run) | i5-13420H | `hype2g.cfg` | #698 | #525 | |
+| ~~Intel-A~~ DONE 2026-09-03 (five attempts) | i5-13420H | `hype2g.cfg` | #729 #795 #796 #797 #798 #698 #525 | #603 | |
 | AMD-1 | 5950X | `hype1g.cfg` | #426 #775 #790 | #525 #603 | #641 #788 |
 | AMD-2 | 5950X | `hype3g.cfg` (to write) | #388 #715 | | #660 #713 |
 | AMD-3 | 5950X | drive rebuild, `hype3b.cfg` | #687 #688 #689 #653 #754 | | |
@@ -34,7 +34,8 @@ starved by the PS/2 poll, fixed in 92c23a0 (#796). Third attempt (build 92c23a0)
 served the 0xCF9 reset from vCPU 1 on VMX, and hung the second boot on a stale VM-entry
 interrupt, fixed in 478f6f8 (#797). Fourth attempt (build 478f6f8) confirmed #797's fix and found the
 real cause of the hung second boot: the restart handed VMX the NPT table as its EPT root (all-UC),
-fixed in da3e93d (#798). Re-run at da3e93d for #798, #797, #525's second half, #698.**
+fixed in da3e93d (#798). Fifth attempt (build
+da3e93d) PASSED: second boot to login, AP timers climbing. Intel-A is done.**
 
 One Alpine live guest (2 vCPUs, reboot pinned to CPU 1 by `input-2b/vm0.txt`) plus the three
 #603 microtests. Seven physical cores with the BSP. If admission refuses a VM, fall back to

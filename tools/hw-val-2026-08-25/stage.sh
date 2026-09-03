@@ -32,10 +32,10 @@ set -u
 # for the first seven stagings, which is why boot 7 went out with boot 6's card still on the
 # drive. The active script and the card that describes it must move together or the operator
 # is reading instructions for a different run.
-BOOT_INPUT=input-2b
-RUN_CARD=RUN-CARD-2026-09-02-bootA-intel-vmx.md
+BOOT_INPUT=input-1a
+RUN_CARD=RUN-CARD-2026-09-03-bootAMD1.md
 # The config that becomes \hype.cfg. The others are staged beside it as fallbacks.
-ACTIVE_CFG=hype2g.cfg
+ACTIVE_CFG=hype1g.cfg
 
 BOOTLABEL=HYPEBOOT
 # The data partition has NO label. `EADE-CA36` is its exFAT volume UUID, which is what
