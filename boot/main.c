@@ -15895,39 +15895,60 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                  * halt-time snapshot may not be the descriptor that actually
                  * failed, and that is the one untested explanation for the
                  * arm-routine contradiction. Placed at the loop top because the
-                 * dispatch below `continue`s for most exits. */
+                 * dispatch below `continue`s for most exits.
+                 *
+                 * The 5-second gate covers the image-base SCAN as well as the watch it feeds,
+                 * and that is the point rather than tidiness. The scan used to run on every
+                 * kernel-mode exit until it succeeded; on Windows it succeeds on the first one
+                 * and never runs again, but there is no PE image anywhere in a Linux guest, so
+                 * it never succeeded and re-scanned forever -- up to HYPE_PE_SCAN_MAX_PAGES
+                 * (4096) pages, each probed through fw_1_pe_read's byte-at-a-time page-table
+                 * walk, whose own comment assumes it is called "once per periodic dump".
+                 * Measured on boot AMD-L0 run 3, the first run whose guest reached kernel-mode
+                 * code at all: 194 us per iteration, s79=83.0 s of a 120 s accounted window,
+                 * the single largest section in the run.
+                 *
+                 * Scanning faster than the consumer cannot help even on Windows: SELWATCH below
+                 * reports at most once per 5 s, so a base found sooner is a base that sits
+                 * unused. One gate, one cadence, no guest-OS knowledge needed -- and the cost is
+                 * bounded for every guest rather than for the one this probe was written for.
+                 * Same shape as #799's section 5: free when it succeeds early, unbounded when it
+                 * cannot succeed at all. */
                 uint64_t selw_now = hype_rdtsc();
-                if (g_436_kmod_base == 0 && info.guest_rip >= 0xFFFF800000000000ULL) {
-                    fw_1_pe_ctx_t sctx;
-                    sctx.vm = vm;
-                    sctx.ctx = ctx;
-                    g_436_kmod_base = hype_pe_find_image_base(fw_1_pe_read, &sctx, info.guest_rip);
-                    if (g_436_kmod_base != 0 && kind == HYPE_VMM_KIND_SVM) {
-#ifdef HYPE_ENABLE_436_DIAGNOSTICS
-                        /* #436: break on KeBugCheckEx so the bugcheck reports itself --
-                         * caller, parameters and register state, measured rather than
-                         * matched by parameter shape (which has been wrong every time). */
-                        vmm_set_exception_intercepts(kind, ctx, (1u << 1) | (1u << 6));
-                        /* #436: break on the faulting instruction itself (the probe's
-                         * dereference), not on KeBugCheckEx -- the registers there name
-                         * WHERE the bogus pointer was loaded from. */
-                        hype_svm_vcpu_arm_exec_breakpoint(ctx, g_436_kmod_base + 0x25d50bull);
-                        hype_debug_print("fw-1 #436 BP armed on the probe @0x%llx\n",
-                                         (unsigned long long)(g_436_kmod_base + 0x25d50bull));
-#endif
-                    }
-                }
-                if (g_436_kmod_base != 0 && g_fw_1_host_tsc_hz != 0 &&
+                if (g_fw_1_host_tsc_hz != 0 &&
                     selw_now - vm->diag.selw_last > 5u * g_fw_1_host_tsc_hz) {
-                    uint64_t sel = 0, arm = 0, cr3w = vmm_get_cr3(kind, ctx);
                     vm->diag.selw_last = selw_now;
-                    if (cr3w != 0 &&
-                        fw_1_read_guest_va(vm, cr3w, g_436_kmod_base + 0xfc2230ull, &sel, 8) &&
-                        sel != 0) {
-                        (void)fw_1_read_guest_va(vm, cr3w, sel + 0x80ull, &arm, 8);
-                        hype_debug_print("fw-1 #436 SELWATCH desc=%016llx armRVA=0x%llx\n",
-                                         (unsigned long long)sel,
-                                         (unsigned long long)(arm ? arm - g_436_kmod_base : 0));
+                    if (g_436_kmod_base == 0 && info.guest_rip >= 0xFFFF800000000000ULL) {
+                        fw_1_pe_ctx_t sctx;
+                        sctx.vm = vm;
+                        sctx.ctx = ctx;
+                        g_436_kmod_base =
+                            hype_pe_find_image_base(fw_1_pe_read, &sctx, info.guest_rip);
+                        if (g_436_kmod_base != 0 && kind == HYPE_VMM_KIND_SVM) {
+#ifdef HYPE_ENABLE_436_DIAGNOSTICS
+                            /* #436: break on KeBugCheckEx so the bugcheck reports itself --
+                             * caller, parameters and register state, measured rather than
+                             * matched by parameter shape (which has been wrong every time). */
+                            vmm_set_exception_intercepts(kind, ctx, (1u << 1) | (1u << 6));
+                            /* #436: break on the faulting instruction itself (the probe's
+                             * dereference), not on KeBugCheckEx -- the registers there name
+                             * WHERE the bogus pointer was loaded from. */
+                            hype_svm_vcpu_arm_exec_breakpoint(ctx, g_436_kmod_base + 0x25d50bull);
+                            hype_debug_print("fw-1 #436 BP armed on the probe @0x%llx\n",
+                                             (unsigned long long)(g_436_kmod_base + 0x25d50bull));
+#endif
+                        }
+                    }
+                    if (g_436_kmod_base != 0) {
+                        uint64_t sel = 0, arm = 0, cr3w = vmm_get_cr3(kind, ctx);
+                        if (cr3w != 0 &&
+                            fw_1_read_guest_va(vm, cr3w, g_436_kmod_base + 0xfc2230ull, &sel, 8) &&
+                            sel != 0) {
+                            (void)fw_1_read_guest_va(vm, cr3w, sel + 0x80ull, &arm, 8);
+                            hype_debug_print("fw-1 #436 SELWATCH desc=%016llx armRVA=0x%llx\n",
+                                             (unsigned long long)sel,
+                                             (unsigned long long)(arm ? arm - g_436_kmod_base : 0));
+                        }
                     }
                 }
             }
