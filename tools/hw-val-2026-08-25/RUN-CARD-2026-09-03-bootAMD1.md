@@ -28,9 +28,9 @@ the rate bound keep their 90-minute run.
    PASS, `vmexit` triple-faults on purpose, `vmexitstorm` is force-powered-off by its watchdog).
 2. The script logs in, pins the reboot to CPU 1, reboots, logs in again and prints
    `reboot-pin-nonbsp`. **Do not type until it has.**
-3. Then arm the Pico: **BOOTSEL once**, confirm `a0001` in the guest. Keep the Logitech and the
+3. Then arm the Pico: **BOOTSEL once**, confirm `a0001` in the guest. Keep the Logitech mouse receiver and the
    Keychron attached; leave both spare USB drives plugged in (#780's condition).
-4. Leave it 90 minutes from the second login. Type on the Logitech now and then.
+4. Leave it 90 minutes from the second login. Type on the Keychron now and then. The Logitech (046d:c547) is a mouse; its receiver exposes a keyboard HID interface, which is why hype counts `keyboards=3`. The two real keyboards are the Keychron (3434:0da4) and the Pico (cafe:4b44).
 5. Power off. Bring back `HYPE.LOG` and `RUN1A.LOG`.
 
 ## What to read
