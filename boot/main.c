@@ -893,6 +893,29 @@ typedef struct hype_fw_diag {
      * whether the guest had printed anything new, and a guest idling at a static prompt for
      * most of a run made one real boot read as a loop of many identical reboots. */
     unsigned screen_dump_gen;
+    /*
+     * #799: the vt_screen generation the input-script matcher last scanned (0 = never). The
+     * screen scan below was throttled to 10 Hz but not gated on the screen having CHANGED, so a
+     * silent guest still cost a full-grid copy plus a full hype_input_runner_scan() every 100 ms.
+     * Measured on boot AMD-L0 (AMD laptop, 1920x1080): 38.7 ms per scan, 47.5 s of 123 s -- 95%
+     * of all loop housekeeping and 37% of wall time. The 5950X pays the same 12.9 ms per scan and
+     * only escapes because its script COMPLETES (hype_input_runner_scan returns early once
+     * r->done), so `s5` reads as 0.15% there and the cost hid for months.
+     *
+     * That was fatal rather than merely wasteful: the guest was in an early RDTSC delay loop with
+     * interrupts off, hype intercepts RDTSC (#438), so every iteration was a VMEXIT paying the
+     * scan -- while the script's first `expect localhost login:` could not match until the guest
+     * booted. The scan and the expect waited on each other.
+     *
+     * Rescanning an unchanged screen cannot find a match a previous scan missed -- but the
+     * script's pc CAN move without the screen changing (a `send`, a `delay` expiring, a
+     * `timeout` consumed by fw_1_script_step), and #728's rule is that a newly-armed `expect`
+     * gets measured against the screen as it is. `expect GNU GRUB` against an already-painted
+     * static menu is exactly that case. So `scan_pc` forces one scan per pc movement as well;
+     * gating on generation alone would hang those scripts.
+     */
+    unsigned scan_gen;
+    uint32_t scan_pc;
     uint64_t dr_last;
     uint64_t dr_n;
     uint64_t kbd_rte1_last;
@@ -19051,13 +19074,21 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * Throttled to ~10 Hz. A snapshot is a whole-screen copy and the expects it serves are
          * human-scale ("is the menu up"), so doing it per exit would burn the loop for nothing.
          */
-        if (vm->in_script_armed) {
+        /*
+         * #799: and gated on there being something NEW to scan -- a changed screen or a moved
+         * pc -- not only on the 10 Hz throttle. See hype_fw_vm_t.diag.scan_gen for the
+         * measurement: ungated by content this was 37% of the whole host loop on a silent guest.
+         */
+        if (vm->in_script_armed &&
+            (vm->diag.scan_gen != vm->term.generation || vm->diag.scan_pc != vm->in_runner.pc)) {
             unsigned svi = (unsigned)(vm - g_vms);
             uint64_t hz = g_fw_1_host_tsc_hz;
             uint64_t now_s = hype_rdtsc();
             if (hz != 0 && (g_scan_last[svi] == 0 || now_s - g_scan_last[svi] >= hz / 10u)) {
                 unsigned row, col, n = 0;
                 g_scan_last[svi] = now_s;
+                vm->diag.scan_gen = vm->term.generation;
+                vm->diag.scan_pc = vm->in_runner.pc;
                 for (row = 0; row < vm->term.rows; row++) {
                     for (col = 0; col < vm->term.cols; col++) {
                         vm->diag.snap[n++] = hype_vt_screen_cell(&vm->term, col, row).ch;
