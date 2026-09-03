@@ -32,7 +32,9 @@ two more legs. #599/#605 need a fifth boot with a different binary and are a dia
 CR0.CD fault fixed in f26b67c. Second attempt (build f26b67c) proved that fix and found the BSP
 starved by the PS/2 poll, fixed in 92c23a0 (#796). Third attempt (build 92c23a0) met #796,
 served the 0xCF9 reset from vCPU 1 on VMX, and hung the second boot on a stale VM-entry
-interrupt, fixed in 478f6f8 (#797). Re-run at 478f6f8 for #797, #525's second half, #698.**
+interrupt, fixed in 478f6f8 (#797). Fourth attempt (build 478f6f8) confirmed #797's fix and found the
+real cause of the hung second boot: the restart handed VMX the NPT table as its EPT root (all-UC),
+fixed in da3e93d (#798). Re-run at da3e93d for #798, #797, #525's second half, #698.**
 
 One Alpine live guest (2 vCPUs, reboot pinned to CPU 1 by `input-2b/vm0.txt`) plus the three
 #603 microtests. Seven physical cores with the BSP. If admission refuses a VM, fall back to

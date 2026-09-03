@@ -261,3 +261,26 @@ against stale text: a #728-class harness race, and the defence worked as designe
 
 Drive re-staged at 478f6f8, same card. Boot A is owed a fourth time, for #797, #525's second
 half and #698.
+
+## Boot A4 result (Intel i5-13420H, 2026-09-03)
+
+Build `478f6f8-dirty` (#797's fix), same config, 127 s. Logs under
+`tools/hw-val-2026-08-25/logs/bootA4-intel/` (gitignored).
+
+**#797's fix held** (`INTDIAG vm0/0 ... staged_eventinj=0x0` after the restart), and the second
+boot hung again in the same place. This time the numbers said what it was: the first OVMF took
+3 s from VM start to `BdsDxe`; the second spent 53 s inside SEC's LZMA decompressor
+(`rip=0xfffd3ee6..0xfffd413b`, 64-bit code, the range decoder's `shr $0xb; imul`), executing
+continuously at ~1,400 host-tick exits a second with `cr0=0x80000033`. Fifty times slower for the
+same code is uncached memory.
+
+**Cause (#798).** `fw_1_vm_reinit()` reset the vCPU with `vm->npt_pml4` as its paging root. On
+VMX the launch path picks `vm->ept_pml4` (the #272 block, whose own comment describes this very
+defect: NPT permission bits read as EPT R|W|X, but the EPT memory type bits read 0 = UC) and
+records it in `vm->used_root`; the SIPI path uses `used_root`; the restart did not. Every
+restarted VMX guest therefore ran on an NPT table interpreted as EPT: the same pages, all
+uncached. Nested SVM cannot show it, which is why the QEMU rig passes the restart. Fixed in
+da3e93d.
+
+Drive re-staged at da3e93d. Boot A is owed a fifth time, now for #798, #797, #525's second half
+and #698.
