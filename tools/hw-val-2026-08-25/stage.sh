@@ -33,9 +33,9 @@ set -u
 # drive. The active script and the card that describes it must move together or the operator
 # is reading instructions for a different run.
 BOOT_INPUT=input-1a
-RUN_CARD=RUN-CARD-2026-09-03-bootAMD1.md
+RUN_CARD=RUN-CARD-2026-09-03-bootAMD1-laptop.md
 # The config that becomes \hype.cfg. The others are staged beside it as fallbacks.
-ACTIVE_CFG=hype1g.cfg
+ACTIVE_CFG=hype1a.cfg
 
 BOOTLABEL=HYPEBOOT
 # The data partition has NO label. `EADE-CA36` is its exFAT volume UUID, which is what
