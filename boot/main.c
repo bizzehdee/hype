@@ -11674,7 +11674,16 @@ static void fw_1_vm_reinit(hype_fw_vm_t *vm, hype_vcpu_ctx_t *ctx, hype_vmm_kind
     uint64_t reset_cs_base = 0x100000000ULL - 0x10000ULL; /* 0xFFFF0000 */
     uint64_t reset_rip = 0xFFF0ULL;
     uint64_t stack_top = (uint64_t)(uintptr_t)(g_fw_1_guest_stack + sizeof(g_fw_1_guest_stack));
-    uint64_t npt_root_phys = (uint64_t)(uintptr_t)vm->npt_pml4;
+    /*
+     * #798: the root the LAUNCH chose, not vm->npt_pml4. On VMX that is vm->ept_pml4 (the
+     * #272 block below the launch picks it), and a restart that reset the vCPU onto the NPT
+     * table instead handed VMPTRLD an NPT root as EPT: permissions coincide (present|RW|US
+     * reads as R|W|X) but the EPT memory type (bits 5:3) reads 0 -- UC -- so the second boot
+     * ran entirely uncached. Intel boots A3/A4: the first OVMF reached BdsDxe in 3 s, the
+     * second sat in SEC's LZMA decompressor for 53 s and counting. Under nested SVM the same
+     * path uses the NPT table both times and nothing shows.
+     */
+    uint64_t npt_root_phys = vm->used_root != 0ull ? vm->used_root : (uint64_t)(uintptr_t)vm->npt_pml4;
 
     /*
      * #735: PARK EVERY AP BEFORE TOUCHING ANYTHING THE GUEST CAN SEE.
