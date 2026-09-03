@@ -14,7 +14,12 @@ record. There is nothing to watch on a terminal.
 
 ## Before you boot
 
-- Banner sha matches the staged build.
+- Banner reads `build 17785e9-dirty`. That is the expected value: the binary was built at
+  `17785e9`, and the commits after it (`564fbcf`) changed only this run card and `stage.sh`, no C
+  code. `-dirty` is the `edk2` submodule and an untracked `tools/789/` probe file, neither of
+  which is compiled in.
+- The active build must NOT carry the APICv marker -- verified at staging time
+  (`HYPE_ENABLE_APICV set` absent, `HOUSECOST` present).
 - Nothing else needs checking. No spare disks are touched by this config; `target_disk` is a file
   on the drive and exists only to satisfy admission's "needs a disk" check.
 
