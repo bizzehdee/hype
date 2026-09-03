@@ -314,3 +314,14 @@ Five Intel boots in one night, each finding one VMX-only host fault: guest CR0.C
 physical CR0 (#795), the 20 us i8042 poll (#796), a stale VM-entry event across the VMCS rebuild
 (#797), and the NPT root handed to VMX on restart (#798). The Intel side of the runbook is now
 down to #599/#605 (APICv), which wait on #708.
+
+## Boot AMD-1L (AMD laptop, 4 cores) -- no result, kernel never leaves early boot
+
+Build `da3e93d-dirty`, `hype1a.cfg`, 180 s, second time this laptop has done this (2026-08-27,
+build 4b62c48, was the first). GRUB prints `Booting 'Linux lts'` and the kernel then spins with
+interrupts off in RDTSC-timed delay loops at the same kernel offset both times (text+0x1c81d7e),
+never bringing up its APs. Host side: `LOOPPHASE house=77929ms` of 180 s, `COSTHIST body=234731ns`
+per exit against about 1 us on the 5950X. A guest whose early boot is delay loops runs 100x slower
+and never gets to SMP bring-up. Ticket #799; the build now prints `HOUSECOST` per section next to
+`LOOPPHASE` so the next boot on this laptop names the slow step. The laptop cannot run AMD-1
+(hype1g.cfg needs seven cores); that run stays with the 5950X.
