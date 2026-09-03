@@ -14,10 +14,9 @@ record. There is nothing to watch on a terminal.
 
 ## Before you boot
 
-- Banner reads `build 17785e9-dirty`. That is the expected value: the binary was built at
-  `17785e9`, and the commits after it (`564fbcf`) changed only this run card and `stage.sh`, no C
-  code. `-dirty` is the `edk2` submodule and an untracked `tools/789/` probe file, neither of
-  which is compiled in.
+- Banner reads `build 952e364-dirty` for run 2 (run 1 was `17785e9-dirty`). `-dirty` is the
+  `edk2` submodule and untracked `tools/789/` and `tools/799/` files, none of which is compiled
+  in.
 - The active build must NOT carry the APICv marker -- verified at staging time
   (`HYPE_ENABLE_APICV set` absent, `HOUSECOST` present).
 - Nothing else needs checking. No spare disks are touched by this config; `target_disk` is a file
@@ -156,3 +155,31 @@ reads an Intel thermal MSR that does not exist on this part.
 
 Fix section 5 first. It is 37% of the loop, it is hype's own code, and it is measurable on both
 machines. Then re-run L0 and see how much of the 235 us/exit figure is left.
+
+
+## Run 2 -- the same boot, after the section-5 fix (`952e364`)
+
+Run 1 found the cause: `HOUSECOST` section 5 -- the input-script screen scan -- was 95% of loop
+housekeeping and 37% of wall time, because the script's first `expect` could not match while the
+guest was silent, and the scan was throttled to 10 Hz but never gated on the screen having
+changed. `952e364` gates it on the `vt_screen` generation or the runner's pc having moved.
+
+Sandbox before/after at the same 1920x1080 grid (`tools/799/run-799-idlescan.sh`), successive
+`s5` samples: `0 1345 1982 2605 2827 2844 2861` ms before, still climbing, against
+`0 983 1025 1025 1025 1026 1026` ms after, flat. Once the guest goes quiet the fix costs +43 ms
+where the old code cost +1516 ms over the same 150 s.
+
+**The run is exactly the same as run 1.** Same config, same input script, same five minutes,
+same one line to read. Do not change anything: run 1 is the baseline and only the binary differs.
+
+### What run 2 answers
+
+| Read | Run 1 | Run 2 passes when |
+| --- | --- | --- |
+| `HOUSECOST vm0: s5=` | 47,544 ms, 95% of housekeeping | a small fraction of housekeeping, and it stops growing once the guest goes quiet |
+| `LOOPPHASE: house=` / `DRAIN: iters=` | 50,005 ms / 283,259 = 176 us per iteration | far below 176 us; the residue is what is left of #799's 235 us/exit |
+| the guest | GRUB `Booting \`Linux lts'`, then silence | **anything past it.** If the kernel now prints, the RDTSC-loop starvation was the scan, and the rest of the AMD-laptop queue unblocks |
+| `FBSPEED ram=` / `FBCLOCK` | bimodal 54-58 us / 492-498 us and 1650 / 190 per 1000 | expected UNCHANGED -- this fix does not touch the clock oscillation. Record it, do not read it as a failure |
+
+If the guest still stops at `Booting \`Linux lts'`, section 5 was a large amplifier but not the
+whole cause, and the next suspect is the bimodal clock rather than anything in hype's loop.
