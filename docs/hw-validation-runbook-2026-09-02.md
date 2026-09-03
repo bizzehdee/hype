@@ -65,14 +65,14 @@ Duration: 25 minutes. Operator actions: none after power-on.
 
 | Ticket | Read | Passes when |
 | --- | --- | --- |
-| #525 (SVM leg) | as Intel-A | as Intel-A. #735, which blocked this leg, is closed |
-| #698 (SVM, hardware) | `TMRLATE vm0/1` after the restart | climbing. QEMU already shows the fix; this is the hardware record |
-| #603 (SVM leg) | as Intel-A | as Intel-A. The 5950X has the cores the earlier laptop lacked |
-| #426 | the run reaching 90 minutes with input live at the end | no `left dead`, no `REFUSED`, keyboards typing at power-off. Boot 42 reached 71 minutes; the rate bound (#792) removes the cap that would have ended it |
+| #525 (SVM leg) | as Intel-A | recorded 2026-09-03 (bootAMD1-1): 0xCF9 from vCPU 1, restart, second login, `reboot-pin-nonbsp` |
+| #698 (SVM, hardware) | `TMRLATE vm0/1` after the restart | recorded 2026-09-03 (bootAMD1-1): deliveries 7452 -> 48395 after the restart |
+| #603 (SVM leg) | as Intel-A | ~~as Intel-A~~ **PASSED 2026-09-03, run bootAMD1-1** (`hello` PASS after `vmexit`'s triple fault and `vmexitstorm`'s watchdog force-off); #603 closed |
+| #426 | the run reaching 90 minutes with input live at the end (bootAMD1-1 gave 40 minutes, input live, 0 stalls; the 90-minute form is still owed) | no `left dead`, no `REFUSED`, keyboards typing at power-off. Boot 42 reached 71 minutes; the rate bound (#792) removes the cap that would have ended it |
 | #775 | `CTRLSILENCE` / `XHCIRESET` | every stall is followed by `reset #N done ... keyboards=3`. The fault is #781's controller death, not a lost completion; close as answered by #781-#785 |
 | #790 | `cmdring timeouts=` and `REVIVE` | `timeouts=` equals the number of `CTRLSILENCE` No-Ops and nothing else; 0 `REVIVE`. Met in boots 40-42 already; this run is the 90-minute form the ticket asked for |
 | #641 | `APVCPU vm0/N: exits=`, `PERF: hlt_wait=` | recorded. The fix is a design decision, not a run |
-| #788 | doubled characters per 1,000 in `KBDCHARS` | recorded. Boot 42 was 2.7; no fix has landed |
+| #788 | doubled characters per 1,000 in `KBDCHARS` | recorded. Boot 42 was 2.7; bootAMD1-1 (40 min) 2.6; no fix has landed |
 
 Duration: 100 minutes.
 
