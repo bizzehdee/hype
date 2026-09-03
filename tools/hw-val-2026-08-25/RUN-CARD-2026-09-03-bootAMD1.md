@@ -5,6 +5,17 @@ gate #796, reset-path fixes #797/#798). Active config `\hype.cfg` = `hype1g.cfg`
 guest (`run1a`, 2 vCPUs, reboot pinned to CPU 1 by `\input\vm0.txt` = `input-1a/vm0.txt`) plus
 hype1b.cfg's three #603 microtests. Seven physical cores including the BSP; the 5950X has 16.
 
+## Short form (20 minutes) -- what this staging is for
+
+Twenty minutes gives everything except the 90-minute input half. Steps 1 and 2 below take about
+five minutes and close **#603** (the SVM leg of the coverage suite; `hello` PASS after `vmexit`'s
+triple fault and `vmexitstorm`'s force-off) and put the pinned restart on record for **#525/#698**
+on SVM at the current tree. If the Pico and a second keyboard are to hand, do step 3 as well and
+leave the rest of the twenty minutes running: the first #792 stall came at 537 s in boot 42, so a
+single `XHCIRESET ... reset #1` inside the window is possible but not owed, and `KBDCHARS` gives a
+#788 sample. Without them, power off after the second login and the microtests. #426, #641 and
+the rate bound keep their 90-minute run.
+
 ## Before you boot
 
 - Banner sha matches the staged build.
