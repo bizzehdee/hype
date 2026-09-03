@@ -111,11 +111,15 @@ data partitions, one per filesystem) and the config runs three VMs, one sourcing
 
 Duration: 60 minutes plus the rebuild.
 
-## Boot Intel-B -- APICv, only when #708 is fixed
+## Boot Intel-B -- APICv, `hype2c.cfg` (staged 2026-09-03)
 
-`-DHYPE_ENABLE_APICV=1` build, `hype2c.cfg`. #599 and #605 ride it. #708 (the APICv build's
-2-vCPU hang) is open in To Do with no fix landed; until it lands, this boot is a #708
-diagnostic and #605 cannot be judged. Do not stage it for a close.
+`-DHYPE_ENABLE_APICV=1` build active, `hype2c.cfg`, `input-2c` (login only). #599 and #605 ride
+it. #708's candidate fix is in the tree: the BSP HLT wake reads RVI when APICv is live (boot 2c's
+dump had `pending_valid=0` with `gis=0x30ec`, the vector in the page and not in the software
+IRR), and `HLTSHADOW` counts the deadlock case. Card:
+`tools/hw-val-2026-08-25/RUN-CARD-2026-09-03-bootIntelB.md`. If the guest reaches login the
+boot is a #605 gate; if it hangs it is the #708 diagnostic and #605 is untested, not failed.
+Stage with `stage.sh --boot intelb`; `stage.sh --boot amd1` puts the AMD staging back.
 
 ## Decisions this runbook needs
 

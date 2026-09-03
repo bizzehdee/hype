@@ -23,7 +23,8 @@
 #     dropped its link under sustained write before.
 #
 # Usage:
-#   ./stage.sh                 stage the active (default) build + the AVIC build
+#   ./stage.sh                 stage the default, AVIC and APICv builds; boot set amd1
+#   ./stage.sh --boot intelb   the same, for the Intel APICv boot (APICv build active)
 #   ./stage.sh --no-build      stage whatever is already in rig/stage-current/
 #   ./stage.sh --check         verify the staged drive and change nothing
 set -u
@@ -32,10 +33,20 @@ set -u
 # for the first seven stagings, which is why boot 7 went out with boot 6's card still on the
 # drive. The active script and the card that describes it must move together or the operator
 # is reading instructions for a different run.
-BOOT_INPUT=input-1a
-RUN_CARD=RUN-CARD-2026-09-03-bootAMD1.md
-# The config that becomes \hype.cfg. The others are staged beside it as fallbacks.
-ACTIVE_CFG=hype1g.cfg
+# `--boot <name>` selects the set. Each set names the input script, the run card, the config
+# that becomes \hype.cfg (the others are staged beside it as fallbacks) and which build
+# variant becomes \EFI\BOOT\BOOTX64.EFI. All three variants are always staged under
+# \EFI\hype\ so a different one can be made active by copying, without a rebuild.
+BOOT=amd1
+select_boot() {
+  case "$1" in
+    amd1)   BOOT_INPUT=input-1a; RUN_CARD=RUN-CARD-2026-09-03-bootAMD1.md
+            ACTIVE_CFG=hype1g.cfg; ACTIVE_BUILD=default ;;
+    intelb) BOOT_INPUT=input-2c; RUN_CARD=RUN-CARD-2026-09-03-bootIntelB.md
+            ACTIVE_CFG=hype2c.cfg; ACTIVE_BUILD=apicv ;;
+    *) echo "unknown boot set: $1 (amd1|intelb)" >&2; exit 2 ;;
+  esac
+}
 
 BOOTLABEL=HYPEBOOT
 # The data partition has NO label. `EADE-CA36` is its exFAT volume UUID, which is what
@@ -44,13 +55,17 @@ BOOTLABEL=HYPEBOOT
 # neither a label that does not exist nor a UUID that changes on reformat is depended on.
 BUILD=1
 CHECK=0
-for a in "$@"; do
-  case "$a" in
+while [ $# -gt 0 ]; do
+  case "$1" in
     --no-build) BUILD=0 ;;
     --check)    CHECK=1; BUILD=0 ;;
-    *) echo "unknown argument: $a" >&2; exit 2 ;;
+    --boot)     shift; BOOT=${1:-}; [ -n "$BOOT" ] || { echo "--boot needs a name" >&2; exit 2; } ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
+  shift
 done
+select_boot "$BOOT"
+echo "boot set: $BOOT  input=$BOOT_INPUT cfg=$ACTIVE_CFG active-build=$ACTIVE_BUILD card=$RUN_CARD"
 
 die() { echo "stage: $*" >&2; exit 1; }
 cd "$(git rev-parse --show-toplevel)" || die "not in the repo"
@@ -94,6 +109,10 @@ if [ "$BUILD" = 1 ]; then
   make clean >/dev/null 2>&1
   EXTRA_CFLAGS="-DHYPE_ENABLE_AVIC=1" make all CC=clang LD=ld.lld >/dev/null 2>&1 || die "AVIC build failed"
   cp build/hype.efi "$STAGEDIR/hype-avic.efi"
+  echo "building APICv ..."
+  make clean >/dev/null 2>&1
+  EXTRA_CFLAGS="-DHYPE_ENABLE_APICV=1" make all CC=clang LD=ld.lld >/dev/null 2>&1 || die "APICv build failed"
+  cp build/hype.efi "$STAGEDIR/hype-apicv.efi"
   # The microtest kernels ride along: hype2d/hype2g run them, and a stale .bin proves nothing
   # about the hype it is staged with.
   make micro >/dev/null 2>&1 || die "make micro failed"
@@ -106,6 +125,11 @@ if [ "$BUILD" = 1 ]; then
   fi
   strings -a "$STAGEDIR/hype-avic.efi" | grep -q 'ENABLING (HYPE_ENABLE_AVIC set)' \
     || die "the AVIC build does NOT contain the ENABLING string -- EXTRA_CFLAGS did not take"
+  if strings -a "$STAGEDIR/hype-default.efi" | grep -q '(HYPE_ENABLE_APICV set)'; then
+    die "the DEFAULT build contains the APICv marker -- the variants got crossed"
+  fi
+  strings -a "$STAGEDIR/hype-apicv.efi" | grep -q '(HYPE_ENABLE_APICV set)' \
+    || die "the APICv build does NOT contain its marker -- EXTRA_CFLAGS did not take"
 fi
 
 # ---------------------------------------------------------------- scratch images (#738)
@@ -141,7 +165,8 @@ if [ "$CHECK" = 0 ]; then
   echo "staging onto $BOOTMP ..."
   cp "$STAGEDIR/hype-default.efi" "$BOOTMP/EFI/hype/hype-default.efi" || die "copy default"
   cp "$STAGEDIR/hype-avic.efi"    "$BOOTMP/EFI/hype/hype-avic.efi"    || die "copy avic"
-  cp "$STAGEDIR/hype-default.efi" "$BOOTMP/EFI/BOOT/BOOTX64.EFI"      || die "copy active"
+  cp "$STAGEDIR/hype-apicv.efi"   "$BOOTMP/EFI/hype/hype-apicv.efi"   || die "copy apicv"
+  cp "$STAGEDIR/hype-$ACTIVE_BUILD.efi" "$BOOTMP/EFI/BOOT/BOOTX64.EFI" || die "copy active"
   cp $HERE/hype*.cfg "$BOOTMP/" || die "copy configs"
   [ -f "$HERE/$ACTIVE_CFG" ] || die "active config $ACTIVE_CFG not found"
   cp "$HERE/$ACTIVE_CFG" "$BOOTMP/hype.cfg" || die "copy active config"
@@ -185,9 +210,10 @@ verify() {
     echo "  BAD   $name: staged $ha, on media $hb" >&2; RC=1; fi
 }
 if [ -f "$STAGEDIR/hype-default.efi" ]; then
-  verify "$STAGEDIR/hype-default.efi" "$BOOTMP/EFI/BOOT/BOOTX64.EFI" "BOOTX64.EFI"
+  verify "$STAGEDIR/hype-$ACTIVE_BUILD.efi" "$BOOTMP/EFI/BOOT/BOOTX64.EFI" "BOOTX64.EFI (= hype-$ACTIVE_BUILD.efi)"
   verify "$STAGEDIR/hype-default.efi" "$BOOTMP/EFI/hype/hype-default.efi" "hype-default.efi"
   verify "$STAGEDIR/hype-avic.efi"    "$BOOTMP/EFI/hype/hype-avic.efi"    "hype-avic.efi"
+  verify "$STAGEDIR/hype-apicv.efi"   "$BOOTMP/EFI/hype/hype-apicv.efi"   "hype-apicv.efi"
 fi
 for c in $HERE/hype*.cfg; do
   verify "$c" "$BOOTMP/$(basename "$c")" "$(basename "$c")"

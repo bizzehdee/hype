@@ -1104,10 +1104,18 @@ static int build_guest_common(uint64_t cs_base, uint64_t rip, uint64_t stack_phy
         rc |= vmwrite(HYPE_VMCS_EOI_EXIT_BITMAP3, ~0ull);
         rc |= vmwrite(HYPE_VMCS_GUEST_INTERRUPT_STATUS, 0);
     }
-    hype_debug_print("vmx: apicv=%s (slot %u)%s [#599]\n", apicv_on ? "ON" : "off",
+    /* The build variant is named in the string so a staged binary can be told apart from the
+     * default build by `strings` alone -- the same check stage.sh runs on the AVIC build. */
+    hype_debug_print("vmx: apicv=%s (slot %u)%s%s [#599]\n", apicv_on ? "ON" : "off",
                      (unsigned)slot,
                      apicv_on ? " -- register reads/EOI/delivery through the virtual-APIC page"
-                              : "");
+                              : "",
+#if HYPE_ENABLE_APICV
+                     " (HYPE_ENABLE_APICV set)"
+#else
+                     " -- not built in (build -DHYPE_ENABLE_APICV=1 to use it)"
+#endif
+                     );
 
     /* Guest segments. Long mode: flat 64-bit -- base 0, 4GB limit, CS is a
      * long-mode code segment (AR 0xA09B: type=exec/read/accessed, S, P, L,
@@ -3579,6 +3587,18 @@ static void vmx_note_injected(struct hype_vcpu_ctx *real, uint8_t vector) {
 int hype_vmx_apicv_active(hype_vcpu_ctx_t *ctx) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     return real != 0 && real->apicv;
+}
+
+/* #708: the highest vector the virtual-APIC page holds pending, or 0. Under APICv the timer,
+ * IPIs and every device vector are posted straight into vIRR/RVI and never touch pending_irr,
+ * so the trap path's pending_valid is 0 while the page holds work. Owner context only (a VMCS
+ * read); the BSP loop is its vCPU's owner. */
+uint8_t hype_vmx_vcpu_apicv_rvi(hype_vcpu_ctx_t *ctx) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    int ok = 0;
+    if (real == 0 || !real->apicv) return 0;
+    vmx_ensure_current(ctx);
+    return (uint8_t)(vmread(HYPE_VMCS_GUEST_INTERRUPT_STATUS, &ok) & 0xFFu);
 }
 
 /* #599: stamp the guest-visible APIC ID into the virtual-APIC page. With

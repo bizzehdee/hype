@@ -254,6 +254,7 @@ int hype_vmx_vcpu_handle_lapic_access(hype_vcpu_ctx_t *ctx, hype_guest_lapic_t *
                                       const uint8_t *guest_insn_bytes);
 void hype_vmx_vcpu_wake_hlt(hype_vcpu_ctx_t *ctx);
 void hype_vmx_vcpu_clear_intr_shadow(hype_vcpu_ctx_t *ctx); /* #750/#698: the STI bit only */
+uint8_t hype_vmx_vcpu_apicv_rvi(hype_vcpu_ctx_t *ctx); /* #708: RVI, 0 when APICv is off */
 void hype_vmx_vcpu_get_intr_state(hype_vcpu_ctx_t *ctx, hype_vmm_intr_state_t *out);
 int hype_vmx_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx);
 /*

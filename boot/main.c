@@ -15567,6 +15567,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     unsigned long long hltw_req[4] = {0, 0, 0, 0};
     unsigned long long hltw_act[4] = {0, 0, 0, 0};
     unsigned long long hltw_zero = 0, hltw_src_pit = 0, hltw_src_lapic = 0, hltw_src_both = 0;
+    /* #708 probe: BSP HLT exits that re-saved blocking-by-STI, and the subset where the
+     * virtual-APIC page already held a vector (RVI != 0) that the trap-path test below
+     * could not see. A nonzero second count is the APICv BSP deadlock. */
+    unsigned long long hltw_sti = 0, hltw_sti_rvi = 0, hltw_rvi_wake = 0;
     uint64_t lapic_tick_accum = 0; /* M4-6b2: fractional carry converting PIT-rate
                                     * ticks to the LAPIC's 1 GHz base rate */
     /* M4-6d2b: host TSC of the most recent productive (non-HLT) exit --
@@ -17543,6 +17547,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                                      hltw_req[0], hltw_req[1], hltw_req[2], hltw_req[3],
                                      hltw_act[0], hltw_act[1], hltw_act[2], hltw_act[3], hltw_zero,
                                      hltw_src_pit, hltw_src_lapic, hltw_src_both);
+                    hype_debug_print("fw-1 HLTSHADOW: bsp hlt exits with STI blocking=%llu "
+                                     "of those with RVI pending=%llu | rvi wakes=%llu [#708]\n",
+                                     hltw_sti, hltw_sti_rvi, hltw_rvi_wake);
                 }
                 /* M4-6d4: companion line to EXHIST. The real-HW soft lockups
                  * (blkid stuck 24s, kworker stuck 26s -- confirmed by a
@@ -20599,6 +20606,27 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 if (((is.eventinj >> 31) & 1u) != 0u) {
                     vmm_wake_hlt(kind, ctx);
                     continue;
+                }
+                /*
+                 * #708: under APICv the vector is in the virtual-APIC page, not pending_irr.
+                 * pending_valid reads 0, the wake below is skipped, the vCPU re-enters AT the
+                 * HLT with blocking-by-STI re-saved, and the hardware's own virtual-interrupt
+                 * delivery is gated on that very bit -- so it never delivers and the guest
+                 * halts forever (Intel boot 2c: RVI=0xec in the page, pending_valid=0, one
+                 * RIP). The AP loop wakes on "posted something" and never had this. RVI != 0
+                 * is the page's pending_valid; retiring the HLT clears the shadow and the
+                 * CPU delivers on the next entry.
+                 */
+                {
+                    uint8_t rvi = (kind == HYPE_VMM_KIND_VMX) ? hype_vmx_vcpu_apicv_rvi(ctx) : 0u;
+                    int sti_blocked = (is.interrupt_shadow & 1u) != 0u;
+                    if (sti_blocked) { hltw_sti++; }
+                    if (sti_blocked && rvi != 0u) { hltw_sti_rvi++; }
+                    if (if_set && rvi != 0u && !is.pending_valid && !pic_ready) {
+                        hltw_rvi_wake++;
+                        vmm_wake_hlt(kind, ctx);
+                        continue;
+                    }
                 }
                 if (if_set && (is.pending_valid || pic_ready)) {
                     vmm_wake_hlt(kind, ctx); /* retire HLT + clear STI shadow */
