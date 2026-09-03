@@ -123,7 +123,7 @@ diagnostic and #605 cannot be judged. Do not stage it for a close.
 2. Name a sanctioned SATA scratch drive by serial for AMD-2, or accept NVMe + USB only.
 3. Provide the sacrificial USB device for #754.
 4. #641: move to Doing for a fix, or leave On Hold. Three hardware runs already reproduce it.
-5. #790: close on boots 40-42's ring-level evidence, or wait for AMD-1's 90-minute form.
+5. ~~#790~~ closed 2026-09-03 on boots 40-42 (operator's call); #775 closed the same day as answered by #781-#785.
 
 ## On Hold, no boot helps
 
