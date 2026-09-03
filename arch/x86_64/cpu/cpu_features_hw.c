@@ -102,3 +102,26 @@ uint32_t hype_cpu_leaf80000001_edx(void) {
     cpuid(0x80000001u, &a, &b, &c, &d);
     return d;
 }
+
+/*
+ * #802: hypervisor-present bit + the paravirt signature leaf. Exempt hw shim; the decode is
+ * hype_cpu_hypervisor_present()/hype_cpu_hv_signature_decode().
+ *
+ * The signature leaf is read only when the present bit is set. 0x40000000 is above every real
+ * CPU's reported maximum standard leaf, so reading it on bare metal returns whatever the highest
+ * implemented leaf returns -- exactly the #370 mistake of taking one leaf's contents for
+ * another's -- which on some parts is non-zero and would print as a fabricated vendor name.
+ */
+hype_cpu_hv_t hype_cpu_detect_hypervisor(void) {
+    uint32_t a = 0, b = 0, c = 0, d = 0;
+    hype_cpu_hv_t hv;
+
+    cpuid(1u, &a, &b, &c, &d);
+    hv.present = hype_cpu_hypervisor_present(c);
+    hv.signature[0] = '\0';
+    if (hv.present) {
+        cpuid(0x40000000u, &a, &b, &c, &d);
+        hype_cpu_hv_signature_decode(b, c, d, hv.signature);
+    }
+    return hv;
+}

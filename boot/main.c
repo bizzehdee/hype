@@ -1880,8 +1880,25 @@ static void fw_1_phase_checkpoint(hype_fw_vm_t *vm, unsigned phase) {
  */
 extern volatile uint16_t *g_436_loop_section; /* defined with the #436 breadcrumbs below */
 #define HYPE_HOUSECOST_VMS 8u
-#define HYPE_HOUSECOST_SLOTS 12u
-static const uint16_t g_housecost_codes[HYPE_HOUSECOST_SLOTS] = {2, 21, 22, 23, 5, 6, 7, 72, 73, 74, 75, 0};
+#define HYPE_HOUSECOST_SLOTS 25u
+/*
+ * #801: 761 and 768 were emitted by fw_1_loop_section() but had no slot here, so their
+ * intervals were walked past and dropped -- 11 s of a 220 s AMD-L0 run vanished that way.
+ *
+ * 79/80/81 close the other hole. Everything through s75 is inside the housekeeping block; the
+ * rest of the iteration (loop-top prologue, VMRUN, guest execution, exit dispatch) had no marker
+ * at all, so whichever section was open last absorbed it. That is what made s75 look like a
+ * 460 us/exit "elastic wait": it was being charged the guest's own run time. 79 is the pre-entry
+ * prologue, 80 is VMRUN plus guest execution, 81 the post-exit prologue -- so the sections now
+ * sum to wall time and the guest's own time is named separately from hype's.
+ *
+ * 764/769/781/782/795/796/797/798 split what is left of s75 by exit family (MSR, CPUID/RDTSC,
+ * hypercall, interrupt-window, nested-page-fault, IOIO, exception, HLT). Without them "hype's
+ * dispatch" is a single number and the next reader is back to guessing which handler owns it.
+ */
+static const uint16_t g_housecost_codes[HYPE_HOUSECOST_SLOTS] = {
+    2,  21,  22,  23,  5,   6,   7,   72,  73, 74, 75, 761,
+    768, 764, 769, 781, 782, 795, 796, 797, 798, 79, 80, 81, 0};
 static uint64_t g_housecost_tsc[HYPE_HOUSECOST_VMS][HYPE_HOUSECOST_SLOTS];
 static uint64_t g_housecost_mark[HYPE_HOUSECOST_VMS];
 static uint16_t g_housecost_prev[HYPE_HOUSECOST_VMS];
@@ -15686,6 +15703,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
     for (;;) {
         uint8_t timer_vector;
 
+        /* #801 s79: opens the pre-entry span (loop prologue + host input drain). Placed at the
+         * loop top rather than the bottom because most exit handlers `continue`. */
+        fw_1_loop_section(vm, 79u);
+
         if (perf_boot_start_tsc == 0) {
             perf_boot_start_tsc = hype_rdtsc(); /* PERF-1a wall-clock base */
         }
@@ -15986,10 +16007,12 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             (void)fw_1_uplink_pump(kind);
             fw_1_mkdisk_pump(); /* TERM-11 (#487): paced qcow2 create, never a blocking one */
             g_bsp_probe_entry_tsc[(unsigned)(vm - g_vms)] = hype_rdtsc(); /* #483 */
+            fw_1_loop_section(vm, 80u); /* #801 s80: VMRUN + guest execution, hype's own cost excluded */
             if (ops->vcpu_run(ctx, &info) != 0) {
                 fw_1_dev_lock(vm);
                 hype_fatal("fw-1: VM-entry failed (reason=0x%llx)", (unsigned long long)info.reason);
             }
+            fw_1_loop_section(vm, 81u); /* #801 s81: post-exit prologue, up to the housekeeping block */
             {   /* #483: publish this exit for the AP watchdog BEFORE anything that can block. */
                 unsigned vp_ = (unsigned)(vm - g_vms);
                 g_bsp_probe_exit_tsc[vp_] = hype_rdtsc();
@@ -17139,7 +17162,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         unsigned vi = (unsigned)(vm - g_vms);
                         if (vi < g_vm_count) {
                             if (vi < HYPE_HOUSECOST_VMS) {
-                                char hl[300];
+                                char hl[600];
                                 int ho = hype_snprintf(hl, sizeof(hl), "fw-1 HOUSECOST vm%u:", vi);
                                 unsigned hk;
                                 for (hk = 0; hk < HYPE_HOUSECOST_SLOTS && g_housecost_codes[hk] != 0u; hk++) {
@@ -17923,11 +17946,6 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
          * hold shows up as this rather than as the loop-top default. */
         fw_1_loop_section(vm, 22u);
         fw_1_phase_checkpoint(vm, HYPE_FW_PHASE_PERSIST);
-        {   /* #799: the previous iteration ended at section 75; nothing between then and here
-             * (dispatch + guest run) belongs to housekeeping, so restart the clock. */
-            unsigned hv_ = (unsigned)(vm - g_vms);
-            if (hv_ < HYPE_HOUSECOST_VMS) { g_housecost_prev[hv_] = 0u; g_housecost_mark[hv_] = 0ull; }
-        }
         fw_1_loop_section(vm, 2u);
 
         /* M4-6b1: advance the guest PIT + LAPIC timer by the number of
@@ -19443,7 +19461,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             hype_vmx_vcpu_handle_wbinvd();
             continue;
         }
-            g_436_loop_section[(unsigned)(vm-g_vms)]=769;
+        fw_1_loop_section(vm, 769u); /* #801: closes s75, opens the CPUID/RDTSC/MSR family */
         if (vmm_reason_is_cpuid(kind, info.reason)) {
             vmm_handle_cpuid(kind, ctx);
             continue;
@@ -19456,7 +19474,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             continue;
         }
         if (vmm_reason_is_msr(kind, info.reason)) {
-            g_436_loop_section[(unsigned)(vm-g_vms)]=764;
+            fw_1_loop_section(vm, 764u);
             int msr_rc = vmm_handle_msr(kind, ctx, info.reason, &g_fw_1_lapic);
             if (msr_rc > 0) {
                 /* Invalid synthetic-MSR input is a guest fault, not a host fault. */
@@ -19475,7 +19493,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             continue;
         }
         if (vmm_reason_is_hypercall(kind, info.reason)) {
-            g_436_loop_section[(unsigned)(vm-g_vms)]=781;
+            fw_1_loop_section(vm, 781u);
             if (vmm_handle_hypercall(kind, ctx) != 0) {
                 hype_debug_print("fw-1: inactive Hyper-V hypercall instruction at guest_rip=0x%llx\n",
                                  (unsigned long long)info.guest_rip);
@@ -19487,7 +19505,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         if (vmm_reason_is_intr_window(kind, info.reason)) {
             /* The VINTR window opened -- the guest can now take the
              * pending timer IRQ (INT-2). */
-            g_436_loop_section[(unsigned)(vm-g_vms)]=782;
+            fw_1_loop_section(vm, 782u);
             /*
              * #577: feed this exit's RIP into the kernel-RIP histogram too. The host
              * preemption tick loses the race to device exits on a busy guest, so KRIPHIST
@@ -19582,6 +19600,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
 
         if (vmm_reason_is_npf(kind, info.reason)) {
             hype_vmm_npf_t npf;
+            fw_1_loop_section(vm, 795u); /* #801 */
             /* Faulting-instruction bytes for MMIO decode. Prefer AMD's
              * decode-assist capture (valid regardless of guest paging):
              * once a guest runs its own virtual address space (a Linux
@@ -20049,6 +20068,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         }
 
         if (vmm_reason_is_ioio(kind, info.reason)) {
+            fw_1_loop_section(vm, 796u); /* #801 */
 #if HYPE_IO_HISTOGRAM
             /* PERF-1: record EVERY I/O exit's port before the handler cascade
              * runs (peek = decode only, no RIP advance), so the histogram covers
@@ -20238,6 +20258,10 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 continue;
             }
         }
+        /* #801: opens the exception cascade -- unconditional, because the cascade is three
+         * separate `if`s (#DB, then #UD/#GP/#PF, then the catch-all) and a marker inside the
+         * first would name only that one. */
+        fw_1_loop_section(vm, 797u);
         if (vmm_reason_is_exception(kind, ctx, info.reason, 1)) {
             /* #436: the KeBugCheckEx breakpoint. Report the call exactly as the
              * guest made it, then disarm so the bugcheck proceeds untouched. */
@@ -20571,6 +20595,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         }
 
         if (vmm_reason_is_hlt(kind, info.reason)) {
+            fw_1_loop_section(vm, 798u); /* #801 */
             /*
              * #580: THE WAKE COMES FIRST, ABOVE THE BOOT-PROGRESS GATE.
              *
@@ -28220,6 +28245,30 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 ? "Intel"
                 : (cpu_diag.vendor == HYPE_CPU_VENDOR_AMD) ? "AMD" : "unknown",
             cpu_diag.has_vmx, cpu_diag.has_svm);
+        /*
+         * #802: is hype itself a guest? Decides whether guest RDTSC is intercepted.
+         *
+         * The intercept exists only for nested KVM, which can hand an L2 a stopped counter
+         * (#438). On bare metal the TSC advances natively and tsc_offset already gives the guest
+         * its own view, so the intercept buys nothing and costs a VMEXIT per RDTSC -- which is
+         * what left an Alpine guest grinding through 444,140 exits in an early interrupts-off
+         * delay loop on the AMD laptop.
+         *
+         * Printed either way. A silent bare-metal branch would be indistinguishable in the log
+         * from the old unconditional behaviour, which is exactly the ambiguity that would make
+         * the next hardware run unreadable. Must run before ops->vcpu_create() below builds the
+         * first VMCB.
+         */
+        {
+            hype_cpu_hv_t hv = hype_cpu_detect_hypervisor();
+            hype_vmcb_set_rdtsc_intercept(hv.present);
+            hype_debug_print(
+                "cpu: hypervisor-present=%d signature='%s' -- guest RDTSC intercept %s [#802]\n",
+                hv.present, hv.signature,
+                (kind != HYPE_VMM_KIND_SVM)
+                    ? "OFF (VMX never intercepted it)"
+                    : hv.present ? "ON (nested)" : "OFF (bare metal)");
+        }
         /*
          * #298: what hype actually HANDS a guest for CPUID leaf 0, printed beside what the host
          * really is.

@@ -6,6 +6,35 @@
  * index 0, which must be WB or all guest RAM is uncacheable under NPT. */
 #define HYPE_SVM_PAT_POWERON_DEFAULT 0x0007040600070406ULL
 
+/* #802: see the header. ON by default -- the nested-rig-safe answer. */
+static int g_intercept_rdtsc = 1;
+
+void hype_vmcb_set_rdtsc_intercept(int on) {
+    g_intercept_rdtsc = on ? 1 : 0;
+}
+
+int hype_vmcb_rdtsc_intercept(void) {
+    return g_intercept_rdtsc;
+}
+
+uint32_t hype_vmcb_baseline_intercept_misc1(int intercept_rdtsc) {
+    /* Intercept HLT (the guest's only instruction, M2-7), shutdown (a triple fault -- no
+     * exception handling exists yet, so a shutdown must come back to us rather than reset the
+     * machine), CPUID/MSR (CPUMSR-1/CPUMSR-2), IOIO (FW-1 -- a real firmware guest does real
+     * port I/O; hype_svm_vcpu_create()'s own g_iopm fill is what actually marks every port
+     * intercepted, same "control bit only enables interception, the bitmap decides per-port"
+     * split hype_svm_vcpu_create_long_mode() already documents) and INVLPGA -- guest-isolation
+     * baseline: without these, CPUID/RDMSR/WRMSR/IN/OUT execute natively against the real host
+     * CPU/hardware. */
+    uint32_t misc1 = HYPE_SVM_INTERCEPT_HLT | HYPE_SVM_INTERCEPT_SHUTDOWN |
+                     HYPE_SVM_INTERCEPT_CPUID | HYPE_SVM_INTERCEPT_MSR_PROT |
+                     HYPE_SVM_INTERCEPT_IOIO_PROT | HYPE_SVM_INTERCEPT_INVLPGA;
+    if (intercept_rdtsc) {
+        misc1 |= HYPE_SVM_INTERCEPT_RDTSC;
+    }
+    return misc1;
+}
+
 uint16_t hype_vmcb_seg_attrib(uint8_t access, uint8_t flags) {
     return (uint16_t)access | (uint16_t)((flags & 0x0Fu) << 8);
 }
@@ -43,20 +72,7 @@ void hype_vmcb_build_realmode_guest(hype_vmcb_t *vmcb, uint64_t entry_phys, uint
         bytes[i] = 0;
     }
 
-    /* Intercept HLT (the guest's only instruction, M2-7), shutdown
-     * (a triple fault -- no exception handling exists yet, so a
-     * shutdown must come back to us rather than reset the machine),
-     * CPUID/MSR (CPUMSR-1/CPUMSR-2), and IOIO (FW-1 -- a real firmware
-     * guest does real port I/O; hype_svm_vcpu_create()'s own g_iopm
-     * fill is what actually marks every port intercepted, same
-     * "control bit only enables interception, the bitmap decides per-
-     * port" split hype_svm_vcpu_create_long_mode() already documents)
-     * -- guest-isolation baseline: without these, CPUID/RDMSR/WRMSR/
-     * IN/OUT execute natively against the real host CPU/hardware. */
-    vmcb->control.intercept_misc1 = HYPE_SVM_INTERCEPT_HLT | HYPE_SVM_INTERCEPT_SHUTDOWN |
-                                     HYPE_SVM_INTERCEPT_CPUID | HYPE_SVM_INTERCEPT_MSR_PROT |
-                                     HYPE_SVM_INTERCEPT_IOIO_PROT | HYPE_SVM_INTERCEPT_INVLPGA |
-                                     HYPE_SVM_INTERCEPT_RDTSC;
+    vmcb->control.intercept_misc1 = hype_vmcb_baseline_intercept_misc1(g_intercept_rdtsc);
     /* #317: every SVM instruction, not just VMRUN. The guest's EFER.SVME is necessarily set
      * (VMRUN requires it), so these do not #UD on their own -- see the mask's own comment. */
     vmcb->control.intercept_misc2 = HYPE_SVM_INTERCEPT_SVM_INSNS | HYPE_SVM_INTERCEPT_VMMCALL;
@@ -156,13 +172,7 @@ void hype_vmcb_build_long_mode_guest(hype_vmcb_t *vmcb, uint64_t entry_rip, uint
         bytes[i] = 0;
     }
 
-    /* CPUMSR-1/CPUMSR-2: CPUID/MSR intercepted here too, same
-     * guest-isolation baseline reasoning as
-     * hype_vmcb_build_realmode_guest() above. */
-    vmcb->control.intercept_misc1 =
-        HYPE_SVM_INTERCEPT_HLT | HYPE_SVM_INTERCEPT_SHUTDOWN | HYPE_SVM_INTERCEPT_IOIO_PROT |
-        HYPE_SVM_INTERCEPT_CPUID | HYPE_SVM_INTERCEPT_MSR_PROT | HYPE_SVM_INTERCEPT_INVLPGA |
-        HYPE_SVM_INTERCEPT_RDTSC;
+    vmcb->control.intercept_misc1 = hype_vmcb_baseline_intercept_misc1(g_intercept_rdtsc);
     vmcb->control.intercept_misc2 = HYPE_SVM_INTERCEPT_SVM_INSNS |
                                     HYPE_SVM_INTERCEPT_VMMCALL; /* #317/#300 */
 

@@ -69,6 +69,38 @@ typedef struct {
  */
 hype_cpu_diag_t hype_cpu_detect_vmm_kind_diag(void);
 
+/*
+ * #802: is hype itself running as a guest?
+ *
+ * CPUID leaf 1 ECX bit 31 is the architectural "hypervisor present" bit -- reserved-zero on real
+ * hardware, set by every hypervisor that means to be discoverable. This is NOT the same question
+ * as hype_cpu_detect_vmm_kind(), which answers "VMX or SVM", i.e. which vendor's extension to
+ * drive; a nested rig and bare metal answer that one identically.
+ *
+ * It is a hint, not a guarantee: a hypervisor may clear the bit to hide, and the failure mode
+ * matters. A false "bare metal" costs correctness (a workaround that a nested rig needs gets
+ * dropped); a false "nested" costs only performance. So callers must treat 0 as the assertive
+ * answer and anything they cannot confirm as "nested" -- see hype_vmcb_set_rdtsc_intercept().
+ */
+int hype_cpu_hypervisor_present(uint32_t leaf1_ecx);
+
+/*
+ * Decodes CPUID leaf 0x40000000's EBX/ECX/EDX into the 12-character hypervisor signature
+ * ("KVMKVMKVM\0\0\0", "Microsoft Hv", "VMwareVMware", ...). Same byte layout as leaf 0's vendor
+ * string but in plain EBX/ECX/EDX order, which is the one difference worth having a separate
+ * function for. Only meaningful when hype_cpu_hypervisor_present() said yes; `out` is left an
+ * empty string for an all-zero leaf so a log line reads as "unnamed", not as garbage.
+ */
+void hype_cpu_hv_signature_decode(uint32_t ebx, uint32_t ecx, uint32_t edx, char out[13]);
+
+typedef struct {
+    int present;         /* leaf 1 ECX bit 31 */
+    char signature[13];  /* leaf 0x40000000, "" when absent or unnamed */
+} hype_cpu_hv_t;
+
+/* Real CPUID probe for the two above. Exempt hw shim -- the decision logic is the pure pair. */
+hype_cpu_hv_t hype_cpu_detect_hypervisor(void);
+
 /* SVM PAUSE-filter support: CPUID Fn8000_000A_EDX bit 10 (PAUSEFILTER),
  * bit 12 (PFTHRESHOLD). Pure bit checks. */
 int hype_cpu_has_pause_filter(uint32_t leaf8000000a_edx);

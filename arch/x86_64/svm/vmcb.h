@@ -182,9 +182,18 @@ _Static_assert(__builtin_offsetof(hype_vmcb_t, control.exitintinfo) == 0x088, "c
  * svm_vcpu.c) -- not part of any guest's baseline intercept set the
  * way HLT/SHUTDOWN/CPUID/MSR_PROT are. */
 #define HYPE_SVM_INTERCEPT_VINTR (1u << 4)
-/* RDTSC is normally allowed to run directly, but nested KVM can expose a
- * stopped L2 counter.  Intercept it so hype can return the advancing L1 TSC
- * plus the guest's configured offset (#438). */
+/*
+ * RDTSC is normally allowed to run directly, but nested KVM can expose a stopped L2 counter.
+ * Intercept it so hype can return the advancing L1 TSC plus the guest's configured offset (#438).
+ *
+ * #802: NOT part of the unconditional baseline, unlike HLT/SHUTDOWN/CPUID/MSR_PROT/IOIO_PROT/
+ * INVLPGA. Those are guest-isolation intercepts and are never optional; this one is a workaround
+ * for hype's own nested-KVM dev rig. On bare metal the TSC advances natively and tsc_offset
+ * already gives the guest its own view, so intercepting buys nothing and costs a VMEXIT per
+ * RDTSC -- measured on the AMD laptop as an Alpine guest stuck in an early interrupts-off RDTSC
+ * delay loop, 444,140 exits in 220 s, running roughly a thousand times slower than the hardware
+ * it believed it was on. hype_vmcb_set_rdtsc_intercept() is what decides, per boot.
+ */
 #define HYPE_SVM_INTERCEPT_RDTSC (1u << 14)
 /*
  * CPUMSR-1: intercept every guest CPUID (bit 18 of intercept_misc1's
@@ -666,6 +675,28 @@ uint32_t hype_acpi_pm_timer_scale(uint64_t tsc, uint64_t tsc_hz);
  * bit-packing, no CPU state touched.
  */
 uint16_t hype_vmcb_seg_attrib(uint8_t access, uint8_t flags);
+
+/*
+ * #802: whether guest RDTSC is intercepted, applied by both builders below.
+ *
+ * Defaults to ON, which is the pre-#802 behaviour: a hype that never calls the setter keeps
+ * working under nested KVM. Only an affirmative "this is bare metal" turns it off, so the
+ * expensive-but-correct answer is the one you get by omission -- see the failure-mode note on
+ * hype_cpu_hypervisor_present().
+ *
+ * Boot-time policy, not a per-vCPU knob: it is read when a VMCB is built, so it must be set
+ * before the first guest is created. Both builders zero the whole VMCB first, so a VMCB built
+ * before the setter runs would silently keep the old mask.
+ */
+void hype_vmcb_set_rdtsc_intercept(int on);
+int hype_vmcb_rdtsc_intercept(void);
+
+/*
+ * The intercept mask both builders start from: the guest-isolation baseline, plus RDTSC when
+ * `intercept_rdtsc` is nonzero. Split out so the policy is one testable expression rather than
+ * two hand-kept-in-sync literals -- they had already drifted in bit order before #802.
+ */
+uint32_t hype_vmcb_baseline_intercept_misc1(int intercept_rdtsc);
 
 /*
  * Fills `vmcb` (zeroed first) for a minimal real-address-mode guest:

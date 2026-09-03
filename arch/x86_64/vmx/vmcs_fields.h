@@ -64,6 +64,12 @@
  * interrupt/NMI shadow) -- the VMX analogue of SVM's VINTR window, used to
  * deliver a pending vector the guest wasn't ready for at request time. */
 #define HYPE_VMX_PROCBASED_INTERRUPT_WINDOW_EXITING (1u << 2)
+/*
+ * #802: there is deliberately no HYPE_VMX_PROCBASED_RDTSC_EXITING (primary proc-based control,
+ * bit 12). VMX never had the SVM side's unconditional RDTSC intercept, so the VMX path already
+ * lets a guest's RDTSC run natively against the TSC offset -- checked while fixing SVM, and
+ * recorded here because "absent" and "removed by mistake" look identical in a header.
+ */
 /* Secondary processor-based VM-execution control bits used here. */
 /* "Unrestricted guest" (below) requires "enable EPT" to also be 1 --
  * Intel SDM: an unrestricted guest can run with paging disabled, and

@@ -77,7 +77,10 @@ static void test_build_realmode_guest(void) {
               vmcb.control.intercept_misc1 & HYPE_SVM_INTERCEPT_HLT);
     CHECK_HEX("shutdown is intercepted", HYPE_SVM_INTERCEPT_SHUTDOWN,
               vmcb.control.intercept_misc1 & HYPE_SVM_INTERCEPT_SHUTDOWN);
-    CHECK_HEX("RDTSC is intercepted", HYPE_SVM_INTERCEPT_RDTSC,
+    /* #802: RDTSC is policy, not part of the isolation baseline -- assert against the policy
+     * rather than a literal, so this does not depend on which test ran first. */
+    CHECK_HEX("RDTSC follows the #802 policy",
+              hype_vmcb_rdtsc_intercept() ? (unsigned)HYPE_SVM_INTERCEPT_RDTSC : 0u,
               vmcb.control.intercept_misc1 & HYPE_SVM_INTERCEPT_RDTSC);
     CHECK_HEX("VMRUN is intercepted", HYPE_SVM_INTERCEPT_VMRUN,
               vmcb.control.intercept_misc2 & HYPE_SVM_INTERCEPT_VMRUN);
@@ -190,7 +193,10 @@ static void test_build_long_mode_guest(void) {
               vmcb.control.intercept_misc1 & HYPE_SVM_INTERCEPT_HLT);
     CHECK_HEX("shutdown is intercepted", HYPE_SVM_INTERCEPT_SHUTDOWN,
               vmcb.control.intercept_misc1 & HYPE_SVM_INTERCEPT_SHUTDOWN);
-    CHECK_HEX("RDTSC is intercepted", HYPE_SVM_INTERCEPT_RDTSC,
+    /* #802: RDTSC is policy, not part of the isolation baseline -- assert against the policy
+     * rather than a literal, so this does not depend on which test ran first. */
+    CHECK_HEX("RDTSC follows the #802 policy",
+              hype_vmcb_rdtsc_intercept() ? (unsigned)HYPE_SVM_INTERCEPT_RDTSC : 0u,
               vmcb.control.intercept_misc1 & HYPE_SVM_INTERCEPT_RDTSC);
     CHECK_HEX("IOIO is intercepted (unlike the real-mode guest)", HYPE_SVM_INTERCEPT_IOIO_PROT,
               vmcb.control.intercept_misc1 & HYPE_SVM_INTERCEPT_IOIO_PROT);
@@ -669,7 +675,60 @@ static void test_acpi_pm_timer_scale(void) {
               hype_acpi_pm_timer_scale(0x01234567u, 0));
 }
 
+/*
+ * #802: RDTSC is the one intercept in the baseline that is policy, not guest isolation. These
+ * pin both halves: the isolation set is present regardless, and RDTSC follows the flag.
+ */
+static void test_baseline_intercepts(void) {
+    uint32_t isolation = HYPE_SVM_INTERCEPT_HLT | HYPE_SVM_INTERCEPT_SHUTDOWN |
+                         HYPE_SVM_INTERCEPT_CPUID | HYPE_SVM_INTERCEPT_MSR_PROT |
+                         HYPE_SVM_INTERCEPT_IOIO_PROT | HYPE_SVM_INTERCEPT_INVLPGA;
+
+    CHECK_HEX("nested: isolation set plus RDTSC", isolation | HYPE_SVM_INTERCEPT_RDTSC,
+              hype_vmcb_baseline_intercept_misc1(1));
+    CHECK_HEX("bare metal: isolation set, RDTSC dropped", isolation,
+              hype_vmcb_baseline_intercept_misc1(0));
+    CHECK_HEX("RDTSC is the ONLY difference between the two", HYPE_SVM_INTERCEPT_RDTSC,
+              hype_vmcb_baseline_intercept_misc1(1) ^ hype_vmcb_baseline_intercept_misc1(0));
+}
+
+/* #802: the default must be the nested-safe answer -- a hype that never probes keeps the
+ * pre-#802 behaviour rather than silently dropping the #438 workaround. */
+static void test_rdtsc_intercept_defaults_on(void) {
+    CHECK_HEX("intercept defaults to on", 1, hype_vmcb_rdtsc_intercept());
+}
+
+/* #802: both builders must honour the policy -- they had drifted apart before, and a guest
+ * built by the wrong one gets the wrong mask with no other symptom. */
+static void test_builders_honour_rdtsc_policy(void) {
+    hype_vmcb_t vmcb;
+
+    hype_vmcb_set_rdtsc_intercept(0);
+    hype_vmcb_build_realmode_guest(&vmcb, 0x1000, 0x2000, 0x3000, 0x4000);
+    CHECK_HEX("realmode builder drops RDTSC on bare metal", 0,
+              vmcb.control.intercept_misc1 & HYPE_SVM_INTERCEPT_RDTSC);
+    CHECK_HEX("realmode builder keeps CPUID regardless", HYPE_SVM_INTERCEPT_CPUID,
+              vmcb.control.intercept_misc1 & HYPE_SVM_INTERCEPT_CPUID);
+
+    hype_vmcb_build_long_mode_guest(&vmcb, 0x1000, 0x5000, 0x2000, 0x3000, 0x4000);
+    CHECK_HEX("long-mode builder drops RDTSC on bare metal", 0,
+              vmcb.control.intercept_misc1 & HYPE_SVM_INTERCEPT_RDTSC);
+
+    hype_vmcb_set_rdtsc_intercept(1);
+    hype_vmcb_build_realmode_guest(&vmcb, 0x1000, 0x2000, 0x3000, 0x4000);
+    CHECK_HEX("realmode builder keeps RDTSC when nested", HYPE_SVM_INTERCEPT_RDTSC,
+              vmcb.control.intercept_misc1 & HYPE_SVM_INTERCEPT_RDTSC);
+
+    hype_vmcb_build_long_mode_guest(&vmcb, 0x1000, 0x5000, 0x2000, 0x3000, 0x4000);
+    CHECK_HEX("long-mode builder keeps RDTSC when nested", HYPE_SVM_INTERCEPT_RDTSC,
+              vmcb.control.intercept_misc1 & HYPE_SVM_INTERCEPT_RDTSC);
+}
+
 int main(void) {
+    /* Before anything calls the setter. */
+    test_rdtsc_intercept_defaults_on();
+    test_baseline_intercepts();
+    test_builders_honour_rdtsc_policy();
     test_struct_sizes();
     test_field_offsets();
     test_seg_attrib();

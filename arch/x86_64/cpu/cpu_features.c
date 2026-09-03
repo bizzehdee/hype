@@ -44,6 +44,23 @@ hype_vmm_kind_t hype_vmm_kind_select(hype_cpu_vendor_t vendor, int has_vmx, int 
     return HYPE_VMM_KIND_NONE;
 }
 
+int hype_cpu_hypervisor_present(uint32_t leaf1_ecx) {
+    return (int)((leaf1_ecx >> 31) & 1u);
+}
+
+void hype_cpu_hv_signature_decode(uint32_t ebx, uint32_t ecx, uint32_t edx, char out[13]) {
+    unsigned int i;
+
+    /* Plain EBX, ECX, EDX order here -- unlike leaf 0's EBX, EDX, ECX. Byte-copied for the
+     * same strict-aliasing reason as hype_cpu_vendor_from_string(). */
+    for (i = 0; i < 4; i++) {
+        out[i] = (char)((ebx >> (8 * i)) & 0xFFu);
+        out[4 + i] = (char)((ecx >> (8 * i)) & 0xFFu);
+        out[8 + i] = (char)((edx >> (8 * i)) & 0xFFu);
+    }
+    out[12] = '\0';
+}
+
 /* SVM PAUSE-filter support: CPUID Fn8000_000A_EDX bit 10 (PAUSEFILTER) --
  * the VMCB pause_filter_count that lets a spin loop be intercepted after a
  * burst of PAUSEs. Bit 12 (PFTHRESHOLD) additionally enables the

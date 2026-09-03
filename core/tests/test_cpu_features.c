@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <string.h>
 #include "../../arch/x86_64/cpu/cpu_features.h"
 
 static int failures = 0;
@@ -140,7 +141,39 @@ static void test_has_ibpb(void) {
               hype_cpu_has_ibpb(HYPE_CPU_VENDOR_UNKNOWN, ~0u, ~0u));
 }
 
+/* #802 */
+static void test_hypervisor_present(void) {
+    CHECK_INT("leaf1 ECX bit 31 set means nested", 1, hype_cpu_hypervisor_present(1u << 31));
+    CHECK_INT("bit 31 clear means bare metal", 0, hype_cpu_hypervisor_present(~(1u << 31)));
+    CHECK_INT("no other bit is mistaken for it", 0, hype_cpu_hypervisor_present(1u << 30));
+    CHECK_INT("a zero leaf is bare metal", 0, hype_cpu_hypervisor_present(0u));
+}
+
+/* #802: leaf 0x40000000 is EBX,ECX,EDX order -- NOT leaf 0's EBX,EDX,ECX. A test that used the
+ * wrong order would still pass on a palindromic string, so use a real signature. */
+static void test_hv_signature_decode(void) {
+    char out[13];
+
+    /* "KVMKVMKVM" then three NULs: EBX="KVMK", ECX="VMKV", EDX="M" + three NULs. */
+    hype_cpu_hv_signature_decode(0x4b4d564bu, 0x564b4d56u, 0x0000004du, out);
+    CHECK_INT("KVMKVMKVM decodes", 0, strcmp(out, "KVMKVMKVM"));
+
+    /* "Microsoft Hv": EBX="Micr", ECX="osof", EDX="t Hv". */
+    hype_cpu_hv_signature_decode(0x7263694du, 0x666f736fu, 0x76482074u, out);
+    CHECK_INT("Microsoft Hv decodes", 0, strcmp(out, "Microsoft Hv"));
+
+    /* An all-zero leaf must read as an empty string, not as 12 NULs printed by a %s. */
+    hype_cpu_hv_signature_decode(0u, 0u, 0u, out);
+    CHECK_INT("empty leaf is an empty string", 0, strcmp(out, ""));
+
+    /* Always NUL-terminated even when all 12 bytes are used. */
+    hype_cpu_hv_signature_decode(~0u, ~0u, ~0u, out);
+    CHECK_INT("terminated at 12 characters", 12, (int)strlen(out));
+}
+
 int main(void) {
+    test_hypervisor_present();
+    test_hv_signature_decode();
     test_therm_status_requires_the_dts_bit();
     test_has_smep();
     test_spec_ctrl_legal_mask();
