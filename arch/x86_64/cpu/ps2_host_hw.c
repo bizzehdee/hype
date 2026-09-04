@@ -21,6 +21,27 @@ static uint64_t g_kbd_poll_interval_ticks;
 static uint64_t g_kbd_poll_last_tsc;
 static unsigned long long g_kbd_status_reads;
 static uint64_t g_kbd_status_read_max_ticks;
+/*
+ * #808: WHY the polled drain declined to push a byte.
+ *
+ * Boot AMD-L0 run 5 lost all host keyboard input twice (40 s, then the final 22.7 s) with hype's
+ * loop still running -- `ps2reads` climbed 158,444 -> 243,916 while `polled` stayed frozen at
+ * 112. The drain was running at full rate and taking nothing, and the counters could not say
+ * which of its four non-pushing exits fired: they are indistinguishable in `polled` alone.
+ *
+ * Note what misled the first reading of that run: `fw-1 KBDPOLL` is the GUEST's view of ITS
+ * virtual 0x64/0x60 (the #436 breadcrumbs in svm_vcpu.c, which is why it carries a guest RIP).
+ * It says nothing about the physical controller. These counters are the host side, and they are
+ * the ones that answer "why can the operator not type".
+ */
+static unsigned long long g_kbd_exit_floating;  /* st == 0xFF -- no controller answering */
+static unsigned long long g_kbd_exit_empty;     /* OBF clear -- nothing waiting (normal) */
+static unsigned long long g_kbd_exit_data_ff;   /* OBF set but data == 0xFF */
+static unsigned long long g_kbd_exit_aux;       /* mouse byte: consumed and dropped */
+static unsigned long long g_kbd_drain_calls;
+static uint8_t g_kbd_last_st;                   /* the host status the drain last acted on */
+static uint8_t g_kbd_last_data;                 /* ... and the byte it read, if it read one */
+static uint64_t g_kbd_last_push_tsc;            /* when a byte last reached the buffer */
 
 static inline uint64_t kbd_rdtsc(void) {
     uint32_t lo, hi;
@@ -34,6 +55,7 @@ void hype_host_kbd_poll_stats(unsigned long long *status_reads, uint64_t *max_re
     if (status_reads) *status_reads = g_kbd_status_reads;
     if (max_read_ticks) *max_read_ticks = g_kbd_status_read_max_ticks;
 }
+
 
 /*
  * #363: is the host keyboard interrupt still being SERVICED, and on which core?
@@ -159,26 +181,33 @@ static void host_kbd_drain_polled(void) {
          * starved the BSP's render loop so neither guest drew to the screen, and truncated
          * hype's own log mid-line because the flush never ran again.
          */
+        g_kbd_last_st = st; /* #808 */
         if (st == 0xFFu) {
             g_kbd_no_controller = 1u;
+            g_kbd_exit_floating++; /* #808 */
             __asm__ volatile("pushq %0; popfq" ::"r"(flags) : "memory", "cc");
             return;
         }
         if ((st & HYPE_PS2_HOST_STATUS_OBF) == 0u) {
+            g_kbd_exit_empty++; /* #808 */
             __asm__ volatile("pushq %0; popfq" ::"r"(flags) : "memory", "cc");
             return; /* nothing waiting -- the normal exit */
         }
         data = inb(HYPE_PS2_HOST_PORT_DATA);
+        g_kbd_last_data = data; /* #808 */
         __asm__ volatile("pushq %0; popfq" ::"r"(flags) : "memory", "cc");
         if (data == 0xFFu && (st & HYPE_PS2_HOST_STATUS_AUX) == 0u) {
+            g_kbd_exit_data_ff++; /* #808 */
             /* A keyboard never sends 0xFF as a make/break code; it is the floating bus again,
              * or a controller error byte. Consume it and stop rather than feed it upstream. */
             return;
         }
         if ((st & HYPE_PS2_HOST_STATUS_AUX) != 0u) {
+            g_kbd_exit_aux++; /* #808 */
             continue; /* mouse byte: consumed so it cannot block the keyboard, then dropped */
         }
         g_kbd_polled_bytes++;
+        g_kbd_last_push_tsc = kbd_rdtsc(); /* #808 */
         hype_host_kbd_buffer_push(&g_host_kbd_buffer, data);
     }
 }
@@ -232,12 +261,25 @@ int hype_host_kbd_poll_scancode(uint8_t *out_scancode) {
         g_kbd_poll_last_tsc = now;
     }
     g_kbd_drain_busy = 1u;
+    g_kbd_drain_calls++; /* #808 */
     host_kbd_drain_polled();
     g_kbd_drain_busy = 0u;
     return hype_host_kbd_buffer_pop(&g_host_kbd_buffer, out_scancode);
 }
 
 uint64_t hype_host_kbd_polled_bytes(void) { return g_kbd_polled_bytes; }
+void hype_host_kbd_drain_stats(hype_host_kbd_drain_stats_t *out) {
+    if (out == 0) return;
+    out->calls = g_kbd_drain_calls;
+    out->exit_floating = g_kbd_exit_floating;
+    out->exit_empty = g_kbd_exit_empty;
+    out->exit_data_ff = g_kbd_exit_data_ff;
+    out->exit_aux = g_kbd_exit_aux;
+    out->last_status = g_kbd_last_st;
+    out->last_data = g_kbd_last_data;
+    out->last_push_tsc = g_kbd_last_push_tsc;
+    out->no_controller = g_kbd_no_controller;
+}
 
 void hype_host_kbd_inject_scancode(uint8_t scancode) {
     /* Same buffer the ISR pushes into -- see the header for why USB HID joins the

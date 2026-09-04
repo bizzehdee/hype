@@ -30796,6 +30796,36 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                          hype_nvme_host_bsp_lock_timeouts(),
                                          hype_nvme_host_lock_contended());
                         {
+                            /*
+                             * #808: why the polled drain took no byte. `polled` frozen while
+                             * `ps2reads` climbs says the drain is running and declining, and
+                             * `polled` alone cannot say which of its four exits fired.
+                             *
+                             * `empty` climbing ALONE while the operator types means the byte
+                             * never reached the i8042 and the fault is below hype. Any of
+                             * `floating`/`data_ff`/`aux` climbing means hype is discarding it,
+                             * and `st`/`data` say what it saw. `nocrl=1` is the sticky latch --
+                             * once set the drain never runs again for the rest of the boot.
+                             *
+                             * This is the HOST controller. `fw-1 KBDPOLL` below is the GUEST's
+                             * view of its own virtual 0x64/0x60 and answers a different question;
+                             * reading the two as one cost a wrong first diagnosis of run 5.
+                             */
+                            hype_host_kbd_drain_stats_t ds;
+                            uint64_t hz808 = g_vms[0].host_tsc_hz;
+                            hype_host_kbd_drain_stats(&ds);
+                            hype_debug_print("fw-1 KBDDRAIN: calls=%llu | empty=%llu floating=%llu "
+                                             "data_ff=%llu aux=%llu | host st=0x%02x data=0x%02x "
+                                             "nocrl=%u | last push %llums ago [#808]\n",
+                                             ds.calls, ds.exit_empty, ds.exit_floating,
+                                             ds.exit_data_ff, ds.exit_aux,
+                                             (unsigned)ds.last_status, (unsigned)ds.last_data,
+                                             (unsigned)ds.no_controller,
+                                             (ds.last_push_tsc != 0ull && hz808 != 0ull)
+                                                 ? ((hype_rdtsc() - ds.last_push_tsc) * 1000ull) / hz808
+                                                 : 0ull);
+                        }
+                        {
                             unsigned vi;
                             for (vi = 0; vi < g_vm_count; vi++) {
                                 unsigned long long routed = 0, handed = 0, route_drop = 0;

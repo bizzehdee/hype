@@ -104,6 +104,37 @@ void hype_host_kbd_set_poll_interval(uint64_t tsc_ticks);
 void hype_host_kbd_poll_stats(unsigned long long *status_reads, uint64_t *max_read_ticks);
 
 /*
+ * #808: why the polled drain took no byte.
+ *
+ * `polled` advancing means input works; `polled` frozen while `ps2reads` climbs means the drain
+ * is running and declining, and its four non-pushing exits are indistinguishable in `polled`
+ * alone. Boot AMD-L0 run 5 lost all host keyboard input twice with hype's loop still running and
+ * this was unanswerable from the log.
+ *
+ * `exit_empty` is the normal case -- OBF clear, nothing waiting -- so `exit_empty` climbing
+ * alone while the operator types means the byte never reached the i8042 at all, and the fault is
+ * below hype. Any of the other three climbing means hype is discarding it, and `last_status` /
+ * `last_data` say what it saw.
+ *
+ * NOT to be confused with the `fw-1 KBDPOLL` log line, which is the GUEST's view of ITS virtual
+ * 0x64/0x60 (the #436 breadcrumbs in svm_vcpu.c -- it carries a guest RIP) and says nothing about
+ * the physical controller.
+ */
+typedef struct {
+    unsigned long long calls;         /* drain entries */
+    unsigned long long exit_floating; /* st == 0xFF: no controller answering; latches no_controller */
+    unsigned long long exit_empty;    /* OBF clear: nothing waiting -- the normal exit */
+    unsigned long long exit_data_ff;  /* OBF set, data == 0xFF: consumed and dropped */
+    unsigned long long exit_aux;      /* mouse byte: consumed and dropped */
+    unsigned char last_status;        /* host port 0x64 the drain last acted on */
+    unsigned char last_data;          /* host port 0x60 it read, when it read one */
+    unsigned char no_controller;      /* the sticky latch: once set, the drain never runs again */
+    uint64_t last_push_tsc;           /* when a byte last reached the buffer */
+} hype_host_kbd_drain_stats_t;
+
+void hype_host_kbd_drain_stats(hype_host_kbd_drain_stats_t *out);
+
+/*
  * USB-5 (#217): push a scancode into the SAME host queue the PS/2 ISR feeds.
  *
  * This is the whole integration point for USB HID keyboard input. A USB keyboard's
