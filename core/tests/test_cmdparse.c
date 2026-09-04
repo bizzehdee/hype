@@ -104,12 +104,29 @@ int main(void) {
     }
 
     {
+        /* #806: `flush` takes no argument and mutates nothing. It must parse from the bare word
+         * and must NOT be reached by any other spelling -- there is no abbreviation for it,
+         * deliberately, because every other zero-argument verb that got one (`ls`, `stat`,
+         * `sw`) is a read. */
+        hype_cmd_t c = P("flush");
+        CHECK("flush verb", c.verb == HYPE_CMD_FLUSH);
+        CHECK("flush takes no argument", !c.has_arg && c.arg[0] == '\0');
+        c = P("  flush  ");
+        CHECK("flush tolerates surrounding space", c.verb == HYPE_CMD_FLUSH);
+        c = P("flush now");
+        CHECK("flush ignores a stray argument rather than failing",
+              c.verb == HYPE_CMD_FLUSH && c.has_arg && strcmp(c.arg, "now") == 0);
+        c = P("fl");
+        CHECK("flush has no abbreviation", c.verb == HYPE_CMD_UNKNOWN);
+    }
+
+    {
         unsigned i, n = hype_cmd_usage_count();
         /* The range END must name the LAST verb in the enum before HYPE_CMD_UNKNOWN. Adding a
          * verb without a usage entry (or the reverse) fails here, which is what caught #568's
          * `screenshot` before it shipped half-added. */
         CHECK("one usage entry per verb",
-              n == (unsigned)(HYPE_CMD_DUMP - HYPE_CMD_HELP + 1));
+              n == (unsigned)(HYPE_CMD_FLUSH - HYPE_CMD_HELP + 1));
         for (i = 0; i < n; i++) {
             hype_cmd_t c = P(hype_cmd_usage(i));
             if (c.verb == HYPE_CMD_UNKNOWN || c.verb == HYPE_CMD_NONE) {

@@ -53,6 +53,15 @@ typedef enum {
      * published-snapshot side of plan.md decision 43 -- never a live VMCS/VMCB.
      */
     HYPE_CMD_DUMP,
+    /*
+     * #806 (plan.md decision 82): drain the log ring to its sinks now. The only verb in the
+     * operator surface that mutates nothing and never writes back to hype.cfg. It exists
+     * because usb_log_fatal_flush() -- the drain that saves a run's tail -- had exactly two
+     * callers, `host off`/`host reboot` and the panic hook, so an operator who ends a run any
+     * other way loses whatever is still in the ring. Three real boots did exactly that and
+     * their logs end truncated mid-line.
+     */
+    HYPE_CMD_FLUSH,
     HYPE_CMD_UNKNOWN,
 } hype_cmd_verb_t;
 

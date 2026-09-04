@@ -332,6 +332,11 @@ static int g_209_reads_passed;
 static void usb_log_flush(void);
 static void usb_log_fatal_flush(void);
 static void usb_log_fatal_flush(void); /* #513: registered as the panic flush hook */
+/* #806: the `flush` verb reports what the drain actually wrote, and refuses visibly on a core
+ * that does not own the USB stack. Both are defined with the other log-sink helpers, far below
+ * the terminal's command switch. */
+static unsigned int usb_log_flushed_total(void);
+static int usb_log_this_core_owns_usb(void);
 /* USB-5 (#217): defined with the other USB globals, used by the FW-1 dispatch loop and
  * the #233 confirm gate, both of which appear earlier in this file. */
 static unsigned int usb_hid_drain(void);
@@ -2950,6 +2955,37 @@ static void fw_1_host_action_poll(void) {
         }
     }
 #endif
+#ifdef HYPE_806_AUTOTEST_SECS
+    /*
+     * #806: fire the `flush` verb's code path N seconds after boot, exactly as typing it would.
+     * Same reason as HYPE_175_AUTOTEST_SECS directly above: the terminal needs a physical
+     * keyboard, which QEMU validation has no way to drive, so the verb would otherwise be
+     * untestable outside a hardware run. The message is the verb's own, so the rig greps for
+     * one string whichever way it was triggered.
+     */
+    {
+        static uint64_t t806;
+        uint64_t hz806 = g_vms[0].host_tsc_hz;
+        if (hz806 != 0) {
+            if (t806 == 0) {
+                t806 = hype_rdtsc() + (uint64_t)HYPE_806_AUTOTEST_SECS * hz806;
+            } else if (t806 != ~0ull && hype_rdtsc() >= t806) {
+                t806 = ~0ull; /* once */
+                if (!usb_log_this_core_owns_usb()) {
+                    hype_debug_print("fw-1 FLUSHCMD: this core does not own the USB stack -- "
+                                     "nothing written [#806]\n");
+                } else {
+                    unsigned int b806 = usb_log_flushed_total();
+                    unsigned int a806;
+                    usb_log_fatal_flush();
+                    a806 = usb_log_flushed_total();
+                    hype_debug_print("fw-1 FLUSHCMD: %u byte(s) written to the log sink(s) "
+                                     "(%u total this boot) [#806]\n", a806 - b806, a806);
+                }
+            }
+        }
+    }
+#endif
     if (g_host_action == HYPE_HOST_ACTION_NONE) {
         return;
     }
@@ -3213,6 +3249,30 @@ static void term_run_cmdline(void) {
         case HYPE_CMD_CREATE:
             term_create_begin(c.has_arg ? c.arg : 0);
             break;
+        case HYPE_CMD_FLUSH: {
+            /*
+             * #806 (plan.md decision 82): the same drain the host power action and the panic
+             * hook call, reachable on demand. Mutates nothing and writes nothing back to
+             * hype.cfg -- it exists so the operator can make the run's evidence durable
+             * WITHOUT ending the run, which the `host off` procedure cannot do.
+             *
+             * Reports the byte delta rather than "done": a sink that is gone fails silently
+             * inside usb_log_flush(), so a bare success message would be indistinguishable
+             * from having written nothing. Zero is a legitimate answer when the ring was
+             * already empty, and saying so is more useful than hiding it.
+             */
+            unsigned int before, after;
+            if (!usb_log_this_core_owns_usb()) {
+                term_resultf("flush: this core does not own the USB stack -- nothing written");
+                break;
+            }
+            before = usb_log_flushed_total();
+            usb_log_fatal_flush();
+            after = usb_log_flushed_total();
+            term_resultf("flush: %u byte(s) written to the log sink(s) (%u total this boot)",
+                         after - before, after);
+            break;
+        }
         case HYPE_CMD_SCREENSHOT:
             /* #568: the same capture the hotkey performs. term_take_screenshot() reports its own
              * outcome on every path, including where it saved to, so nothing is needed here. */
