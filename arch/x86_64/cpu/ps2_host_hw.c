@@ -59,6 +59,24 @@ static uint64_t g_kbd_last_push_tsc;            /* when a byte last reached the 
 static uint64_t g_kbd_gap_max_ticks;            /* longest interval between two drain calls */
 static uint64_t g_kbd_gap_prev_tsc;
 static unsigned long long g_kbd_isr_obf_clear;  /* ISR entries that found nothing waiting */
+/*
+ * #808, third refinement. Run 8's gap_max was 159 ms and was set ONCE, between the drain's first
+ * call and its 18,582nd -- bring-up -- then never moved across the remaining 289,000 calls. A
+ * lifetime maximum cannot tell that apart from a 159 ms stall every second, so it was the wrong
+ * statistic: it answered "did this ever happen" when the question is "is it happening now".
+ *
+ * gap_over_5ms counts every window long enough to lose a keystroke (a PS/2 byte is ~1 ms on the
+ * wire and the i8042 buffers one), and gap_recent_max resets each time the diagnostic reads it,
+ * so a sample describes the interval it covers rather than the whole boot.
+ *
+ * isr_last_tsc is the one that speaks to the actual failure. Run 5's input death was
+ * isr_entries frozen at 107 with `+0 since last` -- the ISR stopped. "The ISR has not fired for
+ * N ms" is that signature stated directly, visible in the sample where it happens instead of
+ * inferred afterwards from a counter that stopped moving.
+ */
+static unsigned long long g_kbd_gap_over_5ms;
+static uint64_t g_kbd_gap_recent_max_ticks;
+static uint64_t g_kbd_isr_last_tsc;
 
 static inline uint64_t kbd_rdtsc(void) {
     uint32_t lo, hi;
@@ -140,6 +158,7 @@ void hype_host_kbd_isr(const hype_isr_frame_t *frame) {
     (void)frame;
     g_kbd_isr_entries++;
     g_kbd_isr_last_apic = kbd_this_apic();
+    g_kbd_isr_last_tsc = kbd_rdtsc(); /* #808: so a sample can say how long since the last IRQ1 */
     if (st == 0xFFu || (st & HYPE_PS2_HOST_STATUS_OBF) == 0u) {
         g_kbd_isr_obf_clear++; /* #808: fired, but nothing was waiting */
     }
@@ -287,6 +306,12 @@ int hype_host_kbd_poll_scancode(uint8_t *out_scancode) {
         if (g_kbd_gap_prev_tsc != 0ull) {
             uint64_t gap = nowg - g_kbd_gap_prev_tsc;
             if (gap > g_kbd_gap_max_ticks) g_kbd_gap_max_ticks = gap;
+            if (gap > g_kbd_gap_recent_max_ticks) g_kbd_gap_recent_max_ticks = gap;
+            /* 5 ms: a PS/2 byte is ~1 ms on the wire and the i8042 buffers one, so a window
+             * this long has already lost anything typed into it after the first byte. */
+            if (g_kbd_poll_interval_ticks != 0ull && gap > g_kbd_poll_interval_ticks * 20ull) {
+                g_kbd_gap_over_5ms++;
+            }
         }
         g_kbd_gap_prev_tsc = nowg;
     }
@@ -310,6 +335,13 @@ void hype_host_kbd_drain_stats(hype_host_kbd_drain_stats_t *out) {
     out->gap_max_ticks = g_kbd_gap_max_ticks;
     out->isr_obf_clear = g_kbd_isr_obf_clear;
     out->pic_imr = hype_pic_read_master_imr();
+    out->gap_over_thresh = g_kbd_gap_over_5ms;
+    out->gap_recent_max_ticks = g_kbd_gap_recent_max_ticks;
+    out->isr_last_tsc = g_kbd_isr_last_tsc;
+    /* Reading clears the recent window, so the NEXT sample describes only its own interval.
+     * Deliberately a side effect of the read: two readers would each see part of the interval,
+     * and there is exactly one reader. */
+    g_kbd_gap_recent_max_ticks = 0ull;
 }
 
 void hype_host_kbd_inject_scancode(uint8_t scancode) {

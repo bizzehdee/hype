@@ -2931,6 +2931,21 @@ static unsigned fw_1_host_action_begin(unsigned action) {
  * #808: "last push 0ms ago" is what an unset timestamp printed, which reads as "a byte arrived
  * just now" -- the opposite of the truth. Say "never".
  */
+/*
+ * #808: "no IRQ1 for N ms" is run 5's input-death signature stated directly. Separate helper from
+ * the push one so a boot where IRQ1 never fires at all -- #218's premise -- reads as "never"
+ * rather than as a very large number.
+ */
+static const char *kbddrain_irq1_last(const hype_host_kbd_drain_stats_t *ds, uint64_t hz,
+                                      char *out, unsigned cap) {
+    if (ds->isr_last_tsc == 0ull || hz == 0ull) {
+        return "never";
+    }
+    hype_snprintf(out, cap, "%llums ago",
+                  (unsigned long long)(((hype_rdtsc() - ds->isr_last_tsc) * 1000ull) / hz));
+    return out;
+}
+
 static const char *kbddrain_last_push(const hype_host_kbd_drain_stats_t *ds, uint64_t hz,
                                       char *out, unsigned cap) {
     if (ds->last_push_tsc == 0ull || hz == 0ull) {
@@ -30847,11 +30862,13 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                             hype_host_kbd_drain_stats_t ds;
                             uint64_t hz808 = g_vms[0].host_tsc_hz;
                             char lpbuf[32];
+                            char irqbuf[32];
                             hype_host_kbd_drain_stats(&ds);
                             hype_debug_print("fw-1 KBDDRAIN: calls=%llu | empty=%llu floating=%llu "
                                              "data_ff=%llu aux=%llu | host st=0x%02x data=0x%02x "
                                              "nocrl=%u | last push %s | gap_max=%lluus "
-                                             "isr_empty=%llu pic_imr=0x%02x irq1=%s [#808]\n",
+                                             "isr_empty=%llu pic_imr=0x%02x irq1=%s | "
+                                             "gap_recent=%lluus over5ms=%llu irq1_last=%s [#808]\n",
                                              ds.calls, ds.exit_empty, ds.exit_floating,
                                              ds.exit_data_ff, ds.exit_aux,
                                              (unsigned)ds.last_status, (unsigned)ds.last_data,
@@ -30861,7 +30878,12 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                                  ? (unsigned long long)(ds.gap_max_ticks * 1000000ull / hz808)
                                                  : 0ull,
                                              ds.isr_obf_clear, (unsigned)ds.pic_imr,
-                                             (ds.pic_imr & 0x02u) ? "MASKED" : "unmasked");
+                                             (ds.pic_imr & 0x02u) ? "MASKED" : "unmasked",
+                                             (hz808 != 0ull)
+                                                 ? (unsigned long long)(ds.gap_recent_max_ticks * 1000000ull / hz808)
+                                                 : 0ull,
+                                             ds.gap_over_thresh,
+                                             kbddrain_irq1_last(&ds, hz808, irqbuf, sizeof(irqbuf)));
                         }
                         {
                             unsigned vi;

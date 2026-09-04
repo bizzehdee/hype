@@ -141,6 +141,22 @@ typedef struct {
     uint64_t gap_max_ticks;
     unsigned long long isr_obf_clear;
     unsigned char pic_imr;
+    /*
+     * #808 third refinement. gap_max is a LIFETIME maximum and run 8 showed why that is not
+     * enough: its 159 ms was set once at bring-up and never moved again, which a max cannot
+     * distinguish from a 159 ms stall every second.
+     *
+     *   gap_over_thresh    windows longer than 20x the poll interval (5 ms at the #796 4 kHz
+     *                      gate) -- long enough to have lost a keystroke already.
+     *   gap_recent_max     max since the last read; READING CLEARS IT, so each sample describes
+     *                      its own interval rather than the whole boot.
+     *   isr_last_tsc       when IRQ1 last fired. Run 5's input death was the ISR stopping, and
+     *                      "no IRQ1 for N ms" states that directly instead of inferring it from
+     *                      a counter that stopped moving.
+     */
+    unsigned long long gap_over_thresh;
+    uint64_t gap_recent_max_ticks;
+    uint64_t isr_last_tsc;
 } hype_host_kbd_drain_stats_t;
 
 void hype_host_kbd_drain_stats(hype_host_kbd_drain_stats_t *out);
