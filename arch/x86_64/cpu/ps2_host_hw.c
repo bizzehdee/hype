@@ -77,6 +77,17 @@ static unsigned long long g_kbd_isr_obf_clear;  /* ISR entries that found nothin
 static unsigned long long g_kbd_gap_over_5ms;
 static uint64_t g_kbd_gap_recent_max_ticks;
 static uint64_t g_kbd_isr_last_tsc;
+/*
+ * #808: how many drains came from hype_host_kbd_pump() -- i.e. from inside a long block
+ * transfer -- rather than from the BSP's input phase.
+ *
+ * Counted separately because "did the fix run at all" is a question this ticket series has been
+ * caught by twice: #799's screen scan read as 0.15% of the loop on a machine where the code had
+ * stopped running, and #804's PE scan was invisible until a guest got far enough to trigger it.
+ * A hardware run where pumps= stays 0 means the hook is not wired, not that the fix did not
+ * help.
+ */
+static unsigned long long g_kbd_pumps;
 
 static inline uint64_t kbd_rdtsc(void) {
     uint32_t lo, hi;
@@ -353,6 +364,7 @@ void hype_host_kbd_pump(void) {
     }
     g_kbd_drain_busy = 1u;
     g_kbd_drain_calls++;
+    g_kbd_pumps++; /* #808: this drain came from inside a block transfer */
     {
         uint64_t nowg = kbd_rdtsc();
         if (g_kbd_gap_prev_tsc != 0ull) {
@@ -385,6 +397,7 @@ void hype_host_kbd_drain_stats(hype_host_kbd_drain_stats_t *out) {
     out->gap_over_thresh = g_kbd_gap_over_5ms;
     out->gap_recent_max_ticks = g_kbd_gap_recent_max_ticks;
     out->isr_last_tsc = g_kbd_isr_last_tsc;
+    out->pumps = g_kbd_pumps;
     /* Reading clears the recent window, so the NEXT sample describes only its own interval.
      * Deliberately a side effect of the read: two readers would each see part of the interval,
      * and there is exactly one reader. */

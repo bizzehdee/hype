@@ -30952,7 +30952,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                              "data_ff=%llu aux=%llu | host st=0x%02x data=0x%02x "
                                              "nocrl=%u | last push %s | gap_max=%lluus "
                                              "isr_empty=%llu pic_imr=0x%02x irq1=%s | "
-                                             "gap_recent=%lluus over5ms=%llu irq1_last=%s [#808]\n",
+                                             "gap_recent=%lluus over5ms=%llu irq1_last=%s "
+                                             "pumps=%llu [#808]\n",
                                              ds.calls, ds.exit_empty, ds.exit_floating,
                                              ds.exit_data_ff, ds.exit_aux,
                                              (unsigned)ds.last_status, (unsigned)ds.last_data,
@@ -30967,7 +30968,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                                  ? (unsigned long long)(ds.gap_recent_max_ticks * 1000000ull / hz808)
                                                  : 0ull,
                                              ds.gap_over_thresh,
-                                             kbddrain_irq1_last(&ds, hz808, irqbuf, sizeof(irqbuf)));
+                                             kbddrain_irq1_last(&ds, hz808, irqbuf, sizeof(irqbuf)),
+                                             ds.pumps);
                         }
                         {
                             unsigned vi;

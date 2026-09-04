@@ -157,6 +157,12 @@ typedef struct {
     unsigned long long gap_over_thresh;
     uint64_t gap_recent_max_ticks;
     uint64_t isr_last_tsc;
+    /*
+     * #808: drains that came from hype_host_kbd_pump(), i.e. from inside a long block transfer
+     * rather than from the BSP's input phase. Zero means the hook is not wired, which is a
+     * different finding from "the fix did not help".
+     */
+    unsigned long long pumps;
 } hype_host_kbd_drain_stats_t;
 
 void hype_host_kbd_drain_stats(hype_host_kbd_drain_stats_t *out);
