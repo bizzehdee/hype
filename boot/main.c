@@ -2612,6 +2612,18 @@ static volatile unsigned long long g_bsp_ticks;
 #define BSP_PHASE_BAND     9u /* hype_vt_render_cached_bounded */
 #define BSP_PHASE_GOPFLUSH 10u /* hype_debug_flush_gop, i.e. the blit to VRAM */
 #define BSP_PHASE_DASH     11u /* hype_dashboard_render, before any drawing */
+/*
+ * #808: fw_1_vars_service() used to run under BSP_PHASE_FLUSH, which also covers
+ * usb_log_flush_slice(). Two unrelated blockers under one label, and BSPSTARVE could not tell
+ * them apart -- boot AMD-L0 run 10 reported `flush=44(max 163ms)` while `USBFLUSH max=15251us`
+ * said the log slice had honoured its ~10 ms budget, so the 163 ms was probably the varstore
+ * write and the diagnostic named the wrong suspect.
+ *
+ * That is the same defect as the labels fixed earlier in this ticket (`polled=` for the consumed
+ * count, "0ms ago" for never): a name that does not mean what it says, in the one place being
+ * relied on to attribute a fault.
+ */
+#define BSP_PHASE_VARS     12u /* fw_1_vars_service, i.e. the guest varstore write */
 static volatile unsigned int g_bsp_phase;
 /*
  * #370: how many phase TRANSITIONS the BSP has made, not how many passes it has completed.
@@ -30669,7 +30681,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                 if (bp_hz != 0 && (bp_at == 0 || hype_rdtsc() - bp_at >= 10ull * bp_hz)) {
                     static const char *const nm[BSP_PHASE_MAX] = {
                         "idle", "render", "input", "kbddiag", "flush", "fbprobe", "fbcli",
-                        "fbreport", "inval", "band", "gopflush", "dash", "?12", "?13",
+                        "fbreport", "inval", "band", "gopflush", "dash", "vars", "?13",
                         "?14", "?15"
                     };
                     unsigned int q;
@@ -31324,7 +31336,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
 #if HYPE_486_AUTOCREATE
             fw_1_autocreate_probe();
 #endif
-            bsp_phase(BSP_PHASE_FLUSH);
+            bsp_phase(BSP_PHASE_VARS); /* #808: NOT _FLUSH -- see BSP_PHASE_VARS */
             fw_1_vars_service();
             bsp_phase(BSP_PHASE_IDLE);
             if (g_vms[0].host_tsc_hz != 0) {
