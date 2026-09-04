@@ -353,6 +353,8 @@ On the power button: zero `fw-1 HOST:` lines, log truncated mid-line. This run p
 `docs/hw-validation-runbook-2026-09-02.md`.
 
 
+## Run 4 as planned -- superseded by the actual run 4 recorded below. Kept for the read list.
+
 ## Run 4 -- confirm #804 on hardware, close #799, and exercise the flush
 
 Same config and script as every run of this card. Five minutes is enough: run 3 reached login and
@@ -381,3 +383,83 @@ If `s79` has collapsed and the guest still reaches login, this machine's queue
 (`docs/hw-validation-amd-laptop-2026-09-03.md`) moves to **L1** -- #713/#715/#660, the physical
 AHCI+NVMe write pair. Read the #660 caveat there first: contention needs two writers on ONE NVMe
 controller and `tools/hwstick/hype.cfg` has one, so as staged that run can only record zero.
+
+
+## Result -- run 4, 2026-09-04, build `315bbdc-dirty` (logs in `logs/bootAMDL0-4-315bbdc/`)
+
+Found already done on the drive when re-staging for it. `315bbdc` is the last of the three #803
+commits (`99e5ba9`, `72b02ab`, `315bbdc`).
+
+**#804 is confirmed on hardware, decisively. The run says nothing about #803, because it was
+stopped before the guest reached login.**
+
+### #804 -- the bar is met
+
+| | run 3 (`af1595a`) | run 4 (`315bbdc`) | |
+| --- | --- | --- | --- |
+| `HOUSECOST s79=` | 83,006 ms | **86 ms** | |
+| `DRAIN iters=` | 427,804 | 149,620 | |
+| **s79 per iteration** | **194 us** | **0.57 us** | **340x** |
+| s79 share of wall | 57% | 0.26% | |
+
+The nested A/B predicted 7.3x and warned that nested understates it. Hardware gives 340x per
+iteration. `s79` is no longer in the top ten sections; the loop's time now sits where it should,
+in `s795` (NPF, 12,672 ms) and `s798` (HLT, 9,313 ms) -- both guest-serving.
+
+### #799 -- housekeeping holds at ~10 us
+
+`LOOPPHASE: house=1431ms` over `iters=149620` = **9.6 us per iteration**, matching run 3's 10 us.
+Against the 235 us per exit this ticket was filed on. Both runs agree on the fixed build, and
+run 3 already showed the guest reaching `localhost:~#`, so both halves of #799 are answered.
+
+### This run was cut short -- do NOT read it as a #803 regression
+
+There is no login, no `0xCF9` restart and no `SCRIPT vm0: PASS`, and the guest's last state is
+`Booting \`Linux lts'`. That looks like run 1 and run 2's hang, and it is not. Every measure says
+the run simply ended early, at about half of run 3:
+
+| | run 3 | run 4 |
+| --- | --- | --- |
+| `HYPE.LOG` | 378,383 B | 179,827 B |
+| `RUN1A.LOG` last stamp | 265,780 | 150,244 |
+| `DRAIN iters=` | 427,804 | 149,620 |
+| wall (`FBSPEED t=`) | 144,812 ms | 33,342 ms |
+
+Run 3 reached GRUB at `RUN1A` stamp ~83,400 and login at ~265,600. Run 4 ends at 150,244 -- short
+of where run 3's login appeared. And the guest was healthy when the log stops, not stuck:
+`GUESTPC vm0: lastreason=0x78 ... rflags=0x246` (HLT with interrupts enabled) and
+`EXHIST ... hlt=1411 npf=31262 ioio=76014` -- an idling, progressing guest, not the frozen
+`ioio` and `0x6e` signature of runs 1 and 2.
+
+### #803 -- still 6 rejected transfers, still unproven
+
+```
+host-xhci: #377 rejected incomplete transfer (slot=1 ep=4 trb=0x141b3a000 cc=4 residue=31 len=31)
+host-xhci: #377 rejected incomplete transfer (slot=1 ep=3 trb=0x141b39000 cc=4 residue=4096 len=4096)
+```
+
+Six of them, `residue == len` again, so the failures themselves have not gone away on the #803
+build. Whether the bounding work fixed the *restart* stall is untested: this run never restarted.
+
+### How it ended
+
+Power button again -- zero `fw-1 HOST:` lines. `315bbdc` predates `f114aae`, so the operator did
+not yet have the `host off` instruction. Run 5 has it.
+
+## Run 5 -- the full form: #803's restart leg, and the flush
+
+Same config. **Long enough to reach login and get through the reboot** -- run 3 needed about
+2.5 minutes of wall time to reach login, so give it ten and do not stop early. Run 4's whole
+lesson is that a short run reads as a hang.
+
+1. Cold-boot. Stay on the dashboard, do not type.
+2. Wait for `localhost:~#`, then for the script's reboot, then for the **second** login.
+3. Type **`host off`**. Not the power button.
+4. Bring back `HYPE.LOG` and `RUN1A.LOG`.
+
+| Ticket | Read | Passes when |
+| --- | --- | --- |
+| **#803** | a second `localhost login:` after `vm0 restarted (M8-4)`, and the `cc=4` count | the restart reaches login. That is the ticket's own symptom and the only thing that closes it |
+| **#803** | `SCRIPT vm0: PASS pass (21 directive(s))` | the script completes -- it has never done so on this machine |
+| **#806** | the `host off` result line | a **non-zero** byte count; #807 means no QEMU rig can show it |
+| clock | `FBCLOCK ... 190/1000` share | expected unchanged at ~33-34%, as in runs 1-3 |
