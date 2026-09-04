@@ -102,6 +102,35 @@ static unsigned int g_atapi_completion_traced;
  * happens long after those, which is exactly why the first pass at this question had no evidence
  * either way. See #356 for the same lesson at greater cost.
  */
+/*
+ * #803: a deadline for the WHOLE ATAPI command, on top of bot_scsi()'s per-transfer one.
+ *
+ * 72b02ab bounded a single bot_scsi() call at 2000 ms, and run 9 confirmed it fires
+ * (bot_abandons=3). It is still not enough: one ATAPI command issues one transfer per PRD chunk,
+ * each getting a FRESH budget, so several transfers each inside their own bound still summed to
+ * `IN-HOST for 5520ms section=774` and a 6140351 us command. Bounding the transfer left the
+ * command unbounded.
+ *
+ * Checked between chunks, and never before the first -- a command is always given one real
+ * attempt, and a chunk already in flight is never interrupted. Exceeding it takes the same
+ * MEDIUM ERROR exit as a backing-store failure (#287), so the guest is told the truth and the
+ * vCPU is released. 4000 ms is twice the per-transfer budget: any single transfer is already
+ * bounded, so this only catches the accumulation, and it must not fire on a command that is
+ * merely large-but-progressing.
+ */
+#define HYPE_ATAPI_CMD_BUDGET_MS 4000ull
+static uint64_t g_atapi_tsc_hz;
+static unsigned long long g_atapi_cmd_timeouts = 0;
+
+void hype_atapi_set_tsc_hz(uint64_t hz) { g_atapi_tsc_hz = hz; }
+unsigned long long hype_atapi_cmd_timeouts(void) { return g_atapi_cmd_timeouts; }
+
+static inline uint64_t atapi_rdtsc(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | (uint64_t)lo;
+}
+
 static unsigned long long g_atapi_xfers = 0;
 static unsigned long long g_atapi_short_xfers = 0;
 static unsigned long long g_atapi_req_bytes = 0;
@@ -193,6 +222,7 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
     uint64_t media_byte_off = 0; /* GLADDER-10(b): 64-bit byte offset = media_lba * sector size */
     uint32_t remaining;
     uint32_t req_len = 0; /* #803 */
+    uint64_t cmd_t0 = 0;  /* #803 */
     uint32_t transferred;
     uint32_t prd_idx;
     uint8_t status_reg;
@@ -363,6 +393,7 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
     transferred = 0;
     g_atapi_xfers++;
     req_len = remaining; /* #803: kept for the short-transfer report below */
+    cmd_t0 = atapi_rdtsc(); /* #803: whole-command deadline */
     {
         /* #343: what the command ASKED for, before the PRDT list can cut it short. */
         g_atapi_req_bytes += (uint64_t)remaining;
@@ -371,6 +402,16 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
         hype_ahci_prdt_entry_t prd;
         uint32_t chunk;
         uint8_t *dst;
+
+        /* #803: see HYPE_ATAPI_CMD_BUDGET_MS. Never before the first chunk. */
+        if (prd_idx != 0u && g_atapi_tsc_hz != 0 &&
+            atapi_rdtsc() - cmd_t0 > (g_atapi_tsc_hz / 1000ull) * HYPE_ATAPI_CMD_BUDGET_MS) {
+            g_atapi_cmd_timeouts++;
+            hype_atapi_set_media_error(atapi, HYPE_ATAPI_SENSE_KEY_MEDIUM_ERROR,
+                                       HYPE_ATAPI_ASC_UNRECOVERED_READ_ERROR);
+            media_read_failed = 1;
+            break;
+        }
 
         hype_ahci_decode_prdt_entry(prdt_bytes + (uint32_t)prd_idx * 16u, &prd);
         chunk = (prd.byte_count < remaining) ? prd.byte_count : remaining;

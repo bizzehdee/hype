@@ -253,4 +253,9 @@ void hype_atapi_build_identify(const hype_atapi_t *dev, uint8_t out[HYPE_ATAPI_I
  */
 void hype_atapi_set_media_error(hype_atapi_t *dev, uint8_t sense_key, uint8_t asc);
 
+/* #803: host TSC frequency for the whole-command read deadline, and the count of commands that
+ * hit it. Set once from boot after calibration; zero disables the deadline. */
+void hype_atapi_set_tsc_hz(uint64_t hz);
+unsigned long long hype_atapi_cmd_timeouts(void);
+
 #endif /* HYPE_DEVICES_ATAPI_H */
