@@ -463,3 +463,92 @@ lesson is that a short run reads as a hang.
 | **#803** | `SCRIPT vm0: PASS pass (21 directive(s))` | the script completes -- it has never done so on this machine |
 | **#806** | the `host off` result line | a **non-zero** byte count; #807 means no QEMU rig can show it |
 | clock | `FBCLOCK ... 190/1000` share | expected unchanged at ~33-34%, as in runs 1-3 |
+
+
+## Result -- run 5, 2026-09-04, build `a61fe0f-dirty` (logs in `logs/bootAMDL0-5/`)
+
+Operator report: **first boot fully successful, second boot showed IO errors on syslinux, the log
+was 90 KB behind, and then hype was fully frozen -- nothing could be typed.**
+
+Three separate findings. Only the first is #803.
+
+### 1. #803's first half works, the restart leg does not
+
+The script drove the first boot to login and the restart chain fired from the non-BSP vCPU:
+
+```
+fw-1: vm0 vCPU 1 guest reset via ACPI reset register (0xCF9) -> restart [#94 #525]
+fw-1: vm0 restarted (M8-4): pristine firmware restored, RAM zeroed, vcpu reset
+```
+
+The second boot then reached GRUB and stopped at `Booting \`Linux lts'` (`RUN1A.LOG` stamp
+223,545) and the guest printed nothing further. There is no `SCRIPT vm0: PASS`.
+
+**New detail, and it changes the suspect list.** At the end the guest is
+`lastreason=0x78 ... rflags=0x246` -- HLT with interrupts *enabled*, waiting for an interrupt
+that never arrives. That is not runs 1 and 2's signature (RDTSC spin with IF=0). And there are
+**no `cc=4` rejections after stamp 148,272**, well before the restart at 204,288 -- so the six
+BOT failures in this run all belong to the *first* boot, which succeeded anyway. The restart
+stall is not accompanied by fresh transfer errors.
+
+### 2. hype was NOT frozen. The host keyboard path was.
+
+Everything says the loop was alive to the last line: `DRAIN: iters=308514` still climbing,
+`GUESTPC` sampling, `FBSPEED`/`FBCLOCK` alternating normally, and `ps2reads` climbing
+158,444 -> 243,916 across the final samples. hype was polling the i8042 thousands of times a
+second.
+
+What stopped was byte delivery:
+
+```
+KBDIRQ: isr_entries=107 (+0 since last) eois=107 | polled=112 chords=13 ps2polled=5
+        ps2reads=243916 max=12us | bsp_usb_timeouts=9 ...
+KBDPOLL: p64 22675ms ago val=0x05 rip=0xffffffff968db490 | p60 22675ms ago val=0xfa
+```
+
+`polled` frozen at 112 and `isr_entries` frozen at 107 while `ps2reads` climbs by ~17,000 per
+sample. Port 0x64's value last *changed* 22.7 seconds before the log ends, to **0x05 -- OBF set**
+-- with port 0x60 reading **0xFA**, a PS/2 ACK rather than a scancode.
+
+It happened twice. `p64_ago` grew 20.7 s -> 40.7 s in the first window, recovered (`val=0x04`,
+`ago=134ms`, then `ago=11ms`), then froze again for the final 22.7 s:
+
+| `RUN1A`/log stamp | `p64_ago` | `p64` | `p60` |
+| --- | --- | --- | --- |
+| 150,990 -> 197,866 | 20,676 -> 40,678 ms | 0x05 | 0xfa |
+| 206,574 | 134 ms | **0x04** | 0xfa |
+| 225,744 | 11 ms | **0x04** | 0xfa |
+| 242,964 -> 265,135 | 2,667 -> 22,675 ms | 0x05 | 0xfa |
+
+So the operator could not type `flush` or `host off`, which is why this run ended on the power
+button like every other. **This is what made the machine look frozen, and it is a different bug
+from #803.** Raised separately.
+
+Note for anyone reading the absences: `host-hid: no USB boot keyboard on any controller (PS/2
+host keyboard only)`. There were no USB keyboards this run, which is why the log has **zero**
+`HIDTICK`, `CTRLSILENCE`, `XHCIRESET` and `REVIVE` lines. Their absence is not a fix.
+
+### 3. The log on the stick is out of order, and ~90 KB never landed
+
+The newest line in the file is at stamp 267,153, but the file is 293,959 bytes. The final
+**26,799 bytes are older content** -- reading from offset 267,160 gives lines stamped 243,395 and
+243,521, i.e. content that belongs 24 KB earlier. Not padding: zero NUL bytes in that region.
+
+The flush's own account of itself never showed the operator's 90 KB:
+
+```
+USBFLUSH: slices=85 drained=465794B(all sinks) total=4561ms max=1507067us
+          produced=263273B behind=2810B peak=55005B | bursts=24 caught=22 stalled=2
+```
+
+`behind=2810B` at the last sample, but `max=1507067us` -- **one flush slice took 1.5 seconds** --
+and `stalled=2` of 24 bursts. Every earlier run on this machine had `stalled=0`. So the sink was
+struggling, the operator saw it 90 KB behind on the dashboard, and the last ~90 KB of the run --
+including whatever the second boot's syslinux IO errors printed -- never reached the medium.
+
+Raised separately. This is the first run where the log sink has demonstrably lost data, which is
+also why the `flush` verb (#806) could not be exercised: there was no way to type it.
+
+### Unchanged
+
+`FBCLOCK` still bimodal, `cr0=0x80000011` throughout.
