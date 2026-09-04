@@ -660,7 +660,49 @@ static void test_set_media_error(void) {
     }
 }
 
+/*
+ * #803 regression. A no-data command must report a ZERO transfer length, not whatever the
+ * caller's uninitialised stack held: hype_atapi_result_t is a stack struct in
+ * process_ahci_command_slot(), and the AHCI path takes synth_length as the command's transfer
+ * length. PREVENT ALLOW MEDIUM REMOVAL and the unknown-opcode default both returned no data
+ * without setting it, which surfaced on hardware as a 96 MiB "short transfer" for a command that
+ * transfers nothing -- 1.61 GB of phantom shortfall across one boot.
+ *
+ * `out` is deliberately poisoned first: zero-initialising it here would pass against the very
+ * bug this guards, since the fault was a field left untouched rather than a field set wrongly.
+ */
+static void poison_result(hype_atapi_result_t *out) {
+    unsigned char *b = (unsigned char *)out;
+    unsigned int i;
+    for (i = 0; i < sizeof(*out); i++) {
+        b[i] = 0xA5u;
+    }
+}
+
+static void test_no_data_commands_report_zero_length(void) {
+    hype_atapi_t dev;
+    hype_atapi_result_t out;
+    uint8_t cdb[HYPE_ATAPI_CDB_MAX];
+
+    hype_atapi_reset(&dev, g_media, sizeof(g_media));
+    poison_result(&out);
+    make_cdb(cdb, HYPE_ATAPI_CMD_PREVENT_ALLOW_REMOVAL);
+    hype_atapi_execute_cdb(&dev, cdb, &out);
+    CHECK_HEX("PREVENT ALLOW REMOVAL: status GOOD", HYPE_ATAPI_STATUS_GOOD, out.status);
+    CHECK_HEX("PREVENT ALLOW REMOVAL: no media data", 0, out.uses_media_data);
+    CHECK_HEX("PREVENT ALLOW REMOVAL: transfer length is 0", 0, out.synth_length);
+
+    /* The unknown-opcode default had the identical leak. 0xFF is not a modelled command. */
+    hype_atapi_reset(&dev, g_media, sizeof(g_media));
+    poison_result(&out);
+    make_cdb(cdb, 0xFFu);
+    hype_atapi_execute_cdb(&dev, cdb, &out);
+    CHECK_HEX("unknown opcode: CHECK CONDITION", HYPE_ATAPI_STATUS_CHECK_CONDITION, out.status);
+    CHECK_HEX("unknown opcode: transfer length is 0", 0, out.synth_length);
+}
+
 int main(void) {
+    test_no_data_commands_report_zero_length();
     init_media();
 
     test_test_unit_ready_with_media();

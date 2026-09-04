@@ -3171,10 +3171,54 @@ static void bot_absorb_sense(hype_xhci_ctrl_t *c, unsigned int slot,
 #define HYPE_XHCI_BOT_RECOVER_SELFTEST 0
 #endif
 
+/*
+ * #803: a deadline across the RETRY LADDER below, which is where a slow device turns into a
+ * multi-second command.
+ *
+ * One bot_scsi() call can run up to four bot_scsi_once() attempts plus a bot_recover(), each with
+ * its own internal polling. Boot AMD-L0 run 7 measured a single ATAPI command at 6394709 us and
+ * the vCPU parked inside hype (`IN-HOST for 3426ms section=774`) while that ladder ran to
+ * completion. The guest showed 0% CPU and the machine read as locked.
+ *
+ * A first attempt is NEVER cut short, and neither is a recovery already in progress -- the
+ * deadline is only consulted before starting a further attempt, so this abandons a hopeless
+ * sequence rather than interrupting one that might still succeed. Abandoning returns -1, which
+ * the caller reports to the guest as MEDIUM ERROR through the existing #287 path.
+ *
+ * An earlier attempt at this bound (99e5ba9) was placed in blk_usb.c's chunk loop and never
+ * fired: USB_MAX_SECTORS is 128, a 64 KiB media read at 512-byte blocks is exactly 128 sectors,
+ * so that loop runs ONCE and a between-chunks check is unreachable for the dominant case. The
+ * wait is inside a single transfer, so the bound has to be here.
+ *
+ * 2000 ms is set against measurement: healthy service time on this rig was 793 us (run 3, early),
+ * so this is ~2500x the good case. g_tsc_hz == 0 (frequency not yet calibrated) disables the
+ * deadline entirely, which is the pre-#803 behaviour.
+ */
+#define HYPE_BOT_RETRY_BUDGET_MS 2000ull
+static volatile unsigned long long g_bot_deadline_abandons;
+
+unsigned long long hype_xhci_bot_abandons(void) { return g_bot_deadline_abandons; }
+
+static int bot_past_deadline(uint64_t t0) {
+    if (g_tsc_hz == 0) {
+        return 0;
+    }
+    return (rdtsc_now() - t0) > (g_tsc_hz / 1000ull) * HYPE_BOT_RETRY_BUDGET_MS;
+}
+
+static int bot_abandon(const uint8_t *cdb) {
+    g_bot_deadline_abandons++;
+    hype_debug_print("host-xhci: #803 abandoning SCSI op=0x%02x -- retry ladder exceeded %llu ms; "
+                     "reporting a medium error rather than parking the caller\n",
+                     (unsigned)cdb[0], (unsigned long long)HYPE_BOT_RETRY_BUDGET_MS);
+    return -1;
+}
+
 static int bot_scsi(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_msc_eps_t *msc,
                     const uint8_t *cdb, unsigned int cdb_len, uint8_t *data, unsigned int data_len,
                     int dir_in) {
     int forced_fail = 0;
+    uint64_t bot_t0 = rdtsc_now();
 
 #if HYPE_XHCI_BOT_RECOVER_SELFTEST
     {
@@ -3201,6 +3245,9 @@ static int bot_scsi(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_msc_
          */
         if (rc1 == 1) {
             bot_absorb_sense(c, slot, msc, cdb[0]);
+            if (bot_past_deadline(bot_t0)) {
+                return bot_abandon(cdb);
+            }
             rc1 = bot_scsi_once(c, slot, msc, cdb, cdb_len, data, data_len, dir_in);
             if (rc1 == 0) {
                 return 0;
@@ -3212,6 +3259,9 @@ static int bot_scsi(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_msc_
             /* rc1 < 0: the retry broke the TRANSPORT -- fall through to ring recovery. */
         }
     }
+    if (bot_past_deadline(bot_t0)) {
+        return bot_abandon(cdb);
+    }
     if (bot_recover(c, slot, msc) != 0) {
         hype_debug_print("host-xhci: #266 recovery FAILED -- backend not trustworthy, giving up\n");
         return -1; /* recovery itself failed: the backend is not trustworthy */
@@ -3220,10 +3270,17 @@ static int bot_scsi(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_msc_
         /* #266: whether the retry works is the single most useful fact about this
          * path, and it was never reported -- three recoveries in a real-hardware log
          * told us nothing about whether any of them helped. */
-        int rc2 = bot_scsi_once(c, slot, msc, cdb, cdb_len, data, data_len, dir_in);
+        int rc2;
+        if (bot_past_deadline(bot_t0)) {
+            return bot_abandon(cdb);
+        }
+        rc2 = bot_scsi_once(c, slot, msc, cdb, cdb_len, data, data_len, dir_in);
         if (rc2 == 1) {
             /* Transport restored; the device then said a clean NO. Same policy as above. */
             bot_absorb_sense(c, slot, msc, cdb[0]);
+            if (bot_past_deadline(bot_t0)) {
+                return bot_abandon(cdb);
+            }
             rc2 = bot_scsi_once(c, slot, msc, cdb, cdb_len, data, data_len, dir_in);
             if (rc2 == 1) {
                 bot_absorb_sense(c, slot, msc, cdb[0]);

@@ -413,6 +413,11 @@ unsigned int hype_xhci_ep_dci(unsigned int ep_addr);
  * driver falls back to a coarse busy-spin. Call once after TSC calibration. */
 void hype_xhci_set_tsc_hz(uint64_t hz);
 
+/* #803: SCSI commands abandoned because their retry ladder exceeded its deadline. Non-zero means
+ * a hopeless transfer was reported to the caller as a failure instead of parking it -- see
+ * HYPE_BOT_RETRY_BUDGET_MS in xhci_hw.c. */
+unsigned long long hype_xhci_bot_abandons(void);
+
 /* Captured controller geometry + register bases, filled by hype_xhci_host_init. */
 /*
  * #299: how many controllers can be Running at once.

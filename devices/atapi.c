@@ -19,11 +19,29 @@ uint32_t hype_atapi_read10_size_bucket(uint32_t block_count) {
     return 5u;
 }
 
+/*
+ * #803: zeroes the LENGTH as well as the buffer, and the length is the load-bearing half.
+ *
+ * hype_atapi_result_t is an uninitialised stack struct in the caller
+ * (process_ahci_command_slot()), and every handler that returns synthesised data sets
+ * synth_length itself -- but PREVENT ALLOW MEDIUM REMOVAL and the unknown-opcode default do not,
+ * because they return NO data. They called zero_synth() and left synth_length holding whatever
+ * was on the stack, which the AHCI path then took as the command's transfer length.
+ *
+ * On boot AMD-L0 run 7 that read as 100663296 (96 MiB) for a command that transfers nothing:
+ *   #803 SHORT: req=100663296 done=0 owed=100663296 | prdtl=0 prd_sum=0 | cdb=0x1e failed=0
+ * The guest correctly supplied no PRDT, so the fill loop never ran and all 96 MiB was booked as
+ * "owed". Sixteen of those are the entire 1.61 GB shortfall that #803 was opened to explain --
+ * an accounting artifact, not lost guest data. Zeroing here rather than at the two call sites so
+ * the next no-data command added cannot reintroduce it; every caller that returns real data
+ * assigns synth_length after this call and is unaffected.
+ */
 static void zero_synth(hype_atapi_result_t *out) {
     uint32_t i;
     for (i = 0; i < HYPE_ATAPI_MAX_SYNTH_RESPONSE; i++) {
         out->synth_data[i] = 0;
     }
+    out->synth_length = 0;
 }
 
 static void set_check_condition(hype_atapi_t *dev, hype_atapi_result_t *out, uint8_t sense_key, uint8_t asc) {

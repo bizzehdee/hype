@@ -16318,8 +16318,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                      * told the read succeeded. req vs done makes the size of the loss explicit
                      * rather than leaving it to be inferred from a capped trace. */
                     hype_debug_print("fw-1 ATAPIXFER: xfers=%llu short=%llu owed=%llu "
-                                     "req=%llu done=%llu read_timeouts=%llu [#803]\n", ax, as, ao,
-                                     ar, ad, hype_blk_usb_read_timeouts());
+                                     "req=%llu done=%llu read_timeouts=%llu bot_abandons=%llu [#803]\n",
+                                     ax, as, ao, ar, ad, hype_blk_usb_read_timeouts(),
+                                     hype_xhci_bot_abandons());
 #if HYPE_343_VERIFY_READS
                     {   /* #343: content verification, diagnostic builds only. */
                         unsigned long long vc = 0, vm2 = 0;

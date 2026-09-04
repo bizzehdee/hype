@@ -111,13 +111,18 @@ static void usb_xfer_lock(void);
  * showed 0% CPU and the machine read as locked. An unbounded wait protects the bytes of a read
  * that is never going to complete, at the cost of the vCPU that asked for it.
  *
- * The budget is per usb_read() call, checked between chunks, so it bounds the ACCUMULATION of
- * slow chunks rather than one catastrophic transfer -- hype_xhci_msc_read()'s own BOT reset
- * recovery is what bounds a single transfer, and this must not cut that recovery off mid-way.
- * 2000 ms is chosen against measurement, not taste: healthy per-command service time on this rig
- * was 793 us (run 3, early), so the budget is ~2500x the good case and still a third of the
- * observed worst. The first chunk is always attempted regardless, so a mis-set or zero budget can
- * never fail a read without trying it.
+ * SCOPE, corrected after run 7 measured read_timeouts=0 while commands still took 6.39 s: this
+ * bounds only reads that genuinely span MULTIPLE chunks. USB_MAX_SECTORS is 128, and a 64 KiB
+ * media read at 512-byte blocks is exactly 128 sectors, so the loop below runs ONCE for the
+ * dominant case and a between-chunks check never gets a second iteration to fire on. The stall
+ * lives inside a single transfer, and the deadline that actually bounds it is across the retry
+ * ladder in bot_scsi() (HYPE_BOT_RETRY_BUDGET_MS, core/xhci_hw.c). This outer bound is kept
+ * because larger multi-chunk reads do exist and it costs nothing, NOT because it addresses the
+ * observed freeze -- it does not.
+ *
+ * 2000 ms is chosen against measurement: healthy per-command service time on this rig was 793 us
+ * (run 3, early), so the budget is ~2500x the good case. The first chunk is always attempted, so
+ * a mis-set or zero budget can never fail a read without trying it.
  */
 #define HYPE_USB_READ_BUDGET_MS 2000ull
 static uint64_t g_usb_tsc_hz;
