@@ -3978,6 +3978,34 @@ isn't lost.
     into a linear framebuffer today and keeps doing so; the adapter driver's job is to move
     that framebuffer to the device at a rate the dashboard's refresh (§6b) already tolerates.
 
+    **Amended 2026-09-05: the adapter is named, and the work is two phases.** The survey
+    question above is answered -- the operator has a **Fresco Logic FL2000/FL2000DX**, so that
+    is phase 1 and the only phase with a ticket that starts.
+
+    - **Phase 1 -- FL2000/FL2000DX (#793).** FL2000 moves the framebuffer **uncompressed** over
+      a USB bulk endpoint. There is no codec to implement, which is why it goes first: the
+      driver's job reduces to bringing the device up and blitting the dashboard's existing
+      linear framebuffer at it. That is the smallest thing that satisfies this decision's
+      requirement, and it is satisfiable with hardware already to hand.
+    - **Phase 2 -- DisplayLink (#814), LOW priority.** DisplayLink compresses before sending,
+      so a driver means implementing an undocumented codec by reverse engineering. It is
+      deliberately ranked low: it buys broader adapter compatibility and nothing else, and
+      phase 1 already gives the operator a working host console during passthrough.
+
+    **The phases do not share a driver.** A driver written for uncompressed bulk transfer does
+    not generalise to a compressing one, so phase 2 is a second driver behind whatever seam
+    phase 1 establishes -- not an extension of it. Writing phase 1 "generically" in
+    anticipation would be the premature abstraction AGENTS.md rejects; the seam is worth
+    designing only once there is a second implementation to design it against.
+
+    **A throughput question phase 1 must answer, not assume.** 1920x1080 at 32 bpp is ~8 MB a
+    frame uncompressed. Even a slow console refresh is far more USB traffic than hype moves
+    today, and `core/blk_usb.c`'s ticket lock (#346/#362) serialises every host USB transfer
+    across cores -- the same lock that already blinds the input path for hundreds of
+    milliseconds during a log flush (#808, #809). Phase 1 has to measure that interaction
+    before it commits to a refresh rate, because the failure mode is losing the operator's
+    keyboard to keep their screen.
+
 78. **USB Ethernet adapters are a supported host-NIC source, class driver first -- decided
     (2026-09-03).**
 
