@@ -351,3 +351,33 @@ proportion as runs 1 (34%) and 2 (33%).
 On the power button: zero `fw-1 HOST:` lines, log truncated mid-line. This run predates
 `f114aae`, which is what that commit exists to stop -- see the standing rule in
 `docs/hw-validation-runbook-2026-09-02.md`.
+
+
+## Run 4 -- confirm #804 on hardware, close #799, and exercise the flush
+
+Same config and script as every run of this card. Five minutes is enough: run 3 reached login and
+issued its reboot inside the first ~2.5 minutes of wall time.
+
+### The sequence
+
+1. Cold-boot from the drive. Stay on the dashboard, do not type.
+2. Let the script drive the first boot to `localhost:~#` and issue its reboot. **The restart will
+   stall at `Booting \`Linux lts'` -- that is #803 and it is expected.** Do not wait for a second
+   login and do not record a missing `SCRIPT vm0: PASS` as a regression.
+3. At about five minutes, type **`host off`** at the dashboard. Not the power button.
+4. Bring back `HYPE.LOG` and `RUN1A.LOG`.
+
+### What to read
+
+| Ticket | Read | Passes when |
+| --- | --- | --- |
+| **#804** | `HOUSECOST vm0: s79=` against `DRAIN: iters=` | far below run 3's **194 us per iteration** (83,006 ms, 57% of wall). This is #804's stated bar -- the nested A/B was 7.3x, and hardware is the number that counts |
+| **#799** | `LOOPPHASE house=` / `DRAIN iters=`, and the guest reaching `localhost:~#` | housekeeping stays at run 3's ~10 us and the guest boots. Both halves then hold on the fixed build and **#799 closes** -- its original figure was 235 us per exit |
+| **#806** | `flush:` / `fw-1 HOST:` lines after `host off` | a **non-zero** byte count. This is the flush's first non-zero exercise anywhere: #807 means no QEMU rig can show it, because `tools/338`'s log sink has not mounted since #638 |
+| **#803** | `host-xhci: #377 rejected incomplete transfer ... cc=4 residue=` | recorded, not fixed. Count them and note whether `bot_recover()` restored the datapath |
+| clock | `FBCLOCK ... 190/1000` share | expected unchanged at ~33-34%, as in all three prior runs. Still unexplained, still nobody's ticket |
+
+If `s79` has collapsed and the guest still reaches login, this machine's queue
+(`docs/hw-validation-amd-laptop-2026-09-03.md`) moves to **L1** -- #713/#715/#660, the physical
+AHCI+NVMe write pair. Read the #660 caveat there first: contention needs two writers on ONE NVMe
+controller and `tools/hwstick/hype.cfg` has one, so as staged that run can only record zero.
