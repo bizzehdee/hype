@@ -42,6 +42,23 @@ static unsigned long long g_kbd_drain_calls;
 static uint8_t g_kbd_last_st;                   /* the host status the drain last acted on */
 static uint8_t g_kbd_last_data;                 /* ... and the byte it read, if it read one */
 static uint64_t g_kbd_last_push_tsc;            /* when a byte last reached the buffer */
+/*
+ * #808, second probe. Run 7 settled that the drain discards nothing (floating/data_ff/aux all
+ * zero over 330,553 calls, nocrl=0) and that IRQ1 carries ~95% of input on this machine -- 578
+ * ISR entries against ps2polled=34. Input dies when the ISR stops, and the poll does not pick up
+ * the slack, which is the one job it exists for.
+ *
+ * The remaining question is whether the input path is being STARVED rather than broken. The i8042
+ * buffers exactly one byte, so any window in which neither the ISR runs nor the drain is called
+ * loses every keystroke after the first. The BSP has windows like that: run 7 recorded a 162 ms
+ * flush slice against a 10 ms budget and ended with the USB pool at usb_held=64/64.
+ *
+ * So measure the gap between consecutive drains directly. A max gap of tens of milliseconds is
+ * the 4 kHz gate working; hundreds is the answer.
+ */
+static uint64_t g_kbd_gap_max_ticks;            /* longest interval between two drain calls */
+static uint64_t g_kbd_gap_prev_tsc;
+static unsigned long long g_kbd_isr_obf_clear;  /* ISR entries that found nothing waiting */
 
 static inline uint64_t kbd_rdtsc(void) {
     uint32_t lo, hi;
@@ -123,6 +140,9 @@ void hype_host_kbd_isr(const hype_isr_frame_t *frame) {
     (void)frame;
     g_kbd_isr_entries++;
     g_kbd_isr_last_apic = kbd_this_apic();
+    if (st == 0xFFu || (st & HYPE_PS2_HOST_STATUS_OBF) == 0u) {
+        g_kbd_isr_obf_clear++; /* #808: fired, but nothing was waiting */
+    }
     if (st != 0xFFu && (st & HYPE_PS2_HOST_STATUS_OBF) != 0u) {
         uint8_t scancode = inb(HYPE_PS2_HOST_PORT_DATA);
         if ((st & HYPE_PS2_HOST_STATUS_AUX) == 0u) {
@@ -262,6 +282,14 @@ int hype_host_kbd_poll_scancode(uint8_t *out_scancode) {
     }
     g_kbd_drain_busy = 1u;
     g_kbd_drain_calls++; /* #808 */
+    {   /* #808: how long the input path went unserviced. See g_kbd_gap_max_ticks. */
+        uint64_t nowg = kbd_rdtsc();
+        if (g_kbd_gap_prev_tsc != 0ull) {
+            uint64_t gap = nowg - g_kbd_gap_prev_tsc;
+            if (gap > g_kbd_gap_max_ticks) g_kbd_gap_max_ticks = gap;
+        }
+        g_kbd_gap_prev_tsc = nowg;
+    }
     host_kbd_drain_polled();
     g_kbd_drain_busy = 0u;
     return hype_host_kbd_buffer_pop(&g_host_kbd_buffer, out_scancode);
@@ -279,6 +307,9 @@ void hype_host_kbd_drain_stats(hype_host_kbd_drain_stats_t *out) {
     out->last_data = g_kbd_last_data;
     out->last_push_tsc = g_kbd_last_push_tsc;
     out->no_controller = g_kbd_no_controller;
+    out->gap_max_ticks = g_kbd_gap_max_ticks;
+    out->isr_obf_clear = g_kbd_isr_obf_clear;
+    out->pic_imr = hype_pic_read_master_imr();
 }
 
 void hype_host_kbd_inject_scancode(uint8_t scancode) {

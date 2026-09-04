@@ -23,6 +23,9 @@ void hype_pic_remap_and_mask_all(uint8_t master_vector_base);
 /* Unmasks a single IRQ line (0-15). */
 void hype_pic_unmask_irq(uint8_t irq);
 
+/* #808: the master PIC's interrupt mask register. Bit N set = IRQ N masked. */
+uint8_t hype_pic_read_master_imr(void);
+
 /* Sends End-Of-Interrupt for the given IRQ (0-15) -- needed on the
  * slave PIC too when irq >= 8, per the 8259's cascade wiring. */
 void hype_pic_send_eoi(uint8_t irq);

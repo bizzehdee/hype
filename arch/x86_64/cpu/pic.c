@@ -34,6 +34,13 @@ void hype_pic_remap_and_mask_all(uint8_t master_vector_base) {
     outb(PIC2_DATA, 0xFF);
 }
 
+/*
+ * #808: is IRQ1 still unmasked? isr_entries freezing while the machine is otherwise healthy has
+ * two shapes -- the line got masked, or delivery is being starved -- and they want opposite
+ * fixes. One inb of the IMR separates them.
+ */
+uint8_t hype_pic_read_master_imr(void) { return inb(PIC1_DATA); }
+
 void hype_pic_unmask_irq(uint8_t irq) {
     uint16_t port = (irq < 8) ? PIC1_DATA : PIC2_DATA;
     uint8_t bit = (uint8_t)(irq < 8 ? irq : irq - 8);

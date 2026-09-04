@@ -30831,6 +30831,18 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                              * This is the HOST controller. `fw-1 KBDPOLL` below is the GUEST's
                              * view of its own virtual 0x64/0x60 and answers a different question;
                              * reading the two as one cost a wrong first diagnosis of run 5.
+                             *
+                             * #808 second probe: run 7 settled that the drain discards nothing
+                             * and that IRQ1 carries ~95% of input here, so the question moved to
+                             * whether the path is STARVED. The i8042 buffers ONE byte, so any
+                             * window with neither an ISR nor a drain loses every keystroke after
+                             * the first -- and run 7 had a 162 ms flush slice against a 10 ms
+                             * budget and ended with usb_held=64/64.
+                             *
+                             *   gap_max=   longest interval between two drains. Tens of us is
+                             *              the 4 kHz gate; hundreds of ms is the answer.
+                             *   isr_empty= interrupts that fired with nothing waiting.
+                             *   irq1=      MASKED would be a different fault entirely.
                              */
                             hype_host_kbd_drain_stats_t ds;
                             uint64_t hz808 = g_vms[0].host_tsc_hz;
@@ -30838,12 +30850,18 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                             hype_host_kbd_drain_stats(&ds);
                             hype_debug_print("fw-1 KBDDRAIN: calls=%llu | empty=%llu floating=%llu "
                                              "data_ff=%llu aux=%llu | host st=0x%02x data=0x%02x "
-                                             "nocrl=%u | last push %s [#808]\n",
+                                             "nocrl=%u | last push %s | gap_max=%lluus "
+                                             "isr_empty=%llu pic_imr=0x%02x irq1=%s [#808]\n",
                                              ds.calls, ds.exit_empty, ds.exit_floating,
                                              ds.exit_data_ff, ds.exit_aux,
                                              (unsigned)ds.last_status, (unsigned)ds.last_data,
                                              (unsigned)ds.no_controller,
-                                             kbddrain_last_push(&ds, hz808, lpbuf, sizeof(lpbuf)));
+                                             kbddrain_last_push(&ds, hz808, lpbuf, sizeof(lpbuf)),
+                                             (hz808 != 0ull)
+                                                 ? (unsigned long long)(ds.gap_max_ticks * 1000000ull / hz808)
+                                                 : 0ull,
+                                             ds.isr_obf_clear, (unsigned)ds.pic_imr,
+                                             (ds.pic_imr & 0x02u) ? "MASKED" : "unmasked");
                         }
                         {
                             unsigned vi;

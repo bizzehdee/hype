@@ -130,6 +130,17 @@ typedef struct {
     unsigned char last_data;          /* host port 0x60 it read, when it read one */
     unsigned char no_controller;      /* the sticky latch: once set, the drain never runs again */
     uint64_t last_push_tsc;           /* when a byte last reached the buffer */
+    /*
+     * #808 second probe -- starvation, not breakage. The i8042 buffers ONE byte, so any window
+     * in which neither the ISR runs nor the drain is called loses every keystroke after the
+     * first. gap_max is the longest such window the drain saw; tens of ms is the 4 kHz gate
+     * working, hundreds is the answer. isr_obf_clear counts interrupts that fired with nothing
+     * waiting (someone else already took it). pic_imr bit 1 set means IRQ1 is masked, which
+     * would be a different fault entirely.
+     */
+    uint64_t gap_max_ticks;
+    unsigned long long isr_obf_clear;
+    unsigned char pic_imr;
 } hype_host_kbd_drain_stats_t;
 
 void hype_host_kbd_drain_stats(hype_host_kbd_drain_stats_t *out);
