@@ -1087,3 +1087,57 @@ restored single write is still correct at the exact size the hardware uses.
 
 Same procedure: **type from the first 30 seconds and keep tapping**, `flush` while input works,
 then `host off`.
+
+
+## Result -- run 13, 2026-09-05, build `790d747-dirty` (logs in `logs/bootAMDL0-13/`)
+
+**The fix ran and did not work -- and that pair is the result.**
+
+```
+pumps=5019                            <- the block-layer hook fires
+BSPSTARVE >5ms: kbddiag=8(max 58ms) flush=17(max 163ms) vars=9(max 1406ms)
+gap_recent=1237713us over5ms=18       <- 1.24 s with no keyboard drain
+USBFLUSH ... max=163987us stalled=2   <- one flush SLICE took 164 ms
+```
+
+`vars` is still 1406 ms, not run 11's 164 ms, even though the chunking revert landed (zero
+`CHUNK` matches at HEAD) and `vars-run1a.bin` is a correct 540,672 bytes with no failure.
+
+**`pumps=` earned its place immediately.** Without it, "the stall is unchanged" reads as the fix
+failing. With it, the fix demonstrably ran and the conclusion is different: the yield is in the
+wrong place.
+
+### Where the second actually goes
+
+The time is inside **one** `hype_xhci_msc_write()` call, below `core/blk_usb.c`'s chunk loop.
+`next_event_budget()` spins waiting for a completion with
+**`HYPE_XHCI_EVENT_TIMEOUT_US = 1000000`** -- one second, deliberately generous per #266
+(*"being early is what caused the bug"*). A completion that never arrives holds the CPU that
+long, and 1,237,713 us is one of those plus overhead.
+
+That ties it to **#803**: `cc=4` retries are exactly what makes a completion not arrive, and this
+run had 6 of them with `bsp_usb_timeouts=7`.
+
+### Fixed in `ebd9b8e` -- run 14 tests it
+
+The yield now also runs **inside the spin**, every 4,096 iterations -- not every one, because the
+loop's measured mean is ~493,692 spins and the callback reads an I/O port, so per-spin would
+replace one stall with another. The block-layer hook stays: it covers the gaps *between*
+transfers, this one covers the stall *inside* one.
+
+Verified in the repaired 338 rig first (#807): `pumps` 5,019 -> 10,608 with both hooks live, rig
+PASS, `VARS: vars-cdtest.bin saved (540672 bytes)`.
+
+## Run 14 -- what it must show
+
+| Read | Passes when |
+| --- | --- |
+| **`pumps=`** | non-zero and higher than run 13's rate -- both hooks live |
+| **`gap_recent=`** | the **1.24 s** window is gone. This is the one that matters |
+| **`BSPSTARVE ... vars=`** | max falls well below 1406 ms |
+| **`vars-*.bin`** | still 540,672 bytes, no `VARS` failure |
+| `kbddiag=` | expected ~58 ms, still untouched and still next |
+| `SCRIPT vm0: PASS` | #803 -- still only run 9 |
+
+Same procedure: type from the first 30 seconds, keep tapping, `flush` while input works, then
+`host off`.
