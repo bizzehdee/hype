@@ -860,3 +860,39 @@ instead of being matched to a suspect by magnitude.
 Also worth fixing: the `flush` verb's byte count goes to the dashboard result panel via
 `term_resultf()` and **not** into the log, so a run cannot be audited for it afterwards. #806's
 own evidence is unrecoverable from the drive.
+
+
+## Run 10 -- the starvation attribution (`7dbe5fa`)
+
+`BSPSTARVE` blames whichever BSP phase ends having held the loop past 5 ms. QEMU already names a
+culprit, and it is an uncomfortable one:
+
+```
+BSPSTARVE >5ms: kbddiag=40(max 118ms) fbreport=140(max 8ms)
+```
+
+**`kbddiag` -- the phase that prints `KBDIRQ`, `KBDDRAIN`, `LOGHEALTH` and `HIDTICK` -- held the
+BSP for up to 118 ms, forty times**, against a ~75 ms measured input blind window. The phase that
+reports on input starvation is the phase causing it. Third instance of that class after #804 and
+#799's own root cause.
+
+`flush`'s byte count now also reaches the log as `fw-1 FLUSHVERB:` (#806), so a run can be
+audited for it afterwards -- run 9's was not recoverable.
+
+### The sequence
+
+Unchanged: **type from the first 30 seconds, keep tapping every 10-20 s**, watch the echo, note
+the wall-clock moment if it stops. `flush` while input works, then `host off`.
+
+| Read | Answers |
+| --- | --- |
+| **`BSPSTARVE >5ms:`** | which phase holds the BSP on *hardware*, and its max. `none` means the stall is outside `bsp_phase()`'s coverage |
+| `gap_recent=` / `over5ms=` | the blind window, to check against the phase maxima |
+| **`irq1_last=`** | the half phase accounting cannot explain -- IRQ1 went silent for 8.3 s in run 9 |
+| `FLUSHVERB:` | #806's byte count, now auditable |
+| `usb-log: FLUSH FAILED` / `usb_held=` | #809 |
+| `SCRIPT vm0: PASS` | #803 -- run 9 passed; a second pass makes it repeatable rather than lucky |
+
+**Do not read a phase maximum as the whole answer.** Phase starvation explains the poll's blind
+window; it does not explain IRQ1 stopping, and both have to be true for input to die, since
+either path alone would carry it.
