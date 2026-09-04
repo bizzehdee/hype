@@ -3978,6 +3978,32 @@ isn't lost.
     into a linear framebuffer today and keeps doing so; the adapter driver's job is to move
     that framebuffer to the device at a rate the dashboard's refresh (§6b) already tolerates.
 
+    **Amended 2026-09-05, second: SSH is the primary operator surface, so BOTH phases are low
+    priority -- and this decision's refusal gate is now wrong.**
+
+    The premise above is that losing the GOP framebuffer blinds the operator "exactly when it
+    matters most". That holds only for an operator sitting at the machine. The primary interface
+    is the remote one: the management listener of decision #79 (#492 MGMT-1, landed) and SSH
+    (#630 SSH-1). An operator on SSH does not lose the host view when the GPU is passed through,
+    because they were never looking at the GOP.
+
+    So the USB display console is a **convenience for local console use**, not a requirement
+    gating GPU passthrough, and #793/#814 are both **Low**.
+
+    **The consequence that matters is the refusal rule.** "Refuse the passthrough if none is
+    present" was written on the assumption that no USB display means no operator view. With a
+    remote console that is false, and the rule as written would **block GPU passthrough on a
+    machine administered over SSH that has no use for a local display at all** -- refusing a
+    legitimate configuration to protect a view nobody is using. That is worse than the failure
+    it guards against.
+
+    The rule therefore needs conditioning on whether a remote console is actually reachable,
+    not on whether a USB display is plugged in. **Left as an open question rather than reversed
+    here**, because it is a safety gate and the replacement condition needs designing: "is the
+    management listener up and has it a client" is not a property hype can establish at the
+    moment it decides whether to start a guest. Whoever lands PASSTHRU-1 (#700) owns that
+    condition; until then the conservative rule stands and is merely mis-motivated.
+
     **Amended 2026-09-05: the adapter is named, and the work is two phases.** The survey
     question above is answered -- the operator has a **Fresco Logic FL2000/FL2000DX**, so that
     is phase 1 and the only phase with a ticket that starts.
