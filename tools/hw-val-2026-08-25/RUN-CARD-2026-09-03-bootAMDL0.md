@@ -801,3 +801,62 @@ note the wall-clock moment if it stops. Type `flush` while input works, then `ho
 If `gap_recent` is tens of milliseconds every sample on hardware too, the fix is not in the drain:
 it is finding what blocks the BSP that long and either shortening it or servicing the keyboard
 inside it. `BSPCOST` already names the BSP's phases, so the candidate is likely already measured.
+
+
+## Result -- run 9, 2026-09-04, build `e450abf-dirty` (logs in `logs/bootAMDL0-9/`)
+
+**`SCRIPT vm0: PASS pass (21 directive(s), 111682ms)` -- the first time the full script has ever
+completed on this machine.** First boot to login, reboot pinned to vCPU 1, `0xCF9` restart,
+`vm0 restarted (M8-4)`, second boot to login, `at line 69: reboot-pin-nonbsp`. #803's restart
+stall is gone. The operator also used **`host off`** -- the first clean shutdown of this series.
+
+What is left of #803 is data, not a stall: the guest reported **failed to verify modloop** on the
+second boot, and this run has **12** `#377 rejected incomplete transfer` events. A signature check
+failing is what a corrupted or short read looks like from the guest's side. The message itself is
+not in either log -- it was on the guest's screen and the screen sink did not carry it, which is
+its own gap.
+
+### #808 is confirmed on hardware, and it is worse than QEMU
+
+```
+KBDDRAIN: calls=478889 | empty=478889 floating=0 data_ff=0 aux=0 | nocrl=0
+          gap_max=1589475us isr_empty=0 pic_imr=0xfc irq1=unmasked
+          gap_recent=62619us over5ms=120 irq1_last=8279ms ago
+```
+
+| | |
+| --- | --- |
+| `gap_recent` | **62,419 / 62,463 / 62,619 / 62,659 us** -- a ~62 ms blind window in *every* interval, strikingly consistent |
+| `over5ms` | 107 -> 112 -> 117 -> 120, about 5 per interval, indefinitely |
+| `gap_max` | grew 322 ms -> 1.56 s -> 1.57 s -> **1.59 s** across the run, so the big windows recur; they are not one bring-up event |
+| `irq1_last` | 12 ms -> 254 ms -> 3,279 ms -> **8,279 ms ago** -- IRQ1 goes quiet for seconds |
+| ruled out again | `irq1=unmasked`, `isr_empty=0`, `floating`/`data_ff`/`aux` all 0, `nocrl=0` |
+
+So **both paths starve**: the poll is blind ~62 ms at a time with occasional multi-second
+windows, and IRQ1 itself falls silent for seconds. That is the answer to why input dies -- it is
+starvation, and the drain was never the problem. `isr_entries=995 (+0 since last)` on the final
+sample with `consumed` frozen at 1,029 is the death happening again, in view this time.
+
+### The USB flush is the leading suspect, on magnitude alone
+
+`USBFLUSH ... max=318810us` -- a **319 ms slice against a 10 ms budget** -- with `stalled=8` of 41
+bursts and `bsp_usb_timeouts=19`. Same order as the 322 ms and 1.59 s gaps.
+
+**Not proven, and one counter argues against it.** `LOGHEALTH ... input ticks skipped for the USB
+lock=0`: `g_hid_lock_missed` is zero all run. But that counter covers the **USB HID** tick
+(#775), and this laptop has no USB keyboard -- `host-hid: no USB boot keyboard on any
+controller`. The PS/2 drain has no equivalent counter, which is precisely the missing
+instrumentation.
+
+I read that line truncated at first and took the label for a finding. It says zero.
+
+### Next probe
+
+Count PS/2 drain ticks skipped or delayed for the USB lock, the way `g_hid_lock_missed` does for
+HID, and record which BSP phase was running when a gap over the threshold closes --
+`g_436_loop_section` and the `BSPCOST` phases already exist, so a gap can name its own cause
+instead of being matched to a suspect by magnitude.
+
+Also worth fixing: the `flush` verb's byte count goes to the dashboard result panel via
+`term_resultf()` and **not** into the log, so a run cannot be audited for it afterwards. #806's
+own evidence is unrecoverable from the drive.
