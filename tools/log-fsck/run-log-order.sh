@@ -20,9 +20,9 @@ set -u
 cd "$(git rev-parse --show-toplevel)"
 BIN="${TMPDIR:-/tmp}/hype-log-order.$$"
 cc -O2 -Wall -Wextra -o "$BIN" tools/log-fsck/log_order.c || exit 2
+# ONE invocation with every path: the binary's union check is the whole point, and a loop that
+# called it per file would silently reduce it to the single-file check this commit replaced.
 rc=0
-for f in "$@"; do
-    "$BIN" "$f" || rc=1
-done
+"$BIN" "$@" || rc=$?
 rm -f "$BIN"
 exit "$rc"
