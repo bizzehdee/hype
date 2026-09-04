@@ -567,3 +567,80 @@ also why the `flush` verb (#806) could not be exercised: there was no way to typ
 ### Unchanged
 
 `FBCLOCK` still bimodal, `cr0=0x80000011` throughout.
+
+
+## Result -- run 6, 2026-09-04, build `d51ceaf-dirty` (logs in `logs/bootAMDL0-6/`)
+
+The `KBDDRAIN` probe worked and produced clean data. **It does not answer #808, because nobody
+typed during the window the log covers.** Recorded so the next run is set up to answer it.
+
+### What the probe says
+
+```
+KBDDRAIN: calls=106828 | empty=106828 floating=0 data_ff=0 aux=0 | host st=0x14 data=0x00
+          nocrl=0 | last push never
+```
+
+Every one of 106,828 drain calls took the `empty` exit -- OBF clear, nothing waiting. Zero
+`floating`, zero `data_ff`, zero `aux`, and **`nocrl=0`, so the sticky `g_kbd_no_controller`
+latch never fired.** `st=0x14` is bits 2 (SYS) and 4, with bit 0 (OBF) clear.
+
+### Why that answers nothing yet
+
+```
+KBDIRQ: isr_entries=0 (+0 since last) eois=0 | consumed=0 chords=0 poll_pushed=0
+        poll_reads=106828
+```
+
+**`consumed=0`**: hype received not one scancode from any source in the whole logged window. No
+USB keyboard either (`host-hid: no USB boot keyboard on any controller`). So `empty=100%` is
+simply the correct reading for a keyboard nobody was using -- it is what a healthy idle drain
+looks like, not a fault.
+
+The operator *did* type later (they ran `flush`, which answered), but the log stops at stamp
+162,245 and the sink never recovered after that, so the samples covering the typing are in the
+lost tail. `isr_entries=0` throughout is worth keeping: IRQ1 does not fire on this laptop, which
+is #218's whole premise, so input here depends entirely on the poll.
+
+**Run 7 must have the operator typing early and repeatedly**, so `KBDDRAIN` brackets both a
+working keystroke and a lost one. Waiting until something looks wrong is too late -- by then the
+sink is gone and the evidence with it.
+
+### #809's mechanism is identified, and hype already reports it
+
+```
+usb-log: FLUSH FAILED -- retrying each interval; \HYPE.LOG is INCOMPLETE until a retry succeeds.
+         hype itself is unaffected; this is the USB block path (xHCI/MSC).
+usb-log: flush RECOVERED after 6 failed interval(s) -- \HYPE.LOG is growing again
+         (a gap may precede this line).
+```
+
+That is the ~4 KB gap, named by hype itself, with "a gap may precede this line" written into the
+message. It is a **reported** condition, not a silent corruption -- so #809's remaining hole in
+bootAMDL0-3 is very likely this same failure, and the question becomes why the USB block path
+fails at all rather than whether the sink loses data.
+
+Supporting counters: `bsp_usb_timeouts=7`, `USBFLUSH ... max=162427us` (a 162 ms slice against a
+10 ms budget), `stalled=2` of 9 bursts, `behind=1905B` at the last sample.
+
+Then it failed again and did not recover: the operator saw the log 100 KB behind and typing
+`flush` reported **`0 byte(s) written`** -- correct, and the honest answer a bare "done" would
+have hidden. #806's verb did its job on its first real use, just not with the number anyone wanted.
+
+## Run 7 -- the same boot, with the operator typing from the start
+
+1. Cold-boot. **Start typing on the built-in keyboard within the first 30 seconds** and keep
+   going every 10-20 s for the whole run, whether or not anything appears. `KBDDRAIN` prints
+   every ~10 s and needs samples from before, during and after the moment input dies.
+2. Let the script drive the first boot to login and issue its reboot; the restart stalling is
+   #803 and expected.
+3. If input dies, **note the wall-clock moment** -- that is the one thing the log cannot
+   reconstruct.
+4. Type `flush` while it still works, then `host off`.
+
+| Read | Answers |
+| --- | --- |
+| `KBDDRAIN empty=` vs `floating=`/`data_ff=`/`aux=`, across a sample where `consumed=` stops rising | #808: below hype, or hype discarding |
+| `nocrl=` | #808: the sticky-latch suspect, live or dead |
+| `usb-log: FLUSH FAILED` / `RECOVERED after N failed interval(s)` | #809: how often, and whether a gap follows |
+| the `flush` byte count while input still works | #806: its first non-zero exercise |
