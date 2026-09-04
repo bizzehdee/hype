@@ -644,3 +644,74 @@ have hidden. #806's verb did its job on its first real use, just not with the nu
 | `nocrl=` | #808: the sticky-latch suspect, live or dead |
 | `usb-log: FLUSH FAILED` / `RECOVERED after N failed interval(s)` | #809: how often, and whether a gap follows |
 | the `flush` byte count while input still works | #806: its first non-zero exercise |
+
+
+## Result -- run 7, 2026-09-04, build `d51ceaf-dirty` (logs in `logs/bootAMDL0-7/`)
+
+Operator typed from early and kept typing. **#808 now has a mechanism, and it is not the drain.**
+Input never died this run, which is itself the finding.
+
+### The measurement
+
+`KBDDRAIN` and `KBDIRQ` paired across the run:
+
+| `KBDDRAIN` | `isr_entries` | consumed | `ps2polled` |
+| --- | --- | --- | --- |
+| `calls=97185 empty=97185 floating=0 data_ff=0 aux=0 nocrl=0 st=0x14 data=0xe0` | rising | 146 | -- |
+| `calls=217277 empty=217277 floating=0 data_ff=0 aux=0 nocrl=0 st=0x14 data=0xe0` | 509 (+31) | 374 | 27 |
+| `calls=330553 empty=330553 floating=0 data_ff=0 aux=0 nocrl=0 st=0x14 data=0x9c` | **578 (+41)** | **612** | **34** |
+
+Consumed rose monotonically 0 -> 612 for the whole run, so input worked start to finish.
+`floating`, `data_ff` and `aux` stayed at **zero** throughout and `nocrl=0` -- hype never
+discarded a byte and the sticky latch never fired. `data=` cycles through real Set-1 codes
+(0x1c Enter, 0x1e A, 0x1f S, 0x20 D, 0x9c/0x9e breaks), so the drain does reach port 0x60.
+
+### What it means
+
+**IRQ1 fires on this laptop, and it carries essentially all the input: 578 ISR entries against
+`ps2polled=34`.** The polled fallback contributed 5% of 612 scancodes.
+
+That inverts #218's premise. The poll was added because "on the operator's laptop IRQ1 never
+fires -- a full real-hardware run measured isr_entries=0 eois=0". On this machine, in this run, it
+fires 578 times and the poll is a trickle.
+
+And it re-reads run 5 exactly:
+
+| run | `isr_entries` (last) | `ps2polled` | input |
+| --- | --- | --- | --- |
+| bootAMDL0-5 | **107, (+0 since last)** | **5** | died twice, dead at the end |
+| bootAMDL0-7 | 578, (+41 since last) | 34 | alive throughout |
+
+In run 5 the ISR **stopped** -- frozen at 107 with `+0` per sample -- and the poll delivered 5
+bytes in the entire run. **So the polled fallback does not work as a fallback.** It cannot carry
+the load when IRQ1 stops, which is the one job it exists for.
+
+Why it cannot is the open question, and the drain has now answered for itself: it takes the
+`empty` exit on ~100% of calls, discards nothing, and is not latched off. It sees OBF clear
+because in the healthy case the ISR got there first -- but in run 5 the ISR was not running, and
+`ps2polled` still stayed at 5.
+
+**So #808's next probe belongs on IRQ1 delivery, not on the drain.** The question is why the
+interrupt stops, and separately why an unconsumed byte does not then sit in the output buffer for
+the 4 kHz poll to find.
+
+### Also this run
+
+- **No input death**, so the fault is intermittent. Runs 5 and 7 differ in outcome with the same
+  config and build family.
+- The restart chain fired again (`vm0 restarted (M8-4)`) and, as in every run since #803 was
+  filed, the second boot did not reach a second login. No `SCRIPT vm0: PASS`.
+- **#809: two more flush failures**, both self-reported and both recovered --
+  `flush RECOVERED after 1 failed interval(s)` and `after 4 failed interval(s)`, each carrying
+  "a gap may precede this line". `bsp_usb_timeouts` climbed to 16.
+- **New: the USB buffer pool hit its ceiling.** `usb_waiters_max=1 usb_held=64/64` on the final
+  `FBINFLIGHT` line, against `0/64` for the rest of the run. Worth carrying to #809 -- an
+  exhausted pool is a plausible reason a flush interval fails.
+- Ended on the power button again, so the tail is short by whatever was outstanding.
+
+## Run 8 -- what it needs
+
+Not another `KBDDRAIN` run: that probe has said what it can. Run 8 wants an **IRQ1 delivery**
+probe (#808) -- why `isr_entries` stops, and what the i8042 status is at that moment as seen by
+the ISR rather than the drain -- plus whatever #809 gains from the `usb_held=64/64` lead. Both
+are code changes first, so there is nothing to stage until they land.
