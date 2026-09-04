@@ -2927,6 +2927,20 @@ static unsigned fw_1_host_action_begin(unsigned action) {
 }
 
 /* Called from the BSP housekeeping loop every iteration; cheap when idle. */
+/*
+ * #808: "last push 0ms ago" is what an unset timestamp printed, which reads as "a byte arrived
+ * just now" -- the opposite of the truth. Say "never".
+ */
+static const char *kbddrain_last_push(const hype_host_kbd_drain_stats_t *ds, uint64_t hz,
+                                      char *out, unsigned cap) {
+    if (ds->last_push_tsc == 0ull || hz == 0ull) {
+        return "never";
+    }
+    hype_snprintf(out, cap, "%llums ago",
+                  (unsigned long long)(((hype_rdtsc() - ds->last_push_tsc) * 1000ull) / hz));
+    return out;
+}
+
 static void fw_1_host_action_poll(void) {
     unsigned i, still_up = 0;
 #ifdef HYPE_175_AUTOTEST_SECS
@@ -30778,8 +30792,15 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                         uint64_t ps2_max = 0;
                         hype_host_kbd_poll_stats(&ps2_reads, &ps2_max);
                         hype_debug_print("fw-1 KBDIRQ: isr_entries=%llu (+%llu since last) eois=%llu "
-                                         "last_apic=%u | polled=%llu chords=%llu ps2polled=%llu "
-                                         "ps2reads=%llu max=%lluus | "
+                                         /*
+                                          * #808: these labels used to read "polled=" for the
+                                          * CONSUMED scancode count and "ps2polled=" for the
+                                          * poll's own pushes, which is backwards from how they
+                                          * scan and misread me twice in one session -- once into
+                                          * a wrong root cause. Say what each one counts.
+                                          */
+                                         "last_apic=%u | consumed=%llu chords=%llu "
+                                         "poll_pushed=%llu poll_reads=%llu max=%lluus | "
                                          "bsp_usb_timeouts=%llu bsp_ahci_timeouts=%llu "
                                          "bsp_nvme_timeouts=%llu nvme_lock_contended=%llu "
                                          "[#363 #658 #660 #796]\n",
@@ -30813,17 +30834,16 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                              */
                             hype_host_kbd_drain_stats_t ds;
                             uint64_t hz808 = g_vms[0].host_tsc_hz;
+                            char lpbuf[32];
                             hype_host_kbd_drain_stats(&ds);
                             hype_debug_print("fw-1 KBDDRAIN: calls=%llu | empty=%llu floating=%llu "
                                              "data_ff=%llu aux=%llu | host st=0x%02x data=0x%02x "
-                                             "nocrl=%u | last push %llums ago [#808]\n",
+                                             "nocrl=%u | last push %s [#808]\n",
                                              ds.calls, ds.exit_empty, ds.exit_floating,
                                              ds.exit_data_ff, ds.exit_aux,
                                              (unsigned)ds.last_status, (unsigned)ds.last_data,
                                              (unsigned)ds.no_controller,
-                                             (ds.last_push_tsc != 0ull && hz808 != 0ull)
-                                                 ? ((hype_rdtsc() - ds.last_push_tsc) * 1000ull) / hz808
-                                                 : 0ull);
+                                             kbddrain_last_push(&ds, hz808, lpbuf, sizeof(lpbuf)));
                         }
                         {
                             unsigned vi;
