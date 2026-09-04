@@ -260,3 +260,94 @@ plus the guest's configured offset (#438)."* The intercept is in the uncondition
 but RDTSC. hype has no "am I running under a hypervisor" probe today (`hype_cpu_detect_vmm_kind`
 distinguishes Intel from AMD, not nesting), so this needs CPUID leaf 1 ECX bit 31 and a
 conditional intercept.
+
+
+## Result -- run 3, 2026-09-03, build `af1595a-dirty` (logs in `logs/bootAMDL0-3/`)
+
+**The first boot on this machine whose guest reached userspace.** `#802` removed the RDTSC
+intercept that had been holding it in an early delay loop, and `#801`'s section split made the
+next cost visible instead of a guess.
+
+### The guest booted
+
+`RUN1A.LOG`, first boot: GRUB, then the kernel, then
+
+```
+ttyS0| l/reboot/cpu)
+ttyS0| CPU-PINNED-1
+ttyS0| localhost:~#
+ttyS0| clear
+ttyS0| localhost:~# reboot
+```
+
+and `HYPE.LOG` confirms the restart chain fired from the non-BSP vCPU:
+
+```
+fw-1: vm0 vCPU 1 guest reset via ACPI reset register (0xCF9) -> restart [#94 #525]
+fw-1: vm0 restarted (M8-4): pristine firmware restored, RAM zeroed, vcpu reset
+```
+
+`GUESTPC vm0: lastreason=0x78 lastrip=0xffffffffb6c81c2e ... rflags=0x246` -- HLT with interrupts
+enabled, and **zero `lastreason=0x6e`** anywhere in the run. The RDTSC delay loop that defined
+runs 1 and 2 is gone.
+
+### #799's symptom is resolved; the remaining hang is #803, and only on the restart
+
+There is no `SCRIPT vm0: PASS`. The script armed with 21 directives, drove the first boot to
+login, pinned the reboot and issued it -- and the second `expect localhost login:` never matched,
+because the guest stalled after the restart.
+
+That is **#803**, not #799. Its symptom is written in its own title: *first boot reaches login,
+but a guest restart always stalls at `Booting \`Linux lts'`*. Same string as #799, different
+cause, different leg. Evidence in this run:
+
+```
+host-xhci: #377 rejected incomplete transfer (slot=1 ep=4 trb=0x141b39000 cc=4 residue=31 len=31)
+host-xhci: #377 rejected incomplete transfer (slot=1 ep=3 trb=0x141b38000 cc=4 residue=512 len=512)
+```
+
+Five of them, `residue == len` every time, so zero bytes moved. #803's own lead: nothing resets
+the ATAPI device model or the xHCI controller when a guest restarts.
+
+**Do not read a future run's missing `SCRIPT PASS` as a regression while #803 is open.** Any run
+of this card reboots the guest and will stall there.
+
+### Where the loop's time went -- #804, found here
+
+`#801`'s split landed in this build and immediately named its successor:
+
+```
+HOUSECOST vm0: s2=2710ms s21=0ms s22=35ms s23=83ms s5=654ms s6=331ms s7=115ms s72=207ms
+               s73=313ms s74=42ms s75=216ms s761=0ms s768=45ms s764=7ms s769=117ms
+               s781=0ms s782=23ms s795=11643ms s796=291ms s797=1ms s798=10095ms
+               s79=83006ms s80=6141ms s81=3918ms
+LOOPPHASE: diag=429ms persist=99ms house=4377ms dispatch=16511ms
+DRAIN: iters=427804
+```
+
+| | value | per iteration |
+| --- | --- | --- |
+| `house` (all housekeeping) | 4,377 ms | **10 us** |
+| `s79` (pre-entry prologue) | 83,006 ms | **194 us** |
+| wall (`FBSPEED t=`) | 144,812 ms | -- |
+
+**`s79` alone is 57% of wall time**, and `s75` -- the section that looked like a 460 us elastic
+wait in run 2 -- is now 216 ms. That confirms run 2's reading was an accounting artefact, not a
+wait: `s75` had been charged the guest's own run time.
+
+`s79` is the #436 Windows PE-base scan running on every kernel-mode exit, which is
+**#804**, fixed after this run in `7d621a2` (7.3x on the nested rig: `s79` 13,528 ms -> 1,843 ms).
+This run is its hardware baseline.
+
+Housekeeping is now 10 us per iteration, against #799's original 235 us per exit.
+
+### Unchanged and still unexplained
+
+The clock oscillation: 49 of 144 `FBCLOCK` samples at exactly 190/1000 -- 34%, the same
+proportion as runs 1 (34%) and 2 (33%).
+
+### How it ended
+
+On the power button: zero `fw-1 HOST:` lines, log truncated mid-line. This run predates
+`f114aae`, which is what that commit exists to stop -- see the standing rule in
+`docs/hw-validation-runbook-2026-09-02.md`.
