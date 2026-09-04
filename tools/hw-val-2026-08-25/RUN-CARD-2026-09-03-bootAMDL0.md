@@ -528,11 +528,26 @@ Note for anyone reading the absences: `host-hid: no USB boot keyboard on any con
 host keyboard only)`. There were no USB keyboards this run, which is why the log has **zero**
 `HIDTICK`, `CTRLSILENCE`, `XHCIRESET` and `REVIVE` lines. Their absence is not a fix.
 
-### 3. The log on the stick is out of order, and ~90 KB never landed
+### 3. The log lost ~4.2 KB mid-run and ~90 KB at the end -- but it is NOT out of order
 
-The newest line in the file is at stamp 267,153, but the file is 293,959 bytes. The final
-**26,799 bytes are older content** -- reading from offset 267,160 gives lines stamped 243,395 and
-243,521, i.e. content that belongs 24 KB earlier. Not padding: zero NUL bytes in that region.
+**Correction to the first version of this section**, which claimed the file's last 26,799 bytes
+were older content written after the newest record. That was wrong and the error was mine: I
+treated the produced-stream stamp 267,153 as a FILE offset and read from there, which lands
+mid-file on content that is exactly where it belongs. The file ends cleanly on `[0000267153]` at
+file offset 293,836, and `tools/log-fsck/run-log-order.sh` (added for #809) reports `backward=0`
+on this log and on all six others in `logs/`.
+
+What is real is loss, and the log names it itself:
+
+```
+[0000218009] usb-log: BEHIND -- logbuf has 218009 bytes, file has 205575 (#338)
+[0000222322] fw-1 FBSPEED: ...
+```
+
+80 bytes apart in the file, 4,313 apart in the produced stream: **~4.2 KB of records absent**,
+immediately after the sink's own BEHIND warning. Every AMD-laptop run has exactly one such gap
+and both 5950X runs have none -- despite the desktop falling behind 87 and 254 times against the
+laptop's 2-4. So falling behind is not the cause.
 
 The flush's own account of itself never showed the operator's 90 KB:
 
