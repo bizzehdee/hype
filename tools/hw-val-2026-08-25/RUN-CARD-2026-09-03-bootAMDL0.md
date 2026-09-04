@@ -709,9 +709,39 @@ the 4 kHz poll to find.
   exhausted pool is a plausible reason a flush interval fails.
 - Ended on the power button again, so the tail is short by whatever was outstanding.
 
-## Run 8 -- what it needs
+## Run 8 -- the starvation probe (`f0eba66`)
 
-Not another `KBDDRAIN` run: that probe has said what it can. Run 8 wants an **IRQ1 delivery**
-probe (#808) -- why `isr_entries` stops, and what the i8042 status is at that moment as seen by
-the ISR rather than the drain -- plus whatever #809 gains from the `usb_held=64/64` lead. Both
-are code changes first, so there is nothing to stage until they land.
+Run 7 settled what the drain is *not*, so the second #808 probe measures whether the input path
+is being **starved** rather than broken. The i8042 buffers one byte, so any window with neither
+an ISR nor a drain loses every keystroke after the first.
+
+`KBDDRAIN` gains three fields:
+
+- **`gap_max=`** -- longest interval between two consecutive drain calls. Tens of microseconds is
+  the #796 4 kHz gate working; hundreds of milliseconds is the answer.
+- **`isr_empty=`** -- interrupts that fired with nothing waiting.
+- **`pic_imr=` / `irq1=`** -- the master PIC mask. `MASKED` would be a different fault wanting the
+  opposite fix.
+
+**QEMU already shows `gap_max=128932us`** on an idle sandbox with nobody typing -- 129 ms, or 516x
+the 250 us gate interval, with `irq1=unmasked`. If the hardware number is anything like that, the
+poll cannot be a fallback for anything. Treat that as a hypothesis the run tests, not a finding:
+it came out of a check that was only meant to validate a printf.
+
+### The sequence
+
+Same as run 7 -- **type from the first 30 seconds and keep tapping every 10-20 s**, watch the
+echo, and note the wall-clock moment if it stops. Type `flush` while input still works, then
+`host off`.
+
+| Read | Answers |
+| --- | --- |
+| `gap_max=` | whether the input path is blind for long enough to lose keystrokes |
+| `irq1=` | whether IRQ1 is masked (a different fault) or starved |
+| `isr_empty=` vs `isr_entries` rising | whether interrupts fire and find the byte already gone |
+| `consumed=` flatlining while you tap | the death moment, against `gap_max` at that sample |
+| `usb-log: FLUSH FAILED` / `usb_held=` | #809's pool-exhaustion lead |
+| the `flush` byte count while input works | #806's first non-zero exercise |
+
+Input death is **intermittent** -- runs 5 and 7 had the same config and opposite outcomes -- so a
+run that keeps input is not evidence of a fix, and `gap_max` is worth reading either way.
