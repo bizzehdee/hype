@@ -1039,3 +1039,51 @@ It is, and the instrumentation is part of it. `kbddiag` -- the phase that prints
 those lines lengthened the window being measured.** The starvation sits right at the threshold
 where a keystroke survives or does not, which is why the fault comes and goes as logging changes,
 and why "it worked this run" has never been evidence here.
+
+
+## Result -- run 12, 2026-09-04, build `bf38d0d-dirty` (logs in `logs/bootAMDL0-12/`)
+
+**The fix made it 8.6x worse.** Chunking the varstore write at the caller:
+
+```
+BSPSTARVE >5ms: render=10(max 9ms) input=1(max 5ms) kbddiag=16(max 61ms) flush=37(max 327ms)
+                fbreport=1(max 5ms) vars=17(max 1408ms)
+```
+
+`vars` 164 ms -> **1408 ms**, and `flush` 10 ms -> 327 ms. The file stayed correct --
+`vars-run1a.bin` 540,672 bytes, no `VARS` failure -- so the write was right, just far slower.
+
+The cause was written three lines above the call I changed. `fw_1_save_vars()`'s own comment says
+it reuses a correctly-sized file so the checkpoint is *"a pure in-place data write ... only the
+first save of a run allocates, and only then does it touch FAT metadata"*. On the first save the
+file is new, so each of seventeen 32 KiB chunks took `hype_fat32_write_at()`'s **growth** path
+instead of one: seventeen `chain_measure()` walks of a chain that grew each time.
+
+## Where the fix went instead
+
+Reverted, and the yield now lives in **`core/blk_usb.c`'s transfer loops** (`814bf8e`), below
+every filesystem -- so FAT32, exFAT, NTFS and the raw log writes are covered with none of them
+touched, and the request stays **one** operation so the per-call cost cannot come back. An
+intermediate per-filesystem attempt was worse than wrong: it added a field to `hype_fat32_fs_t`
+and **segfaulted the unit suite** (rc=139 against rc=0 either side).
+
+`pumps=` now counts drains that came from inside a transfer, because a run where the stall is
+unchanged must be able to distinguish "the hook is not wired" from "the fix does not help".
+
+**Verified in the sandbox first**, which #807's repair made possible: `pumps=3449` and climbing
+through the repaired 338 rig, and `VARS: vars-cdtest.bin saved (540672 bytes)` proving the
+restored single write is still correct at the exact size the hardware uses.
+
+## Run 13 -- what it must show
+
+| Read | Passes when |
+| --- | --- |
+| **`pumps=`** | non-zero. Zero means the hook is not wired and nothing below is meaningful |
+| **`BSPSTARVE ... vars=`** | max falls from **164 ms** (run 11) -- and is nowhere near run 12's 1408 ms |
+| **`vars-*.bin` on the drive** | still 540,672 bytes, no `VARS` failure |
+| `gap_recent=` / `over5ms=` | the blind window shrinks with it |
+| `kbddiag=` | expected unchanged ~57-61 ms; it is the next target, deliberately untouched |
+| `SCRIPT vm0: PASS` | #803 -- still only run 9 has one |
+
+Same procedure: **type from the first 30 seconds and keep tapping**, `flush` while input works,
+then `host off`.
