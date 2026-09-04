@@ -192,6 +192,7 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
     int stream_media = 0; /* GLADDER-10: media served on demand from a raw disk partition */
     uint64_t media_byte_off = 0; /* GLADDER-10(b): 64-bit byte offset = media_lba * sector size */
     uint32_t remaining;
+    uint32_t req_len = 0; /* #803 */
     uint32_t transferred;
     uint32_t prd_idx;
     uint8_t status_reg;
@@ -361,6 +362,7 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
     prd_idx = 0;
     transferred = 0;
     g_atapi_xfers++;
+    req_len = remaining; /* #803: kept for the short-transfer report below */
     {
         /* #343: what the command ASKED for, before the PRDT list can cut it short. */
         g_atapi_req_bytes += (uint64_t)remaining;
@@ -513,6 +515,42 @@ int process_ahci_command_slot(hype_ahci_t *ahci, hype_atapi_t *atapi,
     if (remaining > 0u) {
         g_atapi_short_xfers++;
         g_atapi_owed_bytes += (uint64_t)remaining;
+        /*
+         * #803: WHY it came up short, which the counters above cannot say.
+         *
+         * Run 6 recorded req=2.02 GB, done=409 MB, owed=1.61 GB over 23 short transfers -- about
+         * 70 MB owed each, which is far too large to be a PRDT a guest merely under-provisioned,
+         * and only 8 of them had a backing-store failure. So either the guest really is asking
+         * for enormous reads, or the request length or the PRDT decode is wrong -- and those need
+         * opposite fixes. The silent short-read fix is deliberately NOT written until this says
+         * which.
+         *
+         * `prd_sum` walks the WHOLE PRDT, not just the entries consumed, because the question is
+         * what the guest provisioned, and the fill loop may have stopped early on a media error.
+         * `failed` separates the two populations: a media failure already reports ERR + sense to
+         * the guest (#287), whereas the PRDT-exhausted case completes as success with an honest
+         * PRDBC, and only the latter is the silent wrong-data path #343 named.
+         *
+         * Bounded to 16 reports: #343's own lesson is that a capped trace reads as "the event
+         * never happened", so the COUNTERS above stay unbounded and this only explains them.
+         */
+        static unsigned g_803_reported = 0;
+        if (g_803_reported < 16u) {
+            uint64_t prd_sum = 0;
+            uint16_t pi;
+            g_803_reported++;
+            for (pi = 0; pi < hdr.prdtl; pi++) {
+                hype_ahci_prdt_entry_t pe;
+                hype_ahci_decode_prdt_entry(prdt_bytes + (uint32_t)pi * 16u, &pe);
+                prd_sum += (uint64_t)pe.byte_count;
+            }
+            hype_debug_print("fw-1 #803 SHORT: req=%u done=%u owed=%u | prdtl=%u prd_sum=%llu "
+                             "| cdb=0x%02x lba=%llu failed=%d\n",
+                             (unsigned)req_len, (unsigned)transferred, (unsigned)remaining,
+                             (unsigned)hdr.prdtl, (unsigned long long)prd_sum,
+                             (unsigned)atapi->last_cdb, (unsigned long long)result.media_lba,
+                             media_read_failed);
+        }
     }
     g_atapi_done_bytes += (uint64_t)transferred;
 

@@ -98,6 +98,34 @@ static void usb_xfer_lock(void);
 
 #define USB_BSP_LOCK_BUDGET 20000000u
 
+/*
+ * #803: the GUEST side needs a bound too, and the comment above explains why it did not have one:
+ * "returning short data to a guest is not an option". That reasoning holds, and this does not
+ * break it -- the bound here does not return short data, it FAILS the read, which reaches the
+ * guest as MEDIUM ERROR / unrecovered read error through the caller's existing #287 path. A real
+ * drive answers a hopeless read the same way, and guests already handle it.
+ *
+ * What forced this: boot AMD-L0 run 6 (2026-09-04, SSD) measured a single ATAPI command at
+ * 6656373 us with 99.995% of it in the medium, and `BSPPROBE ... IN-HOST for 4480ms section=774`
+ * -- the vCPU parked inside hype, not executing its guest, for four and a half seconds. The guest
+ * showed 0% CPU and the machine read as locked. An unbounded wait protects the bytes of a read
+ * that is never going to complete, at the cost of the vCPU that asked for it.
+ *
+ * The budget is per usb_read() call, checked between chunks, so it bounds the ACCUMULATION of
+ * slow chunks rather than one catastrophic transfer -- hype_xhci_msc_read()'s own BOT reset
+ * recovery is what bounds a single transfer, and this must not cut that recovery off mid-way.
+ * 2000 ms is chosen against measurement, not taste: healthy per-command service time on this rig
+ * was 793 us (run 3, early), so the budget is ~2500x the good case and still a third of the
+ * observed worst. The first chunk is always attempted regardless, so a mis-set or zero budget can
+ * never fail a read without trying it.
+ */
+#define HYPE_USB_READ_BUDGET_MS 2000ull
+static uint64_t g_usb_tsc_hz;
+static volatile unsigned long long g_usb_read_budget_timeouts;
+
+void hype_blk_usb_set_tsc_hz(uint64_t hz) { g_usb_tsc_hz = hz; }
+unsigned long long hype_blk_usb_read_timeouts(void) { return g_usb_read_budget_timeouts; }
+
 static volatile unsigned int g_usb_bsp_apic = 0xFFFFFFFFu;
 static volatile unsigned long long g_usb_bsp_lock_timeouts;
 
@@ -263,6 +291,15 @@ static int usb_read(void *hw, uint64_t lba, uint32_t count, void *buf) {
     t0 = usb_rdtsc(); /* after the lock, so contention is not counted as device time */
     while (done < count) {
         uint32_t n = (count - done > USB_MAX_SECTORS) ? USB_MAX_SECTORS : (count - done);
+        /* #803: bounded, but never before the first chunk has been tried -- see the budget's
+         * own comment. Failing here is reported to the guest as a medium error, not as a
+         * short-but-successful read. */
+        if (done != 0u && g_usb_tsc_hz != 0 &&
+            usb_rdtsc() - t0 > (g_usb_tsc_hz / 1000ull) * HYPE_USB_READ_BUDGET_MS) {
+            g_usb_read_budget_timeouts++;
+            usb_xfer_unlock();
+            return -1;
+        }
         if (hype_xhci_msc_read(u->ctrl, u->slot, &u->msc, (uint32_t)(lba + done), n,
                                u->block_size, p + (uint64_t)done * u->block_size) != 0) {
             usb_xfer_unlock();

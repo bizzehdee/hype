@@ -16318,7 +16318,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                      * told the read succeeded. req vs done makes the size of the loss explicit
                      * rather than leaving it to be inferred from a capped trace. */
                     hype_debug_print("fw-1 ATAPIXFER: xfers=%llu short=%llu owed=%llu "
-                                     "req=%llu done=%llu\n", ax, as, ao, ar, ad);
+                                     "req=%llu done=%llu read_timeouts=%llu [#803]\n", ax, as, ao,
+                                     ar, ad, hype_blk_usb_read_timeouts());
 #if HYPE_343_VERIFY_READS
                     {   /* #343: content verification, diagnostic builds only. */
                         unsigned long long vc = 0, vm2 = 0;
@@ -29119,6 +29120,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             }
         }
         hype_xhci_set_tsc_hz(g_fw_1_host_tsc_hz);
+        /* #803: same calibration feeds the guest-media-read budget; without it that bound is
+         * disabled and reads wait indefinitely, which is the pre-#803 behaviour. */
+        hype_blk_usb_set_tsc_hz(g_fw_1_host_tsc_hz);
         /* USB-8 (#231): real HW has MULTIPLE xHCI controllers (chipset + add-in),
          * multiple ports each, and the boot stick may be on ANY of them (behind a
          * hub or not). Scan EVERY xHCI controller via the resumable find_xhci_from,

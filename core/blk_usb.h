@@ -64,6 +64,15 @@ void hype_blk_usb_set_bsp_apic(unsigned int apic_id);
  * queue until the lock is idle, so giving up cannot leave or skip a ticket. */
 unsigned long long hype_blk_usb_bsp_lock_timeouts(void);
 
+/* #803: host TSC frequency for the guest-read budget (see HYPE_USB_READ_BUDGET_MS). Set once from
+ * boot after TSC calibration, same shape as hype_xhci_set_tsc_hz(); zero disables the bound, so a
+ * caller that never sets it keeps the pre-#803 unbounded behaviour. */
+void hype_blk_usb_set_tsc_hz(uint64_t hz);
+
+/* #803: guest media reads abandoned for exceeding that budget. Non-zero means a read was failed
+ * rather than waited on -- the guest saw a medium error, and the vCPU was not parked. */
+unsigned long long hype_blk_usb_read_timeouts(void);
+
 /*
  * #368: the LIVE queue depth and current holder, as opposed to the cumulative counters above.
  * `waiters` is how many cores are queued for the USB path right now; `holder_apic` is the core
