@@ -610,7 +610,9 @@ to fetch the base system, and any online-account/update flow does too.
   first target — broad hardware support, simple register interface,
   well-documented. The supported families for v1 are **Intel e1000e/igb,
   Realtek r8169, Intel igc, Broadcom bnxt/tg3, and Marvell/Aquantia
-  atlantic** (decision #36); each is a separate driver behind the single NIC
+  atlantic** (decision #36), extended by decision #83 with three Intel
+  datacenter families: **ixgbe** (X540 and later 10GbE), **i40e** (700
+  Series / XL710, 10/40GbE) and **ice** (E810/E835, 25/100GbE+); each is a separate driver behind the single NIC
   vtable of decision #34, sitting on the shared host-PCI bind + DMA-ring +
   IRQ/poll facility that decision grows from this work — same isolation
   principle as `blk_backend`, and no second PCI enumerator alongside
@@ -4213,6 +4215,42 @@ isn't lost.
     section above. It reports bytes written and per-sink outcome through `term_resultf()` like
     every other verb, so a failed sink is visible rather than silent. It is safe to type at any
     time and safe to repeat.
+
+83. **Extend §6e's host NIC family list with ixgbe, i40e and ice -- decided (2026-09-04,
+    #811 #812 #813).**
+
+    Decision #36 ratified five host NIC families (Intel e1000e/igb, Realtek r8169, Intel igc,
+    Broadcom bnxt/tg3, Marvell/Aquantia atlantic). That was a closed list, not a general licence
+    for the HNET-D* series, so parts outside it had no ticket and could not get one without
+    coming back here. Three Intel datacenter families are added:
+
+    - **ixgbe** -- X540 and later 10GbE.
+    - **i40e** -- 700 Series, XL710, 10/40GbE.
+    - **ice** -- E810 and E835, 25/100GbE and above.
+
+    **Why these and not "whatever hardware turns up".** The five in decision #36 are what a
+    desktop or laptop is likely to have. These three are what a *server* has, and hype's
+    stated targets include running on real server hardware where the onboard NIC is an X540,
+    an XL710 or an E810 and there is no alternative uplink. A hypervisor that cannot drive the
+    only NIC in the machine has no host networking on that machine at all. The list stays
+    closed: a part outside these eight families still needs a decision, and the answer for one
+    that is merely convenient should be no.
+
+    **Nothing about the shape changes.** Each family is one driver behind the single NIC vtable
+    of decision #34, on the shared host-PCI bind + DMA-ring + IRQ/poll facility (#398/#399/#400,
+    all landed), forwarding-plane only per decision #36 -- no sockets, no endpoint behaviour.
+
+    **These three are riskier than the five, deliberately accepted.** ixgbe, i40e and ice are
+    multi-queue parts with firmware/admin-queue bring-up (ice in particular negotiates with
+    firmware over an admin queue before a single packet moves), against the single-queue
+    register-poke bring-up the existing drivers use. So the DMA-ring facility may need real
+    work rather than reuse, and that is expected to surface as its own ticket rather than being
+    absorbed silently.
+
+    **No QEMU model, so no sandbox validation.** QEMU emulates none of these three, so each
+    ticket's bar is a real-hardware bring-up on the part named in it. That is a slower loop than
+    the rest of HNET and is the reason to size expectations accordingly, not a reason to skip
+    them.
     Relaxing the lock -- per-device queues, out-of-order completion -- is a separate decision
     with a throughput number in front of it; nothing in this one prepares the ground for it
     beyond the tag width.
