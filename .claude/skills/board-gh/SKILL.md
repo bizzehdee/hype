@@ -103,9 +103,28 @@ gh issue close <n> --repo bizzehdee/hype --reason completed   # or: not planned
 Link a dependency ("is blocked by") — REST, not the CLI:
 
 ```sh
+# issue_id is the GLOBAL DATABASE ID, not the repo-local issue number.
+BLOCKER_ID=$(gh api repos/bizzehdee/hype/issues/<blocking-n> --jq .id)
 gh api -X POST repos/bizzehdee/hype/issues/<n>/dependencies/blocked_by \
-  -f issue_id=<blocking-issue-node-or-id>
+  -F issue_id="$BLOCKER_ID"
 ```
+
+**Two traps here, both silent.**
+
+- `-f` sends the value as a string and the API rejects it (`not of type integer`). Use `-F`.
+- Passing the plain issue **number** often SUCCEEDS and links a stranger's issue in another
+  repo, because small integers are valid global ids somewhere. Seen for real: linking "399"
+  and "400" attached issues from unrelated repositories, with a 201 and no warning.
+
+So always read the link back and confirm the repo, not just the number:
+
+```sh
+gh api repos/bizzehdee/hype/issues/<n>/dependencies/blocked_by \
+  --jq '.[] | "#\(.number) \(.repository.full_name) \(.title)"'
+```
+
+`gh issue view <n> --json id` returns the GraphQL node id (`I_kw...`), which this endpoint
+does not accept — that is a different id from the one above.
 
 Add a sub-issue:
 
