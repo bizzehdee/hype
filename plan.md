@@ -4013,6 +4013,21 @@ isn't lost.
       driver's job reduces to bringing the device up and blitting the dashboard's existing
       linear framebuffer at it. That is the smallest thing that satisfies this decision's
       requirement, and it is satisfiable with hardware already to hand.
+
+      **Two findings from the source survey change the shape of this phase**
+      (`research/fresco-fl2000-driver-sources-2026-09-05.md`). There is **no datasheet**; the
+      usable material is a vendor-published GPL-2.0 driver that covers "only the USB part of the
+      display logic" -- no EDID/DDC/I2C, no sync generation. And the chip has **no onboard frame
+      buffering**, needing 373 MB/s continuous at 1920x1080@60 and, at any refresh, each frame's
+      bytes *on time* rather than on average. Against hype's single serialising USB lock and a
+      measured 318,810 us flush slice (#809), that is the phase's central risk, not its byte
+      count. **hype is GPL-3.0 and the driver is GPL-2.0**, which may be outright incompatible;
+      settling that is the first task, before any code.
+
+      **And with decision #79b, this phase is optional in a way it was not.** Any USB device may
+      be assigned to a guest, so the FL2000 can simply be given to a guest that has a real
+      driver for it -- no hype driver at all. #793 exists only for hype drawing its *own*
+      dashboard on the adapter, which SSH already covers. Low priority is generous.
     - **Phase 2 -- DisplayLink (#814), LOW priority.** DisplayLink compresses before sending,
       so a driver means implementing an undocumented codec by reverse engineering. It is
       deliberately ranked low: it buys broader adapter compatibility and nothing else, and
@@ -4116,6 +4131,42 @@ isn't lost.
     second named exception; decision #36 carries the amendment note; §13's two remote-
     management bullets are stubs pointing here; §15's "board ahead of the plan" note is
     closed. AGENTS.md carries no inbound-connection line, so nothing there changes.
+
+79b. **USB passthrough is class-agnostic: any USB device may be assigned to a guest, and once
+    assigned the device is the guest's problem -- decided (2026-09-05, ratifying #595).**
+
+    This is a ratification, not new work. `devices/usb_passthru.c` (#595) already forwards every
+    guest transfer to the real device through the host-ops vtable and serves only `SET_ADDRESS`
+    locally, because the emulated controller owns the address space and the real device keeps
+    the address hype's enumeration gave it. `GET_DESCRIPTOR` returns the **real** VID/PID and
+    descriptors, so the guest binds its own driver to the real thing.
+
+    **So hype needs no per-device knowledge to pass a device through, and must not acquire any.**
+    No device-class allowlist, no per-chip quirk table, no "supported passthrough devices" list.
+    A device hype cannot drive itself is still passable, because driving it is not hype's job
+    once it is assigned. If the guest's driver is wrong or absent, that is the guest's fault and
+    the guest's fault alone -- the same rule §6i applies to a guest that mishandles a disk.
+
+    **The boundary is ownership and contention, not device type.** Three real limits, and none
+    of them is about what the device is:
+
+    - **hype cannot give away a device it is using.** The log sink and the boot medium are on
+      USB (`XHCIOWN` names their controllers, and decision #783 exempts those controllers from
+      reset), and so are the operator's keyboard and mouse when they are USB. Assigning one of
+      those is refused, loudly, by the same "refuse rather than run blind" rule as §6i.
+    - **Every host USB transfer is serialised.** `core/blk_usb.c`'s ticket lock (#346, #362)
+      is one lock across all cores, so a guest hammering a passed-through device contends
+      directly with hype's own log flush -- the interaction #808/#809 are currently about, where
+      a 318,810 us flush slice blinded the input path. Passthrough does not create that problem
+      but it is the easiest way to make it worse, and a per-device throughput bound may be
+      needed. Measure before adding one.
+    - **A hub is not a device.** Assigning a hub means assigning what is behind it, including
+      whatever the operator plugs in later. Hubs are out of scope until there is a reason.
+
+    **Whole-controller assignment is decision #80's problem, not this one.** Handing a guest an
+    entire xHCI function via the IOMMU is PCIe passthrough and inherits every constraint below;
+    it is also only possible for a controller hype is not using, which on the validation
+    machines is rarely true.
 
 80. **PCI-e device passthrough: the authorization boundary -- decided (2026-09-03, #700
     PASSTHRU-1). The invariant becomes "no guest gets UNAUTHORIZED direct hardware access";

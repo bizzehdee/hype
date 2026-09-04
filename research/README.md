@@ -411,3 +411,11 @@ data stream is a sparse, ever-growing sequence of these records; `$Max` holds th
 configured MaximumSize/AllocationDelta. hype only ever APPENDS a record when it is already
 present and active (never creates/enables a journal itself) -- matching #416's scope of
 maintaining an existing journal, not establishing one.
+
+- `fresco-fl2000-driver-sources-2026-09-05.md` — Fresco Logic FL2000/FL2000DX (#793). **No public
+  datasheet exists.** The usable source is https://github.com/F5OEO/fl2k (fetched 2026-09-05), a
+  display driver its README calls "an official driver release from Fresco Logic", **GPL-2.0**,
+  covering "only the USB part of the display logic" — no EDID/DDC/I2C, no sync generation. Two
+  facts that shape the ticket: 373 MB/s continuous at 1920x1080@60 with **no onboard frame
+  buffering**, and a possible **GPL-2.0-only vs GPL-3.0 incompatibility** with hype's own licence.
+  Source deliberately not vendored.
