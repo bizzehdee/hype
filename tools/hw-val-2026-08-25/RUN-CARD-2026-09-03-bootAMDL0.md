@@ -958,3 +958,37 @@ finished, so #803's pass remains run 9's single data point rather than a repeat.
 Not another probe. The attribution is good enough to act on: find why `BSP_PHASE_FLUSH` holds the
 BSP for 163 ms when its own slice budget is 10 ms, and make the input tick run inside or between
 slices. `kbddiag`'s 59 ms is the same shape and the same fix.
+
+
+## Run 11 -- one number, then the fix (`c41064e`)
+
+Run 10 said `flush=44(max 163ms)`. That label covered **two** call sites --
+`fw_1_vars_service()` and `usb_log_flush_slice()` -- so it could not say which. `c41064e` splits
+them: the varstore write now reports as **`vars`**.
+
+The evidence already leans one way. `USBFLUSH ... max=15251us` on run 10 says the log slice
+honoured its ~10 ms budget, so the 163 ms is most likely the varstore write, a multi-KB FAT write
+to USB. This run confirms or refutes that in one line.
+
+QEMU cannot answer it -- it reports neither phase (#807's dead log sink, and its guest barely
+writes varstore), which is the same blindness that made it misattribute `kbddiag`.
+
+### The sequence
+
+Unchanged: **type from the first 30 seconds, keep tapping every 10-20 s**, watch the echo, note
+the wall-clock moment if it stops. `flush` while input works, then `host off`.
+
+Give this one long enough to finish the script -- run 10 ended before `SCRIPT vm0: PASS`, so
+#803's pass is still run 9's single data point.
+
+| Read | Answers |
+| --- | --- |
+| **`BSPSTARVE >5ms:`** -- `vars=` vs `flush=` | which one holds the BSP for 163 ms. This is the whole run |
+| `gap_recent=` / `over5ms=` | the blind window, to check the phase maxima against |
+| `irq1_last=` | the half phase accounting does not explain |
+| `SCRIPT vm0: PASS` | #803 -- makes run 9 repeatable rather than lucky |
+| `FLUSHVERB:` | #806, now that it has produced 110 KB once |
+
+Then the fix is aimed: let the input tick run inside or between whichever phase it turns out to
+be. Bounding the wrong one would read as a fix on any run where input survives, and runs 5 and 7
+already showed the fault is intermittent.
