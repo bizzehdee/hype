@@ -427,6 +427,10 @@ distinct from any guest's own console:
     (TERM-14).
   - `delete` — remove a VM with a two-step confirmation (§6f Delete;
     TERM-15).
+  - `flush` — drain the log ring to its sinks now and report what was
+    written (§10 decision 82). The only verb here that changes nothing:
+    it exists so the operator can secure the evidence mid-run without
+    ending the run.
   Every mutation these commands make is written back to `hype.cfg`
   (the unknown-key-retaining write-back contract of
   `docs/hype-cfg-spec.md`, #220/#221, is what makes that lossless), so
@@ -4173,6 +4177,42 @@ isn't lost.
     lock stays exactly as it is. UAS structures are sized for 16 tags so the on-the-wire format
     and the stream arrays do not need a second design when depth grows, but the driver issues
     one Command IU and waits for its Status IU before the next, the way BOT waits for its CSW.
+
+82. **A `flush` terminal verb: the last-gasp log drain, reachable on demand -- decided
+    (2026-09-04, #806).**
+
+    **The gap.** `usb_log_fatal_flush()` already exists and is already the right code: it
+    drains the log ring to every sink and is the last thing to run before `ResetSystem`. It has
+    exactly two callers -- `fw_1_host_power_act()` (reached by `host off` / `host reboot`) and
+    the panic hook (`hype_fatal_set_flush_hook`). An operator who ends a run any other way
+    reaches neither.
+
+    That is not hypothetical. Boots AMD-1 run 2, AMD-L0 run 1 and AMD-L0 run 2 all ended on the
+    power button: zero `fw-1 HOST:` lines in any of them, and all three logs end truncated
+    mid-line -- AMD-L0 run 2's stops at `usb_sectors=` with nothing after it. The steady lag is
+    ~2 KB (`USBFLUSH ... behind=2079B`) and the worst observed is 25 KB, and it is always the
+    newest output. `docs/hw-validation-runbook-2026-09-02.md` now tells the operator to type
+    `host off`, which closes the shutdown case with no code at all.
+
+    **Why a verb as well as the procedure.** The remaining case is mid-run, and the procedure
+    cannot serve it: securing the log *without* ending the run, before doing something that
+    might wedge the machine. On a serial-less machine -- the AMD laptop -- the on-stick log is
+    the entire record, so "make what I have so far durable, then continue" is a real operation
+    with no expression today.
+
+    **Not a stop-the-world mode.** The obvious larger design -- quiesce every other subsystem,
+    then flush -- is rejected: the counters say the sink is not contended. Over the 119-minute
+    AMD-1 run 2 the flush caught 2,316 of 2,318 bursts (`stalled=2`, 0.09%) with the ring peak
+    at 53 KB against a steady lag of 2.5 KB. There is no backlog for a stop-the-world pass to
+    clear, so it would be machinery for a problem the measurements do not show. `flush` reuses
+    the existing drain exactly as the shutdown path calls it.
+
+    **Contract.** `flush` takes no argument, mutates nothing, and never writes back to
+    `hype.cfg` -- it is the one verb in the operator surface that is not a configuration
+    change, which is why it is listed apart from the mutating verbs in the operator-terminal
+    section above. It reports bytes written and per-sink outcome through `term_resultf()` like
+    every other verb, so a failed sink is visible rather than silent. It is safe to type at any
+    time and safe to repeat.
     Relaxing the lock -- per-device queues, out-of-order completion -- is a separate decision
     with a throughput number in front of it; nothing in this one prepares the ground for it
     beyond the tag width.
