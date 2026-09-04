@@ -33,6 +33,18 @@ void hype_blk_usb_init(hype_blk_usb_t *hw, hype_blk_phys_t *p, hype_blk_backend_
                        const hype_xhci_msc_eps_t *msc, unsigned int block_size,
                        uint64_t total_sectors);
 
+/*
+ * #808: install a callback invoked between the xHCI transfers of one block request.
+ *
+ * Below every filesystem and every raw block user by design -- the problem is not any one
+ * filesystem's, it is that a long block transfer on the BSP starves what else the BSP owes
+ * service to. The i8042 buffers ONE byte, so a window with no keyboard drain loses every
+ * keystroke after the first; a 540,672-byte varstore write measured 164 ms on real hardware.
+ *
+ * Called while the transfer lock is HELD, so the callback must not touch USB. Null clears it.
+ */
+void hype_blk_usb_set_yield(void (*yield)(void));
+
 /* Complete all preceding writes on the USB mass-storage medium. Serialised by
  * the same controller lock as READ(10)/WRITE(10). */
 int hype_blk_usb_sync(hype_blk_usb_t *hw);

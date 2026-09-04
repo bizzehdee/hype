@@ -24113,38 +24113,16 @@ static void fw_1_save_vars(hype_fw_vm_t *vm) {
         return;
     }
     /*
-     * #808: in bounded chunks, pumping the keyboard between them.
-     *
-     * This was one 540 KB write, and boot AMD-L0 run 11 measured it at 164 ms
-     * (BSPSTARVE `vars=5(max 164ms)`) -- by far the longest thing holding the BSP, against the
-     * log flush honouring its own slice budget in the same run (`flush=7(max 10ms)`). The i8042
-     * buffers ONE byte, so a 164 ms window loses every keystroke after the first, which is why
-     * the operator's input dies (#808) while hype itself keeps running.
-     *
-     * 32 KiB is chosen to land each chunk near the ~10 ms the log flush's slice budget already
-     * proves is tolerable, not from first principles -- and the write is byte-identical either
-     * way: hype_fs_write_at() takes an offset, so this is the same bytes to the same places in
-     * the same order, just re-entered. The FIRST failure stops the loop and is reported by the
-     * existing check below, so a torn varstore is reported exactly as before rather than
-     * partially written and called success.
+     * #808: ONE write, deliberately -- see the "reuse an existing correctly-sized file" note
+     * above, which this violated. Boot AMD-L0 run 12 tried this in 32 KiB chunks and it went
+     * from 164 ms to 1408 ms (BSPSTARVE `vars=17(max 1408ms)`), because on the first save of a
+     * run the file is new: every chunk took hype_fat32_write_at()'s GROWTH path instead of one,
+     * so seventeen chain_measure() walks of a chain that got longer each time replaced a single
+     * one. The keyboard now yields from inside the write itself (fs->yield), which needs no
+     * chunking here.
      */
-    {
-        const unsigned int CHUNK = 32u * 1024u;
-        unsigned int done = 0u;
-        rc = 0;
-        while (done < (unsigned int)len) {
-            unsigned int n = (unsigned int)len - done;
-            if (n > CHUNK) n = CHUNK;
-            rc = hype_fs_write_at(&f, done,
-                                  (const void *)(uintptr_t)(vm->combined_host_phys + offset + done),
-                                  n);
-            if (rc != 0) {
-                break;
-            }
-            done += n;
-            hype_host_kbd_pump();
-        }
-    }
+    rc = hype_fs_write_at(&f, 0, (const void *)(uintptr_t)(vm->combined_host_phys + offset),
+                          (unsigned int)len);
     /*
      * #454: report the first failure per VM. A silent failure here is indistinguishable from
      * working persistence right up until a guest's boot entries turn out to be gone -- the same
@@ -27165,6 +27143,13 @@ static int usb_log_setup(const hype_blk_backend_t *be) {
                 g_xhci_reset_policy.log_ctrl = g_fw1_sweep_ctrl_idx; /* #783 */
             }
             g_usb_log_ready = 1; /* "a log sink is up", the gate the flush path uses */
+            /*
+             * #808: drain the i8042 between the xHCI transfers of every USB block request --
+             * below every filesystem, so it covers FAT32, exFAT, NTFS and the raw log writes
+             * with none of them touched. The varstore save was 164 ms for 540,672 bytes against
+             * a controller that buffers one byte.
+             */
+            hype_blk_usb_set_yield(hype_host_kbd_pump);
             hype_fatal_set_flush_hook(usb_log_fatal_flush); /* #513: a panic must reach the stick */
             /* #643: as close to this generation's first line as the boot order allows -- the
              * flush a few lines up already carried anything buffered since TSC=0 (the build

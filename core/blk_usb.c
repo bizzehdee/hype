@@ -273,6 +273,27 @@ static volatile unsigned long long g_usb_xfer_tsc;
 static volatile unsigned long long g_usb_xfer_calls;
 static volatile unsigned long long g_usb_xfer_chunks;
 static volatile unsigned long long g_usb_xfer_sectors;
+/*
+ * #808: called between the xHCI transfers of one block request.
+ *
+ * This is BELOW every filesystem and every raw block user, which is where it belongs: the
+ * problem is not FAT32's, it is that a long block write on the BSP starves whatever else the BSP
+ * owes service to. The i8042 buffers exactly ONE byte, so a window with no keyboard drain loses
+ * every keystroke after the first, and boot AMD-L0 run 11 measured a 540,672-byte varstore write
+ * at 164 ms (BSPSTARVE `vars=5(max 164ms)`) -- #808's whole symptom.
+ *
+ * Splitting that write up at the caller was tried first (run 12) and made it 8.6x WORSE, 1408 ms,
+ * because each piece took the FAT growth path and re-walked the cluster chain. Yielding from
+ * inside the transfer loop keeps the request one operation and fixes it for exFAT, NTFS and the
+ * raw log writes at the same time, with no filesystem touched.
+ *
+ * Injected rather than called directly: this file is core/ and the keyboard is
+ * arch/x86_64/cpu/. Held under the transfer lock, so the callback must not touch USB -- the
+ * keyboard pump touches ports 0x60/0x64 only, which is why it is safe here.
+ */
+static void (*g_usb_xfer_yield)(void);
+
+void hype_blk_usb_set_yield(void (*yield)(void)) { g_usb_xfer_yield = yield; }
 
 static volatile unsigned long long g_usb_xfer_max_tsc;
 
@@ -312,6 +333,7 @@ static int usb_read(void *hw, uint64_t lba, uint32_t count, void *buf) {
         }
         done += n;
         g_usb_xfer_chunks++;
+        if (g_usb_xfer_yield != 0) g_usb_xfer_yield(); /* #808: reads block the BSP too */
     }
     {
         unsigned long long dt = usb_rdtsc() - t0;
@@ -345,6 +367,7 @@ static int usb_write(void *hw, uint64_t lba, uint32_t count, const void *buf) {
             return -1;
         }
         done += n;
+        if (g_usb_xfer_yield != 0) g_usb_xfer_yield(); /* #808 */
     }
     usb_xfer_unlock();
     return 0;
