@@ -896,3 +896,65 @@ the wall-clock moment if it stops. `flush` while input works, then `host off`.
 **Do not read a phase maximum as the whole answer.** Phase starvation explains the poll's blind
 window; it does not explain IRQ1 stopping, and both have to be true for input to die, since
 either path alone would carry it.
+
+
+## Result -- run 10, 2026-09-04, build `fca7a28-dirty` (logs in `logs/bootAMDL0-10/`)
+
+**The hardware attribution is in, it disagrees with QEMU, and #806's verb proved itself.**
+
+### #808: the USB log flush is the primary starver, not the keyboard diagnostic
+
+```
+BSPSTARVE >5ms: render=70(max 8ms) input=2(max 70ms) kbddiag=27(max 59ms) flush=44(max 163ms)
+KBDDRAIN: ... gap_recent=52920us over5ms=156 irq1_last=892ms ago
+```
+
+| phase | count | max | reading |
+| --- | --- | --- | --- |
+| **`flush`** | 44, +4 per interval | **163 ms** | the biggest single blocker and the fastest-growing |
+| `kbddiag` | 27, +3 per interval | 59 ms | real, second |
+| `render` | 70 | 8 ms | frequent, small |
+| `input` | 2 | **70 ms** | rare, but the input phase itself blocking 70 ms is odd and unexplained |
+
+**QEMU was wrong, and only about the thing that mattered.** It reported
+`kbddiag=40(max 118ms)` and **no `flush` entry at all** -- because the 338 rig's log sink never
+mounts (#807), so the phase that dominates on hardware was absent from the sandbox entirely. The
+hardware number was not a formality.
+
+`gap_recent` ~53 ms tracks the sum of these. So #808 and #809 are one problem after all, as run 9
+suspected on magnitude alone -- now by direct attribution rather than coincidence of scale.
+
+### The flush is a latency problem, not a throughput one
+
+`BSPCOST flush 5% total=5741ms` -- five per cent of BSP time. But `BSPSTARVE flush max=163ms`.
+So the fix is not to flush less; it is to stop blocking the input path while flushing.
+
+**And there is a discrepancy worth chasing:** `USBFLUSH ... max=15251us` says the slice honoured
+its ~10 ms budget this run, while `BSPSTARVE` says the `flush` *phase* held 163 ms. Those measure
+different spans -- `usb_log_flush_slice()` versus the whole `BSP_PHASE_FLUSH` -- so the phase is
+doing more than one slice, or something else inside it blocks. That is the next thing to look at,
+and it is a precise question rather than a hunt.
+
+### #806: first non-zero flush anywhere, and it earned its keep
+
+```
+fw-1 FLUSHVERB: 110270 byte(s) written to the log sink(s) (165354 total this boot) [#806]
+fw-1 FLUSHVERB: 772 byte(s) written to the log sink(s) (467476 total this boot) [#806]
+```
+
+**110 KB rescued on the first call.** That is the verb doing exactly what it was built for, on
+hardware, and it is only auditable because the count now reaches the log (#806's own follow-up).
+#807 means no QEMU rig could ever have shown this.
+
+### Otherwise a healthy run
+
+`bsp_usb_timeouts=0`, `stalled=0`, zero `FLUSH FAILED`, input alive to the end
+(`isr_entries=1072 (+25)`, `consumed=1118`, `chords=73`), `host off` used. The guest restarted
+(`vm0 restarted (M8-4)`) but there is no `SCRIPT vm0: PASS` -- the run ended before the script
+finished, so #803's pass remains run 9's single data point rather than a repeat.
+
+## Next
+
+Not another probe. The attribution is good enough to act on: find why `BSP_PHASE_FLUSH` holds the
+BSP for 163 ms when its own slice budget is 10 ms, and make the input tick run inside or between
+slices. `kbddiag`'s 59 ms is the same shape and the same fix.
