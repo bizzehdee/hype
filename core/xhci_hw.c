@@ -621,10 +621,42 @@ static unsigned long long g_evt_count;
  * real deadline in microseconds, with the spin count kept only as a fallback for
  * before the TSC frequency is known.
  */
+/*
+ * #808: called periodically while this loop spins waiting for a completion.
+ *
+ * HYPE_XHCI_EVENT_TIMEOUT_US is ONE SECOND, deliberately generous (#266: "being early is what
+ * caused the bug"). A completion that never arrives therefore holds this loop for up to a second
+ * -- and boot AMD-L0 run 13 measured exactly that: gap_recent=1237713us, a 1.24 s window with no
+ * keyboard drain, while the i8042 buffers ONE byte.
+ *
+ * This is where the yield has to be, and run 13 is what proved it. The previous attempt put it in
+ * core/blk_usb.c's chunk loop, one layer up. It ran -- pumps=5019 on that same run -- and did not
+ * help, because the time is spent INSIDE one hype_xhci_msc_write() call, below that loop. A
+ * counter for "did the fix run" is what made the difference between "does not help" and "was
+ * never wired", which are opposite findings.
+ *
+ * Injected: this is core/ and the keyboard is arch/x86_64/cpu/. Called from a spin that may hold
+ * the USB transfer lock, so the callback must not touch USB -- the keyboard pump touches ports
+ * 0x60/0x64 only.
+ */
+static void (*g_xhci_spin_yield)(void);
+
+void hype_xhci_set_spin_yield(void (*yield)(void)) { g_xhci_spin_yield = yield; }
+
 static int next_event_budget(xhci_hw_t *hw, volatile uint8_t *bar, uint32_t rtsoff,
                              uint32_t out[4], unsigned int budget, unsigned int *spins_used) {
     unsigned int spins = budget;
+    unsigned int yield_ctr = 0u;
     while (spins-- != 0u) {
+        /*
+         * Not every spin: this loop's measured mean is ~493,692 iterations (#266) and the
+         * callback reads an I/O port, so calling it per spin would replace one stall with
+         * another. Every 4,096 keeps the drain well inside the i8042's ~1 ms byte time while
+         * adding nothing measurable to a loop that usually exits early.
+         */
+        if ((++yield_ctr & 0xFFFu) == 0u && g_xhci_spin_yield != 0) {
+            g_xhci_spin_yield();
+        }
         uint32_t d3 = trb_dw(hw->evt_ring, hw->evt_deq, 3);
         if ((int)(d3 & 1u) == (int)hw->evt_cyc) {
             out[0] = trb_dw(hw->evt_ring, hw->evt_deq, 0);

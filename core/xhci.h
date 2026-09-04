@@ -1014,6 +1014,14 @@ int hype_xhci_msc_read(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_m
                        uint32_t lba, unsigned int blocks, unsigned int block_size, void *buf);
 int hype_xhci_msc_write(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_msc_eps_t *msc,
                         uint32_t lba, unsigned int blocks, unsigned int block_size, const void *buf);
+
+/*
+ * #808: called periodically while the event-wait loop spins. HYPE_XHCI_EVENT_TIMEOUT_US is one
+ * second, so a completion that never arrives holds the CPU that long -- measured at 1,237,713 us
+ * on real hardware -- and the i8042 buffers ONE byte, so every keystroke in that window is lost.
+ * Called from a spin that may hold the USB transfer lock: the callback must not touch USB.
+ */
+void hype_xhci_set_spin_yield(void (*yield)(void));
 /* Ask the mass-storage device to make preceding writes durable. */
 int hype_xhci_msc_sync_cache(hype_xhci_ctrl_t *c, unsigned int slot,
                              const hype_xhci_msc_eps_t *msc);

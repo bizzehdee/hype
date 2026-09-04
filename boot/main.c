@@ -27150,6 +27150,14 @@ static int usb_log_setup(const hype_blk_backend_t *be) {
              * a controller that buffers one byte.
              */
             hype_blk_usb_set_yield(hype_host_kbd_pump);
+            /*
+             * #808: and inside the xHCI event-wait spin, which is where the time actually goes.
+             * Run 13 proved the block-layer hook above runs (pumps=5019) and does not help: a
+             * single transfer's completion wait is up to HYPE_XHCI_EVENT_TIMEOUT_US, one second,
+             * and was measured at 1.24 s. The hook above stays -- it covers the gaps between
+             * transfers -- but this is the one that covers the stall.
+             */
+            hype_xhci_set_spin_yield(hype_host_kbd_pump);
             hype_fatal_set_flush_hook(usb_log_fatal_flush); /* #513: a panic must reach the stick */
             /* #643: as close to this generation's first line as the boot order allows -- the
              * flush a few lines up already carried anything buffered since TSC=0 (the build
