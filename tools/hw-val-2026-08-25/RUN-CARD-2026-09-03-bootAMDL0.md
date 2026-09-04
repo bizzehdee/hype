@@ -992,3 +992,50 @@ Give this one long enough to finish the script -- run 10 ended before `SCRIPT vm
 Then the fix is aimed: let the input tick run inside or between whichever phase it turns out to
 be. Bounding the wrong one would read as a fix on any run where input survives, and runs 5 and 7
 already showed the fault is intermittent.
+
+
+## Result -- run 11, 2026-09-04, build `908461f-dirty` (logs in `logs/bootAMDL0-11/`)
+
+**One line, and it was not the flush.**
+
+```
+BSPSTARVE >5ms: render=2(max 8ms) kbddiag=4(max 57ms) flush=7(max 10ms) vars=5(max 164ms)
+```
+
+`vars=164ms` -- `fw_1_save_vars()`, which wrote the whole 540,672-byte varstore in **one**
+`hype_fs_write_at()` call. The i8042 buffers one byte, so a 164 ms window loses every keystroke
+after the first: the whole of #808's symptom.
+
+**The log flush is exonerated** -- `flush=7(max 10ms)`, honouring its own slice budget. Run 10's
+"the flush is the primary starver" was an artefact of one label covering two call sites, and
+fixing the flush would have been fixing the wrong thing. The split in `c41064e` is what made the
+difference.
+
+`gap_recent=50210..58842us` still ~50-59 ms, `over5ms=21`, `irq1_last=69..904ms ago`.
+
+## Fixed in `b9c873d` -- run 12 verifies it
+
+`hype_host_kbd_pump()` drains the i8042 without consuming a scancode, and `fw_1_save_vars()` now
+writes in 32 KiB chunks pumping between them. `kbddiag`'s 57 ms is the same shape and was left
+alone so this change can be attributed on its own.
+
+**Not validatable in QEMU** -- the varstore writes to `g_hype_log.fs`, the USB log volume, which
+has not mounted in any rig since #638 (#807). Third thing #807 has blocked.
+
+### What run 12 must show
+
+| Read | Passes when |
+| --- | --- |
+| **`BSPSTARVE ... vars=`** | max falls from **164 ms** toward the 32 KiB chunk time |
+| **`vars-*.bin` on the drive** | still **540,672 bytes** each, and no `VARS: ... write failed` -- the write must stay correct, not just fast |
+| `gap_recent=` / `over5ms=` | the blind window shrinks with it |
+| `kbddiag=` | expected unchanged at ~57 ms; it is the next target, not this one |
+| `SCRIPT vm0: PASS` | #803 -- still only run 9 has one |
+
+### On "it feels like a timing issue"
+
+It is, and the instrumentation is part of it. `kbddiag` -- the phase that prints `KBDDRAIN`,
+`BSPSTARVE`, `KBDIRQ` and `LOGHEALTH` -- is itself a 57 ms blocker, so **every field added to
+those lines lengthened the window being measured.** The starvation sits right at the threshold
+where a keystroke survives or does not, which is why the fault comes and goes as logging changes,
+and why "it worked this run" has never been evidence here.
