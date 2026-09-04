@@ -13,7 +13,8 @@ triple fault and `vmexitstorm`'s force-off) and put the pinned restart on record
 on SVM at the current tree. If the Pico and a second keyboard are to hand, do step 3 as well and
 leave the rest of the twenty minutes running: the first #792 stall came at 537 s in boot 42, so a
 single `XHCIRESET ... reset #1` inside the window is possible but not owed, and `KBDCHARS` gives a
-#788 sample. Without them, power off after the second login and the microtests. #426, #641 and
+#788 sample. Without them, end the run (`host off`) after the second login and the
+microtests. #426, #641 and
 the rate bound keep their 90-minute run.
 
 ## Before you boot
@@ -31,7 +32,7 @@ the rate bound keep their 90-minute run.
 3. Then arm the Pico: **BOOTSEL once**, confirm `a0001` in the guest. Keep the Logitech mouse receiver and the
    Keychron attached; leave both spare USB drives plugged in (#780's condition).
 4. Leave it 90 minutes from the second login. Type on the Keychron now and then. The Logitech (046d:c547) is a mouse; its receiver exposes a keyboard HID interface, which is why hype counts `keyboards=3`. The two real keyboards are the Keychron (3434:0da4) and the Pico (cafe:4b44).
-5. Power off. Bring back `HYPE.LOG` and `RUN1A.LOG`.
+5. **`host off` first, then power off if it parks.** Typing `host off` at the dashboard is the only path that reaches `usb_log_fatal_flush()` -- the last-gasp drain of the log ring. Pulling the power skips it and truncates the log mid-line, losing the last 2-25 KB, which is the newest and usually the most interesting part. If the firmware has no S5 path hype parks and says so; the flush has already happened by then, so holding the power button after that is safe. Bring back `HYPE.LOG` and `RUN1A.LOG`.
 
 ## What to read
 

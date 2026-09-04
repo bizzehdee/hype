@@ -26,6 +26,23 @@ After Intel-A and AMD-1 both run, #525 and #603 close. Four boots close 14 ticke
 two more legs. #599/#605 need a fifth boot with a different binary and are a diagnostic until
 #708 is fixed (below).
 
+## Ending any run: `host off`, never the power button
+
+`usb_log_fatal_flush()` -- the last-gasp drain of the log ring -- has exactly two callers:
+`fw_1_host_power_act()` (reached by `host off` / `host reboot` at the dashboard) and the panic
+hook. Pulling the power reaches neither.
+
+Boots AMD-1 run 2, AMD-L0 run 1 and AMD-L0 run 2 all ended on the power button: zero `fw-1 HOST:`
+lines in any of them, and all three logs end truncated mid-line. AMD-L0 run 2's last line stops at
+`usb_sectors=` with nothing after it. The steady lag is ~2 KB and the worst observed is 25 KB, and
+it is always the newest output -- on a run that ended because something went wrong, that is the
+part worth having.
+
+So: **`host off` first.** If the firmware has no S5 path hype parks and prints
+`no host S5 path -- parked; power the machine off manually`; the flush has already run at that
+point, so holding the power button after that message is safe. On a serial-less machine the log
+is the entire record.
+
 ## Boot Intel-A -- staged, `RUN-CARD-2026-09-02-bootA-intel-vmx.md`
 
 **First attempt (2026-09-03, build 1daa028) closed #729 and #603's VMX leg; vm0 stalled on the
@@ -61,7 +78,7 @@ Duration: 25 minutes. Operator actions: none after power-on.
 3. Then arm the Pico: **BOOTSEL once**, confirm `a0001` in the guest. Keep the Logitech mouse receiver and the
    Keychron attached. Leave the two spare USB drives plugged in (#780's condition, kept).
 4. Leave it 90 minutes from the second login. Type on the Keychron now and then. The Logitech (046d:c547) is a mouse; its receiver exposes a keyboard HID interface, which is why hype counts `keyboards=3`. The two real keyboards are the Keychron (3434:0da4) and the Pico (cafe:4b44).
-5. Power off. Bring back `HYPE.LOG` and `RUN1A.LOG`.
+5. **`host off` first, then power off if it parks.** Typing `host off` at the dashboard is the only path that reaches `usb_log_fatal_flush()` -- the last-gasp drain of the log ring. Pulling the power skips it and truncates the log mid-line, losing the last 2-25 KB, which is the newest and usually the most interesting part. If the firmware has no S5 path hype parks and says so; the flush has already happened by then, so holding the power button after that is safe. Bring back `HYPE.LOG` and `RUN1A.LOG`.
 
 | Ticket | Read | Passes when |
 | --- | --- | --- |

@@ -14,6 +14,14 @@ longer fitted. The by-serial guard fails safe: an unmatched serial arms nothing,
 costs a wasted boot, never a wrong disk. Never the internal NVMe. Never the SABRENT (boot and log
 medium).
 
+## Ending every boot below
+
+`host off` at the dashboard, never the power button. It is the only path that reaches
+`usb_log_fatal_flush()`, and pulling the power truncates the log mid-line -- all three boots on
+this machine and the 5950X so far lost their tail that way. Full reasoning in
+`docs/hw-validation-runbook-2026-09-02.md`. This machine is serial-less, so the log is the
+entire record.
+
 ## The blocker that orders everything below
 
 `#799` — on this laptop the Alpine kernel never gets past `Booting Linux lts`. `LOOPPHASE` /

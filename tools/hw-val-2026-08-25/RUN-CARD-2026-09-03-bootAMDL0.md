@@ -27,7 +27,7 @@ record. There is nothing to watch on a terminal.
 1. Cold-boot the laptop from the drive.
 2. Stay on the dashboard. **Do not type.** The guest kernel spins from about t=10 s, so the
    evidence is complete long before five minutes are up.
-3. After five minutes, power off.
+3. After five minutes, **`host off` first, then power off if it parks.** Typing `host off` at the dashboard is the only path that reaches `usb_log_fatal_flush()` -- the last-gasp drain of the log ring. Pulling the power skips it and truncates the log mid-line, losing the last 2-25 KB, which is the newest and usually the most interesting part. If the firmware has no S5 path hype parks and says so; the flush has already happened by then, so holding the power button after that is safe.
 4. Bring back `HYPE.LOG`.
 
 Leaving it longer than five minutes costs machine time and adds nothing: the counters are

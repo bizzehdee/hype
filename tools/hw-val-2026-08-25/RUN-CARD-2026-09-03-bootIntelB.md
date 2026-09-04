@@ -32,9 +32,10 @@ the change under test. #599's bar and #605's gate both ride on it.
 2. Wait for `localhost login:`. The script logs in and prints `BOOT-OK-localhost`, then
    `fresh-boot-login`.
 3. **From the login, leave it 10 minutes idle.** That is the window where 2c froze.
-4. Power off. Bring back `HYPE.LOG` and `RUN2C.LOG`.
+4. **`host off` first, then power off if it parks.** Typing `host off` at the dashboard is the only path that reaches `usb_log_fatal_flush()` -- the last-gasp drain of the log ring. Pulling the power skips it and truncates the log mid-line, losing the last 2-25 KB, which is the newest and usually the most interesting part. If the firmware has no S5 path hype parks and says so; the flush has already happened by then, so holding the power button after that is safe. Bring back `HYPE.LOG` and `RUN2C.LOG`.
 
-If the guest never reaches login inside the script's 20-minute timeout, power off then. That
+If the guest never reaches login inside the script's 20-minute timeout, end the run then --
+`host off` first, as in step 4. That
 outcome is the #708 evidence, not a harness fault.
 
 ## What to read
