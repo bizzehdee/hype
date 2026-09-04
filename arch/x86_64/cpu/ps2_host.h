@@ -162,6 +162,16 @@ typedef struct {
 void hype_host_kbd_drain_stats(hype_host_kbd_drain_stats_t *out);
 
 /*
+ * #808: drain the i8042 into the software buffer without consuming a scancode, so a long
+ * operation on the BSP does not lose keystrokes. The i8042 buffers ONE byte; call this between
+ * the chunks of anything that blocks for more than a few milliseconds. Drain-only on purpose --
+ * fw_1_host_input_poll() stays the only consumer, so a pumped byte waits in the buffer for it
+ * rather than being popped with nobody to route it. Touches ports 0x60/0x64 only, so it is safe
+ * to call from inside a USB or FAT write path.
+ */
+void hype_host_kbd_pump(void);
+
+/*
  * USB-5 (#217): push a scancode into the SAME host queue the PS/2 ISR feeds.
  *
  * This is the whole integration point for USB HID keyboard input. A USB keyboard's

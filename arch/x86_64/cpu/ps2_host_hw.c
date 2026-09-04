@@ -321,6 +321,53 @@ int hype_host_kbd_poll_scancode(uint8_t *out_scancode) {
 }
 
 uint64_t hype_host_kbd_polled_bytes(void) { return g_kbd_polled_bytes; }
+
+/*
+ * #808: drain the i8042 into the software buffer WITHOUT consuming a scancode.
+ *
+ * The i8042 holds exactly one byte, so a long operation on the BSP loses every keystroke after
+ * the first. Boot AMD-L0 run 11 named the operation: fw_1_vars_service() at 164 ms
+ * (BSPSTARVE `vars=5(max 164ms)`), against the log flush honouring its own 10 ms slice budget
+ * (`flush=7(max 10ms)`) -- so the answer is to give the varstore write the same treatment, and
+ * to pump the keyboard between its chunks.
+ *
+ * Deliberately drain-only. The consumer is fw_1_host_input_poll() on the input phase and it
+ * stays the only consumer: calling the full poll_scancode() from inside a write path would pop
+ * a byte with nobody to route it, dropping the keystroke this exists to save. Bytes sit in
+ * g_host_kbd_buffer until the input phase reads them, which is exactly what the buffer is for.
+ *
+ * Safe to call from anywhere on the owning core: it touches ports 0x60/0x64 only -- no USB, so
+ * no re-entry into the transfer lock it is being called from underneath -- and
+ * host_kbd_drain_polled() is already guarded against re-entry by g_kbd_drain_busy.
+ */
+void hype_host_kbd_pump(void) {
+    if (g_kbd_no_controller || g_kbd_drain_busy) {
+        return;
+    }
+    if (g_kbd_poll_interval_ticks != 0ull) {
+        uint64_t now = kbd_rdtsc();
+        if (now - g_kbd_poll_last_tsc < g_kbd_poll_interval_ticks) {
+            return;
+        }
+        g_kbd_poll_last_tsc = now;
+    }
+    g_kbd_drain_busy = 1u;
+    g_kbd_drain_calls++;
+    {
+        uint64_t nowg = kbd_rdtsc();
+        if (g_kbd_gap_prev_tsc != 0ull) {
+            uint64_t gap = nowg - g_kbd_gap_prev_tsc;
+            if (gap > g_kbd_gap_max_ticks) g_kbd_gap_max_ticks = gap;
+            if (gap > g_kbd_gap_recent_max_ticks) g_kbd_gap_recent_max_ticks = gap;
+            if (g_kbd_poll_interval_ticks != 0ull && gap > g_kbd_poll_interval_ticks * 20ull) {
+                g_kbd_gap_over_5ms++;
+            }
+        }
+        g_kbd_gap_prev_tsc = nowg;
+    }
+    host_kbd_drain_polled();
+    g_kbd_drain_busy = 0u;
+}
 void hype_host_kbd_drain_stats(hype_host_kbd_drain_stats_t *out) {
     if (out == 0) return;
     out->calls = g_kbd_drain_calls;

@@ -24112,8 +24112,39 @@ static void fw_1_save_vars(hype_fw_vm_t *vm) {
     if (!have) {
         return;
     }
-    rc = hype_fs_write_at(&f, 0, (const void *)(uintptr_t)(vm->combined_host_phys + offset),
-                          (unsigned int)len);
+    /*
+     * #808: in bounded chunks, pumping the keyboard between them.
+     *
+     * This was one 540 KB write, and boot AMD-L0 run 11 measured it at 164 ms
+     * (BSPSTARVE `vars=5(max 164ms)`) -- by far the longest thing holding the BSP, against the
+     * log flush honouring its own slice budget in the same run (`flush=7(max 10ms)`). The i8042
+     * buffers ONE byte, so a 164 ms window loses every keystroke after the first, which is why
+     * the operator's input dies (#808) while hype itself keeps running.
+     *
+     * 32 KiB is chosen to land each chunk near the ~10 ms the log flush's slice budget already
+     * proves is tolerable, not from first principles -- and the write is byte-identical either
+     * way: hype_fs_write_at() takes an offset, so this is the same bytes to the same places in
+     * the same order, just re-entered. The FIRST failure stops the loop and is reported by the
+     * existing check below, so a torn varstore is reported exactly as before rather than
+     * partially written and called success.
+     */
+    {
+        const unsigned int CHUNK = 32u * 1024u;
+        unsigned int done = 0u;
+        rc = 0;
+        while (done < (unsigned int)len) {
+            unsigned int n = (unsigned int)len - done;
+            if (n > CHUNK) n = CHUNK;
+            rc = hype_fs_write_at(&f, done,
+                                  (const void *)(uintptr_t)(vm->combined_host_phys + offset + done),
+                                  n);
+            if (rc != 0) {
+                break;
+            }
+            done += n;
+            hype_host_kbd_pump();
+        }
+    }
     /*
      * #454: report the first failure per VM. A silent failure here is indistinguishable from
      * working persistence right up until a guest's boot entries turn out to be gone -- the same
