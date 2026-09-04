@@ -745,3 +745,59 @@ echo, and note the wall-clock moment if it stops. Type `flush` while input still
 
 Input death is **intermittent** -- runs 5 and 7 had the same config and opposite outcomes -- so a
 run that keeps input is not evidence of a fix, and `gap_max` is worth reading either way.
+
+
+## Result -- run 8, 2026-09-04, build `cf80d6e-dirty` (logs in `logs/bootAMDL0-8/`)
+
+**Three hypotheses eliminated, a baseline established, and the central question untouched --
+because input did not die.**
+
+```
+KBDDRAIN: calls=308264 | empty=308264 floating=0 data_ff=0 aux=0 | host st=0x14 data=0xb2
+          nocrl=0 | last push 4909ms ago | gap_max=159254us isr_empty=0 pic_imr=0xfc
+          irq1=unmasked
+KBDIRQ:   isr_entries=579 (+29 since last) eois=579 | consumed=604 chords=9 poll_pushed=25
+USBFLUSH: max=10002us | behind=1912B | bursts=26 caught=26 stalled=0 | bsp_usb_timeouts=0
+```
+
+- **IRQ1 is never masked** -- `pic_imr=0xfc`, `irq1=unmasked`, every sample. Off the list.
+- **`isr_empty=0`** -- no interrupt ever fired to find the byte already gone.
+- **The drain discards nothing and is never latched off** across 308,264 calls.
+- Healthy run otherwise: flush budget respected (10 ms), `stalled=0`, zero USB timeouts, input
+  alive start to finish. The ISR/poll split holds at ~96%/4%, matching run 7.
+
+### `gap_max` was the wrong statistic
+
+159 ms looked damning and is not usable: it was set **once**, between the drain's first call and
+its 18,582nd -- bring-up -- and never moved across the remaining 289,000 calls. A lifetime maximum
+cannot tell that apart from a 159 ms stall every second.
+
+Replaced in `7030804`. QEMU with the new fields, three consecutive samples, nobody typing:
+
+```
+gap_recent=74573us over5ms=167 irq1_last=never
+gap_recent=75158us over5ms=173 irq1_last=never
+gap_recent=74967us over5ms=180 irq1_last=never
+```
+
+**A ~75 ms blind window in every interval**, `over5ms` climbing 6-7 per sample. Not a bring-up
+artefact. QEMU's timing is not the laptop's, so this is the shape of the answer awaiting the
+hardware number -- but the statistic can now distinguish the cases.
+
+## Run 9 -- the refined probe (`7030804`)
+
+Same procedure: **type from the first 30 seconds, keep tapping every 10-20 s**, watch the echo,
+note the wall-clock moment if it stops. Type `flush` while input works, then `host off`.
+
+| Read | Answers |
+| --- | --- |
+| **`gap_recent=`** per sample | whether the blind window recurs on hardware, and how big |
+| **`over5ms=`** growth per sample | how often the path is blind long enough to lose a keystroke |
+| **`irq1_last=`** | run 5's death signature stated directly -- "no IRQ1 for N ms" |
+| `consumed=` flatlining while you tap | the death moment, read against the three above |
+| `usb-log: FLUSH FAILED` / `usb_held=` | #809's pool-exhaustion lead |
+| the `flush` byte count while input works | #806's first non-zero exercise |
+
+If `gap_recent` is tens of milliseconds every sample on hardware too, the fix is not in the drain:
+it is finding what blocks the BSP that long and either shortening it or servicing the keyboard
+inside it. `BSPCOST` already names the BSP's phases, so the candidate is likely already measured.
