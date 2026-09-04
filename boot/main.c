@@ -2656,13 +2656,39 @@ static uint64_t fw_1_now_ms(void) {
 static unsigned long long g_bsp_phase_tsc[BSP_PHASE_MAX];
 static unsigned long long g_bsp_phase_hits[BSP_PHASE_MAX];
 static uint64_t g_bsp_phase_at;
+/*
+ * #808: which phase was holding the BSP when the input path went blind.
+ *
+ * Run 9 on the AMD laptop measured a ~62 ms window with no i8042 drain in EVERY sample interval
+ * (`gap_recent=62419..62659us`), plus occasional multi-second ones (`gap_max` grew to 1.59 s),
+ * and IRQ1 silent for up to 8.3 s. The i8042 buffers one byte, so those windows lose keystrokes
+ * -- that is why input dies, and the drain itself was exonerated over 478,889 calls.
+ *
+ * What was NOT established is what holds the BSP that long. The USB log flush matches on
+ * magnitude (a 318,810 us slice against a 10 ms budget in the same run) but that is a
+ * coincidence of scale, not evidence, and `LOGHEALTH`'s "input ticks skipped for the USB lock"
+ * reads 0 -- it counts the USB HID tick, which this laptop has no keyboard for.
+ *
+ * bsp_phase() already measures every phase's duration, so the attribution is nearly free: when
+ * a phase ends having run longer than the threshold, blame it. A phase with a large
+ * g_bsp_starve count is what to fix; a run where every count stays zero says the stall is
+ * somewhere bsp_phase() does not cover, which is itself the answer to a different question.
+ */
+static unsigned long long g_bsp_starve[BSP_PHASE_MAX];
+static uint64_t g_bsp_starve_max_tsc[BSP_PHASE_MAX];
+static uint64_t g_bsp_starve_thresh_ticks; /* 5 ms once the TSC rate is known; 0 = not yet */
 
 static inline void bsp_phase(unsigned int p) {
     uint64_t now = hype_rdtsc();
     unsigned int was = g_bsp_phase;
     if (g_bsp_phase_at != 0 && was < BSP_PHASE_MAX) {
-        g_bsp_phase_tsc[was] += now - g_bsp_phase_at;
+        uint64_t dt = now - g_bsp_phase_at;
+        g_bsp_phase_tsc[was] += dt;
         g_bsp_phase_hits[was]++;
+        if (g_bsp_starve_thresh_ticks != 0ull && dt > g_bsp_starve_thresh_ticks) {
+            g_bsp_starve[was]++;
+            if (dt > g_bsp_starve_max_tsc[was]) g_bsp_starve_max_tsc[was] = dt;
+        }
     }
     g_bsp_phase_at = now;
     g_bsp_phase = p;
@@ -3300,6 +3326,14 @@ static void term_run_cmdline(void) {
             after = usb_log_flushed_total();
             term_resultf("flush: %u byte(s) written to the log sink(s) (%u total this boot)",
                          after - before, after);
+            /*
+             * #806: also into the LOG, not only the dashboard result panel. Run 9 used the verb
+             * and its byte count is unrecoverable from the drive afterwards, so the one piece of
+             * evidence the verb exists to produce could not be audited. Printed after the drain,
+             * so it lands in the next flush rather than the one it is reporting on.
+             */
+            hype_debug_print("fw-1 FLUSHVERB: %u byte(s) written to the log sink(s) "
+                             "(%u total this boot) [#806]\n", after - before, after);
             break;
         }
         case HYPE_CMD_SCREENSHOT:
@@ -9005,6 +9039,9 @@ static void fw_1_host_input_poll(void) {
     /* #796: one i8042 status read per 250 us, not per iteration -- see ps2_host_hw.c. */
     if (g_vms[0].host_tsc_hz != 0ull) {
         hype_host_kbd_set_poll_interval(g_vms[0].host_tsc_hz / 4000ull);
+        /* #808: 5 ms -- a PS/2 byte is ~1 ms on the wire and the i8042 buffers one, so a phase
+         * that runs longer than this has already cost a keystroke if one arrived. */
+        g_bsp_starve_thresh_ticks = g_vms[0].host_tsc_hz / 200ull;
     }
     while (hype_host_kbd_poll_scancode(&sc)) {
         uint8_t kb[HYPE_KBD_DECODE_MAX_OUT];
@@ -30650,6 +30687,25 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                              g_bsp_phase_hits[q],
                                              (g_bsp_phase_tsc[q] * 1000000ull) / bp_hz /
                                                  g_bsp_phase_hits[q]);
+                        }
+                        {   /* #808: which phase starved the input path, and by how much */
+                            unsigned int q2;
+                            int any = 0;
+                            for (q2 = 0; q2 < BSP_PHASE_MAX; q2++) {
+                                if (g_bsp_starve[q2] == 0ull) continue;
+                                if (!any) { hype_debug_print("fw-1 BSPSTARVE >5ms:"); any = 1; }
+                                hype_debug_print(" %s=%llu(max %llums)", nm[q2], g_bsp_starve[q2],
+                                                 (bp_hz != 0ull)
+                                                     ? (g_bsp_starve_max_tsc[q2] * 1000ull) / bp_hz
+                                                     : 0ull);
+                            }
+                            if (any) {
+                                hype_debug_print(" [#808]\n");
+                            } else {
+                                hype_debug_print("fw-1 BSPSTARVE >5ms: none -- no phase held the "
+                                                 "BSP past 5 ms, so the input gap is outside "
+                                                 "bsp_phase()'s coverage [#808]\n");
+                            }
                         }
                         hype_debug_print("fw-1 BSPCOST loop iterations=%llu hz=%llu "
                                          "gate=hz/125=%llu cycles -- the input tick fires "
