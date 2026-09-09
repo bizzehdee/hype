@@ -30,10 +30,17 @@ describe hype's own boot drive with a data partition beside the ESP. Rebuild the
 3. ext4 data partition with the Alpine ISO and an empty `hype/disks/` directory (#688).
 4. NTFS data partition with a second copy of the ISO (#689).
 
-Deviation to record on both tickets: three data partitions instead of one 508 GB partition. The
-clauses under test (locator picks partition 1, cfg write-back and logs land only on partition 1,
-ISO read from the data partition, `mkdisk` + guest write on it, clean `fsck` afterwards) do not
-depend on the partition count. Every boot from this drive after the rebuild is a #688/#689 sample.
+Two deviations to record on both tickets. Three data partitions instead of one 508 GB partition:
+the clauses under test (locator picks partition 1, cfg write-back and logs land only on partition
+1, ISO read from the data partition, guest write on it, clean `fsck` afterwards) do not depend on
+the partition count. And the `mkdisk` clause: TERM-11's `mkdisk` lists AHCI and NVMe disks only,
+so it cannot create on a USB-attached drive; the image is staged fully allocated by `stage.sh`
+and the guest writes it in place, which is the writer the clause exercises. Every boot from this
+drive after the rebuild is a #688/#689 sample.
+
+hype's path resolver walks GPT partitions 1..4 and takes the first volume holding the path, so a
+file meant to be served from ext4 or NTFS must not also exist on the exFAT partition. `stage.sh`
+enforces that for `\iso\test.iso` (ext4 only) and stages `\iso\ntfs-test.iso` (NTFS only).
 
 Also before boot 1, in the sandbox:
 
@@ -41,17 +48,22 @@ Also before boot 1, in the sandbox:
   the spare NVMe (other partition, different LBA range) with a second file-backed disk on the
   NTFS partition, drop `vm.suite` (the laptop budget is 3 vCPUs). #660 records zero without two
   writers on one NVMe controller.
-- #788 diagnostic: count HID boot reports where an empty report sits between two identical
-  non-empty reports inside one poll interval, and log the count on the `KBDCHARS` tick. The Pico
-  feeds ~25k alphabet characters per 90 minutes, so any boot with the Pico attached is a sample.
+- #788 diagnostic (landed with this plan): the drain-every-report fix `6dabf79` did not move the
+  rate (2.7 -> 2.6 -> 2.40 per 1,000 across three runs), so the mechanism is still open. `HIDTICK`
+  now carries `typematic=` (make codes hype's auto-repeat synthesised; the Pico types at 8 ms per
+  key, so any repeat on its stream is hype's) and `rebounce=` (a usage pressed again within 30 ms
+  of its own release, a report-level duplicate). Whichever tracks the doubled-character count
+  names the mechanism; both at zero puts it downstream of the report diff. The Pico feeds ~25k
+  alphabet characters per 90 minutes, so any boot with the Pico attached is a sample.
 - Optional, each turns the two boots into more closes: #709 (small; `fs_selftest_disk` key is
   already parsed, `0dddc7a`) unlocks #653 on both boots; the #641 idle yield (AP loop arms a
   host wake deadline and issues a real HLT instead of re-entering VMRUN) unlocks #641 on boot 2.
 
 ## Boot 1: Intel i5-13420H, APICv build, 45 minutes
 
-Card: `tools/hw-val-2026-08-25/RUN-CARD-2026-09-03-bootIntelB.md` as written, plus three
-additions. The internal NVMe is BitLocker Windows and is never named. Plug the Pico in.
+Card: `tools/hw-val-2026-08-25/RUN-CARD-2026-09-09-boot1-intel.md` (`stage.sh --boot intelb`,
+config `hype2h.cfg`, scripts `input-2h/`). The run3d VM for #388/#754 is not autostarted;
+`start run3d` is the last act. The internal NVMe is BitLocker Windows and is never named. Plug the Pico in.
 
 1. Boot the APICv build. Confirm `vmx: apicv=ON`.
 2. vm0 boots the Alpine ISO from the ext4 partition, logs in, sits idle 10 minutes (the 2c

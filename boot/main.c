@@ -413,7 +413,20 @@ typedef struct {
     /* #774: this keyboard's auto-repeat state. Per keyboard, because two keyboards holding
      * different keys must each repeat their own. */
     hype_usb_hid_typematic_t typematic;
+    /*
+     * #788: which of the two candidate mechanisms doubles a character. `typematic_emits`
+     * counts make codes the auto-repeat synthesised (a Pico types at 8 ms per key, so any
+     * repeat on its stream is hype's own). `rebounce` counts a usage pressed again within
+     * HYPE_HID_REBOUNCE_MS of its own release -- a duplicate at the report level, which no
+     * human and no Pico produces. Both zero while the doubles continue puts the fault
+     * downstream of the report diff.
+     */
+    unsigned long long typematic_emits;
+    unsigned long long rebounce;
+    uint8_t last_release_usage;
+    uint64_t last_release_ms;
 } hype_host_kbd_t;
+#define HYPE_HID_REBOUNCE_MS 30u
 
 static hype_host_kbd_t g_hid[HYPE_HOST_KBD_MAX];
 static unsigned int g_hid_count;
@@ -8957,15 +8970,16 @@ static void fw_1_hid_watch(uint64_t now_h, uint64_t hz) {
         hype_debug_print("fw-1 HIDTICK[%u]: %04x:%04x slot%u ep=0x%02x polls=%llu reports=%llu "
                          "arms=%llu lost=%llu skipped=%llu hcevt=%llu ringfull=%llu evict=%llu "
                          "revives=%llu revive_fail=%llu stopped=%llu | cmdring timeouts=%llu "
-                         "guard=%llu recoveries=%llu%s silence_revive=%u | mouse polls=%llu "
-                         "reports=%llu [#775]\n",
+                         "guard=%llu recoveries=%llu%s silence_revive=%u | typematic=%llu "
+                         "rebounce=%llu [#788] | mouse polls=%llu reports=%llu [#775]\n",
                          k, (unsigned)kb->vid, (unsigned)kb->pid, kb->slot, kb->ep,
                          kb->polls, kb->reports,
                          hype_xhci_int_in_arms((hype_xhci_ctrl_t *)&kb->xc, kb->slot, kb->ep),
                          lost, skipped, hce, rfull, evict,
                          hype_xhci_int_in_revives((hype_xhci_ctrl_t *)&kb->xc, kb->slot, kb->ep),
                          rfail, stopped, cmdto, cmdguard, cmdrec, cmddead ? " DEAD" : "",
-                         hype_xhci_silence_revive_enabled(), g_mouse_polls, g_mouse_reports);
+                         hype_xhci_silence_revive_enabled(), kb->typematic_emits, kb->rebounce,
+                         g_mouse_polls, g_mouse_reports);
     }
 }
 
@@ -25504,6 +25518,9 @@ static unsigned int usb_hid_drain(void) {
                 hype_host_kbd_inject_scancode(rep[ri]);
             }
             injected += rn;
+            if (rn != 0u) {
+                kb->typematic_emits++; /* #788 */
+            }
         }
         /*
          * SERIALISED against the mass-storage datapath. This poll drives the host controller
@@ -25557,6 +25574,39 @@ static unsigned int usb_hid_drain(void) {
     return injected;
 }
 
+static int hid_report_has_usage(const uint8_t *report, uint8_t usage) {
+    unsigned int i;
+    for (i = 2u; i < HYPE_USB_HID_REPORT_LEN; i++) {
+        if (report[i] == usage) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* #788: count a key that comes back within HYPE_HID_REBOUNCE_MS of its own release. */
+static void hid_note_rebounce(hype_host_kbd_t *kb, const uint8_t *report, uint64_t now_ms) {
+    unsigned int i;
+
+    if (!kb->have_prev) {
+        return;
+    }
+    for (i = 2u; i < HYPE_USB_HID_REPORT_LEN; i++) {
+        uint8_t u = report[i];
+        if (u != 0u && u != 0x01u && !hid_report_has_usage(kb->prev, u) &&
+            u == kb->last_release_usage && now_ms - kb->last_release_ms < HYPE_HID_REBOUNCE_MS) {
+            kb->rebounce++;
+        }
+    }
+    for (i = 2u; i < HYPE_USB_HID_REPORT_LEN; i++) {
+        uint8_t u = kb->prev[i];
+        if (u != 0u && u != 0x01u && !hid_report_has_usage(report, u)) {
+            kb->last_release_usage = u;
+            kb->last_release_ms = now_ms;
+        }
+    }
+}
+
 static void hid_handle_report(hype_host_kbd_t *kb, const uint8_t *report, uint8_t *codes,
                               unsigned int codes_cap, unsigned int *injected) {
     unsigned int n, i;
@@ -25572,6 +25622,7 @@ static void hid_handle_report(hype_host_kbd_t *kb, const uint8_t *report, uint8_
                          (unsigned)kb->vid, (unsigned)kb->pid, kb->slot);
     }
     hype_usb_hid_typematic_note(&kb->typematic, report, fw_1_now_ms()); /* #774 */
+    hid_note_rebounce(kb, report, fw_1_now_ms()); /* #788 */
     n = hype_usb_hid_report_to_scancodes(kb->have_prev ? kb->prev : 0, report, codes,
                                          codes_cap);
     for (i = 0; i < HYPE_USB_HID_REPORT_LEN; i++) {

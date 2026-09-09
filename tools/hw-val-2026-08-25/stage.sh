@@ -39,12 +39,16 @@ set -u
 # variant becomes \EFI\BOOT\BOOTX64.EFI. All three variants are always staged under
 # \EFI\hype\ so a different one can be made active by copying, without a rebuild.
 BOOT=amd1
+NEED_DATA_FS=0
 select_boot() {
   case "$1" in
     amd1)   BOOT_INPUT=input-1a; RUN_CARD=RUN-CARD-2026-09-03-bootAMD1.md
             ACTIVE_CFG=hype1g.cfg; ACTIVE_BUILD=default ;;
-    intelb) BOOT_INPUT=input-2c; RUN_CARD=RUN-CARD-2026-09-03-bootIntelB.md
-            ACTIVE_CFG=hype2c.cfg; ACTIVE_BUILD=apicv ;;
+    # Boot 1 of docs/hw-validation-queue-2026-09-09.md: the APICv run plus the ext4/NTFS
+    # data-partition legs (#688 #689) and the scratch-stick write + pull (#388 #754). Needs
+    # the four-partition drive layout (FAT32 + exFAT + ext4 + NTFS); refuses without it.
+    intelb) BOOT_INPUT=input-2h; RUN_CARD=RUN-CARD-2026-09-09-boot1-intel.md
+            ACTIVE_CFG=hype2h.cfg; ACTIVE_BUILD=apicv; NEED_DATA_FS=1 ;;
     # L0 on the AMD LAPTOP, not the 5950X: five minutes to read one HOUSECOST line for #799.
     # Deliberately the same config and input script as the 2026-09-03 laptop attempt that
     # measured 235 us/exit, so the two runs are comparable. The laptop is serial-less and
@@ -102,6 +106,19 @@ ensure_mounted() {
 BOOTMP=$(ensure_mounted "$BOOTDEV") || exit 1
 DATAMP=$(ensure_mounted "$DATADEV") || exit 1
 echo "mounted: $BOOTMP  $DATAMP"
+# 2026-09-09 layout: ext4 and NTFS data partitions beside the exFAT one (#688 #689). hype's
+# path resolver walks GPT partitions 1..4 and takes the FIRST volume holding the path, so a
+# file meant to be served from ext4 or NTFS must not also exist on the exFAT partition.
+EXT4DEV=$(lsblk -rpno NAME,FSTYPE "/dev/$BOOTDISK" | awk '$2=="ext4"{print $1; exit}')
+NTFSDEV=$(lsblk -rpno NAME,FSTYPE "/dev/$BOOTDISK" | awk '$2=="ntfs"{print $1; exit}')
+EXT4MP=""; NTFSMP=""
+if [ -n "$EXT4DEV" ] && [ -n "$NTFSDEV" ]; then
+  EXT4MP=$(ensure_mounted "$EXT4DEV") || exit 1
+  NTFSMP=$(ensure_mounted "$NTFSDEV") || exit 1
+  echo "data filesystems: ext4=$EXT4MP  ntfs=$NTFSMP"
+elif [ "$NEED_DATA_FS" = 1 ]; then
+  die "boot set $BOOT needs ext4 and NTFS partitions on /dev/$BOOTDISK -- rebuild the drive first (docs/hw-validation-queue-2026-09-09.md)"
+fi
 
 # ---------------------------------------------------------------- build
 if [ "$BUILD" = 1 ]; then
@@ -146,7 +163,8 @@ mk_image() {
   # Split: `local` expands ALL its arguments before any assignment takes effect, so
   # referencing $rel in the same statement that sets it is unbound under `set -u`.
   local rel=$1 want=$2 have=0
-  local path="$DATAMP/$rel"
+  local base=${3:-$DATAMP}
+  local path="$base/$rel"
   mkdir -p "$(dirname "$path")"
   [ -f "$path" ] && have=$(stat -c %s "$path")
   if [ "$have" = "$want" ]; then echo "  ok    $rel ($want bytes)"; return 0; fi
@@ -166,6 +184,22 @@ echo "scratch images (#738):"
 IMG_RC=0
 mk_image "hype/disks/run1a-scratch.img" $((2 * 1024 * 1024 * 1024)) || IMG_RC=1
 mk_image "hype/disks/run2b-scratch.img" $((2 * 1024 * 1024 * 1024)) || IMG_RC=1
+mk_image "hype/disks/run2c-scratch.img" $((2 * 1024 * 1024 * 1024)) || IMG_RC=1
+if [ -n "$EXT4MP" ]; then
+  # #688 / #689: the guest images and their ISOs live ONLY on ext4 / NTFS (see above).
+  mk_image "hype/disks/ext4-scratch.img" $((1 * 1024 * 1024 * 1024)) "$EXT4MP" || IMG_RC=1
+  mk_image "hype/disks/ntfs-scratch.img" $((1 * 1024 * 1024 * 1024)) "$NTFSMP" || IMG_RC=1
+  if [ "$CHECK" = 0 ]; then
+    ISO_SRC=$HERE/../../disk-images/hwval-data-2026-09-09/iso/test.iso
+    [ -f "$ISO_SRC" ] || die "no Alpine ISO at $ISO_SRC"
+    mkdir -p "$EXT4MP/iso" "$NTFSMP/iso"
+    [ -f "$EXT4MP/iso/test.iso" ]      || cp "$ISO_SRC" "$EXT4MP/iso/test.iso"      || die "copy ISO to ext4"
+    [ -f "$NTFSMP/iso/ntfs-test.iso" ] || cp "$ISO_SRC" "$NTFSMP/iso/ntfs-test.iso" || die "copy ISO to NTFS"
+    [ ! -e "$DATAMP/iso/test.iso" ] || die "$DATAMP/iso/test.iso exists and would shadow the ext4 copy -- remove it"
+  fi
+  echo "ext4 data partition:"; ls -l "$EXT4MP/iso" "$EXT4MP/hype/disks" 2>/dev/null | sed 's/^/  /'
+  echo "NTFS data partition:"; ls -l "$NTFSMP/iso" "$NTFSMP/hype/disks" 2>/dev/null | sed 's/^/  /'
+fi
 
 # ---------------------------------------------------------------- copy
 if [ "$CHECK" = 0 ]; then
@@ -187,9 +221,14 @@ if [ "$CHECK" = 0 ]; then
   # log belongs to is recoverable from the drive alone after the fact.
   [ -f "$HERE/$BOOT_INPUT/vm0.txt" ] || die "input script $BOOT_INPUT/vm0.txt not found"
   mkdir -p "$BOOTMP/input" "$BOOTMP/$BOOT_INPUT"
-  cp "$HERE/$BOOT_INPUT/vm0.txt" "$BOOTMP/input/vm0.txt"      || die "copy input script"
-  cp "$HERE/$BOOT_INPUT/vm0.txt" "$BOOTMP/$BOOT_INPUT/vm0.txt" || die "copy input archive"
-  cp docs/hw-validation-runbook-2026-09-02.md "$BOOTMP/QUEUE.md" 2>/dev/null || true
+  # Every VM's script, not only vm0's: a stale \input\vm1.txt from an earlier set would
+  # otherwise drive this set's second VM.
+  rm -f "$BOOTMP"/input/vm*.txt
+  for f in "$HERE/$BOOT_INPUT"/vm*.txt; do
+    cp "$f" "$BOOTMP/input/$(basename "$f")"      || die "copy input script $(basename "$f")"
+    cp "$f" "$BOOTMP/$BOOT_INPUT/$(basename "$f")" || die "copy input archive $(basename "$f")"
+  done
+  cp docs/hw-validation-queue-2026-09-09.md "$BOOTMP/QUEUE.md" 2>/dev/null || true
   cp docs/qemu-vs-hardware.md "$BOOTMP/QEMU-VS-HARDWARE.md" 2>/dev/null || true
   # Logs cleared so the next boot starts from a clean rotation. Archive them FIRST --
   # this script does not, deliberately: losing a boot's evidence is worse than an
@@ -230,7 +269,9 @@ if [ -d "$STAGEDIR/micro" ]; then
   for m in "$STAGEDIR"/micro/*.bin; do verify "$m" "$BOOTMP/EFI/hype/micro/$(basename "$m")" "micro/$(basename "$m")"; done
 fi
 if [ "$CHECK" = 0 ]; then
-  verify "$HERE/$BOOT_INPUT/vm0.txt" "$BOOTMP/input/vm0.txt" "input/vm0.txt"
+  for f in "$HERE/$BOOT_INPUT"/vm*.txt; do
+    verify "$f" "$BOOTMP/input/$(basename "$f")" "input/$(basename "$f")"
+  done
   verify "$HERE/$RUN_CARD" "$BOOTMP/RUN-CARD.md" "RUN-CARD.md"
 fi
 echo "scratch image on media:"
