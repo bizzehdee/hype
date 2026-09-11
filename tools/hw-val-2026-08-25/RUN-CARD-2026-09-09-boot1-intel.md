@@ -122,3 +122,14 @@ vm0 vCPU 1/2/3: SIPI received x10 each (the guest retried its AP bring-up ten ti
 
 Probe the reason-45 exit: vector, `gis` and VISR word before/after, so the log says whether the
 guest's EOIs for 0x20..0x30 reach EOI virtualization at all. Count reason-45 exits per vector.
+
+## Re-staged 2026-09-11 with `658c3ce` `6eeea58` and the #815 sync -- what the next i5 boot adds
+
+| Read | Passes when |
+| --- | --- |
+| `fw-1: IA32_TSC_ADJUST supported -- AP TSC sync at bring-up armed` | printed once before the APs start |
+| `fw-1 TSCSYNC: apic=N before=+X us adjust=-T ticks after=+Y us` per AP | `before` about +1,050,000 us on this machine (the boot-1 measurement), `adjust` about -2.74e9 ticks, `after` within -5..+5 us. `tsc_adjust=NO` means the part hides the MSR and the skew stays |
+| `KBDDRAIN gap_max=` | never near 7.06e9 us again, with or without `foreign=` |
+| `vmx apicv-eoi #n: vec=0x.. gis=0x.... visr[w]=0x........ -- bit clear/STILL SET` | the #708 answer: EOI exits for 0x20..0x30 with the bit clear = the EOIs virtualize and something else re-sets VISR; no EOI exits for those vectors at all = the guest's EOIs never reach EOI virtualization; STILL SET = the CPU left it |
+| `vmx apicv-state: ... \| eoi-exits=N still_set=M per-vec: 0xec=.. 0x30=..` | one record per dump now, per-vector histogram; `still_set` should be 0 |
+| `vmx apicv-wr ... (seen=N)` | at most 64 lines then one per ~6.5 s; the log stays in the hundreds of KB |
