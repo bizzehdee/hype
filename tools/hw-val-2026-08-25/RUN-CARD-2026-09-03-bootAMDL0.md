@@ -1141,3 +1141,50 @@ PASS, `VARS: vars-cdtest.bin saved (540672 bytes)`.
 
 Same procedure: type from the first 30 seconds, keep tapping, `flush` while input works, then
 `host off`.
+
+
+## Result -- run 14, 2026-09-11, build `a6c4154-dirty`, **Intel i5-13420H** (logs in `logs/bootI5-14/`)
+
+Not the AMD laptop: the drive was booted on the i5 (host TSC 2611 MHz, i8042 present,
+`st=0x1c`). About 5 minutes (rtc 10:02:36, last log write 10:07:18). Ended at the power button,
+not `host off` (0 matches); the last records are typed text at the dashboard (48 `TERMCMD`),
+so input was alive to the end.
+
+```
+KBDDRAIN: calls=1181709 | ... | gap_max=7062505501us ... | gap_recent=7062490917us over5ms=774405 irq1_last=93067ms ago pumps=608420
+BSPSTARVE >5ms: input=1(max 5ms) kbddiag=30(max 173ms) flush=35(max 3112ms) fbreport=86(max 11ms) vars=25(max 4911ms)
+USBLOCK: acquires=10370 spins=165784597 avg=15986 max=15140018 on apic=17
+USBLOCK: acquires=24109 spins=516538602 avg=21425 max=15892990 on apic=9
+SCRIPT vm0: PASS pass (21 directive(s), 150260ms)
+VARS: vars-run1a.bin saved (540672 bytes)
+```
+
+| Read | Result |
+| --- | --- |
+| `pumps=` | 608,420 of 1,181,709 drains -- both hooks fire. **Not comparable to run 13.** `USBLOCK ... on apic=17` and `on apic=9` say APs hold the USB lock, so the xHCI spin yield runs on APs and `pumps=` counts AP drains, not BSP relief |
+| `gap_recent=` | **unreadable.** 7,062,480,182 us in every sample after the first. 2^64 / 2,611,484,700 Hz = 7,063,699,846 us, so the printed value is a wrapped **negative** gap: (2^64 - value x hz) / 1e6 = 3.12e9..3.19e9 ticks = **-1.19 .. -1.22 s**, steady across 50 samples. `g_kbd_gap_prev_tsc` is written from two cores. `over5ms=` (774,405 of 1,181,709) is polluted the same way |
+| `BSPSTARVE vars=` | max **4911 ms** (run 13: 1406). `flush` max 3112 ms (163). `kbddiag` max 173 ms (58). Worse on every phase -- different machine and USB drive, so not a like-for-like |
+| `vars-run1a.bin` | 540,672 bytes, saved |
+| `SCRIPT vm0: PASS` | yes, 150 s, `reboot-pin-nonbsp` reached -- the first PASS since run 9, but on the i5, so it does not close the #803 AMD leg |
+| `TMRLATE` | `worst_late=7.45..7.77 s` on vCPU 1-3 (the APs) |
+
+### What the negative gap says
+
+`hype_host_kbd_pump()` is documented "safe to call from anywhere **on the owning core**". The
+xHCI event wait is not on the owning core: guest ISO reads go through the USB lock from AP
+cores (apic 9 and 17 above), so the pump drains the i8042 (ports 0x60/0x64, under `cli`) from an
+AP while the BSP's input phase drains it too, and both push into `g_host_kbd_buffer`, whose
+push is not SMP-safe. `g_kbd_drain_busy` is a plain flag, not an atomic, so it does not
+serialise them.
+
+A steady -1.2 s cannot come from two cores interleaving on one synchronised TSC; that would
+give microseconds. Either this i5's cores carry a ~1.2 s TSC offset, or something else moves
+`prev` a second into the future. hype has no per-AP TSC-delta probe, so this is open.
+
+### Next
+
+1. Restrict the pump to the BSP (APIC id check at entry). Then `gap_*`, `over5ms=` and `pumps=`
+   have one writer again and mean what the header says.
+2. Log the BSP-vs-AP `rdtsc` delta per AP at bring-up (one exchange through the mailbox). That
+   decides skew against race with one line per core.
+3. Run 14 proper on the AMD laptop, so `gap_recent` compares with run 13's 1.24 s.
