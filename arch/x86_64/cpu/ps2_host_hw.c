@@ -88,6 +88,18 @@ static uint64_t g_kbd_isr_last_tsc;
  * help.
  */
 static unsigned long long g_kbd_pumps;
+/*
+ * #808, run 14: the pump is reached from the xHCI event-wait spin, and that spin runs on
+ * whichever core holds the USB transfer lock -- on hardware an AP doing a guest's ISO reads
+ * (USBLOCK `on apic=17`, `on apic=9`, `on apic=3`), not only the BSP. Two cores draining ports
+ * 0x60/0x64 and pushing into one buffer whose push is plain C is a race, and the gap statistics
+ * above assume one writer (the i5 run printed a wrapped -1.2 s gap). So the pump keeps to the
+ * core that owns the input path and counts what it turned away.
+ */
+static uint32_t g_kbd_owner_apic = 0xFFFFFFFFu;
+static unsigned long long g_kbd_pumps_foreign;
+
+void hype_host_kbd_set_owner_apic(uint32_t apic_id) { g_kbd_owner_apic = apic_id; }
 
 static inline uint64_t kbd_rdtsc(void) {
     uint32_t lo, hi;
@@ -349,10 +361,15 @@ uint64_t hype_host_kbd_polled_bytes(void) { return g_kbd_polled_bytes; }
  *
  * Safe to call from anywhere on the owning core: it touches ports 0x60/0x64 only -- no USB, so
  * no re-entry into the transfer lock it is being called from underneath -- and
- * host_kbd_drain_polled() is already guarded against re-entry by g_kbd_drain_busy.
+ * host_kbd_drain_polled() is already guarded against re-entry by g_kbd_drain_busy. Any other
+ * core is turned away at the door (g_kbd_owner_apic).
  */
 void hype_host_kbd_pump(void) {
     if (g_kbd_no_controller || g_kbd_drain_busy) {
+        return;
+    }
+    if (g_kbd_owner_apic != 0xFFFFFFFFu && kbd_this_apic() != g_kbd_owner_apic) {
+        g_kbd_pumps_foreign++;
         return;
     }
     if (g_kbd_poll_interval_ticks != 0ull) {
@@ -398,6 +415,7 @@ void hype_host_kbd_drain_stats(hype_host_kbd_drain_stats_t *out) {
     out->gap_recent_max_ticks = g_kbd_gap_recent_max_ticks;
     out->isr_last_tsc = g_kbd_isr_last_tsc;
     out->pumps = g_kbd_pumps;
+    out->pumps_foreign = g_kbd_pumps_foreign;
     /* Reading clears the recent window, so the NEXT sample describes only its own interval.
      * Deliberately a side effect of the read: two readers would each see part of the interval,
      * and there is exactly one reader. */

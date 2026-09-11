@@ -163,6 +163,10 @@ typedef struct {
      * different finding from "the fix did not help".
      */
     unsigned long long pumps;
+    /* #808: pump calls turned away because they ran on a core other than the owner. Non-zero
+     * on hardware whenever an AP holds the USB lock; it is the count of races that did not
+     * happen, not a fault. */
+    unsigned long long pumps_foreign;
 } hype_host_kbd_drain_stats_t;
 
 void hype_host_kbd_drain_stats(hype_host_kbd_drain_stats_t *out);
@@ -173,9 +177,12 @@ void hype_host_kbd_drain_stats(hype_host_kbd_drain_stats_t *out);
  * the chunks of anything that blocks for more than a few milliseconds. Drain-only on purpose --
  * fw_1_host_input_poll() stays the only consumer, so a pumped byte waits in the buffer for it
  * rather than being popped with nobody to route it. Touches ports 0x60/0x64 only, so it is safe
- * to call from inside a USB or FAT write path.
+ * to call from inside a USB or FAT write path -- but only on the owning core: the xHCI wait it
+ * hangs off runs on whichever core holds the USB lock, so the pump checks the caller's APIC id
+ * against the owner set below and returns at once on any other core.
  */
 void hype_host_kbd_pump(void);
+void hype_host_kbd_set_owner_apic(uint32_t apic_id);
 
 /*
  * USB-5 (#217): push a scancode into the SAME host queue the PS/2 ISR feeds.

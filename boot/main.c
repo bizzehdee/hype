@@ -27269,6 +27269,9 @@ static void usb_log_latch_bsp_core(void) {
     /* #363: and tell blk_usb, so the BSP's USB waits are bounded and a stuck guest core cannot
      * take the console down with it. */
     hype_blk_usb_set_bsp_apic(g_usb_log_bsp_apic_id);
+    /* #808: the keyboard pump hangs off the xHCI wait, which APs also run; it must drain the
+     * i8042 from this core only. */
+    hype_host_kbd_set_owner_apic(g_usb_log_bsp_apic_id);
     /* #658: same reason, for the AHCI host port lock. */
     hype_ahci_host_set_bsp_apic(g_usb_log_bsp_apic_id);
     /* #660: same reason, for the NVMe host queue/bounce-buffer lock. */
@@ -31012,7 +31015,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                              "nocrl=%u | last push %s | gap_max=%lluus "
                                              "isr_empty=%llu pic_imr=0x%02x irq1=%s | "
                                              "gap_recent=%lluus over5ms=%llu irq1_last=%s "
-                                             "pumps=%llu [#808]\n",
+                                             "pumps=%llu foreign=%llu [#808]\n",
                                              ds.calls, ds.exit_empty, ds.exit_floating,
                                              ds.exit_data_ff, ds.exit_aux,
                                              (unsigned)ds.last_status, (unsigned)ds.last_data,
@@ -31028,7 +31031,7 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                                  : 0ull,
                                              ds.gap_over_thresh,
                                              kbddrain_irq1_last(&ds, hz808, irqbuf, sizeof(irqbuf)),
-                                             ds.pumps);
+                                             ds.pumps, ds.pumps_foreign);
                         }
                         {
                             unsigned vi;
