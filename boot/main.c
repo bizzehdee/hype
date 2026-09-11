@@ -3441,6 +3441,38 @@ static volatile uint32_t g_fw_1_ap_vmm_ok;
  * skew and a reading in the tens of us is none.
  */
 static volatile uint64_t g_fw_1_ap_entry_tsc;
+/*
+ * #815: boot 1 on the i5-13420H measured every AP's TSC 1.05 s AHEAD of the BSP
+ * (`TSCSKEW: apic=8..42 ap-bsp=+1050609..+1050632us`; the AMD laptop: -197 us). hype arms
+ * timers in BSP TSC units and reads TSC on whichever core is running, so a skewed AP fires
+ * them a second off (run 14: TMRLATE worst_late 7 s) and any shared TSC stamp wraps
+ * (KBDDRAIN gap_recent=7,062,480,182us). Linux fixes this at CPU bring-up by writing
+ * IA32_TSC_ADJUST on the AP so its TSC matches the boot CPU; so does this.
+ *
+ * Protocol, one AP at a time (bring-up is sequential): the AP arrives at the gate (1); the BSP
+ * stamps its TSC and opens it (2); the AP reads its own TSC at once, the difference is the
+ * offset plus one cache-line round trip (~1 us); the AP writes TSC_ADJUST by -offset when the
+ * offset is past the noise, stamps again and reports (3); the BSP times the report against
+ * its own clock for the "after" line. Both sides bound their waits, so a core that never
+ * shows up costs 50 ms, not a hang.
+ */
+static volatile uint32_t g_fw_1_ap_sync_gate;
+static volatile uint64_t g_fw_1_ap_sync_bsp_tsc;
+static volatile uint64_t g_fw_1_ap_sync_ap_before;   /* AP TSC read at gate open */
+static volatile uint64_t g_fw_1_ap_sync_ap_after;    /* AP TSC read after the adjust */
+static volatile int64_t g_fw_1_ap_sync_adjust_ticks; /* what the AP wrote, 0 = untouched */
+static int g_fw_1_tsc_adjust_supported;              /* CPUID.(7,0):EBX[1], read once on the BSP */
+#define HYPE_MSR_IA32_TSC_ADJUST 0x3bu
+#define FW_1_TSC_SYNC_NOISE_US 50ull /* one round trip is ~1 us; a real offset is hundreds+ */
+
+static inline uint64_t fw_1_rdmsr(uint32_t msr) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(msr));
+    return ((uint64_t)hi << 32) | lo;
+}
+static inline void fw_1_wrmsr(uint32_t msr, uint64_t v) {
+    __asm__ volatile("wrmsr" : : "c"(msr), "a"((uint32_t)v), "d"((uint32_t)(v >> 32)) : "memory");
+}
 /* AP-bring-up result, latched so the diag tick can re-emit it after the one-shot
  * AP-SMOKETEST line has scrolled out of the live display.
  * -2 = smoketest not reached; -3 = skipped (no <1MB trampoline page);
@@ -3955,12 +3987,67 @@ static int fw_1_ap_start_probed(uint8_t apic_id, unsigned slot, void *arg, uint6
                              (unsigned)apic_id, (delta_us < 0) ? "-" : "+",
                              (delta_us < 0) ? -delta_us : delta_us);
         }
+        /* #815: the sync handshake. The AP is spinning at gate 1 by now (or arrives within 50 ms). */
+        {
+            uint64_t t0 = hype_rdtsc();
+            while (g_fw_1_ap_sync_gate != 1u && hype_rdtsc() - t0 < limit) { __asm__ volatile("pause"); }
+            if (g_fw_1_ap_sync_gate == 1u) {
+                uint64_t bsp_after;
+                g_fw_1_ap_sync_bsp_tsc = hype_rdtsc();
+                __atomic_store_n(&g_fw_1_ap_sync_gate, 2u, __ATOMIC_SEQ_CST);
+                t0 = hype_rdtsc();
+                while (g_fw_1_ap_sync_gate != 3u && hype_rdtsc() - t0 < limit) { __asm__ volatile("pause"); }
+                bsp_after = hype_rdtsc();
+                if (g_fw_1_ap_sync_gate == 3u) {
+                    long long before_us = (long long)(g_fw_1_ap_sync_ap_before - g_fw_1_ap_sync_bsp_tsc) *
+                                          1000000ll / (long long)tsc_hz;
+                    long long after_us = (long long)(g_fw_1_ap_sync_ap_after - bsp_after) *
+                                         1000000ll / (long long)tsc_hz;
+                    hype_debug_print("fw-1 TSCSYNC: apic=%u before=%s%lldus adjust=%s%lld ticks after=%s%lldus "
+                                     "(before/after = AP minus BSP; after includes one round trip, so "
+                                     "-1..-5 us is synchronised) tsc_adjust=%s [#815]\n",
+                                     (unsigned)apic_id, (before_us < 0) ? "-" : "+",
+                                     (before_us < 0) ? -before_us : before_us,
+                                     (g_fw_1_ap_sync_adjust_ticks < 0) ? "-" : "+",
+                                     (g_fw_1_ap_sync_adjust_ticks < 0) ? -g_fw_1_ap_sync_adjust_ticks
+                                                                        : g_fw_1_ap_sync_adjust_ticks,
+                                     (after_us < 0) ? "-" : "+", (after_us < 0) ? -after_us : after_us,
+                                     g_fw_1_tsc_adjust_supported ? "yes" : "NO (skew left in place)");
+                } else {
+                    hype_debug_print("fw-1 TSCSYNC: apic=%u -- AP did not report within 50 ms [#815]\n",
+                                     (unsigned)apic_id);
+                }
+            } else {
+                hype_debug_print("fw-1 TSCSYNC: apic=%u -- AP never reached the gate [#815]\n",
+                                 (unsigned)apic_id);
+            }
+            __atomic_store_n(&g_fw_1_ap_sync_gate, 0u, __ATOMIC_SEQ_CST);
+        }
     }
     return rc;
 }
 
 static void fw_1_ap_main(void *arg) {
     g_fw_1_ap_entry_tsc = hype_rdtsc(); /* #808 TSCSKEW probe -- first thing, see the slot */
+    {   /* #815: sync this core's TSC to the BSP before anything reads it. See the gate. */
+        uint64_t t0 = hype_rdtsc();
+        __atomic_store_n(&g_fw_1_ap_sync_gate, 1u, __ATOMIC_SEQ_CST);
+        while (g_fw_1_ap_sync_gate != 2u && hype_rdtsc() - t0 < (1ull << 31)) { __asm__ volatile("pause"); }
+        if (g_fw_1_ap_sync_gate == 2u) {
+            uint64_t ap_now = hype_rdtsc();
+            int64_t off = (int64_t)(ap_now - g_fw_1_ap_sync_bsp_tsc);
+            int64_t noise = (int64_t)(g_vms[0].host_tsc_hz / 1000000ull * FW_1_TSC_SYNC_NOISE_US);
+            g_fw_1_ap_sync_ap_before = ap_now;
+            g_fw_1_ap_sync_adjust_ticks = 0;
+            if (g_fw_1_tsc_adjust_supported && noise != 0 && (off > noise || off < -noise)) {
+                uint64_t adj = fw_1_rdmsr(HYPE_MSR_IA32_TSC_ADJUST);
+                fw_1_wrmsr(HYPE_MSR_IA32_TSC_ADJUST, adj - (uint64_t)off);
+                g_fw_1_ap_sync_adjust_ticks = -off;
+            }
+            g_fw_1_ap_sync_ap_after = hype_rdtsc();
+            __atomic_store_n(&g_fw_1_ap_sync_gate, 3u, __ATOMIC_SEQ_CST);
+        }
+    }
     /* STEP 2: `arg` is this core's VM index (0 => g_vms[0] on AP1, 1 =>
      * g_vms[1] on AP2). Selects this core's guest, its own SVM host-save area,
      * and (below) its host_tsc_hz for the LAPIC-timer calibration. */
@@ -28789,6 +28876,14 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             uint64_t t0 = fb_tsc_begin();
             stall_fn(20000);
             g_fw_1_host_tsc_hz = (hype_rdtsc() - t0) * 50ULL; /* *(1e6/20000) */
+            {   /* #815: can this part re-base an AP's TSC? CPUID.(7,0):EBX[1] = IA32_TSC_ADJUST. */
+                uint32_t b7 = 0u;
+                fw_1_host_cpuid(7u, 0u, 0, &b7, 0, 0);
+                g_fw_1_tsc_adjust_supported = (int)((b7 >> 1) & 1u);
+                hype_debug_print("fw-1: IA32_TSC_ADJUST %s -- AP TSC sync at bring-up %s [#815]\n",
+                                 g_fw_1_tsc_adjust_supported ? "supported" : "NOT supported",
+                                 g_fw_1_tsc_adjust_supported ? "armed" : "off");
+            }
             /* #265: from here on the write stats can stamp their first write. */
             hype_blk_wstats_set_clock(hype_rdtsc);
             hype_debug_print("fw-1: host TSC calibrated at %llu Hz (%llu MHz)\n",
