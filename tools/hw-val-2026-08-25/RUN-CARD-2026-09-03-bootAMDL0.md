@@ -1246,3 +1246,46 @@ Three changes from the two run-14 logs, all in the same build:
 
 Same procedure. The Intel boot 1 of the 2026-09-09 queue carries the same build and reads the
 same lines, so the i5's `TSCSKEW` comes from that boot.
+
+
+## Result -- run 15 build, AMD laptop, boot-1 config (`8ab98e2-dirty`, `hype2h.cfg`; logs in `logs/bootAMDL0-15-hype2h/`)
+
+The drive was staged for the Intel boot 1 and booted on the AMD laptop instead (NVMe
+`5ME3N005713803V2W`, TSC 2096 MHz). Admission fitted two of the four VMs (`run2c` 2 cores,
+`run2e` 1; `run2n` did not fit on 3 guest cores). The operator saw both guests stop at
+"verifying modloop" and used the power button; no `host off`, no `TERMCMD`, about 2 minutes of
+guest time in the log.
+
+```
+host-xhci: #266 bulk TIMEOUT waiting for slot=1 ep=4 trb=0x141b3bfa0 (0 foreign seen this boot)
+host-xhci: #803 abandoning SCSI op=0x28 -- retry ladder exceeded 2000 ms; reporting a medium error rather than parking the caller
+stream-rd #25: off=87957504 chunk=65536 lba0=220549120 isosz=278921216 ret=-1
+stream-rd #26: off=4767744 chunk=4096 lba0=220549120 isosz=278921216 ret=-1
+FBINFLIGHT: during the masked loop: usb_waiters_max=2 usb_held=64/64
+USBWAIT: lock wait total=6370ms max=2821139us
+host-xhci: #266 bulk TIMEOUT waiting for slot=1 ep=4 trb=0x141b3b010     <- second, 13 s later
+host-xhci: #266 BOT recovery finished rc=0 ... post-recovery retry SUCCEEDED -- datapath restored
+```
+
+**The freeze is an ISO read that came back as a medium error.** Two guests verifying modloop
+read the same ISO through the one USB drive (`ISOCACHE` 33-41% hits, ATAPI `thru` 4.5-12 MB/s,
+pool `usb_held=64/64` with two waiters). The drive's bulk IN timed out (#266); the #803 retry
+ladder gave up at 2000 ms and handed the guest a medium error for two ISO chunks (offsets
+87,957,504 and 4,767,744). Alpine's modloop verification does not survive that. The second
+timeout 13 s later recovered through BOT reset. Both guests were still taking exits and
+issuing ATAPI reads at the last flush, so hype and the vCPUs were alive; the guests were stuck
+on the failed read. Same bridge, same signature as #803's stall, now under two-VM ISO load.
+
+### #808 readings from the same log
+
+| Read | Result |
+| --- | --- |
+| `TSCSKEW` | 6 APs, `-194 .. -198us`, all within 4 us of each other. Synchronised; no per-core offset on this machine. The i5 is still unmeasured |
+| `foreign=` | `pumps=60205 foreign=156565` -- the AP calls are turned away, 2.6 per BSP pump |
+| `gap_recent=` | 5 samples: 305 ms (bring-up), **40,685 / 41,583 / 41,497 us**, and 258 ms in the sample holding the bulk timeout. The consistent ~41 ms window is NOT gone |
+| `kbddiag=` | `4(max 79ms)` -- the per-record drain did not remove it. Only 4 of the dumps went over 5 ms, so the 79 ms is one block, not the record stream |
+| `flush=` | `19(max 258ms)`; `vars=5(max 1670ms)` |
+
+The ~41 ms window matches neither `kbddiag` (rare) nor `vars`; `flush` is the candidate with 19
+occurrences. Next: stamp the BSP phase at the start and end of each recorded gap so the sample
+names the phase itself.
