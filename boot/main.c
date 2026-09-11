@@ -13621,6 +13621,7 @@ wait_for_sipi:
         } else if (kind == HYPE_VMM_KIND_VMX &&
                    info.reason == HYPE_VMX_EXIT_REASON_VIRTUALIZED_EOI) {
             hype_vmx_apicv_note_delivered(ctx, (uint8_t)(info.qualification & 0xFFu));
+            hype_vmx_apicv_eoi_probe(ctx, (uint8_t)(info.qualification & 0xFFu)); /* #708 */
             (void)hype_guest_lapic_write(lapic, HYPE_GUEST_LAPIC_REG_EOI, 4u, 0u);
         } else if (kind == HYPE_VMM_KIND_VMX &&
                    info.reason == HYPE_VMX_EXIT_REASON_APIC_ACCESS) {
@@ -19818,6 +19819,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             }
 #endif
             hype_vmx_apicv_note_delivered(ctx, (uint8_t)(info.qualification & 0xFFu));
+            hype_vmx_apicv_eoi_probe(ctx, (uint8_t)(info.qualification & 0xFFu)); /* #708 */
             (void)hype_guest_lapic_write(&g_fw_1_lapic, HYPE_GUEST_LAPIC_REG_EOI, 4u, 0u);
             continue;
         }

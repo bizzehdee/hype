@@ -10,6 +10,7 @@
 
 #include "../../../core/blk_backend.h"
 #include "../../../core/fatal.h"
+#include "../../../core/format.h"
 #include "../cpu/isr.h"
 #include "../../../core/guest_mem.h"
 #include "../../../core/guest_mtrr.h" /* #729: the guest MTRR model, shared with SVM */
@@ -363,6 +364,17 @@ struct hype_vcpu_ctx {
      * the SVM side exactly, because the INTDIAG line must mean the same thing on both vendors.
      */
     unsigned long long int_eventinj;
+    /*
+     * #708 boot 1 (i5, APICv): the vAPIC page held eight IO-APIC vectors in VISR that no EOI ever
+     * cleared (gis=0x3030), so IRQ0 was never deliverable and the guest idled for 16 minutes.
+     * The reason-45 exit is where the CPU tells us an EOI was virtualized; count them per vector
+     * and check the VISR bit is gone afterwards, so the next run says which of the two it is:
+     * EOIs that never reach virtualization, or virtualization that leaves the bit set.
+     */
+    uint32_t apicv_eoi_count[256];
+    unsigned long long apicv_eoi_exits;
+    unsigned long long apicv_eoi_visr_still_set;
+    unsigned long long apicv_eoi_probe_last_tsc;
     unsigned long long int_defer;
     unsigned long long int_window;
     unsigned long long int_overwrite;
@@ -3664,19 +3676,35 @@ void hype_vmx_apicv_dump(hype_vcpu_ctx_t *ctx) {
     int ok = 0;
     unsigned w;
     uint64_t gis;
+    char buf[480];
+    int n;
+    unsigned shown;
     if (real == 0 || !real->apicv) return;
     gis = vmread(HYPE_VMCS_GUEST_INTERRUPT_STATUS, &ok);
-    hype_debug_print("vmx apicv-state: gis=0x%llx virr:", (unsigned long long)gis);
-    for (w = 0; w < 8u; w++) {
+    /* One record, one print: boot 1 on the i5 tore this line across four prints from other
+     * cores and the VISR words -- the finding -- had to be pieced back together by hand. */
+    n = hype_snprintf(buf, sizeof(buf), "vmx apicv-state: gis=0x%llx virr:", (unsigned long long)gis);
+    for (w = 0; w < 8u && n > 0 && (unsigned)n < sizeof(buf); w++) {
         uint32_t v = *(volatile uint32_t *)(real->vapic + 0x200u + w * 0x10u);
-        if (v != 0u) hype_debug_print(" [%u]=0x%x", w, v);
+        if (v != 0u) n += hype_snprintf(buf + n, sizeof(buf) - (unsigned)n, " [%u]=0x%x", w, v);
     }
-    hype_debug_print(" isr:");
-    for (w = 0; w < 8u; w++) {
+    if (n > 0 && (unsigned)n < sizeof(buf)) n += hype_snprintf(buf + n, sizeof(buf) - (unsigned)n, " isr:");
+    for (w = 0; w < 8u && n > 0 && (unsigned)n < sizeof(buf); w++) {
         uint32_t v = *(volatile uint32_t *)(real->vapic + 0x100u + w * 0x10u);
-        if (v != 0u) hype_debug_print(" [%u]=0x%x", w, v);
+        if (v != 0u) n += hype_snprintf(buf + n, sizeof(buf) - (unsigned)n, " [%u]=0x%x", w, v);
     }
-    hype_debug_print("\n");
+    /* #708: EOI exits seen per vector (top 8 nonzero), and how many left their VISR bit set. */
+    if (n > 0 && (unsigned)n < sizeof(buf)) {
+        n += hype_snprintf(buf + n, sizeof(buf) - (unsigned)n, " | eoi-exits=%llu still_set=%llu per-vec:",
+                           real->apicv_eoi_exits, real->apicv_eoi_visr_still_set);
+    }
+    for (w = 0, shown = 0; w < 256u && shown < 8u && n > 0 && (unsigned)n < sizeof(buf); w++) {
+        if (real->apicv_eoi_count[w] != 0u) {
+            n += hype_snprintf(buf + n, sizeof(buf) - (unsigned)n, " 0x%02x=%u", w, real->apicv_eoi_count[w]);
+            shown++;
+        }
+    }
+    hype_debug_print("%s\n", buf);
 }
 
 /* #599: the reason-45 (virtualized EOI) exit names the completed vector; run
@@ -3686,6 +3714,43 @@ void hype_vmx_apicv_note_delivered(hype_vcpu_ctx_t *ctx, uint8_t vector) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     if (real == 0) return;
     vmx_note_injected(real, vector);
+}
+
+static inline uint64_t apicv_rdtsc(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+/* #708: run at every reason-45 exit, owner context. See apicv_eoi_count in the ctx. */
+void hype_vmx_apicv_eoi_probe(hype_vcpu_ctx_t *ctx, uint8_t vector) {
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    int ok = 0;
+    uint64_t gis;
+    uint32_t visr_word;
+    int still_set;
+    uint64_t now;
+    if (real == 0 || !real->apicv) return;
+    vmx_ensure_current(ctx);
+    gis = vmread(HYPE_VMCS_GUEST_INTERRUPT_STATUS, &ok);
+    visr_word = *(volatile uint32_t *)(real->vapic + 0x100u + (uint32_t)(vector >> 5) * 0x10u);
+    still_set = (visr_word & ((uint32_t)1u << (vector & 31u))) != 0u;
+    real->apicv_eoi_exits++;
+    real->apicv_eoi_count[vector]++;
+    if (still_set) real->apicv_eoi_visr_still_set++;
+    now = apicv_rdtsc();
+    /* First 32 in full, every still-set case (rate-limited), then one line per ~6.5 s. */
+    if (real->apicv_eoi_exits <= 32ull || still_set ||
+        now - real->apicv_eoi_probe_last_tsc > (1ull << 34)) {
+        if (!still_set || now - real->apicv_eoi_probe_last_tsc > (1ull << 30)) {
+            hype_debug_print("vmx apicv-eoi #%llu: vec=0x%02x gis=0x%04llx visr[%u]=0x%08x after "
+                             "the virtual EOI -- bit %s | still_set=%llu [#708]\n",
+                             real->apicv_eoi_exits, (unsigned)vector,
+                             (unsigned long long)(gis & 0xFFFFu), (unsigned)(vector >> 5), visr_word,
+                             still_set ? "STILL SET" : "clear", real->apicv_eoi_visr_still_set);
+            real->apicv_eoi_probe_last_tsc = now;
+        }
+    }
 }
 
 int hype_vmx_vcpu_take_injected_vector(hype_vcpu_ctx_t *ctx, uint8_t *out_vector) {
