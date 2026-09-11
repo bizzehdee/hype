@@ -70,6 +70,7 @@ Then archive the logs to `logs/boot1-intel/` and re-stage.
 | #689 | `SCRIPT vm2: PASS`, same for `\iso\ntfs-test.iso` and `ntfs-scratch.img`, `ntfsfix -n` clean | Intel leg met, same deviation |
 | #388 | `READBACK-MATCH` on run3d; host-side: the boot drive's four volumes unchanged | the write landed on the named stick and nowhere else |
 | #754 | `DIAG: GONE ... refused=` climbing after the pull; hype alive to `host off`; no resume after re-plug; stick `fsck` | the bridge-under-yank half of #747 |
+| #808 | `fw-1 TSCSKEW: apic=N ap-bsp=+Xus` per AP; `KBDDRAIN ... gap_recent= ... pumps=P foreign=F`; `BSPSTARVE ... kbddiag=` | run 14 on this machine printed a `gap_recent` that decoded to -1.2 s (two cores stamping one TSC). `TSCSKEW` in the seconds on any AP names a per-core TSC offset as the cause; tens of us on every AP says it was the AP pump, now turned away (`foreign` > 0). Either way `gap_recent` must now read in ms, and `kbddiag` well under the 173 ms run 14 measured here |
 | #788 | `HIDTICK[...] typematic=T rebounce=R [#788]` on the Pico's line against the doubled-character count from `KBDCHARS` | `T` tracking the doubles = hype's auto-repeat fires on an 8 ms stream; `R` tracking them = a duplicate at the report level; both 0 = downstream of the report diff |
 
 ## Re-staging afterwards

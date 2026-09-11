@@ -1220,3 +1220,29 @@ runs had an AP holding the USB lock. So the AP pump alone does not produce the w
 is specific to the i5 -- a per-core TSC offset is the standing candidate, and the BSP-vs-AP
 `rdtsc` delta probe (next, item 2 above) decides it. The BSP guard on the pump (item 1) stays
 correct regardless: two cores still drain the i8042 into one buffer.
+
+## Run 15 -- what it must show (`735c6fa` `5c6d5ab` `c1339fd`)
+
+Three changes from the two run-14 logs, all in the same build:
+
+1. **Pump on the owning core only** (`735c6fa`). `KBDDRAIN ... pumps=P foreign=F`: `F` counts the
+   AP calls turned away. Non-zero whenever an AP holds the USB lock. The 338 rig printed
+   `pumps=5127 foreign=339107`, so on hardware expect `F` >> `P`.
+2. **`TSCSKEW` per AP** (`5c6d5ab`). One line per AP start:
+   `fw-1 TSCSKEW: apic=N ap-bsp=+Xus`. Tens of us = synchronised (the trampoline tail; the
+   338 rig under KVM printed `-167us`). Seconds = a per-core TSC offset, which is what the i5's
+   wrapped `gap_recent` would then be.
+3. **Drain after every debug record** (`c1339fd`). `BSPSTARVE ... kbddiag=` max should fall
+   from 59 ms to single-digit ms, and `gap_recent=` should fall from 53 ms with it.
+
+| Read | Passes when |
+| --- | --- |
+| **`gap_recent=`** | below 10 ms once past bring-up; run 14 (AMD) settled at 53 ms |
+| **`kbddiag=`** max | well under 59 ms |
+| `foreign=` | non-zero; `gap_max`/`gap_recent` never near 7.06e9 us again on either machine |
+| `TSCSKEW` | every AP within tens of us of the BSP on the AMD laptop; on the i5, whatever it says IS the answer to the run-14 wrap |
+| `vars=` max | unchanged is fine (~1.5 s); the keyboard no longer waits for it |
+| `SCRIPT vm0: PASS` | as run 14 |
+
+Same procedure. The Intel boot 1 of the 2026-09-09 queue carries the same build and reads the
+same lines, so the i5's `TSCSKEW` comes from that boot.
