@@ -3637,10 +3637,18 @@ void hype_vmx_apicv_sync_timer(hype_vcpu_ctx_t *ctx, uint32_t current_count) {
     if (real == 0 || !real->apicv) return;
 #if HYPE_ENABLE_APICV
     { /* bring-up probe: prove the sync runs, against which page, with moving values */
-        static unsigned sync_probe;
-        if (sync_probe < 3u || (sync_probe % 100000u) == 0u) {
-            hype_debug_print("vmx apicv-sync #%u: page=%llx ccr=%u\n", sync_probe,
+        /* A count modulus is no gate under an exit storm: boot 1 on the i5 ran this 1e9 times
+         * (HLT storm, #708) and the 1-in-100000 print landed 69,693 lines. Time-gated instead:
+         * first three, then one per ~6.5 s (2^34 cycles, no hz needed here). */
+        static unsigned long long sync_probe, sync_last_tsc;
+        uint32_t lo, hi;
+        uint64_t now;
+        __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+        now = ((uint64_t)hi << 32) | lo;
+        if (sync_probe < 3u || now - sync_last_tsc > (1ull << 34)) {
+            hype_debug_print("vmx apicv-sync #%llu: page=%llx ccr=%u\n", sync_probe,
                              (unsigned long long)(uintptr_t)real->vapic, current_count);
+            sync_last_tsc = now;
         }
         sync_probe++;
     }

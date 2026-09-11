@@ -19778,9 +19778,23 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         if (kind == HYPE_VMM_KIND_VMX && info.reason == HYPE_VMX_EXIT_REASON_APIC_WRITE) {
             uint32_t aw_off = (uint32_t)(info.qualification & 0xFFFu);
 #if HYPE_ENABLE_APICV
-            hype_debug_print("vmx apicv-wr: off=0x%x val=0x%x rip=0x%llx\n", aw_off,
-                             hype_vmx_apicv_read32(ctx, aw_off),
-                             (unsigned long long)info.guest_rip); /* bring-up probe */
+            {
+                /*
+                 * Bring-up probe, rate-limited: boot 1 on the i5 printed it 210,129 times (one
+                 * per TMICT re-arm of a guest that never left its idle loop) -- 23 MB of log,
+                 * two thirds of every line. First 64 writes in full, then one line per ~6.5 s
+                 * (2^34 cycles) with the count of what was skipped.
+                 */
+                static unsigned long long aw_seen, aw_last_tsc;  /* #563 one-per-host: a probe budget, not VM state */
+                uint64_t aw_now = hype_rdtsc();
+                aw_seen++;
+                if (aw_seen <= 64ull || aw_now - aw_last_tsc > (1ull << 34)) {
+                    hype_debug_print("vmx apicv-wr: off=0x%x val=0x%x rip=0x%llx (seen=%llu)\n",
+                                     aw_off, hype_vmx_apicv_read32(ctx, aw_off),
+                                     (unsigned long long)info.guest_rip, aw_seen);
+                    aw_last_tsc = aw_now;
+                }
+            }
 #endif
             (void)hype_guest_lapic_write(&g_fw_1_lapic, aw_off, 4u,
                                          hype_vmx_apicv_read32(ctx, aw_off));
