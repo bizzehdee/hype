@@ -80,6 +80,14 @@ void hype_debug_print(const char *fmt, ...);
  */
 void hype_debug_print_always(const char *fmt, ...);
 void hype_debug_vprint_always(const char *fmt, va_list ap);
+/*
+ * #808: called once after every record is out on both sinks. The 10-second diagnostics dump
+ * held the BSP for 59 ms (`BSPSTARVE kbddiag=`) against an i8042 that buffers one byte; a record
+ * is at most 512 bytes, so a keyboard drain between records bounds the blind window to one
+ * record's serial time. The callee must not log (it would recurse once) and must be cheap on
+ * every core, because this runs under every debug line hype prints.
+ */
+void hype_debug_set_record_yield(void (*yield)(void));
 void hype_debug_set_level(hype_log_level_t level);
 hype_log_level_t hype_debug_get_level(void);
 int hype_debug_level_enabled(hype_log_level_t level);

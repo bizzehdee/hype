@@ -209,6 +209,10 @@ int hype_debug_level_enabled(hype_log_level_t level) {
  * for hype_fatal(), which must never be filtered: a panic that the log level swallowed would be the
  * worst bug this file could have.
  */
+static void (*g_debug_record_yield)(void);
+
+void hype_debug_set_record_yield(void (*yield)(void)) { g_debug_record_yield = yield; }
+
 void hype_debug_print(const char *fmt, ...) {
     va_list ap;
     if (!hype_log_level_enabled(g_hype_log_level, HYPE_LOG_DEBUG)) {
@@ -274,5 +278,8 @@ void hype_debug_vprint_always(const char *fmt, va_list ap_in) {
         if (!g_gop_deferred) {
             hype_gop_flush(hype_fatal_get_gop_protocol(), gop, hype_fatal_get_real_fb());
         }
+    }
+    if (g_debug_record_yield != 0) {
+        g_debug_record_yield(); /* #808: outside the logbuf lock, after both sinks */
     }
 }
