@@ -1188,3 +1188,35 @@ give microseconds. Either this i5's cores carry a ~1.2 s TSC offset, or somethin
 2. Log the BSP-vs-AP `rdtsc` delta per AP at bring-up (one exchange through the mailbox). That
    decides skew against race with one line per core.
 3. Run 14 proper on the AMD laptop, so `gap_recent` compares with run 13's 1.24 s.
+
+
+## Result -- run 14 (AMD laptop), 2026-09-11, build `a6c4154-dirty` (logs in `logs/bootAMDL0-14/`)
+
+**The 1.24 s window is gone.** 6.5 minutes (rtc 10:18:56 to `all guests down -- powering off`),
+`host off` typed and honoured, 200 `TERMCMD`, log complete.
+
+```
+KBDDRAIN: calls=618123 | ... | gap_max=524057us ... | gap_recent=53471us over5ms=56 irq1_last=5145ms ago pumps=55596
+BSPSTARVE >5ms: render=12(max 8ms) input=1(max 13ms) kbddiag=39(max 59ms) flush=30(max 167ms) vars=33(max 1518ms)
+USBLOCK: acquires=24810 spins=858935600 avg=34620 max=845120524 on apic=3
+SCRIPT vm0: PASS pass (21 directive(s), 83914ms)
+VARS: vars-run1a.bin saved (540672 bytes)
+```
+
+| Read | Result |
+| --- | --- |
+| **`gap_recent=`** | 31 samples. Bring-up 524,057 us (once, as every run). Then **3,041 .. 60,871 us**, settling at 53,0xx-53,8xx us for the last 14 samples. Run 13's 1,237,713 us does not recur. **PASS** |
+| **`pumps=`** | 55,596 (run 13: 5,019). Both hooks live |
+| `BSPSTARVE vars=` | max **1518 ms** -- unchanged from run 13's 1406. Expected in hindsight: the yield does not shorten the varstore write, it drains the keyboard *inside* it. The phase still holds the BSP; the keyboard no longer waits for it |
+| `kbddiag=` | max 59 ms, and `gap_recent` settles at 53 ms -- the next target, as the card said |
+| `vars-run1a.bin` | 540,672 bytes, saved |
+| `SCRIPT vm0: PASS` | **yes, on the AMD laptop**, 83.9 s to `reboot-pin-nonbsp`. First AMD PASS since run 9 -- #803 evidence |
+| `USBLOCK` | held from apic 3 (an AP) with `max=845120524` spins -- 0.4 s at 2096 MHz. The AP pump ran here too |
+
+### Against the i5 run
+
+The same build printed a wrapped -1.2 s `gap_recent` on the i5 and a clean 53 ms here, and both
+runs had an AP holding the USB lock. So the AP pump alone does not produce the wrap; the -1.2 s
+is specific to the i5 -- a per-core TSC offset is the standing candidate, and the BSP-vs-AP
+`rdtsc` delta probe (next, item 2 above) decides it. The BSP guard on the pump (item 1) stays
+correct regardless: two cores still drain the i8042 into one buffer.
