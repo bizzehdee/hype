@@ -3428,6 +3428,19 @@ static hype_vmm_kind_t g_fw_1_kind;
  * business, reached through ops->enable_on (see vmm_ops.h). */
 static uint8_t (*g_ap_vmm_page)[4096];
 static volatile uint32_t g_fw_1_ap_vmm_ok;
+/*
+ * #808, run 14: the i5 printed a KBDDRAIN gap that decoded to -1.2 s, steady across 50 samples,
+ * with two cores stamping one TSC variable; the AMD laptop, same build, same two-core pattern,
+ * printed 53 ms. Interleaving on one synchronised TSC gives microseconds, so the standing
+ * candidate is a per-core TSC offset on that machine -- and hype had no measurement of it.
+ *
+ * One slot, not per-AP: bring-up is sequential on the BSP (the trampoline page is shared), the
+ * AP writes it on C entry, the BSP reads it before the next start. The BSP stamps its own TSC
+ * the moment the trampoline's alive flag was seen; the AP stamps on entering fw_1_ap_main(),
+ * which is the trampoline's tail later -- tens of microseconds, so a reading in the seconds is
+ * skew and a reading in the tens of us is none.
+ */
+static volatile uint64_t g_fw_1_ap_entry_tsc;
 /* AP-bring-up result, latched so the diag tick can re-emit it after the one-shot
  * AP-SMOKETEST line has scrolled out of the live display.
  * -2 = smoketest not reached; -3 = skipped (no <1MB trampoline page);
@@ -3911,7 +3924,43 @@ static unsigned fw_1_vcpu_slot(unsigned vm_idx, unsigned vcpu_idx) {
     return vm_idx * HYPE_MAX_VCPUS_PER_VM + vcpu_idx;
 }
 
+static void fw_1_ap_main(void *arg);
+
+/* #808: hype_ap_start() plus the BSP-vs-AP TSC delta line. Every AP start goes through here so
+ * a machine with skewed cores says so once per core, at bring-up, in the log. */
+static int fw_1_ap_start_probed(uint8_t apic_id, unsigned slot, void *arg, uint64_t tsc_hz) {
+    int rc;
+    uint64_t bsp_tsc;
+    g_fw_1_ap_entry_tsc = 0ull;
+    rc = hype_ap_start((volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE, apic_id,
+                       (void *)(uintptr_t)g_ap_tramp_page, g_ap_cr3,
+                       (uint64_t)(uintptr_t)(g_ap_stacks[slot] + HYPE_AP_STACK_BYTES),
+                       tsc_hz, fw_1_ap_main, arg, g_hype_nx_supported);
+    bsp_tsc = hype_rdtsc();
+    if (rc == 0 && tsc_hz != 0ull) {
+        uint64_t limit = tsc_hz / 20ull; /* 50 ms: the AP is already in long mode */
+        uint64_t ap_tsc = 0ull;
+        while (hype_rdtsc() - bsp_tsc < limit) {
+            ap_tsc = g_fw_1_ap_entry_tsc;
+            if (ap_tsc != 0ull) break;
+            __asm__ volatile("pause");
+        }
+        if (ap_tsc == 0ull) {
+            hype_debug_print("fw-1 TSCSKEW: apic=%u -- AP did not reach C entry within 50 ms "
+                             "[#808]\n", (unsigned)apic_id);
+        } else {
+            long long delta_us = (long long)(ap_tsc - bsp_tsc) * 1000000ll / (long long)tsc_hz;
+            hype_debug_print("fw-1 TSCSKEW: apic=%u ap-bsp=%s%lldus (tens of us = synchronised, "
+                             "the trampoline tail; seconds = a per-core TSC offset) [#808]\n",
+                             (unsigned)apic_id, (delta_us < 0) ? "-" : "+",
+                             (delta_us < 0) ? -delta_us : delta_us);
+        }
+    }
+    return rc;
+}
+
 static void fw_1_ap_main(void *arg) {
+    g_fw_1_ap_entry_tsc = hype_rdtsc(); /* #808 TSCSKEW probe -- first thing, see the slot */
     /* STEP 2: `arg` is this core's VM index (0 => g_vms[0] on AP1, 1 =>
      * g_vms[1] on AP2). Selects this core's guest, its own SVM host-save area,
      * and (below) its host_tsc_hz for the LAPIC-timer calibration. */
@@ -24645,11 +24694,8 @@ static int fw_1_start_new_vm(unsigned vi) {
         if (sel < 0) {
             continue;
         }
-        rc = hype_ap_start((volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE,
-                           (uint8_t)sel, (void *)(uintptr_t)g_ap_tramp_page, g_ap_cr3,
-                           (uint64_t)(uintptr_t)(g_ap_stacks[slot] + HYPE_AP_STACK_BYTES),
-                           g_vms[0].host_tsc_hz, fw_1_ap_main, (void *)FW_1_AP_ARG(vi, cv),
-                           g_hype_nx_supported);
+        rc = fw_1_ap_start_probed((uint8_t)sel, slot, (void *)FW_1_AP_ARG(vi, cv),
+                                  g_vms[0].host_tsc_hz);
         HYPE_LOGF(HYPE_LOG_INFO, "fw-1 CREATE: vm%u vCPU %u on apic=%d -> rc=%d [#486]\n", vi, cv, sel, rc);
         if (rc == 0) {
             started++;
@@ -30592,12 +30638,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                 g_ap_slot_apic_id[vi] = id;
                                 g_ap_slot_valid[vi] = 1;
                             }
-                            rc = hype_ap_start(
-                                (volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE, id,
-                                (void *)(uintptr_t)g_ap_tramp_page, g_ap_cr3,
-                                (uint64_t)(uintptr_t)(g_ap_stacks[slot] + HYPE_AP_STACK_BYTES),
-                                g_fw_1_host_tsc_hz, fw_1_ap_main,
-                                (void *)FW_1_AP_ARG(vi, cv), g_hype_nx_supported);
+                            rc = fw_1_ap_start_probed(id, slot, (void *)FW_1_AP_ARG(vi, cv),
+                                                      g_fw_1_host_tsc_hz);
                             if (cv == 0u) {
                                 if (vi == 0u) g_fw_1_ap_rc = rc;
                                 else if (vi == 1u) g_fw_1_ap2_rc = rc;
