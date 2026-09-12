@@ -258,3 +258,24 @@ fw-1 VIEWSWITCH: view=0 complete in 28ms over 1 render passes; debug_gop_writes=
 | new | **Host lockup** right after a view switch to vm0 while all three guests hit the USB drive (`run2n` bulk write, `run2c`/`run2e` ISO reads). The BSP logged nothing after `VIEWSWITCH ... complete`; only guest-core EOI lines follow. No `#803` abandon, no USB lock timeout, no `PANIC`. The BSP's USB lock and the BOT retry ladder are both bounded, so a wedged USB transfer alone should not have taken the dashboard down. Cause not established |
 | probe | `main.c` reason-45 probe printed 3,033 unthrottled lines (serial EOIs) and pushed the log 43 KB behind before the freeze. Now time-gated |
 | #815 #599 | not re-read (22 s run) |
+
+## #817 -- AP stack overflow, and what the next i5 boot must show
+
+Found while building a QEMU rig for the freeze above: `fw_1_resolve_on_any_fs()` had a 19,160-byte
+frame on a VM core's 16 KiB AP stack, so every file-backed disk and ISO resolve ran ~15 KB past the
+bottom of its slot. In QEMU that returned to address 0 and halted the core; where the memory below
+is live it corrupts it silently -- and on this machine all three VMs resolved their disks on AP
+cores just before the freeze. **Unproven as the freeze's cause.** Fixed in `c69112e`; every AP stack
+is now painted and checked.
+
+QEMU after the fix (`tools/708/run-708-viewswitch.sh`, three VMs, 16 KiB stacks): all three disks
+attached, `SCRIPT vm0/vm1/vm2: PASS`, both 64 MB bulk writes `BULK-0`, the console switched into vm0
+and back twice during the load, the BSP kept running, no `APSTACK OVERFLOW`, deepest slot 10,920 B.
+
+| Read | Passes when |
+| --- | --- |
+| `fw-1 APSTACK OVERFLOW: vm.. vCPU .. (slot ..)` | never printed |
+| `fw-1 APSTACK: bytes used of 16384 by slot: ...` (every ~30 s) | every slot well under 16384 -- record the deepest |
+| the operator switches to vm0 during `run2n`'s bulk write, then back with the chord | the switch back works and the log carries on |
+| `SCRIPT vm0/vm1/vm2: PASS`, `EXT4-WRITE-DONE`, `NTFS-WRITE-DONE` | all three guests finish (#708, #688, #689) |
+| `host off` at the end | `powering off the host`, no `PANIC` (#816 again) |
