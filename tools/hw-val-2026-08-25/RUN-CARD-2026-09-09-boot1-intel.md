@@ -149,3 +149,42 @@ cannot show the i5 failure. Only this machine can.
 | `memory map: N RuntimeServicesCode region(s) kept for the NX pass` | `N` = 1 (`[66] RuntimeServicesCode phys=0x3da3f000 pages=976`), no `TRUNCATED` |
 | `paging: NX applied to every host page except 2 executable range(s)` | 2, with `exec-exempt 0x3da3f000+0x3d0000 (UEFI RuntimeServicesCode)`; no `WARNING no RuntimeServicesCode` |
 | `fw-1 HOST: ... powering off the host` at `host off` | the machine powers off, or parks with `no host S5 path`. No `PANIC` after it |
+
+## Result -- 2026-09-12, build `dd22513-dirty`, Intel i5-13420H (logs in `logs/bootI5-boot1-2026-09-12/`)
+
+320 s (`FBSPEED t=320245ms`). APICv on every slot. Admission as the card expects: `run2c` two
+cores, `run2e` and `run2n` one each, `run3d` reserved and not started. Steps 3-6 did not run: no
+10-minute idle, no `flush`, no `start run3d`, no pull. The dashboard received `test`, `help`, a
+few words, then `host off`, which panicked (#816). No `TIMERSTALL`, no `WATCHDOG`. **No guest
+reached login**: all three stop after GRUB's `Booting 'Linux lts'`, as on 2026-09-11.
+
+```
+fw-1 TSCSYNC: apic=8 before=+1120929us adjust=-2927344800 ticks after=+0us   <- all 8 APs the same
+vmx apicv-eoi: 363 lines -- vec=0x20 x106, 0x31 x3, 0xec x254; every one "bit clear"
+vmx apicv-state: gis=0x3030 virr: [1]=0x1001a isr: [1]=0x10000 | eoi-exits=22012 still_set=0 per-vec: 0x20=352 0x31=1 0xec=21659
+  virr [1]=0x1001a   <- 0x21 0x23 0x24 0x30 pending (all three VMs)
+  isr  [1]=0x10000   <- only 0x30 in service (2026-09-11: eight vectors)
+HLTSHADOW: bsp hlt exits with STI blocking=30257703 of those with RVI pending=30257703 | rvi wakes=30257703
+INTDIAG vm0/0: eventinj=1614217 ... IF=1 shadow=0x1        (vm1/0 2566960, vm2/0 1914789)
+vm0 vCPU 1/2/3, vm1 vCPU 1: SIPI received x10 each
+host-xhci: MSC identity serial='03025220071724203145' source=inquiry-vpd80   <- the 0781:5567 on port 9
+host-hid: no USB boot keyboard on any controller (PS/2 host keyboard only)
+```
+
+| Ticket | Result |
+| --- | --- |
+| #815 | **PASS.** `IA32_TSC_ADJUST supported`; every AP `before=+1120929us`, `adjust` -2.927e9 ticks, `after=+0us`. The offset differs from 2026-09-11 (+1.05 s); the sync measures it per boot. `gap_max` peaked at 278,685 us |
+| #599 probes | **PASS.** Log 1.46 MB, 13,980 lines (2026-09-11: 23 MB). `apicv-wr` 115 lines for `seen=85940`; `apicv-sync` 338 lines |
+| #708 | **FAIL, answered.** The EOI-exit bitmap is all ones (`vmcs_hw.c`, since 2d2e40f), so every guest EOI exits. EOI virtualization works: 0x20, 0x31 and 0xec EOIs exit and clear their VISR bit, `still_set=0` in every dump. **There is no EOI exit for 0x30 at all** while SVI stays 0x30. The guest never EOIs 0x30, so PPR 0x30 holds back IRQ0 and every 0x2x vector |
+| #599 bar, #605 | not met; signature on #708 |
+| #688 #689 | not met: no `EXT4-WRITE-DONE` / `NTFS-WRITE-DONE` |
+| #388 #754 | not exercised. The 0781:5567 on port 9 reads `03025220071724203145`. The Cruzer Blade reads `4C530201070308103214` through the same inquiry-vpd80 path on boots 32-40 and 387-reg, and on the bench. A different stick was plugged in; `run3d`'s `id_match` would not have matched. Config left unchanged |
+| #788 | no data: no USB keyboard enumerated. USB devices: 13d3:54b1, 8087:0026, 0781:5567, 152d:1561 (the hw-val drive) |
+| #808 | `gap_recent` median 31.3 ms (30.9 to 279 ms, the 279 ms sample at bring-up), `foreign=46662`, `TMRLATE worst_late` max 474 ms (vm0/0; run 14: 7 s). **`kbddiag` max 407 ms: not under run 14's 173 ms** |
+| #816 | `host off` PANIC inside `ResetSystem()`: fixed in abb15a8, needs the next i5 boot |
+
+### What decides #708 next
+
+Find what puts 0x30 in service without the guest's handler running to its EOI. First check:
+whether VM-entry event injection (`eventinj` 1.6-2.6 M per BSP with APICv on) still carries
+IO-APIC vectors alongside the vIRR/RVI post.
