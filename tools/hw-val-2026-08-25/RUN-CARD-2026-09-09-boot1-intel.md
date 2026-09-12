@@ -4,7 +4,8 @@ Plan: `docs/hw-validation-queue-2026-09-09.md`, boot 1. Tickets: #599 #605 #708,
 (Intel legs), #388 #754, and a #788 sample.
 
 **The Intel box's only NVMe is the user's BitLocker Windows install.** Nothing in this run names
-a physical target except the 8 GB SanDisk scratch stick (hype serial `4C530201070308103214`).
+a physical target except the SanDisk scratch stick left plugged into the i5 (USB 0781:5567, hype
+serial `03025220071724203145`; retargeted 2026-09-12 from the Cruzer Blade `4C530201070308103214`).
 Boot from the hw-val drive, nothing else.
 
 Build: **APICv** (`-DHYPE_ENABLE_APICV=1`) is the active `\EFI\BOOT\BOOTX64.EFI`; default and
@@ -14,7 +15,7 @@ VMs, `run3d` not autostarted. Scripts `\input\vm0..3.txt` = `input-2h/`.
 ## Plug in, in this order
 
 1. The hw-val drive (boot medium). Four partitions: `HYPEBOOT` FAT32, exFAT, ext4, NTFS.
-2. The 8 GB SanDisk scratch stick. **Its contents are destroyed by step 6.**
+2. The SanDisk scratch stick already in the i5. **Its contents are destroyed by step 6.**
 3. The Pico keyboard (the #788 sample) and the Keychron to type on.
 
 ## Before you boot
@@ -22,7 +23,7 @@ VMs, `run3d` not autostarted. Scripts `\input\vm0..3.txt` = `input-2h/`.
 - Banner sha matches the staging output.
 - `vmx: apicv=ON (slot 0) ... (HYPE_ENABLE_APICV set)`. If it prints `apicv=off`, the part did
   not grant the controls; note it and go on -- steps 3-6 do not depend on it.
-- `media: registered host device N = usb serial='4C530201070308103214'` -- the scratch stick is
+- `media: registered host device N = usb serial='03025220071724203145'` -- the scratch stick is
   seen. Without it step 6 cannot run; re-seat it and cold boot.
 - Admission grants `run2c` two cores, `run2e` and `run2n` one each.
 
@@ -178,7 +179,7 @@ host-hid: no USB boot keyboard on any controller (PS/2 host keyboard only)
 | #708 | **FAIL, answered.** The EOI-exit bitmap is all ones (`vmcs_hw.c`, since 2d2e40f), so every guest EOI exits. EOI virtualization works: 0x20, 0x31 and 0xec EOIs exit and clear their VISR bit, `still_set=0` in every dump. **There is no EOI exit for 0x30 at all** while SVI stays 0x30. The guest never EOIs 0x30, so PPR 0x30 holds back IRQ0 and every 0x2x vector |
 | #599 bar, #605 | not met; signature on #708 |
 | #688 #689 | not met: no `EXT4-WRITE-DONE` / `NTFS-WRITE-DONE` |
-| #388 #754 | not exercised. The 0781:5567 on port 9 reads `03025220071724203145`. The Cruzer Blade reads `4C530201070308103214` through the same inquiry-vpd80 path on boots 32-40 and 387-reg, and on the bench. A different stick was plugged in; `run3d`'s `id_match` would not have matched. Config left unchanged |
+| #388 #754 | not exercised. The 0781:5567 on port 9 reads `03025220071724203145`. The Cruzer Blade reads `4C530201070308103214` through the same inquiry-vpd80 path on boots 32-40 and 387-reg, and on the bench. A different stick was plugged in; `run3d`'s `id_match` would not have matched. `hype2h.cfg` and `hype3d.cfg` now target `03025220071724203145`, the stick that stays in the i5 |
 | #788 | no data: no USB keyboard enumerated. USB devices: 13d3:54b1, 8087:0026, 0781:5567, 152d:1561 (the hw-val drive) |
 | #808 | `gap_recent` median 31.3 ms (30.9 to 279 ms, the 279 ms sample at bring-up), `foreign=46662`, `TMRLATE worst_late` max 474 ms (vm0/0; run 14: 7 s). **`kbddiag` max 407 ms: not under run 14's 173 ms** |
 | #816 | `host off` PANIC inside `ResetSystem()`: fixed in abb15a8, needs the next i5 boot |
