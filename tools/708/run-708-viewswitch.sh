@@ -24,7 +24,7 @@ export LC_ALL=C
 cd "$(git rev-parse --show-toplevel)"
 
 VARIANT="${1:-default}"
-EFI="rig/stage-current/hype-$VARIANT.efi"
+EFI="${EFI:-rig/stage-current/hype-$VARIANT.efi}"
 S="${SCRATCH:-rig/708-view}"
 ISO=disk-images/hwval-data-2026-09-09/iso/test.iso
 HERE=tools/hw-val-2026-08-25
@@ -115,9 +115,13 @@ grep -a -E "SCRIPT vm[0-9]: (PASS|FAIL)" "$LOG" | cut -c1-160
 grep -a -E "vm[0-9] ttyS0\| (READBACK-MATCH|BULK-[0-9]+|EXT4-WRITE-DONE|NTFS-WRITE-DONE|BOOT-OK-)" "$LOG" | cut -c1-120
 echo "=== view switches ==="
 grep -a -n "VIEWSWITCH" "$LOG" | cut -c1-140
-first=$(grep -a -n -m1 "VIEWSWITCH: action" "$LOG" | cut -d: -f1)
+if ! grep -aq "vm2 ttyS0| READBACK-MATCH" "$LOG"; then
+  echo "INVALID: run2n never read back its signature, so the i5's load was never reached"; exit 2
+fi
+# A refused jump (VM not ready) logs "-> view=-1" and tests nothing.
+first=$(grep -a -n -m1 "VIEWSWITCH: action=2 -> view=0" "$LOG" | cut -d: -f1)
 if [ -z "$first" ]; then
-  echo "INVALID: no chord reached hype (no VIEWSWITCH) -- nothing was tested"; exit 2
+  echo "INVALID: the console never entered vm0 (no 'action=2 -> view=0') -- nothing was tested"; exit 2
 fi
 after=$(awk -v n="$first" 'NR>n && /FBSPEED: t=/' "$LOG" | wc -l)
 echo "FBSPEED lines after the first switch: $after"
