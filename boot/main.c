@@ -1,6 +1,7 @@
 #include "../core/efi_types.h"
 #include "../core/console.h"
 #include "../core/stack_protector.h"
+#include "../core/stack_watermark.h" /* #817 */
 #include "../core/fatal.h"
 #include "../core/gop.h"
 #include "../core/gop_mode.h"
@@ -8974,6 +8975,61 @@ static void fw_1_ctrl_silence_probe(unsigned int ctrl, unsigned int nsilent,
                      pr.cmd_timeouts);
 }
 
+/*
+ * #817: every AP stack slot's depth, measured against the paint laid down at allocation.
+ *
+ * The overflow line fires at once and once per slot: an overflowing core writes into the slot
+ * below it (another vCPU's live stack, or whatever sits under slot 0), so when it happened matters
+ * more than any summary. The depth summary is for sizing -- which paths come close -- every ~30 s.
+ */
+static void fw_1_ap_stack_check(uint64_t now_h, uint64_t hz) {
+    static uint64_t reported[8];
+    static uint64_t summary_last;
+    unsigned slots, s, touched = 0u, deepest_slot = 0u;
+    uint64_t deepest = 0u;
+    char buf[400];
+    int n;
+
+    if (g_ap_stacks == 0) {
+        return;
+    }
+    slots = g_max_vms * HYPE_MAX_VCPUS_PER_VM;
+    if (slots > 64u * 8u) {
+        slots = 64u * 8u;
+    }
+    n = hype_snprintf(buf, sizeof(buf), "fw-1 APSTACK: bytes used of %u by slot:",
+                      (unsigned)HYPE_AP_STACK_BYTES);
+    for (s = 0; s < slots; s++) {
+        uint64_t used = hype_stack_used(g_ap_stacks[s], HYPE_AP_STACK_BYTES);
+        if (used == 0u) {
+            continue;
+        }
+        touched++;
+        if (used > deepest) {
+            deepest = used;
+            deepest_slot = s;
+        }
+        if (n > 0 && (unsigned)n < sizeof(buf)) {
+            n += hype_snprintf(buf + n, sizeof(buf) - (unsigned)n, " %u=%llu", s,
+                               (unsigned long long)used);
+        }
+        if (hype_stack_guard_hit(used, HYPE_AP_STACK_BYTES) &&
+            (reported[s >> 6] & (1ull << (s & 63u))) == 0u) {
+            reported[s >> 6] |= 1ull << (s & 63u);
+            HYPE_LOGF(HYPE_LOG_ERROR,
+                      "fw-1 APSTACK OVERFLOW: vm%u vCPU %u (slot %u) used %llu of %u bytes -- it "
+                      "ran into the memory below its slot, which is now corrupt [#817]\n",
+                      s / HYPE_MAX_VCPUS_PER_VM, s % HYPE_MAX_VCPUS_PER_VM, s,
+                      (unsigned long long)used, (unsigned)HYPE_AP_STACK_BYTES);
+        }
+    }
+    if (touched != 0u && hz != 0ull && (summary_last == 0ull || now_h - summary_last >= hz * 30ull)) {
+        summary_last = now_h;
+        hype_debug_print("%s | deepest slot %u=%llu [#817]\n", buf, deepest_slot,
+                         (unsigned long long)deepest);
+    }
+}
+
 static void fw_1_hid_watch(uint64_t now_h, uint64_t hz) {
     static uint64_t watch_last;
     static unsigned long long prev_reports[HYPE_HOST_KBD_MAX];
@@ -9071,6 +9127,7 @@ static void fw_1_hid_watch(uint64_t now_h, uint64_t hz) {
 
     if (hz == 0ull || (watch_last != 0ull && now_h - watch_last < hz * 2ull)) return;
     watch_last = now_h;
+    fw_1_ap_stack_check(now_h, hz); /* #817: on the same two-second beat */
     /*
      * Log health, on the same two-second beat.
      *
@@ -10183,8 +10240,14 @@ static const char *fw_1_resolve_on_any_fs(const char *path, hype_file_map_t *out
      * guarantee those ranges carry.
      */
     if (hype_ntfs_probe(fatvol_read, 0) == 0) {
-        hype_ntfs_t ntfs;
-        hype_file_rmap_t rmap;
+        /*
+         * #817: static, not locals. These two are 12,912 + 6,168 bytes, and the compiler reserves
+         * a function's whole frame on entry -- so every resolve, FAT32 hits included, took a
+         * 19,160-byte frame on a VM core's 16 KiB AP stack and ran ~15 KB past its bottom. Both
+         * callers hold media_scan_lock(), the same reason the caller's hype_file_map_t is static.
+         */
+        static hype_ntfs_t ntfs;
+        static hype_file_rmap_t rmap;
         rmap.too_fragmented = 0;
         if (hype_ntfs_mount(fatvol_read, 0, &ntfs) == 0 &&
             hype_ntfs_resolve(&ntfs, path, &rmap) == 0 &&
@@ -28477,6 +28540,14 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      */
     g_ap_stacks = (uint8_t (*)[HYPE_AP_STACK_BYTES])(uintptr_t)fw_alloc_zeroed_pages(
         g_max_vms * HYPE_MAX_VCPUS_PER_VM * (HYPE_AP_STACK_BYTES / 4096u));
+    /* #817: painted before any AP runs, so fw_1_ap_stack_check() can measure each slot's depth
+     * and name an overflow instead of it corrupting the slot below in silence. */
+    if (g_ap_stacks != 0) {
+        unsigned s;
+        for (s = 0; s < g_max_vms * HYPE_MAX_VCPUS_PER_VM; s++) {
+            hype_stack_paint(g_ap_stacks[s], HYPE_AP_STACK_BYTES);
+        }
+    }
     vm = &g_vms[0];
     /*
      * INPUT-8 (#281): load each VM's expect script here, PRE-EBS, because this is the
