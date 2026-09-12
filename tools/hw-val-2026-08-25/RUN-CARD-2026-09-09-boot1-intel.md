@@ -189,3 +189,33 @@ host-hid: no USB boot keyboard on any controller (PS/2 host keyboard only)
 Find what puts 0x30 in service without the guest's handler running to its EOI. First check:
 whether VM-entry event injection (`eventinj` 1.6-2.6 M per BSP with APICv on) still carries
 IO-APIC vectors alongside the vIRR/RVI post.
+
+## Result -- 2026-09-12 (second), build `66ba1dc-dirty`, Intel i5-13420H (logs in `logs/bootI5-boot1-2026-09-12b/`)
+
+122 s (`FBSPEED t=122078ms`, rtc 21:50:02). Staged by `stage.sh --boot intelb` after the #816 and
+ext4-image fixes. Steps 3-6 did not run. Dashboard: `test`, `test`, `host off`. **No guest reached
+login**: all three stop after GRUB's `Booting 'Linux lts'`, with the same #708 signature.
+
+```
+memory map: 1 RuntimeServicesCode region(s) kept for the NX pass [#604]
+paging: NX applied to every host page except 2 executable range(s) [#604]
+paging:   exec-exempt 0x3da3f000+0x3d0000 (UEFI RuntimeServicesCode)
+fw-1 HOST: off requested -- shutting down 3 guest(s), grace 10s, force-off fallback [#175]
+fw-1 HOST: all guests down -- powering off the host [#175]          <- last line; PANIC=0, no "did not take"
+m5-8: FILE-backed guest disk \hype\disks\ext4-scratch.img on ext -- 1073741824 bytes, 2 extent(s), 2097152 sectors [writable, persists to the file]
+fw-1 TSCSYNC: apic=8 before=+1323090us adjust=-3455152795 ticks after=+0us   <- all 8 APs the same
+vmx apicv-state: gis=0x3030 virr: [1]=0x1001a isr: [1]=0x10000 | eoi-exits=12656 still_set=0 per-vec: 0x20=329 0x31=1 0xec=12326
+```
+
+| Ticket | Result |
+| --- | --- |
+| #816 | **PASS.** One RuntimeServicesCode region kept, 2 exempt ranges, `host off` reached `powering off the host` with no `PANIC` and no `did not take` line, so `ResetSystem()` did not return |
+| #688 | ext4 image now resolves (2 extents, writable): the `stage.sh` fix holds on hardware. Leg still not met: `run2e` never logged in |
+| #689 | not met: `run2n` never logged in (`ntfs-scratch.img` resolved as before) |
+| #708 | **FAIL, unchanged.** All three VMs end `gis=0x3030`, vIRR 0x21 0x23 0x24 0x30, vISR 0x30 only. EOI exits for 0x20 (322-352 per VM), 0x31 (1), 0xec; never 0x30; `still_set=0`. `HLTSHADOW` RVI wakes 11.5 M. `eventinj` 1.58-2.56 M per BSP. SIPI x10 on vm0 vCPU 1-3 and vm1 vCPU 1 |
+| #599 bar, #605 | not met; signature on #708 |
+| #815 | **PASS again.** `before=+1323090us` this boot (+1.12 s and +1.05 s on the earlier two), `after=+0us` on every AP |
+| #599 probes | 822 KB, 8,431 lines for 122 s. `apicv-wr` 82, `apicv-sync` 129, `apicv-eoi` 214 |
+| #808 | `gap_recent` median 31.3 ms, `foreign=42500`, `TMRLATE worst_late` max 474 ms. `kbddiag` max 405 ms: still not under 173 ms |
+| #388 #754 | not exercised (`run3d` not started). The SanDisk registered as `03025220071724203145`, which now matches `id_match` |
+| #788 | no data: no USB keyboard enumerated |
