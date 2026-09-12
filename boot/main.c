@@ -19897,13 +19897,17 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
 #if HYPE_ENABLE_APICV
             { /* bring-up probe: which vectors EOI through reason 45, and how often.
                  * A shared sample budget across VMs is fine for a probe: one-per-host (#563). */
-                static unsigned long long eoi45;
+                static unsigned long long eoi45, eoi45_last_tsc;
                 eoi45++;
                 uint64_t ev = info.qualification & 0xFFu;
-                if (eoi45 <= 8u || (eoi45 % 500u) == 0u ||
-                    (ev != 0xecu && ev != 0x20u && ev != 0x30u && ev != 0xefu)) {
+                uint64_t now45 = hype_rdtsc();
+                /* #708: time-gated, not by vector. Once the 8259 fix let 0x2x EOIs through, the
+                 * old "every non-timer vector" rule printed 3,033 lines (serial IRQs) and pushed
+                 * the log 43 KB behind just before the i5 froze -- the tail that was lost. */
+                if (eoi45 <= 8u || now45 - eoi45_last_tsc > (1ull << 34)) {
                     hype_debug_print("vmx apicv-eoi #%llu: vec=0x%llx\n", eoi45,
                                      (unsigned long long)ev);
+                    eoi45_last_tsc = now45;
                 }
             }
 #endif

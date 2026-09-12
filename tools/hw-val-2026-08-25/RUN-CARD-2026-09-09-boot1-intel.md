@@ -235,3 +235,26 @@ VM-entry injection under APICv. There is no Intel QEMU, so this boot is the firs
 | `per-vec: 0x20=...` across successive `apicv-state` records | still growing after the first `apicv-extint` line |
 | `SCRIPT vm0: PASS`, `fresh-boot-login`, `EXT4-WRITE-DONE`, `NTFS-WRITE-DONE` | `run2c`, `run2e` and `run2n` log in: #708, #599's bar, #605 and the #688/#689 Intel legs |
 | `apicv-extint` lines present but SVI still stuck at 0x30 | the fix did not cover the cause: record the `apicv-state` and `apicv-eoi` lines on #708 |
+
+## Result -- 2026-09-12 (third), build `11d8fd4-dirty`, Intel i5-13420H (logs in `logs/bootI5-boot1-2026-09-12c/`)
+
+rtc 22:31:50. **The #708 fix works; the host then locked up about 22 s in** (`FBSPEED t=22466ms` is
+the last). Operator: switched to vm0, saw a blank console with a cursor, the chord would not switch
+away, the USB-SATA LED stayed dark for ~30 s, powered off. The log ends mid-run with no `host off`
+and `behind=42933 B` never written.
+
+```
+vmx apicv-extint #1: vec=0x30 injected from the 8259, not posted | gis=0x0000 visr[1]=0x00000000 deferred=1 [#708]
+  (4 lines, all vec=0x30, VISR clear each time)
+vm2 ttyS0| Welcome to Alpine Linux 3.21 / localhost login: / READBACK-MATCH, then the 64 MB BULK dd started
+apicv-eoi exits by vector: 0x23=2099 0x24=835 0x20=105 0x25=39 0xec=30 0x21=22 0x26=6, still_set=0
+fw-1 VIEWSWITCH: action=4 -> view=0 (-1 = dashboard) [#363]
+fw-1 VIEWSWITCH: view=0 complete in 28ms over 1 render passes; debug_gop_writes=228 [#373 #380]   <- last BSP line
+```
+
+| Ticket | Result |
+| --- | --- |
+| #708 | **Fix confirmed.** 8259 vectors injected with VISR clear, SVI never stuck, 0x21-0x26 EOIs flow for the first time under APICv, `run2n` logged in and read back its signature -- the first guest login under APICv on this machine. Not closed: the host froze, and `run2c`/`run2e` had not had time to reach login (`run2n` took ~218 KB of log from `Booting` to `login:`; the others got ~195 KB before the log ends) |
+| new | **Host lockup** right after a view switch to vm0 while all three guests hit the USB drive (`run2n` bulk write, `run2c`/`run2e` ISO reads). The BSP logged nothing after `VIEWSWITCH ... complete`; only guest-core EOI lines follow. No `#803` abandon, no USB lock timeout, no `PANIC`. The BSP's USB lock and the BOT retry ladder are both bounded, so a wedged USB transfer alone should not have taken the dashboard down. Cause not established |
+| probe | `main.c` reason-45 probe printed 3,033 unthrottled lines (serial EOIs) and pushed the log 43 KB behind before the freeze. Now time-gated |
+| #815 #599 | not re-read (22 s run) |
