@@ -101,4 +101,17 @@ UINT64 hype_memmap_usable_bytes(const EFI_MEMORY_DESCRIPTOR *map, UINTN map_size
 UINT64 hype_memmap_largest_conventional_bytes(const EFI_MEMORY_DESCRIPTOR *map, UINTN map_size,
                                               UINTN desc_size);
 
+/*
+ * #604: copies every descriptor of one memory type out of the map as base/size pairs, so the
+ * caller can keep them after the map is freed. Writes at most `cap` entries and returns how many
+ * descriptors matched: a return above `cap` means the copy was truncated. Pure.
+ */
+typedef struct {
+    UINT64 base;
+    UINT64 size;
+} hype_memmap_range_t;
+
+UINTN hype_memmap_collect_type(const EFI_MEMORY_DESCRIPTOR *map, UINTN map_size, UINTN desc_size,
+                               UINT32 type, hype_memmap_range_t *out, UINTN cap);
+
 #endif /* HYPE_MEMMAP_H */

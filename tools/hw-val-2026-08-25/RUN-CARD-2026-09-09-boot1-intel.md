@@ -80,8 +80,10 @@ queue gets its own set once its config is written.
 
 ## Result -- 2026-09-11, build `8ab98e2-dirty`, Intel i5-13420H (logs in `logs/bootI5-boot1/`)
 
-16 minutes (rtc 11:24:25 to `all guests down -- powering off`), `host off` honoured, log intact
-at 23 MB. Admission fitted all four VMs; `run2c` `run2e` `run2n` autostarted, `run3d` was never
+16 minutes (rtc 11:24:25 to `all guests down -- powering off`), log intact at 23 MB. **`host off`
+was not honoured** (corrected 2026-09-12): the log ends in `PANIC: vector=14 (Page Fault)
+error_code=0x11 rip=0x3dd8b528 cr2=0x3dd8b528` inside `ResetSystem()`. The panic hook flushed the
+log, which is why it looked like a clean power-off. See #816. Admission fitted all four VMs; `run2c` `run2e` `run2n` autostarted, `run3d` was never
 started. **No guest reached login.** All three stopped after GRUB's `Booting 'Linux lts'`; the
 kernel ran (it programs its LAPIC timer from `rip=0x...091ffc` 210,000 times) and idled in
 `sti; hlt` for the whole run.
@@ -133,3 +135,17 @@ guest's EOIs for 0x20..0x30 reach EOI virtualization at all. Count reason-45 exi
 | `vmx apicv-eoi #n: vec=0x.. gis=0x.... visr[w]=0x........ -- bit clear/STILL SET` | the #708 answer: EOI exits for 0x20..0x30 with the bit clear = the EOIs virtualize and something else re-sets VISR; no EOI exits for those vectors at all = the guest's EOIs never reach EOI virtualization; STILL SET = the CPU left it |
 | `vmx apicv-state: ... \| eoi-exits=N still_set=M per-vec: 0xec=.. 0x30=..` | one record per dump now, per-vector histogram; `still_set` should be 0 |
 | `vmx apicv-wr ... (seen=N)` | at most 64 lines then one per ~6.5 s; the log stays in the hundreds of KB |
+
+## #816 -- `host off` panicked on both i5 boots (2026-09-11, 2026-09-12)
+
+The NX pass read `RuntimeServicesCode` from a memory map efi_main had already freed. On this
+machine the pool was reused, so only hype's image stayed executable and `ResetSystem()` faulted
+at `rip=cr2=0x3dd8b528`, `error_code=0x11`. The regions are now copied while the map is live.
+QEMU (4 host reboots through `ResetSystem`) passes, but its freed pool was never reused, so it
+cannot show the i5 failure. Only this machine can.
+
+| Read | Passes when |
+| --- | --- |
+| `memory map: N RuntimeServicesCode region(s) kept for the NX pass` | `N` = 1 (`[66] RuntimeServicesCode phys=0x3da3f000 pages=976`), no `TRUNCATED` |
+| `paging: NX applied to every host page except 2 executable range(s)` | 2, with `exec-exempt 0x3da3f000+0x3d0000 (UEFI RuntimeServicesCode)`; no `WARNING no RuntimeServicesCode` |
+| `fw-1 HOST: ... powering off the host` at `host off` | the machine powers off, or parks with `no host S5 path`. No `PANIC` after it |

@@ -3020,17 +3020,8 @@ static void fw_1_host_action_poll(void) {
             if (t175 == 0) {
                 t175 = hype_rdtsc() + (uint64_t)HYPE_175_AUTOTEST_SECS * hz175;
             } else if (hype_rdtsc() >= t175) {
-                g_host_action_reason = "the tag keyboard is dead and the log is failing";
+                g_host_action_reason = "HYPE_175_AUTOTEST_SECS elapsed";
                 (void)fw_1_host_action_begin(HYPE_HOST_ACTION_REBOOT);
-            } else if (quiet[k] == FW1_HID_DEAD_TICKS) {
-                hype_debug_print("fw-1 DEADMAN: the tag keyboard (%04x:%04x slot%u) is dead "
-                                 "after %llu revive(s) and %llu failed revive(s) -- NOT "
-                                 "rebooting, the log is healthy and the rest of the run is "
-                                 "worth more than the salvage [#175 #452]\n",
-                                 (unsigned)kb->vid, (unsigned)kb->pid, kb->slot,
-                                 hype_xhci_int_in_revives((hype_xhci_ctrl_t *)&kb->xc,
-                                                          kb->slot, kb->ep),
-                                 rfail);
             }
         }
     }
@@ -27966,14 +27957,23 @@ static void fw_alloc_vm_aux_arena(EFI_BOOT_SERVICES *bs) {
  * and where they sit is the firmware's business. RuntimeServicesDATA is deliberately NOT
  * exempted: nothing executes out of it, and exempting data would give away most of what the
  * NX pass is for.
+ *
+ * The regions are copied out while the map is live (efi_main, right after the dump), not read
+ * from the map here. Both NX passes run after efi_main's FreePool(map). Reading the freed pool
+ * is what cost the Intel i5 boots of 2026-09-11 and 2026-09-12: later allocations overwrote the
+ * descriptors, the pass exempted only the image, and `host off` faulted inside ResetSystem() at
+ * rip == cr2 = 0x3dd8b528, error_code=0x11. The AMD machines passed only because their freed pool
+ * was not reused.
  */
+#define HYPE_RT_CODE_MAX (HYPE_PAGING_MAX_EXEC_RANGES - 2u)
+static hype_memmap_range_t g_rt_code[HYPE_RT_CODE_MAX];
+static UINTN g_rt_code_found;
+
 static unsigned int fw_1_exec_exempt_ranges(hype_exec_range_t *out, unsigned int cap,
-                                            const EFI_MEMORY_DESCRIPTOR *map, UINTN map_size,
-                                            UINTN desc_size, uint64_t tramp_page) {
+                                            uint64_t tramp_page) {
     unsigned int n = 0;
-    UINTN count = (desc_size > 0) ? (map_size / desc_size) : 0;
+    UINTN kept = (g_rt_code_found < HYPE_RT_CODE_MAX) ? g_rt_code_found : HYPE_RT_CODE_MAX;
     UINTN i;
-    const UINT8 *base = (const UINT8 *)map;
 
     if (out == 0 || cap == 0) {
         return 0;
@@ -27988,13 +27988,9 @@ static unsigned int fw_1_exec_exempt_ranges(hype_exec_range_t *out, unsigned int
         out[n].size = 4096ULL;
         n++;
     }
-    for (i = 0; i < count && n < cap; i++) {
-        const EFI_MEMORY_DESCRIPTOR *d = (const EFI_MEMORY_DESCRIPTOR *)(base + i * desc_size);
-        if (d->Type != EfiRuntimeServicesCode) {
-            continue;
-        }
-        out[n].base = d->PhysicalStart;
-        out[n].size = d->NumberOfPages * 4096ULL;
+    for (i = 0; i < kept && n < cap; i++) {
+        out[n].base = g_rt_code[i].base;
+        out[n].size = g_rt_code[i].size;
         n++;
     }
     return n;
@@ -28222,6 +28218,12 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     }
 
     hype_memmap_dump(hype_debug_print, map, map_size, desc_size);
+    g_rt_code_found = hype_memmap_collect_type(map, map_size, desc_size, EfiRuntimeServicesCode,
+                                               g_rt_code, HYPE_RT_CODE_MAX);
+    hype_debug_print("memory map: %llu RuntimeServicesCode region(s) kept for the NX pass%s "
+                     "[#604]\n", (unsigned long long)g_rt_code_found,
+                     (g_rt_code_found > HYPE_RT_CODE_MAX) ? " -- TRUNCATED, ResetSystem() may fault"
+                                                          : "");
     /* RAM-1: computed here, before the map is freed, so the admission
      * check ahead of the guest-RAM allocation below is against this
      * machine's own real usable RAM, not a guess. */
@@ -28817,7 +28819,6 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
             if (g_hype_nx_supported) {
                 hype_exec_range_t ex[HYPE_PAGING_MAX_EXEC_RANGES];
                 unsigned int nex = fw_1_exec_exempt_ranges(ex, HYPE_PAGING_MAX_EXEC_RANGES,
-                                                           map, map_size, desc_size,
                                                            g_ap_tramp_page);
                 hype_paging_apply_nx(ap_pd, HYPE_PAGING_MAX_GB, ex, nex);
             }
@@ -29042,12 +29043,16 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
      */
     if (g_hype_nx_supported) {
         hype_exec_range_t ex[HYPE_PAGING_MAX_EXEC_RANGES];
-        unsigned int nex = fw_1_exec_exempt_ranges(ex, HYPE_PAGING_MAX_EXEC_RANGES,
-                                                   map, map_size, desc_size, 0);
+        unsigned int nex = fw_1_exec_exempt_ranges(ex, HYPE_PAGING_MAX_EXEC_RANGES, 0);
         unsigned int k;
         hype_paging_apply_nx(g_pd, HYPE_PAGING_MAX_GB, ex, nex);
         hype_debug_print("paging: NX applied to every host page except %u executable range(s) "
                          "[#604]\n", nex);
+        if (g_rt_code_found == 0) {
+            hype_debug_print("paging: WARNING no RuntimeServicesCode region exempted -- "
+                             "ResetSystem() will fault, so `host off` / `host reboot` will "
+                             "panic [#604]\n");
+        }
         for (k = 0; k < nex; k++) {
             hype_debug_print("paging:   exec-exempt 0x%llx+0x%llx%s\n",
                              (unsigned long long)ex[k].base, (unsigned long long)ex[k].size,

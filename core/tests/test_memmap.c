@@ -488,7 +488,81 @@ static void test_largest_conventional_block(void) {
     CHECK_INT("empty map -> 0", 0ULL, hype_memmap_largest_conventional_bytes(m, 0, sizeof(m[0])));
 }
 
+/*
+ * #604 regression, Intel i5 boots 2026-09-11 and 2026-09-12. The NX pass read
+ * RuntimeServicesCode out of a memory map efi_main had already freed, found none, and
+ * `host off` faulted inside ResetSystem() at rip == cr2 = 0x3dd8b528, error_code=0x11. The
+ * regions are now copied out while the map is live. This checks the copy: the i5's region is
+ * kept with the right extent, the copy stands on its own once the map buffer is overwritten,
+ * and firmware's larger descriptor stride is honoured.
+ */
+static void test_collect_runtime_code(void) {
+    enum { STRIDE = sizeof(EFI_MEMORY_DESCRIPTOR) + 8 };
+    UINT8 raw[STRIDE * 4];
+    EFI_MEMORY_DESCRIPTOR d;
+    hype_memmap_range_t out[2];
+    UINTN found;
+    unsigned i;
+    static const struct { UINT32 type; UINT64 start; UINT64 pages; } src[4] = {
+        {EfiBootServicesCode, 0x3ca81000ULL, 4030},
+        {EfiRuntimeServicesCode, 0x3da3f000ULL, 976},
+        {EfiRuntimeServicesData, 0x3de0f000ULL, 3280},
+        {EfiRuntimeServicesCode, 0x80000000ULL, 16},
+    };
+
+    memset(raw, 0xa5, sizeof(raw));
+    for (i = 0; i < 4; i++) {
+        memset(&d, 0, sizeof(d));
+        d.Type = src[i].type;
+        d.PhysicalStart = src[i].start;
+        d.NumberOfPages = src[i].pages;
+        memcpy(raw + i * STRIDE, &d, sizeof(d));
+    }
+    memset(out, 0, sizeof(out));
+    found = hype_memmap_collect_type((const EFI_MEMORY_DESCRIPTOR *)raw, sizeof(raw), STRIDE,
+                                     EfiRuntimeServicesCode, out, 2);
+    memset(raw, 0, sizeof(raw));
+
+    CHECK_INT("two RuntimeServicesCode regions found", 2, found);
+    if (out[0].base != 0x3da3f000ULL || out[0].size != 976ULL * 4096ULL) {
+        printf("FAIL: i5 runtime code region not kept: 0x%llx+0x%llx\n",
+               (unsigned long long)out[0].base, (unsigned long long)out[0].size);
+        failures++;
+    }
+    if (out[0].base > 0x3dd8b528ULL || out[0].base + out[0].size <= 0x3dd8b528ULL) {
+        printf("FAIL: kept region does not cover the faulting ResetSystem rip\n");
+        failures++;
+    }
+    if (out[1].base != 0x80000000ULL || out[1].size != 16ULL * 4096ULL) {
+        printf("FAIL: second runtime code region wrong: 0x%llx+0x%llx\n",
+               (unsigned long long)out[1].base, (unsigned long long)out[1].size);
+        failures++;
+    }
+
+    memset(out, 0, sizeof(out));
+    for (i = 0; i < 4; i++) {
+        memset(&d, 0, sizeof(d));
+        d.Type = EfiRuntimeServicesCode;
+        d.PhysicalStart = 0x1000ULL * (i + 1);
+        d.NumberOfPages = 1;
+        memcpy(raw + i * STRIDE, &d, sizeof(d));
+    }
+    found = hype_memmap_collect_type((const EFI_MEMORY_DESCRIPTOR *)raw, sizeof(raw), STRIDE,
+                                     EfiRuntimeServicesCode, out, 1);
+    CHECK_INT("truncation reports every match", 4, found);
+    CHECK_INT("truncation writes only cap entries", 0, (int)out[1].base);
+
+    CHECK_INT("NULL map -> 0", 0, hype_memmap_collect_type(0, 64, 8, EfiRuntimeServicesCode, out, 2));
+    CHECK_INT("desc_size 0 -> 0", 0,
+              hype_memmap_collect_type((const EFI_MEMORY_DESCRIPTOR *)raw, 64, 0,
+                                       EfiRuntimeServicesCode, out, 2));
+    CHECK_INT("NULL out still counts", 4,
+              hype_memmap_collect_type((const EFI_MEMORY_DESCRIPTOR *)raw, sizeof(raw), STRIDE,
+                                       EfiRuntimeServicesCode, 0, 0));
+}
+
 int main(void) {
+    test_collect_runtime_code();
     test_largest_conventional_block();
     test_type_name();
     test_get_success();
