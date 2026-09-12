@@ -5334,6 +5334,17 @@ static void vmm_request_interrupt(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
     }
     vmm_sync_lapic_isr(kind, ctx, lapic);
 }
+/* #708: a vector the guest's 8259 acknowledged. Under Intel APICv it is injected, never posted to
+ * the virtual-APIC page (hype_vmx_vcpu_request_extint); SVM already injects every vector. */
+static void vmm_request_pic_interrupt(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx,
+                                      hype_guest_lapic_t *lapic, uint8_t vector) {
+    if (kind == HYPE_VMM_KIND_VMX) {
+        hype_vmx_vcpu_request_extint(ctx, vector);
+    } else {
+        hype_svm_vcpu_request_interrupt(ctx, vector);
+    }
+    vmm_sync_lapic_isr(kind, ctx, lapic);
+}
 static int vmm_reason_is_intr_window(hype_vmm_kind_t kind, uint64_t reason) {
     return kind == HYPE_VMM_KIND_VMX ? (reason == HYPE_VMX_EXIT_REASON_INTERRUPT_WINDOW)
                                      : (reason == HYPE_SVM_EXITCODE_VINTR);
@@ -19234,7 +19245,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
         if (!vmm_deliver_pending_if_ready(kind, ctx, &g_fw_1_lapic)) {
             uint8_t pic_vector;
             if (hype_pic_emu_acknowledge(&g_fw_1_pic, &pic_vector)) {
-                vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, pic_vector);
+                vmm_request_pic_interrupt(kind, ctx, &g_fw_1_lapic, pic_vector); /* #708 */
                 vmm_note_pic_pending(kind, ctx, pic_vector); /* #512: prunable if masked later */
                 /* Attribute by the master vector base: IRQ0 = PIT
                  * clockevent, anything else = the AHCI line. */
@@ -21009,7 +21020,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     if (!vmm_deliver_pending_if_ready(kind, ctx, &g_fw_1_lapic)) { /* #364 */
                         uint8_t v;
                         if (hype_pic_emu_acknowledge(&g_fw_1_pic, &v)) {
-                            vmm_request_interrupt(kind, ctx, &g_fw_1_lapic, v);
+                            vmm_request_pic_interrupt(kind, ctx, &g_fw_1_lapic, v); /* #708 */
                             vmm_note_pic_pending(kind, ctx, v); /* #512 */
                             if (v == g_fw_1_pic.master.irq_offset) {
                                 pit_irqs++;

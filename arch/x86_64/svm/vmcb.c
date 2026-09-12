@@ -404,6 +404,18 @@ int hype_svm_irr_highest(const uint32_t irr[8]) {
     return -1;
 }
 
+int hype_svm_irr_take_injectable(uint32_t irr[8], int event_staged, int can_accept) {
+    int v;
+    if (event_staged || !can_accept) {
+        return -1;
+    }
+    v = hype_svm_irr_highest(irr);
+    if (v >= 0) {
+        hype_svm_irr_clear(irr, (uint8_t)v);
+    }
+    return v;
+}
+
 #define HYPE_ACPI_PM_TIMER_HZ 3579545ULL
 #define HYPE_ACPI_PM_TIMER_MASK 0x00FFFFFFu
 

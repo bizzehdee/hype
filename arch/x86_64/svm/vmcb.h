@@ -644,6 +644,11 @@ int hype_svm_irr_highest(const uint32_t irr[8]);
  * bug report claiming interrupts were being overwritten. A count cannot be misread that way. */
 int hype_svm_irr_count(const uint32_t irr[8]);
 
+/* #708: take the highest pending vector for VM-entry injection, but only when no event is already
+ * staged and the guest accepts an interrupt. Clears and returns that vector; otherwise returns -1
+ * and leaves `irr` untouched, so a deferred vector is never lost. Pure. */
+int hype_svm_irr_take_injectable(uint32_t irr[8], int event_staged, int can_accept);
+
 /*
  * M4-6b2: scale the host TSC down to the ACPI Power-Management timer's
  * architectural 3.579545 MHz rate and mask to 24 bits (this project's FADT

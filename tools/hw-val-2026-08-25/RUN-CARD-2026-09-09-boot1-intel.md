@@ -219,3 +219,19 @@ vmx apicv-state: gis=0x3030 virr: [1]=0x1001a isr: [1]=0x10000 | eoi-exits=12656
 | #808 | `gap_recent` median 31.3 ms, `foreign=42500`, `TMRLATE worst_late` max 474 ms. `kbddiag` max 405 ms: still not under 173 ms |
 | #388 #754 | not exercised (`run3d` not started). The SanDisk registered as `03025220071724203145`, which now matches `id_match` |
 | #788 | no data: no USB keyboard enumerated |
+
+## #708 fix -- what the next i5 boot must show
+
+Cause, from the three APICv boots: an 8259-acknowledged vector was posted to the virtual-APIC page.
+The CPU set its VISR bit and SVI; the guest EOIs a PIC interrupt at the 8259 (`mISR=0x0`), never at
+the local APIC, so SVI stayed 0x30 and PPR 0x30 blocked IRQ0 and every 0x2x vector. Every APICv boot
+had `pic_delivered` 1-2; the non-APICv boot that logs in had 0. The fix injects 8259 vectors with
+VM-entry injection under APICv. There is no Intel QEMU, so this boot is the first test.
+
+| Read | Passes when |
+| --- | --- |
+| `vmx apicv-extint #n: vec=0x.. injected from the 8259, not posted \| gis=... visr[w]=...` | printed once per early 8259 delivery (up to 16). Its presence with `PITROUTE pic_delivered` above 0 confirms the path ran |
+| `vmx apicv-state: gis=... \| extint injected=N deferred=M \| eoi-exits=...` | `N` > 0, and `isr:` never stuck at `[1]=0x10000` with `gis=0x3030` |
+| `per-vec: 0x20=...` across successive `apicv-state` records | still growing after the first `apicv-extint` line |
+| `SCRIPT vm0: PASS`, `fresh-boot-login`, `EXT4-WRITE-DONE`, `NTFS-WRITE-DONE` | `run2c`, `run2e` and `run2n` log in: #708, #599's bar, #605 and the #688/#689 Intel legs |
+| `apicv-extint` lines present but SVI still stuck at 0x30 | the fix did not cover the cause: record the `apicv-state` and `apicv-eoi` lines on #708 |

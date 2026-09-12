@@ -353,6 +353,11 @@ struct hype_vcpu_ctx {
     /* #512: which pending_irr bits the PIC-acknowledge path queued -- the only ones the #455
      * prune may cancel. See the SVM ctx's field of the same name. */
     uint32_t pending_pic[8];
+    /* #708: 8259-acknowledged vectors waiting for VM-entry injection while APICv is on. Owner
+     * core only. See hype_vmx_vcpu_request_extint for why they never enter the vIRR. */
+    uint32_t apicv_extint[8];
+    unsigned long long apicv_extint_injected;
+    unsigned long long apicv_extint_deferred;
     /* #456: vectors staged into VM_ENTRY_INTR_INFO since the caller last drained this.
      * Mirrors the SVM ctx's field of the same name -- see svm.h on why the guest's
      * emulated LAPIC ISR must be marked at injection time, not at request time. */
@@ -491,8 +496,11 @@ static void vmx_ctx_reset_pending(struct hype_vcpu_ctx *ctx) {
     for (i = 0; i < 8u; i++) {
         ctx->pending_irr[i] = 0;
         ctx->pending_pic[i] = 0; /* #512 */
+        ctx->apicv_extint[i] = 0; /* #708 */
         ctx->inj_notify[i] = 0; /* #456 */
     }
+    ctx->apicv_extint_injected = 0;
+    ctx->apicv_extint_deferred = 0;
     /* #563: and the injection-outcome counters, for the same reason -- a recycled slot
      * reporting the previous guest's totals is exactly the mis-attribution this moved them
      * per-vCPU to prevent. */
@@ -3695,7 +3703,9 @@ void hype_vmx_apicv_dump(hype_vcpu_ctx_t *ctx) {
     }
     /* #708: EOI exits seen per vector (top 8 nonzero), and how many left their VISR bit set. */
     if (n > 0 && (unsigned)n < sizeof(buf)) {
-        n += hype_snprintf(buf + n, sizeof(buf) - (unsigned)n, " | eoi-exits=%llu still_set=%llu per-vec:",
+        n += hype_snprintf(buf + n, sizeof(buf) - (unsigned)n,
+                           " | extint injected=%llu deferred=%llu | eoi-exits=%llu still_set=%llu per-vec:",
+                           real->apicv_extint_injected, real->apicv_extint_deferred,
                            real->apicv_eoi_exits, real->apicv_eoi_visr_still_set);
     }
     for (w = 0, shown = 0; w < 256u && shown < 8u && n > 0 && (unsigned)n < sizeof(buf); w++) {
@@ -3800,8 +3810,8 @@ void hype_vmx_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector) {
      * through the guest IDT itself -- no software IRR, no event injection, no
      * interrupt-window exit. The EOI-exit bitmap is all-ones, so completion
      * accounting happens on the reason-45 exit instead of at injection.
-     * External-interrupt EVENT injection is never mixed with this path: the
-     * two would race hardware's own RVI/SVI state.
+     * 8259 vectors are the one exception and never come here under APICv:
+     * hype_vmx_vcpu_request_extint injects them, which leaves RVI/SVI alone.
      */
     if (real->apicv) {
         vmx_apicv_post_owner(real, vector);
@@ -3842,6 +3852,53 @@ void hype_vmx_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector) {
 }
 
 /*
+ * #708: stage the highest queued 8259 vector for VM-entry injection if the guest can take it now,
+ * and keep the interrupt window armed while any remain. Under APICv nothing else uses the window.
+ *
+ * Posting an 8259 vector to the vIRR (vmx_apicv_post_owner) is the #708 hang. Virtual-interrupt
+ * delivery sets the vector's VISR bit and SVI, but a guest servicing a PIC interrupt EOIs the
+ * 8259, never the local APIC, so the bit is never cleared. PPR then blocks that class and every
+ * lower vector for the rest of the run. All three i5 APICv boots ended SVI=0x30 after one
+ * PIC-delivered IRQ0 (PITROUTE pic_delivered=1..2) with no EOI exit for 0x30; the non-APICv run
+ * that logs in had pic_delivered=0. VM-entry injection delivers through the guest IDT without
+ * touching RVI or SVI, which is what an ExtINT from the 8259 is.
+ */
+static int vmx_apicv_inject_extint(struct hype_vcpu_ctx *real) {
+    int v = hype_svm_irr_take_injectable(real->apicv_extint, vmx_entry_event_staged(),
+                                         vmx_can_accept_interrupt());
+    if (v >= 0) {
+        vmwrite(HYPE_VMCS_VM_ENTRY_INTR_INFO_FIELD, HYPE_VMX_ENTRY_INTR_EXT(v));
+        vmx_note_injected(real, (uint8_t)v); /* #456 */
+        real->apicv_extint_injected++;
+        if (real->apicv_extint_injected <= 16ull) {
+            int ok = 0;
+            uint64_t gis = vmread(HYPE_VMCS_GUEST_INTERRUPT_STATUS, &ok);
+            uint32_t visr = *(volatile uint32_t *)(real->vapic + 0x100u + (uint32_t)(v >> 5) * 0x10u);
+            hype_debug_print("vmx apicv-extint #%llu: vec=0x%02x injected from the 8259, not posted | "
+                             "gis=0x%04llx visr[%u]=0x%08x deferred=%llu [#708]\n",
+                             real->apicv_extint_injected, (unsigned)v,
+                             (unsigned long long)(gis & 0xFFFFu), (unsigned)(v >> 5), visr,
+                             real->apicv_extint_deferred);
+        }
+    }
+    vmx_set_intr_window(hype_svm_irr_any(real->apicv_extint) ? 1 : 0);
+    return v >= 0;
+}
+
+void hype_vmx_vcpu_request_extint(hype_vcpu_ctx_t *ctx, uint8_t vector) {
+    vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
+    struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    if (!real->apicv) {
+        hype_vmx_vcpu_request_interrupt(ctx, vector);
+        return;
+    }
+    hype_svm_irr_set(real->apicv_extint, vector);
+    if (!vmx_apicv_inject_extint(real)) {
+        real->apicv_extint_deferred++;
+    }
+}
+
+/*
  * VMX-4: the analogue of hype_svm_vcpu_deliver_pending_if_ready -- poll-inject
  * a queued vector the moment the guest can take it, rather than relying solely
  * on the interrupt-window exit firing. On SVM this fixed a real wedge (a
@@ -3854,7 +3911,8 @@ int hype_vmx_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     int v;
 
-    if (!hype_svm_irr_any(real->pending_irr)) {
+    if (!hype_svm_irr_any(real->pending_irr) &&
+        !(real->apicv && hype_svm_irr_any(real->apicv_extint))) {
         return 0;
     }
     /*
@@ -3872,6 +3930,9 @@ int hype_vmx_vcpu_deliver_pending_if_ready(hype_vcpu_ctx_t *ctx) {
             hype_svm_irr_clear(real->pending_pic, (uint8_t)v);
             vmx_apicv_post_owner(real, (uint8_t)v);
             vmx_note_injected(real, (uint8_t)v); /* #456 */
+            drained = 1;
+        }
+        if (vmx_apicv_inject_extint(real)) { /* #708: 8259 vectors inject, never post */
             drained = 1;
         }
         return drained;
@@ -3906,8 +3967,10 @@ void hype_vmx_vcpu_handle_intr_window(hype_vcpu_ctx_t *ctx) {
     vmx_ensure_current(ctx); /* #483: field access follows the CURRENT VMCS */
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
     if (real->apicv) {
-        (void)hype_vmx_vcpu_deliver_pending_if_ready(ctx); /* #599: vIRR path, never event-inject */
-        vmx_set_intr_window(0);
+        /* #599: vIRR path for APIC vectors; #708: 8259 vectors inject, so the window stays armed
+         * while any are still queued. */
+        (void)hype_vmx_vcpu_deliver_pending_if_ready(ctx);
+        vmx_set_intr_window(hype_svm_irr_any(real->apicv_extint) ? 1 : 0);
         return;
     }
     int v = hype_svm_irr_highest(real->pending_irr);
@@ -4178,6 +4241,11 @@ void hype_vmx_vcpu_note_pic_pending(hype_vcpu_ctx_t *ctx, uint8_t vector) {
 
 void hype_vmx_vcpu_cancel_pic_pending(hype_vcpu_ctx_t *ctx, uint8_t vector) {
     struct hype_vcpu_ctx *real = (struct hype_vcpu_ctx *)ctx;
+    if ((real->apicv_extint[vector >> 5] & ((uint32_t)1u << (vector & 31u))) != 0u) { /* #708 */
+        vmx_ensure_current(ctx);
+        hype_svm_irr_clear(real->apicv_extint, vector);
+        vmx_set_intr_window(hype_svm_irr_any(real->apicv_extint) ? 1 : 0);
+    }
     if ((real->pending_pic[vector >> 5] & ((uint32_t)1u << (vector & 31u))) != 0u) {
         vmx_ensure_current(ctx); /* #483: vmx_set_intr_window writes the CURRENT VMCS */
         hype_svm_irr_clear(real->pending_irr, vector);
@@ -4271,10 +4339,14 @@ void hype_vmx_vcpu_get_intr_state(hype_vcpu_ctx_t *ctx, hype_vmm_intr_state_t *o
         out->vintr = 0;
     }
     out->can_accept = hype_svm_can_accept_interrupt(out->rflags, out->interrupt_shadow);
-    out->pending_valid = hype_svm_irr_any(real->pending_irr);
-    out->pending_count = hype_svm_irr_count(real->pending_irr); /* #356 */
+    /* #708: a queued 8259 vector is pending too, or the HLT wake never retires the HLT for it. */
+    out->pending_valid = hype_svm_irr_any(real->pending_irr) || hype_svm_irr_any(real->apicv_extint);
+    out->pending_count = hype_svm_irr_count(real->pending_irr) +
+                         hype_svm_irr_count(real->apicv_extint); /* #356 */
     {
         int hv = hype_svm_irr_highest(real->pending_irr);
+        int he = hype_svm_irr_highest(real->apicv_extint);
+        if (he > hv) hv = he;
         out->pending_vector = (uint8_t)(hv < 0 ? 0 : hv);
     }
 }

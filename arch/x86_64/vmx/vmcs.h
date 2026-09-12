@@ -173,6 +173,9 @@ int hype_vmx_vcpu_handle_virtio_blk_npf(hype_vcpu_ctx_t *ctx, hype_virtio_blk_t 
 void hype_vmx_vcpu_set_gdt(hype_vcpu_ctx_t *ctx, uint64_t base, uint16_t limit);
 void hype_vmx_vcpu_set_idt(hype_vcpu_ctx_t *ctx, uint64_t base, uint16_t limit);
 void hype_vmx_vcpu_request_interrupt(hype_vcpu_ctx_t *ctx, uint8_t vector);
+/* #708: an 8259-acknowledged vector. Same as request_interrupt without APICv; under APICv it is
+ * VM-entry injected (now, or from the interrupt window), never posted to the virtual-APIC page. */
+void hype_vmx_vcpu_request_extint(hype_vcpu_ctx_t *ctx, uint8_t vector);
 void hype_vmx_vcpu_handle_intr_window(hype_vcpu_ctx_t *ctx);
 
 /* #412: allocate the VMX per-vCPU pools (VMCS/virtual-APIC/MSR-area/ctx) sized to

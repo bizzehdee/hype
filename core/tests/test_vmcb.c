@@ -642,6 +642,31 @@ static void test_irr_set_any_highest_clear(void) {
     CHECK_HEX("empty again after clearing all", 0, hype_svm_irr_any(irr));
 }
 
+/*
+ * #708: under Intel APICv an 8259 vector waits in its own IRR until VM-entry injection is possible,
+ * because posting it to the virtual-APIC page leaves its VISR bit set forever. A staged event or a
+ * guest that cannot accept must leave every vector pending; a ready guest gets the highest first.
+ */
+static void test_irr_take_injectable(void) {
+    uint32_t irr[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    CHECK_HEX("empty IRR -> -1", (unsigned long long)(long long)-1,
+              (unsigned long long)(long long)hype_svm_irr_take_injectable(irr, 0, 1));
+
+    hype_svm_irr_set(irr, 0x30u); /* the PIT's IRQ0 through the guest's 8259 */
+    hype_svm_irr_set(irr, 0x21u);
+    CHECK_HEX("event already staged -> -1", (unsigned long long)(long long)-1,
+              (unsigned long long)(long long)hype_svm_irr_take_injectable(irr, 1, 1));
+    CHECK_HEX("staged: nothing taken", 2, hype_svm_irr_count(irr));
+    CHECK_HEX("guest cannot accept -> -1", (unsigned long long)(long long)-1,
+              (unsigned long long)(long long)hype_svm_irr_take_injectable(irr, 0, 0));
+    CHECK_HEX("cannot accept: nothing taken", 2, hype_svm_irr_count(irr));
+
+    CHECK_HEX("ready: highest first", 0x30u, hype_svm_irr_take_injectable(irr, 0, 1));
+    CHECK_HEX("0x30 cleared, 0x21 still pending", 0x21u, hype_svm_irr_highest(irr));
+    CHECK_HEX("then 0x21", 0x21u, hype_svm_irr_take_injectable(irr, 0, 1));
+    CHECK_HEX("empty after both", 0, hype_svm_irr_any(irr));
+}
+
 static void test_irr_boundary_vectors(void) {
     uint32_t irr[8] = {0, 0, 0, 0, 0, 0, 0, 0};
     hype_svm_irr_set(irr, 0u);    /* lowest vector -> word 0 bit 0 */
@@ -771,6 +796,7 @@ int main(void) {
     test_vintr_priority_honours_virtual_tpr();
     test_irr_holds_multiple_vectors_and_drains_by_priority();
     test_irr_set_any_highest_clear();
+    test_irr_take_injectable();
     test_irr_boundary_vectors();
     test_acpi_pm_timer_scale();
 
