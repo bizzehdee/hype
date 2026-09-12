@@ -167,17 +167,24 @@ mk_image() {
   local path="$base/$rel"
   mkdir -p "$(dirname "$path")"
   [ -f "$path" ] && have=$(stat -c %s "$path")
-  if [ "$have" = "$want" ]; then echo "  ok    $rel ($want bytes)"; return 0; fi
-  if [ "$have" != 0 ]; then
+  # #816: an ext4 extent marked unwritten reads as zeros only through the host's ext4 driver.
+  # hype reads the sectors directly and refuses such a file (#696), so a right-sized image made
+  # by fallocate is still unusable: both 2026-09 i5 boots logged `ext4-scratch.img NOT FOUND`.
+  if [ "$have" = "$want" ] && ! filefrag -v "$path" 2>/dev/null | grep -q unwritten; then
+    echo "  ok    $rel ($want bytes)"; return 0
+  fi
+  if [ "$have" = "$want" ]; then
+    echo "  REWRITE $rel: unwritten extents, which hype refuses (#696)"
+  elif [ "$have" != 0 ]; then
     echo "  RESIZE $rel: $have -> $want bytes"
   else
     echo "  create $rel ($want bytes)"
   fi
-  # Fully allocated, not sparse: hype only ever writes in place, so a hole is a
-  # write that silently goes nowhere.
   if [ "$CHECK" = 1 ]; then echo "  (--check: not creating)"; return 1; fi
-  fallocate -l "$want" "$path" 2>/dev/null || dd if=/dev/zero of="$path" bs=1M \
-      count=$((want / 1048576)) status=none || die "could not create $rel"
+  # Real zeros, never fallocate: fallocate leaves ext4 extents unwritten and exFAT's
+  # ValidDataLength short (tools/make-disk-image.sh), and hype only ever writes in place.
+  dd if=/dev/zero of="$path" bs=1M count=$((want / 1048576)) conv=fsync status=none \
+      || die "could not create $rel"
   return 0
 }
 echo "scratch images (#738):"
