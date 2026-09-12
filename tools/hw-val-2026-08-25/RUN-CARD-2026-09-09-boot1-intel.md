@@ -279,3 +279,27 @@ and back twice during the load, the BSP kept running, no `APSTACK OVERFLOW`, dee
 | the operator switches to vm0 during `run2n`'s bulk write, then back with the chord | the switch back works and the log carries on |
 | `SCRIPT vm0/vm1/vm2: PASS`, `EXT4-WRITE-DONE`, `NTFS-WRITE-DONE` | all three guests finish (#708, #688, #689) |
 | `host off` at the end | `powering off the host`, no `PANIC` (#816 again) |
+
+## Result -- 2026-09-13, build `f21188f-dirty`, Intel i5-13420H (logs in `logs/bootI5-boot1-2026-09-13/`)
+
+rtc 00:14:15. **Froze again**; operator also reports terrible performance. The log ends at
+`FBSPEED t=17028ms`. No view switch this time (no `VIEWSWITCH` line), so the switch is not the
+trigger.
+
+```
+m5-8: FILE-backed guest disk \hype\disks\run2c-scratch.img on exFAT -- 2147483648 bytes, 1 extent(s)
+m5-8: FILE-backed guest disk \hype\disks\ext4-scratch.img on ext -- 1073741824 bytes, 2 extent(s)
+m5-8: FILE-backed guest disk \hype\disks\ntfs-scratch.img on NTFS -- 1073741824 bytes, 1 extent(s)
+fw-1 APSTACK: bytes used of 16384 by slot: 0=8224 1=1376 2=1376 3=1376 8=8224 9=1376 16=8224 24=8224 | deepest slot 0=8224 [#817]
+vm2 ttyS0| READBACK-MATCH
+vm2 ttyS0| dd if=/dev/urandom of=/dev/vda bs=1M count=64 seek=1 oflag=direct 2>&1; echo BULK-$?   <- last run2n line
+fw-1 FBINFLIGHT: during the masked loop: usb_waiters_max=1 usb_held=64/64 | usb_sectors=+0 usb_calls=+0
+usb-log: BEHIND -- logbuf has 407067 bytes, file has 398613 (#338)                                  <- log ends ~1 s later
+```
+
+| Ticket | Result |
+| --- | --- |
+| #817 | no `APSTACK OVERFLOW`; deepest 8,224 B. The overflow is fixed, and it was **not** the freeze |
+| #708 | 6 `apicv-extint` injections, no stuck SVI; `run2n` logged in and read back again; `run2c`/`run2e` not at login when it froze |
+| freeze | **Same moment on both freezing boots: `run2n`'s 64 MB `oflag=direct` write to `ntfs-scratch.img` begins and the host locks within ~1 s.** Its image, both ISOs and hype's log all go through the one USB-SATA drive. QEMU with the images on AHCI does not freeze; a USB-backed rig (`tools/708/run-708-usbload.sh`) is the next test. The in-transfer keyboard pump was ruled out: it turns away any core but the keyboard owner |
+| performance | BSP input tick 67 Hz (wants 125) |
