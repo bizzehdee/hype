@@ -53,6 +53,13 @@ int hype_blk_usb_sync(hype_blk_usb_t *hw);
  * #362: USB transfer-lock contention counters. `max_spin_apic` names the core that waited longest,
  * which is what distinguishes "the BSP is being starved" from "everyone waits a bit".
  */
+/* #708: microseconds the transfer lock has been held by its CURRENT holder (0 = free), and the
+ * worst any holder has ever kept it. A guest core wedged inside a transfer never releases it,
+ * and the log -- which needs the same lock -- is the first thing to stop, so the dashboard is
+ * where this has to be reported. */
+unsigned long long hype_blk_usb_lock_held_us(unsigned int *holder_apic);
+unsigned long long hype_blk_usb_lock_held_max_us(void);
+
 void hype_blk_usb_lock_stats(unsigned long long *acquires, unsigned long long *spins,
                              unsigned long long *max_spins, unsigned int *max_spin_apic);
 

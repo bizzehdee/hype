@@ -10081,7 +10081,25 @@ static void fw_1_render_console(void) {
             {
                 static char alert_line[96];
                 unsigned int panics = hype_fatal_core_panic_count();
-                if (panics > 0u) {
+                unsigned int lock_apic = 0xFFFFFFFFu;
+                unsigned long long lock_us = hype_blk_usb_lock_held_us(&lock_apic);
+                if (lock_us > 2000000ull) {
+                    /*
+                     * #708: a core has been inside a USB transfer for more than two seconds.
+                     *
+                     * Nothing else can say so. The log needs this same lock, so it stops the
+                     * moment the wedge starts -- every i5 freeze ends mid-sentence with no
+                     * death throes for exactly that reason. The BSP is fine (it acquires
+                     * through a bounded spin and gives up), so the dashboard is still being
+                     * drawn, and the operator's own report is that view switches still work,
+                     * just slowly, with some skipped. This turns that into a statement.
+                     */
+                    hype_snprintf(alert_line, sizeof(alert_line),
+                                  "** USB WEDGED %llus ON apic=%u -- \\HYPE.LOG HAS STOPPED; "
+                                  "that core is stuck in a transfer [#708] **",
+                                  lock_us / 1000000ull, lock_apic);
+                    alert = alert_line;
+                } else if (panics > 0u) {
                     hype_snprintf(alert_line, sizeof(alert_line),
                                   "** %u CORE PANIC(S) -- apic=%u halted; see the log for the "
                                   "fault [#461] **",
@@ -16816,9 +16834,17 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                     unsigned int lapic = 0;
                     hype_blk_usb_lock_stats(&la, &ls, &lm, &lapic);
                     if (la != 0) {
-                        hype_debug_print("fw-1 USBLOCK: acquires=%llu spins=%llu avg=%llu "
-                                         "max=%llu on apic=%u [#362]\n", la, ls, ls / la, lm,
-                                         lapic);
+                        {   /* #708: the longest any core has KEPT the lock, beside how long
+                             * cores waited for it. A wedge shows up here as a held time that
+                             * dwarfs every transfer's service time. */
+                            unsigned int hnow_apic = 0xFFFFFFFFu;
+                            hype_debug_print("fw-1 USBLOCK: acquires=%llu spins=%llu avg=%llu "
+                                             "max=%llu on apic=%u | held max=%lluus now=%lluus "
+                                             "apic=%d [#362 #708]\n", la, ls, ls / la, lm, lapic,
+                                             hype_blk_usb_lock_held_max_us(),
+                                             hype_blk_usb_lock_held_us(&hnow_apic),
+                                             (hnow_apic == 0xFFFFFFFFu) ? -1 : (int)hnow_apic);
+                        }
                     }
                     {
                         /* #365: device time vs hype's own overhead. us_per_chunk is the number

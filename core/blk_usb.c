@@ -57,6 +57,17 @@ static volatile unsigned long long g_usb_lock_wait_max;
 static volatile unsigned int g_usb_ticket_next;   /* next ticket handed out */
 static volatile unsigned int g_usb_ticket_owner;  /* ticket currently served */
 static volatile unsigned int g_usb_lock_holder_apic = 0xFFFFFFFFu; /* core inside the transfer */
+/*
+ * #708: when the current holder took the lock, and the longest any holder has ever kept it.
+ *
+ * A guest core that wedges inside a transfer never releases this, and everything that needs USB
+ * stops with it -- the log first, which is exactly why the failure has no record: the only
+ * surface that reports it is the one the wedge kills. The BSP survives (it acquires through
+ * usb_xfer_lock_bounded() and gives up), so the dashboard is still being drawn and is the right
+ * place to say so. held_since is 0 when the lock is free.
+ */
+static volatile unsigned long long g_usb_lock_held_since;
+static volatile unsigned long long g_usb_lock_held_max;
 
 /*
  * #362: measurement, kept in tree deliberately.
@@ -158,6 +169,7 @@ static int usb_xfer_lock_bounded(void) {
         if (hype_ticket_lock_try_claim(&g_usb_ticket_next, &g_usb_ticket_owner)) {
             __atomic_store_n(&g_usb_lock_holder_apic, usb_xfer_this_apic(),
                              __ATOMIC_RELAXED);
+            __atomic_store_n(&g_usb_lock_held_since, usb_rdtsc(), __ATOMIC_RELAXED);
             __atomic_fetch_add(&g_usb_lock_acquires, 1ull, __ATOMIC_RELAXED);
             __atomic_fetch_add(&g_usb_lock_spins, spins, __ATOMIC_RELAXED);
             return 0;
@@ -193,6 +205,7 @@ static void usb_xfer_lock(void) {
         }
     }
     __atomic_store_n(&g_usb_lock_holder_apic, usb_xfer_this_apic(), __ATOMIC_RELAXED);
+    __atomic_store_n(&g_usb_lock_held_since, usb_rdtsc(), __ATOMIC_RELAXED);
     __atomic_fetch_add(&g_usb_lock_acquires, 1ull, __ATOMIC_RELAXED);
     __atomic_fetch_add(&g_usb_lock_spins, spins, __ATOMIC_RELAXED);
     if (spins > __atomic_load_n(&g_usb_lock_max_spins, __ATOMIC_RELAXED)) {
@@ -202,6 +215,14 @@ static void usb_xfer_lock(void) {
 }
 
 static void usb_xfer_unlock(void) {
+    unsigned long long since = __atomic_load_n(&g_usb_lock_held_since, __ATOMIC_RELAXED);
+    if (since != 0ull) {
+        unsigned long long held = usb_rdtsc() - since;
+        if (held > __atomic_load_n(&g_usb_lock_held_max, __ATOMIC_RELAXED)) {
+            __atomic_store_n(&g_usb_lock_held_max, held, __ATOMIC_RELAXED);
+        }
+    }
+    __atomic_store_n(&g_usb_lock_held_since, 0ull, __ATOMIC_RELAXED);
     __atomic_store_n(&g_usb_lock_holder_apic, 0xFFFFFFFFu, __ATOMIC_RELAXED);
     __atomic_fetch_add(&g_usb_ticket_owner, 1u, __ATOMIC_RELEASE);
 }
@@ -391,4 +412,26 @@ void hype_blk_usb_init(hype_blk_usb_t *hw, hype_blk_phys_t *p, hype_blk_backend_
     hw->msc = *msc;
     hw->block_size = block_size;
     hype_blk_phys_init(p, be, usb_read, usb_write, hw, total_sectors);
+}
+
+/*
+ * #708: how long the lock has been held RIGHT NOW, in microseconds, and by which core.
+ * Returns 0 when the lock is free. Safe from a core that does not hold it -- it only reads.
+ */
+unsigned long long hype_blk_usb_lock_held_us(unsigned int *holder_apic) {
+    unsigned long long since = __atomic_load_n(&g_usb_lock_held_since, __ATOMIC_RELAXED);
+    if (holder_apic != 0) {
+        *holder_apic = __atomic_load_n(&g_usb_lock_holder_apic, __ATOMIC_RELAXED);
+    }
+    if (since == 0ull || g_usb_tsc_hz == 0ull) {
+        return 0ull;
+    }
+    return ((usb_rdtsc() - since) * 1000000ull) / g_usb_tsc_hz;
+}
+
+unsigned long long hype_blk_usb_lock_held_max_us(void) {
+    if (g_usb_tsc_hz == 0ull) {
+        return 0ull;
+    }
+    return (__atomic_load_n(&g_usb_lock_held_max, __ATOMIC_RELAXED) * 1000000ull) / g_usb_tsc_hz;
 }
