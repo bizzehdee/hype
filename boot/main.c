@@ -8799,6 +8799,8 @@ static int fw_1_load_kernel(hype_fw_vm_t *vm, unsigned vi); /* #535 */
 static void fw_1_save_vars(hype_fw_vm_t *vm);
 static void fw_1_load_saved_vars(hype_fw_vm_t *vm);
 static void fw_1_vars_prealloc(hype_fw_vm_t *vm); /* #821 */
+static const char *fw_1_usb_wedge_alert(void); /* #708 */
+static void fw_1_overlay_line(const char *text); /* #708 */
 
 /* #454: varstore request kinds, in vm->vars_req. */
 #define HYPE_FW_VARS_REQ_NONE 0u
@@ -9984,6 +9986,9 @@ static void fw_1_render_console(void) {
                 g_vms[view].ramfb_blits++; /* #549 */
                 g_render_calls++;
                 g_render_pushes++;
+                /* #708: over the guest's own screen -- a VM view had no alert row, so switching
+                 * into one hid the wedge alert at the moment it mattered most. */
+                fw_1_overlay_line(fw_1_usb_wedge_alert());
                 bsp_phase(BSP_PHASE_GOPFLUSH);
                 hype_debug_flush_gop();
                 fw_1_view_switch_pass(view, 1, tsc_hz);
@@ -10081,77 +10086,9 @@ static void fw_1_render_console(void) {
             {
                 static char alert_line[192];
                 unsigned int panics = hype_fatal_core_panic_count();
-                unsigned int lock_apic = 0xFFFFFFFFu;
-                unsigned long long lock_us = hype_blk_usb_lock_held_us(&lock_apic);
-                /*
-                 * #708: LATCHED, like the core-panic alert beside it and for the same reason.
-                 *
-                 * The first one an operator managed to read cleared itself while they were
-                 * reading it: "i saw the alert, but it went away. it was in vm2, i didnt see the
-                 * section or the apic". A wedge that recovers is the single most useful thing
-                 * this has found -- it says the core comes back -- and an alert that erases the
-                 * evidence of its own event is worse than none. Once seen, it stays, showing the
-                 * WORST hold and the core that owned it.
-                 */
-                static unsigned long long wedge_peak_us;
-                static unsigned int wedge_apic;
-                static int wedge_slot;
-                static unsigned int wedge_sec;
-                if (lock_us > wedge_peak_us) {
-                    wedge_peak_us = lock_us;
-                    wedge_apic = lock_apic;
-                    wedge_slot = fw_1_ap_slot_of(lock_apic);
-                    wedge_sec = (wedge_slot >= 0 && g_436_loop_section != 0)
-                                    ? (unsigned)g_436_loop_section[wedge_slot] : 0u;
-                }
-                if (wedge_peak_us > 2000000ull) {
-                    /*
-                     * #708: a core has been inside a USB transfer for more than two seconds.
-                     *
-                     * Nothing else can say so. The log needs this same lock, so it stops the
-                     * moment the wedge starts -- every i5 freeze ends mid-sentence with no
-                     * death throes for exactly that reason. The BSP is fine (it acquires
-                     * through a bounded spin and gives up), so the dashboard is still being
-                     * drawn, and the operator's own report is that view switches still work,
-                     * just slowly, with some skipped. This turns that into a statement.
-                     */
-                    /*
-                     * #708: name WHERE, not just who. The first boot to raise this alert said
-                     * "USB WEDGED on apic=24" and nothing else, and the log -- dead by
-                     * definition -- could not fill in the rest. apic -> VM comes from the same
-                     * table the AP timer ISR uses, and the section is the #436 breadcrumb that
-                     * BSPPROBE reports, so the number means the same thing in both places.
-                     */
-                    static unsigned int wedge_reported;
-                    /* Held now, or the worst seen and since released -- an operator needs to be
-                     * able to tell those apart at a glance. */
-                    hype_snprintf(alert_line, sizeof(alert_line),
-                                  "** USB WEDGED: vm%d apic=%u section=%u held the transfer lock "
-                                  "%llu.%llus (%s) -- \\HYPE.LOG stops while it is held [#708] **",
-                                  wedge_slot, wedge_apic, wedge_sec,
-                                  wedge_peak_us / 1000000ull,
-                                  (wedge_peak_us % 1000000ull) / 100000ull,
-                                  (lock_us > 2000000ull) ? "STILL HELD" : "released, peak");
-                    alert = alert_line;
-                    /*
-                     * #708: say it in the LOG too, once.
-                     *
-                     * The first two boots to raise this alert left no trace in HYPE.LOG at all,
-                     * because the alert was a dashboard string and nothing else -- so afterwards
-                     * there was no way to tell a run where it fired from one where it did not,
-                     * and the operator reading it off the screen was the only record. The line
-                     * may well never reach the file: the flush needs the very lock that is
-                     * wedged. But it costs nothing, it lands in the log buffer immediately, and
-                     * if the holder ever does let go the whole tail flushes with this in it.
-                     */
-                    if (!wedge_reported) {
-                        wedge_reported = 1;
-                        HYPE_LOGF(HYPE_LOG_ERROR,
-                                  "fw-1 USB WEDGED: apic=%u vm%d section=%u has held the "
-                                  "transfer lock %llums -- everything needing USB has stopped, "
-                                  "this log included [#708]\n",
-                                  wedge_apic, wedge_slot, wedge_sec, wedge_peak_us / 1000ull);
-                    }
+                const char *wedge = fw_1_usb_wedge_alert();
+                if (wedge != 0) {
+                    alert = wedge;
                 } else if (panics > 0u) {
                     hype_snprintf(alert_line, sizeof(alert_line),
                                   "** %u CORE PANIC(S) -- apic=%u halted; see the log for the "
@@ -12815,6 +12752,72 @@ static int fw_1_optical_npf(hype_fw_vm_t *vm, hype_vmm_kind_t kind, hype_vcpu_ct
         return 0;
     }
     return 0;
+}
+
+/*
+ * #708: the latched USB-wedge alert, as a line both view branches can show.
+ *
+ * It lived inside the dashboard branch, which is why the operator never read it: "i didnt see
+ * the message, i switched away to a vm for a second, and thats when everything locked up". A VM
+ * view drew the guest and nothing else, so switching hid the wedge alert -- and the core-panic
+ * and log-stall alerts with it -- at exactly the moment they mattered most.
+ *
+ * Latched on the worst hold ever seen, because a wedge that RECOVERS otherwise erases its own
+ * evidence: the first alert anyone managed to read cleared itself while they were reading it.
+ * Returns 0 until a hold has passed the threshold, and never returns 0 again afterwards.
+ */
+#define HYPE_USB_WEDGE_ALERT_US 2000000ull
+static char g_wedge_line[192];
+static unsigned long long g_wedge_peak_us;
+static unsigned int g_wedge_apic;
+static int g_wedge_slot;
+static unsigned int g_wedge_sec;
+static unsigned int g_wedge_logged;
+
+static const char *fw_1_usb_wedge_alert(void) {
+    unsigned int now_apic = 0xFFFFFFFFu;
+    unsigned long long now_us = hype_blk_usb_lock_held_us(&now_apic);
+
+    if (now_us > g_wedge_peak_us) {
+        g_wedge_peak_us = now_us;
+        g_wedge_apic = now_apic;
+        g_wedge_slot = fw_1_ap_slot_of(now_apic);
+        g_wedge_sec = (g_wedge_slot >= 0 && g_436_loop_section != 0)
+                          ? (unsigned)g_436_loop_section[g_wedge_slot] : 0u;
+    }
+    if (g_wedge_peak_us <= HYPE_USB_WEDGE_ALERT_US) {
+        return (const char *)0;
+    }
+    hype_snprintf(g_wedge_line, sizeof(g_wedge_line),
+                  "** USB WEDGED: vm%d apic=%u section=%u held the transfer lock %llu.%llus "
+                  "(%s) -- \\HYPE.LOG stops while it is held [#708] **",
+                  g_wedge_slot, g_wedge_apic, g_wedge_sec,
+                  g_wedge_peak_us / 1000000ull, (g_wedge_peak_us % 1000000ull) / 100000ull,
+                  (now_us > HYPE_USB_WEDGE_ALERT_US) ? "STILL HELD" : "released, peak");
+    if (!g_wedge_logged) {
+        g_wedge_logged = 1;
+        HYPE_LOGF(HYPE_LOG_ERROR,
+                  "fw-1 USB WEDGED: apic=%u vm%d section=%u has held the transfer lock %llums -- "
+                  "everything needing USB has stopped, this log included [#708]\n",
+                  g_wedge_apic, g_wedge_slot, g_wedge_sec, g_wedge_peak_us / 1000ull);
+    }
+    return g_wedge_line;
+}
+
+/* #708: one line of text straight onto the framebuffer, over whatever is already there. The
+ * VM views have no alert row of their own and a guest's screen must not be reformatted to make
+ * one, so the alert is simply painted across the top. */
+static void fw_1_overlay_line(const char *text) {
+    unsigned int col = 0u;
+    if (text == 0 || g_gop_console.fb == 0 || g_gop_console.cols == 0u) {
+        return;
+    }
+    for (; text[col] != '\0' && col < g_gop_console.cols; col++) {
+        hype_gop_draw_glyph(&g_gop_console, col, 0u, (unsigned char)text[col]);
+    }
+    if (col != 0u) {
+        hype_gop_mark_dirty_rect(&g_gop_console, 0u, (col * 8u) - 1u, 0u, 15u);
+    }
 }
 
 static hype_fw_dev_t fw_1_shared_mmio_npf(hype_fw_vm_t *vm, hype_vmm_kind_t kind,
