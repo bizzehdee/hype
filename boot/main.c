@@ -3397,7 +3397,73 @@ static void term_run_cmdline(void) {
 }
 
 /* Feed one decoded keystroke byte to the dashboard command line. */
+/*
+ * #820: where the dashboard's typing latency actually goes.
+ *
+ * The operator reports 30-40 seconds to type "host off" -- nine characters -- on runs whose
+ * BSPSTARVE and BSPCOST numbers look fine. Nothing in the tree measured the thing they are
+ * describing, so every explanation for it so far has been a guess. These three do, and they
+ * split the path at the only two places it can be lost:
+ *
+ *   poll gap   how often the BSP even looks at the host keyboard. If this is seconds, the
+ *              character is sitting in the device and nothing has fetched it.
+ *   char gap   time between two characters hype actually accepted. Compared against the poll
+ *              gap it says whether the loss is before or after the fetch.
+ *   echo       accepted character -> the next push that put pixels on the glass. If this is
+ *              seconds, hype has the character and the screen has not caught up.
+ *
+ * TSC deltas, bucketed, no per-key log line: typing is thousands of keys and only the shape of
+ * the distribution and the worst case matter.
+ */
+static uint64_t g_key_poll_last_tsc, g_key_poll_gap_max, g_key_polls;
+static uint64_t g_key_char_last_tsc, g_key_char_gap_max, g_key_chars;
+static uint64_t g_key_echo_pending_tsc, g_key_echo_max, g_key_echo_total, g_key_echoes;
+static uint64_t g_key_poll_hist[6], g_key_char_hist[6], g_key_echo_hist[6];
+
+/* <1ms, <10ms, <50ms, <200ms, <1s, >=1s */
+static void fw_1_key_bucket(uint64_t *hist, uint64_t dt_tsc, uint64_t hz) {
+    uint64_t us;
+    if (hz == 0ull) {
+        return;
+    }
+    us = (dt_tsc * 1000000ull) / hz;
+    if (us < 1000ull) hist[0]++;
+    else if (us < 10000ull) hist[1]++;
+    else if (us < 50000ull) hist[2]++;
+    else if (us < 200000ull) hist[3]++;
+    else if (us < 1000000ull) hist[4]++;
+    else hist[5]++;
+}
+
+/* #820: called from the dashboard push once the cells are on the glass. */
+static void fw_1_key_echo_done(uint64_t now, uint64_t hz) {
+    uint64_t dt;
+    if (g_key_echo_pending_tsc == 0ull || hz == 0ull) {
+        return;
+    }
+    dt = now - g_key_echo_pending_tsc;
+    g_key_echo_pending_tsc = 0ull;
+    g_key_echoes++;
+    g_key_echo_total += dt;
+    if (dt > g_key_echo_max) g_key_echo_max = dt;
+    fw_1_key_bucket(g_key_echo_hist, dt, hz);
+}
+
 static void term_cmdline_key(uint8_t ch) {
+    {   /* #820: this is the moment hype has the character; the echo timer starts here. */
+        uint64_t hz = g_vms[0].host_tsc_hz;
+        uint64_t now = hype_rdtsc();
+        if (hz != 0ull) {
+            if (g_key_char_last_tsc != 0ull) {
+                uint64_t dt = now - g_key_char_last_tsc;
+                if (dt > g_key_char_gap_max) g_key_char_gap_max = dt;
+                fw_1_key_bucket(g_key_char_hist, dt, hz);
+            }
+            g_key_char_last_tsc = now;
+            g_key_chars++;
+            if (g_key_echo_pending_tsc == 0ull) g_key_echo_pending_tsc = now;
+        }
+    }
     if (ch == '\r' || ch == '\n') {
         term_run_cmdline();
     } else if (ch == 0x7Fu || ch == 0x08u) {
@@ -9262,6 +9328,19 @@ static void fw_1_kbdchars_note(uint8_t ch) {
 }
 
 static void fw_1_host_input_poll(void) {
+    {   /* #820: how often the BSP actually reaches the host keyboard. */
+        uint64_t hz = g_vms[0].host_tsc_hz;
+        uint64_t now = hype_rdtsc();
+        if (hz != 0ull) {
+            if (g_key_poll_last_tsc != 0ull) {
+                uint64_t dt = now - g_key_poll_last_tsc;
+                if (dt > g_key_poll_gap_max) g_key_poll_gap_max = dt;
+                fw_1_key_bucket(g_key_poll_hist, dt, hz);
+            }
+            g_key_poll_last_tsc = now;
+            g_key_polls++;
+        }
+    }
     uint8_t sc;
     /*
      * #363: pull USB HID keyboard reports here, on the BSP -- RATE-LIMITED.
@@ -10079,6 +10158,10 @@ static void fw_1_render_console(void) {
                 g_render_pushes++;
                 bsp_phase(BSP_PHASE_GOPFLUSH);
                 hype_debug_flush_gop();
+                /* #820: pixels are on the glass now -- close any keystroke waiting on an echo.
+                 * `more` is deliberately ignored: the command line is one row, and the operator
+                 * has seen their character as soon as the band carrying it is pushed. */
+                fw_1_key_echo_done(hype_rdtsc(), tsc_hz);
             }
             fw_1_view_switch_pass(-1, !more, tsc_hz);
         }
@@ -31170,6 +31253,41 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                                  "BSP past 5 ms, so the input gap is outside "
                                                  "bsp_phase()'s coverage [#808]\n");
                             }
+                        }
+                        {   /* #820: the typing path, on the same 10-second beat. Buckets are
+                             * <1ms/<10ms/<50ms/<200ms/<1s/>=1s. */
+                            hype_debug_print(
+                                "fw-1 KEYLAT: polls=%llu gap[%llu/%llu/%llu/%llu/%llu/%llu] "
+                                "max=%lluus | chars=%llu gap[%llu/%llu/%llu/%llu/%llu/%llu] "
+                                "max=%lluus | echoes=%llu [%llu/%llu/%llu/%llu/%llu/%llu] "
+                                "mean=%lluus max=%lluus [#820]\n",
+                                (unsigned long long)g_key_polls,
+                                (unsigned long long)g_key_poll_hist[0],
+                                (unsigned long long)g_key_poll_hist[1],
+                                (unsigned long long)g_key_poll_hist[2],
+                                (unsigned long long)g_key_poll_hist[3],
+                                (unsigned long long)g_key_poll_hist[4],
+                                (unsigned long long)g_key_poll_hist[5],
+                                (unsigned long long)((g_key_poll_gap_max * 1000000ull) / bp_hz),
+                                (unsigned long long)g_key_chars,
+                                (unsigned long long)g_key_char_hist[0],
+                                (unsigned long long)g_key_char_hist[1],
+                                (unsigned long long)g_key_char_hist[2],
+                                (unsigned long long)g_key_char_hist[3],
+                                (unsigned long long)g_key_char_hist[4],
+                                (unsigned long long)g_key_char_hist[5],
+                                (unsigned long long)((g_key_char_gap_max * 1000000ull) / bp_hz),
+                                (unsigned long long)g_key_echoes,
+                                (unsigned long long)g_key_echo_hist[0],
+                                (unsigned long long)g_key_echo_hist[1],
+                                (unsigned long long)g_key_echo_hist[2],
+                                (unsigned long long)g_key_echo_hist[3],
+                                (unsigned long long)g_key_echo_hist[4],
+                                (unsigned long long)g_key_echo_hist[5],
+                                (unsigned long long)(g_key_echoes
+                                    ? ((g_key_echo_total / g_key_echoes) * 1000000ull) / bp_hz
+                                    : 0ull),
+                                (unsigned long long)((g_key_echo_max * 1000000ull) / bp_hz));
                         }
                         hype_debug_print("fw-1 BSPCOST loop iterations=%llu hz=%llu "
                                          "gate=hz/125=%llu cycles -- the input tick fires "
