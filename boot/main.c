@@ -1490,6 +1490,19 @@ typedef struct hype_fw_vm {
      * called on every VM exit and a real disk write on every exit would be pathological. */
     uint64_t vars_last_save_tsc;
     /*
+     * #819: how many times this VM's guest has written its varstore, and the value that was
+     * current when the file last matched RAM. Equal means the file is already correct and the
+     * five-second checkpoint has nothing to do.
+     *
+     * Exact, not a heuristic: fw_1_flash_set_trap() leaves the flash window mapped READ-ONLY
+     * when it is not trapping, so every guest write to the varstore takes a nested-page fault
+     * and is counted in fw_1_flash_npf(). There is no path by which the varstore changes
+     * without passing through there. Per-VM, not the g_flash_vars_writes global beside it,
+     * which counts every VM's writes together and would keep all four VMs saving forever.
+     */
+    uint64_t vars_write_seq;
+    uint64_t vars_saved_seq;
+    /*
      * #454: varstore I/O request this VM's core has posted to the BSP.
      *
      * Only the BSP may touch the shared FAT/xHCI state (#239), and under
@@ -5834,6 +5847,7 @@ static int fw_1_flash_npf(hype_fw_vm_t *vm, hype_vmm_kind_t kind, hype_vcpu_ctx_
         if (rc == 0) {
             if (npf->is_write) {
                 g_flash_vars_writes++;
+                vm->vars_write_seq++; /* #819: this VM's varstore is now dirty */
             } else {
                 /* #556: the first few reads, with the mode that was in force -- so a wrong
                  * synthesized value and a read that never got here look different. */
@@ -24373,8 +24387,14 @@ static int fw_1_vm_name_plausible(const char *name); /* #513: defined with fw_1_
  */
 static hype_fs_file_t g_vars_file;
 
+/* #819: checkpoints that wrote, and checkpoints that found the file already correct. Reported
+ * with the FLASH line so a run says how much varstore I/O the dirty check actually avoided. */
+static uint64_t g_vars_save_written;
+static uint64_t g_vars_save_skipped;
+
 static void fw_1_save_vars(hype_fw_vm_t *vm) {
     uint64_t offset, len;
+    uint64_t seq;
     char path[48];
     hype_fs_file_t *f = &g_vars_file;
     int have = 0;
@@ -24382,6 +24402,27 @@ static void fw_1_save_vars(hype_fw_vm_t *vm) {
 
     if (!usb_log_this_core_owns_usb() || !g_hype_log_ready || vm->combined_host_phys == 0 ||
         fw_1_vars_region(vm, &offset, &len) != 0 || !fw_1_vm_name_plausible(vm->name)) {
+        return;
+    }
+    /*
+     * #819: nothing has changed since the file was written -- do not write it again.
+     *
+     * The five-second checkpoint used to write the whole varstore unconditionally, per VM,
+     * forever. On the i5 that is 540,672 bytes x 4 VMs every 5 s: boot 2026-09-13c moved
+     * 553,599 sectors (283 MB) over USB in one run for NVRAM that four guests wrote 30,748
+     * times during firmware init and then never touched again. The write happens on the BSP,
+     * inside the loop that also renders the console and reads the keyboard, so every one of
+     * them is a stall the operator sees: BSPSTARVE reported vars=46 (max 2144ms) on hardware
+     * and vars=37 (max 35793ms) in tools/708/run-708-fsload.sh, where the input tick fell to
+     * 1 in 40 seconds.
+     *
+     * Read the sequence BEFORE the write and store it only on success: a guest write that
+     * lands while this one is in flight leaves the two unequal, so the next checkpoint saves
+     * again rather than trusting a file that missed it.
+     */
+    seq = vm->vars_write_seq;
+    if (seq == vm->vars_saved_seq) {
+        g_vars_save_skipped++;
         return;
     }
     hype_snprintf(path, sizeof(path), "vars-%s.bin", vm->name);
@@ -24413,6 +24454,10 @@ static void fw_1_save_vars(hype_fw_vm_t *vm) {
      * misread usb_log_flush_limit() already refuses to allow. Reported once because the periodic
      * checkpoint repeats every few seconds.
      */
+    if (rc == 0) {
+        vm->vars_saved_seq = seq; /* #819: the file now matches RAM as of `seq` */
+        g_vars_save_written++;
+    }
     if (rc != 0 && !vm->vars_save_failed) {
         vm->vars_save_failed = 1;
         hype_debug_print("fw-1 VARS: %s write failed (%llu bytes) -- NVRAM will not persist for "
@@ -24443,6 +24488,9 @@ static void fw_1_load_saved_vars(hype_fw_vm_t *vm) {
         if (hype_fs_read_at(f, 0, g_vars_load_buf, (unsigned int)len) == 0) {
             hype_guest_ram_copy((void *)(uintptr_t)(vm->combined_host_phys + offset),
                                 g_vars_load_buf, len);
+            /* #819: RAM is now exactly what the file holds, so the next checkpoint has
+             * nothing to write until the guest touches the varstore again. */
+            vm->vars_saved_seq = vm->vars_write_seq;
             hype_debug_print("fw-1 VARS: %s restored (%llu bytes) [#441]\n", path,
                              (unsigned long long)len);
         }
@@ -24476,12 +24524,35 @@ static int fw_1_vm_name_plausible(const char *name) {
     return p >= cfg0 && p < cfg0 + sizeof(g_hype_cfg);
 }
 
+/*
+ * #819: how many varstore requests have ever been posted to the BSP, and how many it has
+ * already walked for. The BSP's loop calls fw_1_vars_service() on every iteration -- 173 million
+ * times in one 2026-09-13 hardware run -- and until now every one of those walked g_vms reading
+ * each VM's `vars_req`, which the guest APs write, and called usb_log_this_core_owns_usb(),
+ * which is a LAPIC MMIO read. Both are expensive for the same reason: they touch storage another
+ * core owns. Together they made BSPCOST report the vars phase at 19% of the BSP loop on hardware
+ * and 61% in tools/708/run-708-fsload.sh, for a service that had nothing to do on all but a
+ * handful of calls.
+ *
+ * A posting core bumps the counter AFTER it has stored vars_req, so a BSP that sees the bump
+ * sees the request. The BSP latches the value it read before walking, so a request posted during
+ * the walk bumps past the latch and is picked up next time rather than lost.
+ */
+static volatile uint64_t g_vars_req_posted;
+static uint64_t g_vars_req_seen;
+
 static void fw_1_vars_service(void) {
     unsigned int i;
+    uint64_t posted;
 
+    posted = __atomic_load_n(&g_vars_req_posted, __ATOMIC_ACQUIRE);
+    if (posted == g_vars_req_seen) {
+        return; /* #819: nothing posted -- one load of a line no other core writes */
+    }
     if (!usb_log_this_core_owns_usb()) {
         return;
     }
+    g_vars_req_seen = posted;
     /*
      * #513 THE BUG: g_vm_count, never HYPE_FW_MAX_VMS. #394 made g_vms a pool block sized for
      * g_vm_count elements; this loop kept the old static-array bound and walked SIX phantom
@@ -24553,6 +24624,8 @@ static void fw_1_vars_request(hype_fw_vm_t *vm, uint32_t kind, int wait) {
     seq = vm->vars_req_seq + 1u;
     vm->vars_req_seq = seq;
     vm->vars_req = kind;
+    /* #819: release, so the BSP that observes this bump also observes vars_req above it. */
+    (void)__atomic_add_fetch(&g_vars_req_posted, 1ull, __ATOMIC_RELEASE);
     if (!wait) {
         return;
     }
@@ -31569,12 +31642,16 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                  * BDS means OVMF still concluded "not flash". */
                                 hype_debug_print("fw-1 FLASH: vars_writes=%llu vars_reads=%llu "
                                                  "trap_flips=%llu "
-                                                 "code_writes_ignored=%llu trap_now=%u [#457 #556]\n",
+                                                 "code_writes_ignored=%llu trap_now=%u | "
+                                                 "checkpoints written=%llu skipped-unchanged=%llu "
+                                                 "[#457 #556 #819]\n",
                                                  (unsigned long long)g_flash_vars_writes,
                                                  (unsigned long long)g_flash_vars_reads,
                                                  (unsigned long long)g_flash_trap_flips,
                                                  (unsigned long long)g_flash_code_writes_ignored,
-                                                 (unsigned)g_vms[0].flash_trap_mode);
+                                                 (unsigned)g_vms[0].flash_trap_mode,
+                                                 (unsigned long long)g_vars_save_written,
+                                                 (unsigned long long)g_vars_save_skipped);
                                 {   /* #483: each VM dispatch core's progress, reported from THIS
                                      * core -- when a dispatch loop wedges (VMX: one exit in
                                      * 180 s) it cannot print its own diagnostics, and the AP-side
