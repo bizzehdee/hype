@@ -68,6 +68,7 @@ static volatile unsigned int g_usb_lock_holder_apic = 0xFFFFFFFFu; /* core insid
  */
 static volatile unsigned long long g_usb_lock_held_since;
 static volatile unsigned long long g_usb_lock_held_max;
+static volatile unsigned int g_usb_lock_held_max_apic = 0xFFFFFFFFu; /* #708: who set held_max */
 
 /*
  * #362: measurement, kept in tree deliberately.
@@ -220,6 +221,9 @@ static void usb_xfer_unlock(void) {
         unsigned long long held = usb_rdtsc() - since;
         if (held > __atomic_load_n(&g_usb_lock_held_max, __ATOMIC_RELAXED)) {
             __atomic_store_n(&g_usb_lock_held_max, held, __ATOMIC_RELAXED);
+            __atomic_store_n(&g_usb_lock_held_max_apic,
+                             __atomic_load_n(&g_usb_lock_holder_apic, __ATOMIC_RELAXED),
+                             __ATOMIC_RELAXED);
         }
     }
     __atomic_store_n(&g_usb_lock_held_since, 0ull, __ATOMIC_RELAXED);
@@ -429,7 +433,10 @@ unsigned long long hype_blk_usb_lock_held_us(unsigned int *holder_apic) {
     return ((usb_rdtsc() - since) * 1000000ull) / g_usb_tsc_hz;
 }
 
-unsigned long long hype_blk_usb_lock_held_max_us(void) {
+unsigned long long hype_blk_usb_lock_held_max_us(unsigned int *apic) {
+    if (apic != 0) {
+        *apic = __atomic_load_n(&g_usb_lock_held_max_apic, __ATOMIC_RELAXED);
+    }
     if (g_usb_tsc_hz == 0ull) {
         return 0ull;
     }

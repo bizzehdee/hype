@@ -58,7 +58,7 @@ int hype_blk_usb_sync(hype_blk_usb_t *hw);
  * and the log -- which needs the same lock -- is the first thing to stop, so the dashboard is
  * where this has to be reported. */
 unsigned long long hype_blk_usb_lock_held_us(unsigned int *holder_apic);
-unsigned long long hype_blk_usb_lock_held_max_us(void);
+unsigned long long hype_blk_usb_lock_held_max_us(unsigned int *apic);
 
 void hype_blk_usb_lock_stats(unsigned long long *acquires, unsigned long long *spins,
                              unsigned long long *max_spins, unsigned int *max_spin_apic);

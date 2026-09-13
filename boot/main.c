@@ -10079,11 +10079,32 @@ static void fw_1_render_console(void) {
              * Say so, on the one surface the operator of a serial-less machine can read.
              */
             {
-                static char alert_line[96];
+                static char alert_line[192];
                 unsigned int panics = hype_fatal_core_panic_count();
                 unsigned int lock_apic = 0xFFFFFFFFu;
                 unsigned long long lock_us = hype_blk_usb_lock_held_us(&lock_apic);
-                if (lock_us > 2000000ull) {
+                /*
+                 * #708: LATCHED, like the core-panic alert beside it and for the same reason.
+                 *
+                 * The first one an operator managed to read cleared itself while they were
+                 * reading it: "i saw the alert, but it went away. it was in vm2, i didnt see the
+                 * section or the apic". A wedge that recovers is the single most useful thing
+                 * this has found -- it says the core comes back -- and an alert that erases the
+                 * evidence of its own event is worse than none. Once seen, it stays, showing the
+                 * WORST hold and the core that owned it.
+                 */
+                static unsigned long long wedge_peak_us;
+                static unsigned int wedge_apic;
+                static int wedge_slot;
+                static unsigned int wedge_sec;
+                if (lock_us > wedge_peak_us) {
+                    wedge_peak_us = lock_us;
+                    wedge_apic = lock_apic;
+                    wedge_slot = fw_1_ap_slot_of(lock_apic);
+                    wedge_sec = (wedge_slot >= 0 && g_436_loop_section != 0)
+                                    ? (unsigned)g_436_loop_section[wedge_slot] : 0u;
+                }
+                if (wedge_peak_us > 2000000ull) {
                     /*
                      * #708: a core has been inside a USB transfer for more than two seconds.
                      *
@@ -10102,13 +10123,15 @@ static void fw_1_render_console(void) {
                      * BSPPROBE reports, so the number means the same thing in both places.
                      */
                     static unsigned int wedge_reported;
-                    int wslot = fw_1_ap_slot_of(lock_apic);
-                    unsigned wsec = (wslot >= 0 && g_436_loop_section != 0)
-                                        ? (unsigned)g_436_loop_section[wslot] : 0u;
+                    /* Held now, or the worst seen and since released -- an operator needs to be
+                     * able to tell those apart at a glance. */
                     hype_snprintf(alert_line, sizeof(alert_line),
-                                  "** USB WEDGED %llus: apic=%u vm%d section=%u -- \\HYPE.LOG "
-                                  "HAS STOPPED, that core is stuck in a transfer [#708] **",
-                                  lock_us / 1000000ull, lock_apic, wslot, wsec);
+                                  "** USB WEDGED: vm%d apic=%u section=%u held the transfer lock "
+                                  "%llu.%llus (%s) -- \\HYPE.LOG stops while it is held [#708] **",
+                                  wedge_slot, wedge_apic, wedge_sec,
+                                  wedge_peak_us / 1000000ull,
+                                  (wedge_peak_us % 1000000ull) / 100000ull,
+                                  (lock_us > 2000000ull) ? "STILL HELD" : "released, peak");
                     alert = alert_line;
                     /*
                      * #708: say it in the LOG too, once.
@@ -10127,7 +10150,7 @@ static void fw_1_render_console(void) {
                                   "fw-1 USB WEDGED: apic=%u vm%d section=%u has held the "
                                   "transfer lock %llums -- everything needing USB has stopped, "
                                   "this log included [#708]\n",
-                                  lock_apic, wslot, wsec, lock_us / 1000ull);
+                                  wedge_apic, wedge_slot, wedge_sec, wedge_peak_us / 1000ull);
                     }
                 } else if (panics > 0u) {
                     hype_snprintf(alert_line, sizeof(alert_line),
@@ -16867,11 +16890,18 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         {   /* #708: the longest any core has KEPT the lock, beside how long
                              * cores waited for it. A wedge shows up here as a held time that
                              * dwarfs every transfer's service time. */
-                            unsigned int hnow_apic = 0xFFFFFFFFu;
+                            unsigned int hnow_apic = 0xFFFFFFFFu, hmax_apic = 0xFFFFFFFFu;
+                            unsigned long long hmax = hype_blk_usb_lock_held_max_us(&hmax_apic);
+                            /* #708: a wedge that RECOVERS leaves no other trace once the alert
+                             * clears -- name the core that set the high-water, not just the
+                             * duration, so the log says which VM it was after the fact. */
                             hype_debug_print("fw-1 USBLOCK: acquires=%llu spins=%llu avg=%llu "
-                                             "max=%llu on apic=%u | held max=%lluus now=%lluus "
-                                             "apic=%d [#362 #708]\n", la, ls, ls / la, lm, lapic,
-                                             hype_blk_usb_lock_held_max_us(),
+                                             "max=%llu on apic=%u | held max=%lluus by apic=%d "
+                                             "vm%d | now=%lluus apic=%d [#362 #708]\n",
+                                             la, ls, ls / la, lm, lapic, hmax,
+                                             (hmax_apic == 0xFFFFFFFFu) ? -1 : (int)hmax_apic,
+                                             (hmax_apic == 0xFFFFFFFFu) ? -1
+                                                 : fw_1_ap_slot_of(hmax_apic),
                                              hype_blk_usb_lock_held_us(&hnow_apic),
                                              (hnow_apic == 0xFFFFFFFFu) ? -1 : (int)hnow_apic);
                         }
