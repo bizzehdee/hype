@@ -8798,6 +8798,7 @@ static void fw_1_uplink_adopt_config(void) {
 static int fw_1_load_kernel(hype_fw_vm_t *vm, unsigned vi); /* #535 */
 static void fw_1_save_vars(hype_fw_vm_t *vm);
 static void fw_1_load_saved_vars(hype_fw_vm_t *vm);
+static void fw_1_vars_prealloc(hype_fw_vm_t *vm); /* #821 */
 
 /* #454: varstore request kinds, in vm->vars_req. */
 #define HYPE_FW_VARS_REQ_NONE 0u
@@ -24474,6 +24475,7 @@ static hype_fs_file_t g_vars_file;
  * with the FLASH line so a run says how much varstore I/O the dirty check actually avoided. */
 static uint64_t g_vars_save_written;
 static uint64_t g_vars_save_skipped;
+static uint64_t g_vars_prealloc; /* #821 */
 
 static void fw_1_save_vars(hype_fw_vm_t *vm) {
     uint64_t offset, len;
@@ -24552,6 +24554,52 @@ static void fw_1_save_vars(hype_fw_vm_t *vm) {
     }
 }
 
+/*
+ * #821: give this VM's varstore file its blocks BEFORE the guest runs.
+ *
+ * #819 cut the periodic checkpoint from ~530 writes a run to 3 -- one per VM, the moment its
+ * firmware finishes writing NVRAM. Those three are the expensive kind: the file does not exist
+ * yet, so hype_fs_write_at() takes hype_fat32_write_at()'s GROWTH path and walks a chain that
+ * gets longer with every cluster. Boot 2026-09-13g measured them at BSPSTARVE vars=3(max
+ * 1597ms), and KEYLAT's poll gap max of 1,619,415us is the same event seen from the keyboard:
+ * for 1.6 s the BSP polls nothing and draws nothing.
+ *
+ * Chunking is the wrong fix and was already tried -- #808 measured 164 ms becoming 1408 ms,
+ * because every chunk re-entered the growth path. Doing the allocation EARLY is the right one:
+ * it is the same work, moved from "three guests booting and the operator watching" to setup,
+ * where the BSP has nothing else to do. Afterwards every checkpoint is a pure in-place write,
+ * which is what #454's "reuse an existing correctly-sized file" note always intended.
+ *
+ * Best-effort, exactly like the restore beside it: no log sink yet means no-op, and the first
+ * checkpoint then pays what it used to.
+ */
+static void fw_1_vars_prealloc(hype_fw_vm_t *vm) {
+    uint64_t offset, len;
+    char path[48];
+    hype_fs_file_t *f = &g_vars_file;
+
+    if (!usb_log_this_core_owns_usb() || !g_hype_log_ready || vm->combined_host_phys == 0 ||
+        fw_1_vars_region(vm, &offset, &len) != 0 || !fw_1_vm_name_plausible(vm->name)) {
+        return;
+    }
+    hype_snprintf(path, sizeof(path), "vars-%s.bin", vm->name);
+    if (hype_fs_lookup(&g_hype_log.fs, path, f) == 0 && f->size == len) {
+        return; /* already the right size -- every write to it is in-place from here */
+    }
+    if (hype_fs_create(&g_hype_log.fs, path, f) != 0) {
+        return;
+    }
+    if (hype_fs_write_at(f, 0, (const void *)(uintptr_t)(vm->combined_host_phys + offset),
+                         (unsigned int)len) == 0) {
+        g_vars_prealloc++;
+        /* The file now holds exactly what RAM holds, so the next checkpoint has nothing to do
+         * until the guest writes its varstore -- and that write will be in-place. */
+        vm->vars_saved_seq = vm->vars_write_seq;
+        hype_debug_print("fw-1 VARS: %s pre-allocated (%llu bytes) -- the first checkpoint is "
+                         "now an in-place write [#821]\n", path, (unsigned long long)len);
+    }
+}
+
 static void fw_1_load_saved_vars(hype_fw_vm_t *vm) {
     static uint8_t g_vars_load_buf[HYPE_FW_1_VARS_LOAD_BUF_MAX];
     uint64_t offset, len;
@@ -24567,6 +24615,20 @@ static void fw_1_load_saved_vars(hype_fw_vm_t *vm) {
     /* hype_fs_lookup() confirms both existence and size before any read -- a file that exists
      * but is the wrong size (a stale save from a differently-sized OVMF_VARS.fd, say) is treated
      * as absent rather than partially applied. */
+    /*
+     * #821: no usable file yet -- create it at full size NOW, while this runs.
+     *
+     * This is reached from the launch-time restore, which run_fw_1_test() posts with wait=1 and
+     * the BSP services before the guest is started. The allocating write therefore happens on a
+     * quiet machine instead of 1.6 s into three guests booting, and every checkpoint afterwards
+     * takes #454's in-place path. Putting it in run_fw_1_test() directly did not work and is
+     * worth recording: that function runs on the VM's own AP, so usb_log_this_core_owns_usb()
+     * is false there and the call was a silent no-op (prealloc=0 in the rig).
+     */
+    if (hype_fs_lookup(&g_hype_log.fs, path, f) != 0 || f->size != len) {
+        fw_1_vars_prealloc(vm);
+        return;
+    }
     if (hype_fs_lookup(&g_hype_log.fs, path, f) == 0 && f->size == len) {
         if (hype_fs_read_at(f, 0, g_vars_load_buf, (unsigned int)len) == 0) {
             hype_guest_ram_copy((void *)(uintptr_t)(vm->combined_host_phys + offset),
@@ -31762,14 +31824,15 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                                  "trap_flips=%llu "
                                                  "code_writes_ignored=%llu trap_now=%u | "
                                                  "checkpoints written=%llu skipped-unchanged=%llu "
-                                                 "[#457 #556 #819]\n",
+                                                 "prealloc=%llu [#457 #556 #819 #821]\n",
                                                  (unsigned long long)g_flash_vars_writes,
                                                  (unsigned long long)g_flash_vars_reads,
                                                  (unsigned long long)g_flash_trap_flips,
                                                  (unsigned long long)g_flash_code_writes_ignored,
                                                  (unsigned)g_vms[0].flash_trap_mode,
                                                  (unsigned long long)g_vars_save_written,
-                                                 (unsigned long long)g_vars_save_skipped);
+                                                 (unsigned long long)g_vars_save_skipped,
+                                                 (unsigned long long)g_vars_prealloc);
                                 {   /* #483: each VM dispatch core's progress, reported from THIS
                                      * core -- when a dispatch loop wedges (VMX: one exit in
                                      * 180 s) it cannot print its own diagnostics, and the AP-side
