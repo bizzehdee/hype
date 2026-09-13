@@ -10101,6 +10101,7 @@ static void fw_1_render_console(void) {
                      * table the AP timer ISR uses, and the section is the #436 breadcrumb that
                      * BSPPROBE reports, so the number means the same thing in both places.
                      */
+                    static unsigned int wedge_reported;
                     int wslot = fw_1_ap_slot_of(lock_apic);
                     unsigned wsec = (wslot >= 0 && g_436_loop_section != 0)
                                         ? (unsigned)g_436_loop_section[wslot] : 0u;
@@ -10109,6 +10110,25 @@ static void fw_1_render_console(void) {
                                   "HAS STOPPED, that core is stuck in a transfer [#708] **",
                                   lock_us / 1000000ull, lock_apic, wslot, wsec);
                     alert = alert_line;
+                    /*
+                     * #708: say it in the LOG too, once.
+                     *
+                     * The first two boots to raise this alert left no trace in HYPE.LOG at all,
+                     * because the alert was a dashboard string and nothing else -- so afterwards
+                     * there was no way to tell a run where it fired from one where it did not,
+                     * and the operator reading it off the screen was the only record. The line
+                     * may well never reach the file: the flush needs the very lock that is
+                     * wedged. But it costs nothing, it lands in the log buffer immediately, and
+                     * if the holder ever does let go the whole tail flushes with this in it.
+                     */
+                    if (!wedge_reported) {
+                        wedge_reported = 1;
+                        HYPE_LOGF(HYPE_LOG_ERROR,
+                                  "fw-1 USB WEDGED: apic=%u vm%d section=%u has held the "
+                                  "transfer lock %llums -- everything needing USB has stopped, "
+                                  "this log included [#708]\n",
+                                  lock_apic, wslot, wsec, lock_us / 1000ull);
+                    }
                 } else if (panics > 0u) {
                     hype_snprintf(alert_line, sizeof(alert_line),
                                   "** %u CORE PANIC(S) -- apic=%u halted; see the log for the "
