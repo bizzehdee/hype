@@ -35,10 +35,17 @@ CFLAGS  := --target=$(TARGET) -ffreestanding -fshort-wchar -mno-red-zone \
            -Wall -Wextra -g -O1 -std=c11 -MMD -MP \
            -Werror=constant-conversion \
            -fstack-protector-strong \
+           -fstack-usage \
            -DHYPE_BUILD_ID='"$(HYPE_BUILD_ID)"' \
            -DHYPE_BUILD_DATE='"$(HYPE_BUILD_DATE)"' \
            -DHYPE_BUILD_TAG='"$(HYPE_BUILD_TAG)"' $(EXTRA_CFLAGS)
 LDFLAGS := -flavor link -subsystem:efi_application -entry:efi_main
+
+# #818: a guest core runs its VM on one of the packed, guard-page-less AP stacks, so any call
+# chain reachable from fw_1_ap_main() that is deeper than one slot corrupts the core next to it.
+# Read the bound from the source rather than repeating it here, and check it at every link --
+# clang's -fstack-usage records (above) are what make the check possible.
+AP_STACK_BYTES := $(shell sed -n 's/^#define HYPE_AP_STACK_BYTES \([0-9]*\)u\?$$/\1/p' boot/main.c)
 
 BUILD_DIR := build
 CORE_SRCS := core/format.c core/console.c core/halt.c core/memmap.c \
@@ -184,6 +191,7 @@ $(OUT): $(OBJS)
 	$(LD) $(LDFLAGS) -out:$@ $(OBJS)
 	@tools/check-no-vex.sh $(OUT)
 	@tools/check-no-preebs-fileio.sh boot/main.c
+	@python3 tools/817/stack-depth.py --check --limit $(AP_STACK_BYTES) fw_1_ap_main
 
 test:
 	@python3 tools/check-fw1-statics.py

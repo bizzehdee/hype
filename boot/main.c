@@ -3396,7 +3396,20 @@ static void term_cmdline_key(uint8_t ch) {
 }
 
 static uint64_t g_ap_tramp_page;
-#define HYPE_AP_STACK_BYTES 16384u
+/*
+ * #818: 64 KiB, not the original 16 KiB.
+ *
+ * tools/817/stack-depth.py, run over the -fstack-usage records and the direct-call relocations
+ * of the built objects, measures the worst chain reachable from fw_1_ap_main() at 47,744 bytes:
+ * run_fw_1_test() -> fw_1_vm_reinit() -> fw_1_load_kernel() (25,416 by itself) -> fw_1_boot_volume()
+ * -> fw_1_boot_vol_verify(). Restarting a `boot = kernel` VM from its own core therefore ran
+ * 17 KB past a 16 KiB slot. The slots are packed with no guard page, so that lands in the next
+ * core's live stack.
+ *
+ * 64 KiB clears the measured worst case with room for the indirect calls the analysis cannot
+ * see. `make` runs the analysis as check-ap-stack and fails if a chain ever exceeds this.
+ */
+#define HYPE_AP_STACK_BYTES 65536u
 /* #413: one AP stack per VM (was g_ap_stack + g_ap2_stack). Pool-allocated,
  * page-aligned, sized to g_vm_count. Used by the AP during early bring-up on
  * g_ap_cr3's flat [0,64GB) map before it switches to g_pml4, so like the former
@@ -8997,6 +9010,27 @@ static void fw_1_ap_stack_check(uint64_t now_h, uint64_t hz) {
     if (slots > 64u * 8u) {
         slots = 64u * 8u;
     }
+    /*
+     * #818: the overflow answer comes from the guard band alone, so this beat reads 256 bytes
+     * per slot however large the slots are. The high-water walk below is what costs a pass over
+     * every slot, and it only runs on the 30-second summary.
+     */
+    for (s = 0; s < slots; s++) {
+        if (!hype_stack_guard_disturbed(g_ap_stacks[s], HYPE_AP_STACK_BYTES) ||
+            (reported[s >> 6] & (1ull << (s & 63u))) != 0u) {
+            continue;
+        }
+        reported[s >> 6] |= 1ull << (s & 63u);
+        HYPE_LOGF(HYPE_LOG_ERROR,
+                  "fw-1 APSTACK OVERFLOW: vm%u vCPU %u (slot %u) reached the guard at the bottom "
+                  "of its %u-byte slot -- it ran into the memory below, which is now corrupt "
+                  "[#817 #818]\n",
+                  s / HYPE_MAX_VCPUS_PER_VM, s % HYPE_MAX_VCPUS_PER_VM, s,
+                  (unsigned)HYPE_AP_STACK_BYTES);
+    }
+    if (hz == 0ull || (summary_last != 0ull && now_h - summary_last < hz * 30ull)) {
+        return;
+    }
     n = hype_snprintf(buf, sizeof(buf), "fw-1 APSTACK: bytes used of %u by slot:",
                       (unsigned)HYPE_AP_STACK_BYTES);
     for (s = 0; s < slots; s++) {
@@ -9013,17 +9047,8 @@ static void fw_1_ap_stack_check(uint64_t now_h, uint64_t hz) {
             n += hype_snprintf(buf + n, sizeof(buf) - (unsigned)n, " %u=%llu", s,
                                (unsigned long long)used);
         }
-        if (hype_stack_guard_hit(used, HYPE_AP_STACK_BYTES) &&
-            (reported[s >> 6] & (1ull << (s & 63u))) == 0u) {
-            reported[s >> 6] |= 1ull << (s & 63u);
-            HYPE_LOGF(HYPE_LOG_ERROR,
-                      "fw-1 APSTACK OVERFLOW: vm%u vCPU %u (slot %u) used %llu of %u bytes -- it "
-                      "ran into the memory below its slot, which is now corrupt [#817]\n",
-                      s / HYPE_MAX_VCPUS_PER_VM, s % HYPE_MAX_VCPUS_PER_VM, s,
-                      (unsigned long long)used, (unsigned)HYPE_AP_STACK_BYTES);
-        }
     }
-    if (touched != 0u && hz != 0ull && (summary_last == 0ull || now_h - summary_last >= hz * 30ull)) {
+    if (touched != 0u) {
         summary_last = now_h;
         hype_debug_print("%s | deepest slot %u=%llu [#817]\n", buf, deepest_slot,
                          (unsigned long long)deepest);
@@ -24324,10 +24349,34 @@ static int fw_1_vars_region(const hype_fw_vm_t *vm, uint64_t *out_offset, uint64
 
 static int fw_1_vm_name_plausible(const char *name); /* #513: defined with fw_1_vars_service */
 
+/*
+ * #818: the varstore file handle, OFF the stack.
+ *
+ * hype_fs_file_t is 12,560 bytes, and both functions below used to hold one as a local -- a
+ * 12,696-byte frame each. The five-second checkpoint in fw_1_publish_and_render() calls them
+ * through fw_1_vars_request(), which is inlined into run_fw_1_test(), so a GUEST core makes
+ * that call on its own AP stack.
+ *
+ * It does no file I/O there: usb_log_this_core_owns_usb() is "is this core the BSP", so on an
+ * AP both functions return at their first line. But the frame is claimed BEFORE that line runs.
+ * The MS ABI prologue is `mov eax,0x31a8; call __chkstk; sub rsp,rax`, and hype's __chkstk
+ * (arch/x86_64/cpu/chkstk.S) probes every page of the frame with `orq $0,(%rcx)` on the way
+ * down. From the AP's measured 8,224-byte baseline (fw_1_ap_main 1,208 + run_fw_1_test 6,984)
+ * that reaches 20,888 bytes -- 4,504 bytes past the end of a 16 KiB slot, into the top of the
+ * neighbouring slot, which is where that core's live frames are. The probe writes each qword
+ * back unchanged, so it only loses data when the neighbour stores to the same qword inside the
+ * read-modify-write window; there is no lock prefix. Narrow, but it is a live-stack race that
+ * should not exist, and it costs nothing to remove.
+ *
+ * One shared instance is safe because only the BSP gets past the guard above: every use of this
+ * is on one core. It is NOT per-VM state -- nothing in it outlives the call.
+ */
+static hype_fs_file_t g_vars_file;
+
 static void fw_1_save_vars(hype_fw_vm_t *vm) {
     uint64_t offset, len;
     char path[48];
-    hype_fs_file_t f;
+    hype_fs_file_t *f = &g_vars_file;
     int have = 0;
     int rc;
 
@@ -24339,9 +24388,9 @@ static void fw_1_save_vars(hype_fw_vm_t *vm) {
     /* #454: reuse an existing correctly-sized file so the steady-state checkpoint is a pure
      * in-place data write -- the #204/#199 discipline. Only the first save of a run (or one after
      * the varstore size changed) allocates, and only then does it touch FAT metadata. */
-    if (hype_fs_lookup(&g_hype_log.fs, path, &f) == 0 && f.size == len) {
+    if (hype_fs_lookup(&g_hype_log.fs, path, f) == 0 && f->size == len) {
         have = 1;
-    } else if (hype_fs_create(&g_hype_log.fs, path, &f) == 0) {
+    } else if (hype_fs_create(&g_hype_log.fs, path, f) == 0) {
         have = 1;
     }
     if (!have) {
@@ -24356,7 +24405,7 @@ static void fw_1_save_vars(hype_fw_vm_t *vm) {
      * one. The keyboard now yields from inside the write itself (fs->yield), which needs no
      * chunking here.
      */
-    rc = hype_fs_write_at(&f, 0, (const void *)(uintptr_t)(vm->combined_host_phys + offset),
+    rc = hype_fs_write_at(f, 0, (const void *)(uintptr_t)(vm->combined_host_phys + offset),
                           (unsigned int)len);
     /*
      * #454: report the first failure per VM. A silent failure here is indistinguishable from
@@ -24379,7 +24428,7 @@ static void fw_1_load_saved_vars(hype_fw_vm_t *vm) {
     static uint8_t g_vars_load_buf[HYPE_FW_1_VARS_LOAD_BUF_MAX];
     uint64_t offset, len;
     char path[48];
-    hype_fs_file_t f;
+    hype_fs_file_t *f = &g_vars_file;
 
     if (!usb_log_this_core_owns_usb() || !g_hype_log_ready || vm->combined_host_phys == 0 ||
         fw_1_vars_region(vm, &offset, &len) != 0 || len > sizeof(g_vars_load_buf) ||
@@ -24390,8 +24439,8 @@ static void fw_1_load_saved_vars(hype_fw_vm_t *vm) {
     /* hype_fs_lookup() confirms both existence and size before any read -- a file that exists
      * but is the wrong size (a stale save from a differently-sized OVMF_VARS.fd, say) is treated
      * as absent rather than partially applied. */
-    if (hype_fs_lookup(&g_hype_log.fs, path, &f) == 0 && f.size == len) {
-        if (hype_fs_read_at(&f, 0, g_vars_load_buf, (unsigned int)len) == 0) {
+    if (hype_fs_lookup(&g_hype_log.fs, path, f) == 0 && f->size == len) {
+        if (hype_fs_read_at(f, 0, g_vars_load_buf, (unsigned int)len) == 0) {
             hype_guest_ram_copy((void *)(uintptr_t)(vm->combined_host_phys + offset),
                                 g_vars_load_buf, len);
             hype_debug_print("fw-1 VARS: %s restored (%llu bytes) [#441]\n", path,

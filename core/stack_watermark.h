@@ -32,4 +32,13 @@ uint64_t hype_stack_used(const uint8_t *base, uint64_t len);
 /* 1 when `used` reaches into the guard at the bottom of a `len`-byte stack. */
 int hype_stack_guard_hit(uint64_t used, uint64_t len);
 
+/*
+ * #818: 1 when any byte of the guard itself has been disturbed -- the same answer as
+ * hype_stack_guard_hit(hype_stack_used(...), len), but it reads only the guard instead of
+ * walking the slot up to the deepest frame. The periodic check runs this over every slot on
+ * its two-second beat and keeps the full hype_stack_used() walk for the slower high-water
+ * summary, so raising the slot size does not raise the cost of noticing an overflow.
+ */
+int hype_stack_guard_disturbed(const uint8_t *base, uint64_t len);
+
 #endif /* HYPE_CORE_STACK_WATERMARK_H */

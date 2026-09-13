@@ -72,12 +72,50 @@ static void test_degenerate_inputs(void) {
               hype_stack_guard_hit(hype_stack_used(tiny, sizeof(tiny)), sizeof(tiny)));
 }
 
+/*
+ * #818: the cheap guard-band read must give the same verdict as the full walk, because the
+ * periodic check now uses it instead -- a slot is 64 KiB and reading all of it every two
+ * seconds for every core is what the walk would cost.
+ */
+static void test_guard_band_read_agrees_with_the_full_walk(void) {
+    static uint8_t s[STACK];
+    unsigned depths[] = { 1u, 100u, 3000u, STACK - HYPE_STACK_GUARD_BYTES - 1u,
+                          STACK - HYPE_STACK_GUARD_BYTES, STACK - 1u, STACK };
+    unsigned i;
+
+    hype_stack_paint(s, sizeof(s));
+    CHECK_U64("untouched: guard band clean", 0, hype_stack_guard_disturbed(s, sizeof(s)));
+
+    for (i = 0; i < sizeof(depths) / sizeof(depths[0]); i++) {
+        unsigned d = depths[i];
+        hype_stack_paint(s, sizeof(s));
+        memset(s + (STACK - d), 0x00, d);
+        CHECK_U64("guard band matches the full walk",
+                  (unsigned long long)hype_stack_guard_hit(hype_stack_used(s, sizeof(s)),
+                                                           sizeof(s)),
+                  (unsigned long long)hype_stack_guard_disturbed(s, sizeof(s)));
+    }
+}
+
+static void test_guard_band_degenerate_inputs(void) {
+    uint8_t tiny[8];
+    CHECK_U64("NULL stack is not a hit", 0, hype_stack_guard_disturbed(0, 64));
+    hype_stack_paint(tiny, sizeof(tiny));
+    CHECK_U64("stack smaller than the guard, untouched", 0,
+              hype_stack_guard_disturbed(tiny, sizeof(tiny)));
+    tiny[0] = 0x11;
+    CHECK_U64("stack smaller than the guard, any use is a hit", 1,
+              hype_stack_guard_disturbed(tiny, sizeof(tiny)));
+}
+
 int main(void) {
     test_untouched_stack_reports_zero();
     test_depth_is_measured_from_the_top();
     test_lowest_disturbed_byte_wins();
     test_overflow_reaches_the_guard();
     test_degenerate_inputs();
+    test_guard_band_read_agrees_with_the_full_walk();
+    test_guard_band_degenerate_inputs();
     if (failures == 0) {
         printf("all tests passed\n");
         return 0;

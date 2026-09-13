@@ -10,8 +10,8 @@
 # other guests' ISO reads also take. tools/708/run-708-viewswitch.sh kept its images on AHCI and
 # passed -- it never took this path.
 #
-# This rig puts the ISO, all three images and hype's log on one QEMU usb-storage device (the ESP
-# stays on AHCI so the boot path is the known-good one). hype's serial is a file, so a freeze
+# This rig boots from one QEMU usb-storage device that also holds the ISO, all three images and
+# hype's log. hype's serial is a file, so a freeze
 # cannot lose the tail. Once run2n reads back, the watcher waits for the BSP's FBSPEED lines; if
 # they stop for 30 s it records every CPU's registers and a screenshot from the monitor, then quits.
 #
@@ -31,14 +31,17 @@ HERE=tools/hw-val-2026-08-25
 [ -f "$ISO" ] || { echo "no ISO at $ISO"; exit 2; }
 
 rm -rf "$S"; mkdir -p "$S"
-# ESP on AHCI: hype, firmware, config and input scripts only.
-dd if=/dev/zero of="$S"/esp.img bs=1M count=64 status=none
-printf '2048,,U\n' | sfdisk --label gpt -q "$S"/esp.img
-mformat -i "$S"/esp.img@@1M -F ::
-mmd -i "$S"/esp.img@@1M ::/EFI ::/EFI/BOOT ::/EFI/hype ::/input
-mcopy -i "$S"/esp.img@@1M "$EFI" ::/EFI/BOOT/BOOTX64.EFI
-mcopy -i "$S"/esp.img@@1M fw/OVMF_CODE.fd fw/OVMF_VARS.fd ::/EFI/hype/
-for v in 0 1 2; do mcopy -i "$S"/esp.img@@1M "$HERE/input-2h/vm$v.txt" "::/input/vm$v.txt"; done
+# One USB drive, booted from, like the i5: GPT with a FAT32 partition holding hype, firmware, config,
+# input scripts, the ISO and the three images. hype writes its log only to the volume it booted
+# from (#638) and resolves media only in GPT partitions 1-4, so a partitionless stick beside an
+# AHCI ESP (this rig's first cut) put neither the log nor the images on USB.
+dd if=/dev/zero of="$S"/usb.img bs=1M count=3800 conv=fsync status=none
+printf '2048,,U\n' | sfdisk --label gpt -q "$S"/usb.img
+mformat -i "$S"/usb.img@@1M -F -v HYPEBOOT ::
+mmd -i "$S"/usb.img@@1M ::/EFI ::/EFI/BOOT ::/EFI/hype ::/input ::/iso ::/hype ::/hype/disks
+mcopy -i "$S"/usb.img@@1M "$EFI" ::/EFI/BOOT/BOOTX64.EFI
+mcopy -i "$S"/usb.img@@1M fw/OVMF_CODE.fd fw/OVMF_VARS.fd ::/EFI/hype/
+for v in 0 1 2; do mcopy -i "$S"/usb.img@@1M "$HERE/input-2h/vm$v.txt" "::/input/vm$v.txt"; done
 cat > "$S"/hype.cfg <<'CFG'
 [hype]
 config_version = 1
@@ -75,15 +78,10 @@ os_hint = linux
 target_disk = file:\hype\disks\run2n.img
 target_disk_size_gb = 1
 CFG
-mcopy -i "$S"/esp.img@@1M "$S"/hype.cfg ::/hype.cfg
-
-# The USB drive: ISO, the three images, and hype's log. Superfloppy FAT32, as the #119 rig uses.
-dd if=/dev/zero of="$S"/usb.img bs=1M count=3700 conv=fsync status=none
-mkfs.vfat -F 32 -n HYPEUSB "$S"/usb.img >/dev/null
-mmd -i "$S"/usb.img ::/iso ::/hype ::/hype/disks
-mcopy -i "$S"/usb.img "$ISO" ::/iso/test.iso
+mcopy -i "$S"/usb.img@@1M "$S"/hype.cfg ::/hype.cfg
+mcopy -i "$S"/usb.img@@1M "$ISO" ::/iso/test.iso
 dd if=/dev/zero of="$S"/zero1g.img bs=1M count=1024 status=none
-for d in run2c run2e run2n; do mcopy -i "$S"/usb.img "$S"/zero1g.img "::/hype/disks/$d.img"; done
+for d in run2c run2e run2n; do mcopy -i "$S"/usb.img@@1M "$S"/zero1g.img "::/hype/disks/$d.img"; done
 rm -f "$S"/zero1g.img
 cp /usr/share/edk2/ovmf/OVMF_VARS.fd "$S"/VARS.fd
 
@@ -114,19 +112,16 @@ fbcount() { grep -a -c "FBSPEED: t=" "$LOG" 2>/dev/null || echo 0; }
   -accel kvm -cpu host -smp 16,sockets=1,cores=8,threads=2 \
   -drive if=pflash,format=raw,readonly=on,file=/usr/share/edk2/ovmf/OVMF_CODE.fd \
   -drive if=pflash,format=raw,file="$S"/VARS.fd \
-  -device ich9-ahci,id=ahci \
-  -drive format=raw,file="$S"/esp.img,if=none,id=d0 \
-  -device ide-hd,drive=d0,bus=ahci.0,bootindex=0 \
   -device qemu-xhci,id=xhci \
   -drive format=raw,file="$S"/usb.img,if=none,id=stick \
-  -device usb-storage,bus=xhci.0,drive=stick,serial=HYPEUSB708 \
+  -device usb-storage,bus=xhci.0,drive=stick,serial=HYPEUSB708,bootindex=0 \
   -serial "file:$LOG" -monitor stdio -display none -vga std >"$S"/mon.log 2>"$S"/qemu.err || true
 
 echo "=== build / vendor ==="
 grep -a -m2 -E "^hype: build|vmm: (SVM|VMX) detected" "$LOG"
 echo "PANIC=$(grep -a -c PANIC "$LOG") APSTACK_OVERFLOW=$(grep -a -c 'APSTACK OVERFLOW' "$LOG")"
 echo "=== disks and log sink ==="
-grep -a -E "m5-8: (FILE-backed|target_disk)|host-fat: vm[0-9] resolved|usb-log: .*(open|ready|HYPE.LOG)|log sink" "$LOG" | cut -c1-150 | head -8
+grep -a -E "m5-8: (FILE-backed|target_disk)|host-fat: vm[0-9] resolved|usb-log: |XHCIOWN" "$LOG" | cut -c1-150 | head -8
 echo "=== scripts ==="
 grep -a -E "SCRIPT vm[0-9]: (PASS|FAIL)" "$LOG" | cut -c1-120
 grep -a -E "vm[0-9] ttyS0\| (READBACK-MATCH|BULK-[0-9]+|EXT4-WRITE-DONE|NTFS-WRITE-DONE|BOOT-OK-)" "$LOG" | cut -c1-100

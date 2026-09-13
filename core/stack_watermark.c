@@ -29,3 +29,17 @@ int hype_stack_guard_hit(uint64_t used, uint64_t len) {
     }
     return used > len - HYPE_STACK_GUARD_BYTES;
 }
+
+int hype_stack_guard_disturbed(const uint8_t *base, uint64_t len) {
+    uint64_t n, i;
+    if (base == 0) {
+        return 0;
+    }
+    n = (len < HYPE_STACK_GUARD_BYTES) ? len : HYPE_STACK_GUARD_BYTES;
+    for (i = 0; i < n; i++) {
+        if (base[i] != (uint8_t)HYPE_STACK_PAINT_BYTE) {
+            return 1;
+        }
+    }
+    return 0;
+}
