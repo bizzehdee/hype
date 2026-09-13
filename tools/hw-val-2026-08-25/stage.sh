@@ -284,6 +284,31 @@ fi
 echo "scratch image on media:"
 ls -l "$DATAMP/hype/disks/" 2>/dev/null | tail -n +2 | sed 's/^/  /'
 
+# ---------------------------------------------------------------- leave the drive safe to pull
+#
+# #818: this script used to leave every filesystem it mounted still mounted. Pull the drive in
+# that state and its ext4 keeps needs_recovery set on disk -- and hype's ext reader refuses such
+# a volume outright (core/ext.c: "an unreplayed journal: nothing on disk can be trusted yet"),
+# two sectors in. That is exactly what the i5 boots of 2026-09-13 16:10 and 17:28 hit: run2c and
+# run2e found neither their ISO nor their disk and sat at "No bootable option or device was
+# found", and the only thing said about it was "NOT FOUND on any of GPT partitions 1-4". FAT32,
+# exFAT and NTFS have no equivalent flag, so the fault looked ext4-specific and build-related
+# when it was neither.
+echo "unmounting everything so the drive is safe to unplug ..."
+sync
+STILL=""
+for d in "$BOOTDEV" "$DATADEV" ${EXT4DEV:+"$EXT4DEV"} ${NTFSDEV:+"$NTFSDEV"}; do
+  [ -n "$d" ] || continue
+  [ -n "$(mountpt "$d")" ] || continue
+  udisksctl unmount -b "$d" >/dev/null 2>&1
+  if [ -n "$(mountpt "$d")" ]; then STILL="$STILL $d"; else echo "  unmounted $d"; fi
+done
+if [ -n "$STILL" ]; then
+  echo "  STILL MOUNTED:$STILL -- unmount these before unplugging, or hype will be handed a" >&2
+  echo "  dirty volume and refuse it [#818]" >&2
+  RC=1
+fi
+
 [ "$IMG_RC" = 0 ] || RC=1
-if [ "$RC" = 0 ]; then echo "STAGED OK"; else echo "STAGING HAS PROBLEMS -- see above" >&2; fi
+if [ "$RC" = 0 ]; then echo "STAGED OK -- safe to unplug"; else echo "STAGING HAS PROBLEMS -- see above" >&2; fi
 exit "$RC"

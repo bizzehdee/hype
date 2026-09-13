@@ -39,23 +39,30 @@ CFG="${CFG:-$HERE/hype2h.cfg}"
 # exFAT/NTFS ones mount as the caller anyway. debugfs write is NOT used -- it lays a big file
 # down in ~100 extents and hype's resolver caps at 64 (see the ext4/FAT test-volume recipe).
 MOUNTED=()
-fs_mount() { # $1 = image -> echoes the mount point
-    local l dev m mp
+MP=""
+# Sets MP, and does NOT echo it: the first cut was called as `MP=$(fs_mount ...)`, and a command
+# substitution is a subshell, so every `MOUNTED+=(...)` was thrown away with it. Nothing was ever
+# unmounted, each dd copied a still-mounted filesystem, and the assembled ext4 came out
+# "needs journal recovery" -- which hype's ext driver will not read, so run2c and run2e were lost
+# with only "NOT FOUND on any of GPT partitions 1-4" to say so.
+fs_mount() { # $1 = image; sets MP
+    local l dev m
+    MP=""
     l=$(udisksctl loop-setup -f "$1" --no-user-interaction) || return 1
     dev=$(echo "$l" | grep -oE '/dev/loop[0-9]+')
+    [ -n "$dev" ] || return 1
     MOUNTED+=("$dev")
     # udisks may already have auto-mounted the new loop device; asking again is an error.
     for _ in 1 2 3 4 5; do
-        mp=$(lsblk -no MOUNTPOINT "$dev" | head -1)
-        [ -n "$mp" ] && break
+        MP=$(lsblk -no MOUNTPOINT "$dev" | head -1)
+        [ -n "$MP" ] && break
         sleep 1
     done
-    if [ -z "$mp" ]; then
+    if [ -z "$MP" ]; then
         m=$(udisksctl mount -b "$dev" --no-user-interaction) || return 1
-        mp=$(echo "$m" | sed -E 's/^Mounted .* at //; s/\.$//')
+        MP=$(echo "$m" | sed -E 's/^Mounted .* at //; s/\.$//')
     fi
-    [ -n "$mp" ] || return 1
-    echo "$mp"
+    [ -n "$MP" ]
 }
 fs_umount_all() {
     local dev
@@ -87,7 +94,7 @@ dd if=/dev/zero of="$S"/zero1g.img bs=1M count=1024 status=none
 # ---- p2 exFAT: run2c's image --------------------------------------------------------------
 dd if=/dev/zero of="$S"/p2.img bs=1M count=1100 status=none
 mkfs.exfat -L HYPEDATA "$S"/p2.img >/dev/null
-MP=$(fs_mount "$S"/p2.img) || { echo "p2 mount failed"; exit 2; }
+fs_mount "$S"/p2.img || { echo "p2 mount failed"; exit 2; }
 mkdir -p "$MP/hype/disks"; cp "$S"/zero1g.img "$MP/hype/disks/run2c-scratch.img"
 sync; fs_umount_all
 
@@ -99,7 +106,7 @@ dd if=/dev/zero of="$S"/p3.img bs=1M count=1700 status=none
 # partitions 1-4" to say so.
 mkfs.ext4 -q -F -b 4096 -O ^orphan_file,^metadata_csum_seed -E root_owner=1000:1000 \
     -L HYPEEXT4 "$S"/p3.img
-MP=$(fs_mount "$S"/p3.img) || { echo "p3 mount failed"; exit 2; }
+fs_mount "$S"/p3.img || { echo "p3 mount failed"; exit 2; }
 mkdir -p "$MP/iso" "$MP/hype/disks"
 cp "$ISO" "$MP/iso/test.iso"; cp "$S"/zero1g.img "$MP/hype/disks/ext4-scratch.img"
 sync; fs_umount_all
@@ -107,11 +114,17 @@ sync; fs_umount_all
 # ---- p4 NTFS: the #689 ISO and image -------------------------------------------------------
 dd if=/dev/zero of="$S"/p4.img bs=1M count=1700 status=none
 mkfs.ntfs -q -f -F -L HYPENTFS "$S"/p4.img >/dev/null
-MP=$(fs_mount "$S"/p4.img) || { echo "p4 mount failed"; exit 2; }
+fs_mount "$S"/p4.img || { echo "p4 mount failed"; exit 2; }
 mkdir -p "$MP/iso" "$MP/hype/disks"
 cp "$ISO" "$MP/iso/ntfs-test.iso"; cp "$S"/zero1g.img "$MP/hype/disks/ntfs-scratch.img"
 sync; fs_umount_all
 sync
+# The assembled ext4 must be CLEAN. A volume dd'd out while still mounted comes out
+# "needs journal recovery", and hype's ext driver will not read it -- that cost this rig two
+# whole runs, both of which looked like "the images just were not there".
+if dumpe2fs -h "$S"/p3.img 2>/dev/null | grep -q needs_recovery; then
+    echo "p3 was not cleanly unmounted -- refusing to assemble a dirty ext4"; exit 2
+fi
 rm -f "$S"/zero1g.img
 
 # ---- assemble the whole drive ---------------------------------------------------------------
