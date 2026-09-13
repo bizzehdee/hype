@@ -10094,10 +10094,20 @@ static void fw_1_render_console(void) {
                      * drawn, and the operator's own report is that view switches still work,
                      * just slowly, with some skipped. This turns that into a statement.
                      */
+                    /*
+                     * #708: name WHERE, not just who. The first boot to raise this alert said
+                     * "USB WEDGED on apic=24" and nothing else, and the log -- dead by
+                     * definition -- could not fill in the rest. apic -> VM comes from the same
+                     * table the AP timer ISR uses, and the section is the #436 breadcrumb that
+                     * BSPPROBE reports, so the number means the same thing in both places.
+                     */
+                    int wslot = fw_1_ap_slot_of(lock_apic);
+                    unsigned wsec = (wslot >= 0 && g_436_loop_section != 0)
+                                        ? (unsigned)g_436_loop_section[wslot] : 0u;
                     hype_snprintf(alert_line, sizeof(alert_line),
-                                  "** USB WEDGED %llus ON apic=%u -- \\HYPE.LOG HAS STOPPED; "
-                                  "that core is stuck in a transfer [#708] **",
-                                  lock_us / 1000000ull, lock_apic);
+                                  "** USB WEDGED %llus: apic=%u vm%d section=%u -- \\HYPE.LOG "
+                                  "HAS STOPPED, that core is stuck in a transfer [#708] **",
+                                  lock_us / 1000000ull, lock_apic, wslot, wsec);
                     alert = alert_line;
                 } else if (panics > 0u) {
                     hype_snprintf(alert_line, sizeof(alert_line),
