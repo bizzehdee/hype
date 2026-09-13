@@ -20,11 +20,15 @@ set -u
 export LC_ALL=C
 cd "$(git rev-parse --show-toplevel)"
 
-EFI="${EFI:-rig/stage-current/hype-default.efi}"
-S="${SCRATCH:-rig/708-fsload}"
+# $S, $EFI and $CFG come from the CALLER and are NOT defaulted here. They were, and because
+# this is sourced rather than run, `S="${SCRATCH:-rig/708-fsload}"` silently reset the caller's
+# scratch directory whenever SCRATCH was unset -- tools/820's first run built its image, booted
+# it and wrote its log into rig/708-fsload while reporting rig/820-typing.
 ISO=disk-images/hwval-data-2026-09-09/iso/test.iso
 HERE=tools/hw-val-2026-08-25
-CFG="${CFG:-$HERE/hype2h.cfg}"
+: "${S:?make-fsload-image.sh: the caller must set S}"
+: "${EFI:?make-fsload-image.sh: the caller must set EFI}"
+: "${CFG:?make-fsload-image.sh: the caller must set CFG}"
 [ -f "$EFI" ] || { echo "no $EFI"; exit 2; }
 [ -f "$ISO" ] || { echo "no ISO at $ISO"; exit 2; }
 
