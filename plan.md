@@ -4410,6 +4410,42 @@ isn't lost.
     Refusing is the reversible choice. A later decision can give the combination a meaning
     without breaking any config that starts today.
 
+85. **Shared-tier run queues are per pCPU, with no vCPU migration in v1 -- decided
+    (2026-09-24, #468).**
+
+    SMP-12 (#468) had to choose between one run queue per shared-tier pCPU and one per pool.
+    The choice decides whether migration exists at all.
+
+    **The rule.** Each shared-tier hardware thread owns one run queue. A shared vCPU is
+    placed on one thread at admission and stays there for the whole run. Pick-next is
+    round-robin with the fixed `shared_timeslice_us` slice (decision 39): the vCPU at the head
+    of the runnable FIFO runs for one slice, then goes to the tail. A halted, blocked or
+    stopped vCPU leaves the FIFO, and returns to the tail when it becomes runnable again.
+
+    **Why per pCPU.**
+    - A queue has one owner core, so pick-next needs no cross-core lock.
+    - Trust groups (decision 40, SMP-17) become a placement rule: the queues of one physical
+      core only hold vCPUs of one group. Pick-next never has to check a group.
+    - A dedicated vCPU is exactly a queue of length one, which is the "one vCPU-run primitive"
+      of decision 39.
+    - No migration means no guest-TSC hand-off between cores and no cross-core cache refill
+      on every slice.
+
+    **Why round-robin and nothing cleverer.** It is fair by construction, and its worst-case
+    wait is `(n - 1) × slice` for n runnable vCPUs on one queue. SMP-20 must prove that bound,
+    and a priority or credit scheduler would make the proof depend on the policy's state.
+    Nothing measured asks for a weighted policy yet.
+
+    **The cost, stated plainly.** No load balancing: when every vCPU on one thread is busy and
+    another thread is idle, the idle time is lost. Placement at admission (SMP-16) must spread
+    vCPUs evenly to limit this.
+
+    **Rejected: one queue per pool.** It balances load by construction, but it takes a
+    cross-core lock on every pick, migrates on every slice, and must check the trust group
+    inside pick-next. **Rejected for v1: per-pCPU queues plus a balancer.** A balancer is the
+    right way to add migration if SMP-22 measures an imbalance that matters. That needs its
+    own decision, with the measurement in front of it.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what
