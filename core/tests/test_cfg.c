@@ -3305,7 +3305,113 @@ static void test_serialize_skips_a_section_whose_vm_was_dropped(void) {
     }
 }
 
+/* #467: cpu_mode and isolation_group -- defaults, provenance, explicit values, refusals. */
+static void test_467_cpu_mode_and_isolation_group_defaults(void) {
+    hype_cfg_t out;
+    hype_cfg_result_t res = parse_copy(DISPLAY_TEST_BASE, &out);
+
+    CHECK_INT("467 base parses", HYPE_CFG_OK, res.status);
+    CHECK_INT("467 cpu_mode defaults to dedicated", (int)HYPE_CFG_CPU_DEDICATED,
+              (int)out.vms[0].cpu_mode);
+    CHECK_INT("467 cpu_mode provenance is default", 0,
+              (out.vms[0].seen_fields & HYPE_CFG_F_CPU_MODE) != 0);
+    CHECK_INT("467 isolation_group unset", 0, out.vms[0].has_isolation_group);
+    CHECK_INT("467 isolation_group provenance is default", 0,
+              (out.vms[0].seen_fields & HYPE_CFG_F_ISOLATION_GROUP) != 0);
+    CHECK_STR("467 default group is the VM's own name", "a",
+              hype_cfg_vm_isolation_group(&out.vms[0]));
+    CHECK_STR("467 NULL vm group is empty", "", hype_cfg_vm_isolation_group(0));
+}
+
+static void test_467_cpu_mode_and_isolation_group_set(void) {
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+
+    res = parse_copy(DISPLAY_TEST_BASE "cpu_mode = shared\nisolation_group = payroll\n", &out);
+    CHECK_INT("467 explicit values parse", HYPE_CFG_OK, res.status);
+    CHECK_INT("467 cpu_mode shared", (int)HYPE_CFG_CPU_SHARED, (int)out.vms[0].cpu_mode);
+    CHECK_INT("467 cpu_mode provenance is set", 1,
+              (out.vms[0].seen_fields & HYPE_CFG_F_CPU_MODE) != 0);
+    CHECK_INT("467 isolation_group provenance is set", 1,
+              (out.vms[0].seen_fields & HYPE_CFG_F_ISOLATION_GROUP) != 0);
+    CHECK_STR("467 group is the configured one", "payroll",
+              hype_cfg_vm_isolation_group(&out.vms[0]));
+    CHECK_STR("467 shared name", "shared", hype_cfg_cpu_mode_name(out.vms[0].cpu_mode));
+
+    res = parse_copy(DISPLAY_TEST_BASE "cpu_mode = dedicated\n", &out);
+    CHECK_INT("467 explicit dedicated parses", HYPE_CFG_OK, res.status);
+    CHECK_INT("467 cpu_mode dedicated", (int)HYPE_CFG_CPU_DEDICATED, (int)out.vms[0].cpu_mode);
+    CHECK_INT("467 explicit dedicated provenance is set", 1,
+              (out.vms[0].seen_fields & HYPE_CFG_F_CPU_MODE) != 0);
+    CHECK_STR("467 dedicated name", "dedicated", hype_cfg_cpu_mode_name(out.vms[0].cpu_mode));
+}
+
+static void test_467_malformed_values_are_refused(void) {
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+    char longname[HYPE_CFG_NAME_MAX + 64];
+    char cfg[512];
+    unsigned int i;
+
+    /* §4.3: a bad [vm.*] value is reported, as for every other VM enum -- a typo must not
+     * silently become the dedicated tier. */
+    res = parse_copy(DISPLAY_TEST_BASE "cpu_mode = sharde\n", &out);
+    CHECK_INT("467 unknown cpu_mode is refused", HYPE_CFG_ERR_BAD_VALUE, res.status);
+    res = parse_copy(DISPLAY_TEST_BASE "cpu_mode = shared\ncpu_mode = dedicated\n", &out);
+    CHECK_INT("467 duplicate cpu_mode is refused", HYPE_CFG_ERR_DUPLICATE_KEY, res.status);
+    res = parse_copy(DISPLAY_TEST_BASE "isolation_group =\n", &out);
+    CHECK_INT("467 empty isolation_group is refused", HYPE_CFG_ERR_BAD_VALUE, res.status);
+    res = parse_copy(DISPLAY_TEST_BASE "isolation_group = a\nisolation_group = b\n", &out);
+    CHECK_INT("467 duplicate isolation_group is refused", HYPE_CFG_ERR_DUPLICATE_KEY, res.status);
+
+    for (i = 0; i < HYPE_CFG_NAME_MAX + 8u; i++) longname[i] = 'g';
+    longname[i] = '\0';
+    snprintf(cfg, sizeof(cfg), "%sisolation_group = %s\n", DISPLAY_TEST_BASE, longname);
+    res = parse_copy(cfg, &out);
+    CHECK_INT("467 over-long isolation_group is refused", HYPE_CFG_ERR_VALUE_TOO_LONG, res.status);
+}
+
+static void test_467_write_back_round_trip_keeps_unknown_keys(void) {
+    hype_cfg_t out;
+    hype_cfg_t back;
+    static char written[16384];
+    hype_cfg_serialize_result_t ser;
+    hype_cfg_result_t res;
+
+    res = parse_copy(DISPLAY_TEST_BASE "cpu_mode = shared\nisolation_group = payroll\n"
+                     "future_key = keep me\n", &out);
+    CHECK_INT("467 round-trip source parses", HYPE_CFG_OK, res.status);
+    ser = hype_cfg_serialize(&out, written, sizeof(written));
+    CHECK_INT("467 serialize not truncated", 0, ser.truncated);
+    CHECK_INT("467 cpu_mode written", 1, strstr(written, "cpu_mode = shared") != NULL);
+    CHECK_INT("467 isolation_group written", 1,
+              strstr(written, "isolation_group = payroll") != NULL);
+    CHECK_INT("467 unknown key kept", 1, strstr(written, "future_key = keep me") != NULL);
+
+    res = parse_copy(written, &back);
+    CHECK_INT("467 re-parse ok", HYPE_CFG_OK, res.status);
+    CHECK_INT("467 cpu_mode survived", (int)HYPE_CFG_CPU_SHARED, (int)back.vms[0].cpu_mode);
+    CHECK_STR("467 isolation_group survived", "payroll", back.vms[0].isolation_group);
+    CHECK_INT("467 unknown key still retained", 1, back.unknown_count);
+
+    /* Explicit dedicated is kept; an absent key is not invented. */
+    res = parse_copy(DISPLAY_TEST_BASE "cpu_mode = dedicated\n", &out);
+    CHECK_INT("467 dedicated source parses", HYPE_CFG_OK, res.status);
+    hype_cfg_serialize(&out, written, sizeof(written));
+    CHECK_INT("467 explicit dedicated written", 1, strstr(written, "cpu_mode = dedicated") != NULL);
+    res = parse_copy(DISPLAY_TEST_BASE, &out);
+    CHECK_INT("467 bare source parses", HYPE_CFG_OK, res.status);
+    hype_cfg_serialize(&out, written, sizeof(written));
+    CHECK_INT("467 absent cpu_mode not written", 0, strstr(written, "cpu_mode") != NULL);
+    CHECK_INT("467 absent isolation_group not written", 0,
+              strstr(written, "isolation_group") != NULL);
+}
+
 int main(void) {
+    test_467_cpu_mode_and_isolation_group_defaults();
+    test_467_cpu_mode_and_isolation_group_set();
+    test_467_malformed_values_are_refused();
+    test_467_write_back_round_trip_keeps_unknown_keys();
     test_bus_usb_msc();
     test_attach_detach_disk();
     test_label_from_the_spec_example_is_accepted();

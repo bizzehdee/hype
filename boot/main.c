@@ -15205,6 +15205,18 @@ static void fw_1_phase1_config(void) {
         {
             hype_adm_result_t ir;
 
+            {
+                unsigned vi;
+                for (vi = 0; vi < g_hype_cfg.vm_count; vi++) {
+                    if (hype_adm_vm_shared_with_cpu_set(&g_hype_cfg.vms[vi])) {
+                        HYPE_LOGF(HYPE_LOG_ERROR, "adm: REFUSED -- vm%u sets cpu_mode = shared AND "
+                                         "cpu_set: a shared VM runs on the host-wide pool, so a "
+                                         "per-VM pin has no meaning -- remove one of the two "
+                                         "[#467 decision 84]\n", vi);
+                        fw_1_refuse_vm(vi);
+                    }
+                }
+            }
             ir = hype_adm_check_cpu_set(&g_hype_cfg, g_cpu_topo.count);
             if (ir.status != HYPE_ADM_OK) {
                 HYPE_LOGF(HYPE_LOG_ERROR, "adm: REFUSED -- cpu_set breach (code %d) between vm%u and vm%u: "
@@ -24995,6 +25007,10 @@ static void term_config_cmd(int idx, const char *nm) {
     } else {
         term_cfg_line(nm, "cpu_set", "(unpinned)", 0);
     }
+    term_cfg_line(nm, "cpu_mode", hype_cfg_cpu_mode_name(vm->cpu_mode),
+                 (sf & HYPE_CFG_F_CPU_MODE) != 0);
+    term_cfg_line(nm, "isolation_group", hype_cfg_vm_isolation_group(vm),
+                 (sf & HYPE_CFG_F_ISOLATION_GROUP) != 0);
     term_cfg_line_uint(nm, "mem_mb", vm->mem_mb, (sf & HYPE_CFG_F_MEM_MB) != 0);
     term_cfg_line(nm, "boot",
                   (vm->boot == HYPE_CFG_BOOT_DISK)     ? "disk"

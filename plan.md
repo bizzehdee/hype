@@ -4387,6 +4387,29 @@ isn't lost.
     (hardware validation on the JMS561U, with the BOT-fallback failure forced once to prove
     the policy). #598 stays Low priority: BOT is correct and adequate for every current use.
 
+84. **`cpu_mode = shared` with an explicit `cpu_set` is refused -- decided (2026-09-24,
+    #467).**
+
+    Decision 39 added the shared tier but did not say what a `cpu_set` means on a shared VM.
+    There were two readings: "pin to these cores" and "share these cores". Neither holds up.
+
+    - "Pin" contradicts the tier. A shared VM runs on the one host-wide pool (§3, decision
+      39), and the dedicated tier already exists for a VM that wants its own cores.
+    - "Share these cores" is per-VM affinity inside the pool. The scheduler core (#468) has
+      no affinity concept, and every affinity shape would be one more case for SMP-20's
+      preemption proof. No config asks for it.
+
+    **The rule.** Admission (§6i) refuses a VM that sets both `cpu_mode = shared` and
+    `cpu_set`, and logs its index and the reason. Every other VM still runs, as with every
+    other §6i refusal. The parser still accepts both keys and keeps both for write-back: the
+    refusal is a cross-key check, not a parse failure.
+
+    **Rejected: ignore `cpu_set` with a warning.** The VM would start, and an explicit
+    operator setting would silently have no effect.
+
+    Refusing is the reversible choice. A later decision can give the combination a meaning
+    without breaking any config that starts today.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what

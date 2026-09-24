@@ -111,6 +111,12 @@ hype_adm_result_t hype_adm_check_vcpus(const hype_cfg_t *cfg, unsigned int physi
  */
 hype_adm_result_t hype_adm_check_cpu_set(const hype_cfg_t *cfg, unsigned int physical_core_count);
 
+/*
+ * #467 / §10 decision 84: 1 when a VM sets both `cpu_mode = shared` and `cpu_set`. That VM is
+ * refused: a shared VM runs on the host-wide pool, so a per-VM pin has no defined meaning.
+ */
+int hype_adm_vm_shared_with_cpu_set(const hype_cfg_vm_t *vm);
+
 /* Rejects if any two VMs' target_disk resolve to the same file: path
  * or the same physical: serial/GUID -- security-critical per §10
  * decision #20, not just hygiene (see plan.md §6i). Varstore

@@ -157,6 +157,10 @@ hype_adm_result_t hype_adm_check_cpu_set(const hype_cfg_t *cfg, unsigned int phy
     return adm_ok();
 }
 
+int hype_adm_vm_shared_with_cpu_set(const hype_cfg_vm_t *vm) {
+    return vm->cpu_mode == HYPE_CFG_CPU_SHARED && vm->has_cpu_set;
+}
+
 static int target_disk_equal(const hype_cfg_target_disk_t *a, const hype_cfg_target_disk_t *b) {
     return a->kind == b->kind && hype_streq(a->path_or_id, b->path_or_id);
 }

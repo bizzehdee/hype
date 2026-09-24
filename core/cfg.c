@@ -280,6 +280,24 @@ static hype_cfg_status_t apply_field(hype_cfg_vm_t *vm, unsigned int *seen, char
         *seen |= HYPE_CFG_F_CPU_SET;
         return HYPE_CFG_OK;
     }
+    if (hype_streq(key, "cpu_mode")) {
+        if (*seen & HYPE_CFG_F_CPU_MODE) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (hype_streq(val, "dedicated")) vm->cpu_mode = HYPE_CFG_CPU_DEDICATED;
+        else if (hype_streq(val, "shared")) vm->cpu_mode = HYPE_CFG_CPU_SHARED;
+        else return HYPE_CFG_ERR_BAD_VALUE;
+        *seen |= HYPE_CFG_F_CPU_MODE;
+        return HYPE_CFG_OK;
+    }
+    if (hype_streq(key, "isolation_group")) {
+        if (*seen & HYPE_CFG_F_ISOLATION_GROUP) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (hype_strlcpy(vm->isolation_group, val, HYPE_CFG_NAME_MAX) >= HYPE_CFG_NAME_MAX) {
+            return HYPE_CFG_ERR_VALUE_TOO_LONG;
+        }
+        if (vm->isolation_group[0] == '\0') return HYPE_CFG_ERR_BAD_VALUE;
+        vm->has_isolation_group = 1;
+        *seen |= HYPE_CFG_F_ISOLATION_GROUP;
+        return HYPE_CFG_OK;
+    }
     if (hype_streq(key, "mem_mb")) {
         hype_cfg_status_t st;
         if (*seen & HYPE_CFG_F_MEM_MB) return HYPE_CFG_ERR_DUPLICATE_KEY;
@@ -2217,6 +2235,15 @@ const char *hype_cfg_vm_display_name(const hype_cfg_vm_t *vm) {
     return (vm->label[0] != '\0') ? vm->label : vm->name;
 }
 
+const char *hype_cfg_vm_isolation_group(const hype_cfg_vm_t *vm) {
+    if (vm == 0) return "";
+    return vm->has_isolation_group ? vm->isolation_group : vm->name;
+}
+
+const char *hype_cfg_cpu_mode_name(hype_cfg_cpu_mode_t mode) {
+    return (mode == HYPE_CFG_CPU_SHARED) ? "shared" : "dedicated";
+}
+
 int hype_cfg_vm_has_target_disk(const hype_cfg_vm_t *vm) {
     if (vm == 0) return 0;
     /* A physical target is named by id/serial, a file target by path -- both land in path_or_id,
@@ -2387,6 +2414,13 @@ static void serialize_vm(hype_cfg_w_t *w, const hype_cfg_vm_t *vm) {
     w_kv_uint(w, "vcpus", vm->vcpus);
     if (vm->has_cpu_set) {
         w_kv_cpu_list(w, "cpu_set", vm->cpu_set, vm->cpu_set_count);
+    }
+    /* #467: written when the operator wrote it, so an explicit `cpu_mode = dedicated` survives. */
+    if ((vm->seen_fields & HYPE_CFG_F_CPU_MODE) || vm->cpu_mode != HYPE_CFG_CPU_DEDICATED) {
+        w_kv(w, "cpu_mode", hype_cfg_cpu_mode_name(vm->cpu_mode));
+    }
+    if (vm->has_isolation_group) {
+        w_kv(w, "isolation_group", vm->isolation_group);
     }
     w_kv_uint(w, "mem_mb", vm->mem_mb);
     w_kv(w, "boot",

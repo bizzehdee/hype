@@ -190,6 +190,16 @@ typedef enum {
     HYPE_CFG_DISPLAY_BOCHS
 } hype_cfg_display_t;
 
+/*
+ * #467 / §10 decision 39: the VM's scheduling tier. Dedicated (the default, zero) is today's
+ * exclusive 1:1 pinning. Shared opts into the time-sliced pool; until SMP-13 (#469) exists a
+ * shared VM still runs on the dedicated path.
+ */
+typedef enum {
+    HYPE_CFG_CPU_DEDICATED = 0,
+    HYPE_CFG_CPU_SHARED
+} hype_cfg_cpu_mode_t;
+
 typedef enum {
     HYPE_CFG_OS_WINDOWS,
     HYPE_CFG_OS_LINUX,
@@ -246,6 +256,15 @@ typedef struct {
     int has_cpu_set;
     unsigned int cpu_set[HYPE_CFG_MAX_CPUS];
     unsigned int cpu_set_count;
+
+    hype_cfg_cpu_mode_t cpu_mode; /* #467 */
+
+    /*
+     * #467: trust group for core sharing. Empty when unset, which means the VM is its own group
+     * (default-deny, decision 39); read it through hype_cfg_vm_isolation_group().
+     */
+    int has_isolation_group;
+    char isolation_group[HYPE_CFG_NAME_MAX];
 
     unsigned int mem_mb;
 
@@ -389,7 +408,9 @@ enum {
     HYPE_CFG_F_DISPLAY = 1u << 20,    /* #565 */
     HYPE_CFG_F_NICS = 1u << 21,       /* #583 */
     HYPE_CFG_F_INITRD = 1u << 22,     /* #545 */
-    HYPE_CFG_F_TPM = 1u << 23         /* #433 */
+    HYPE_CFG_F_TPM = 1u << 23,        /* #433 */
+    HYPE_CFG_F_CPU_MODE = 1u << 24,   /* #467 */
+    HYPE_CFG_F_ISOLATION_GROUP = 1u << 25 /* #467 */
 };
 
 /*
@@ -1005,6 +1026,12 @@ uint64_t hype_cfg_size_gb_to_bytes(unsigned int gb);
  * a parsed VM: the parser rejects both an empty section id and an empty `label =`.
  */
 const char *hype_cfg_vm_display_name(const hype_cfg_vm_t *vm);
+
+/* #467: the VM's isolation group -- the configured one, else the VM's own section name. */
+const char *hype_cfg_vm_isolation_group(const hype_cfg_vm_t *vm);
+
+/* #467: "dedicated" or "shared". */
+const char *hype_cfg_cpu_mode_name(hype_cfg_cpu_mode_t mode);
 
 /*
  * #357: does this VM configure a `target_disk` at all?

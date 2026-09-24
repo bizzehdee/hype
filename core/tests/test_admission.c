@@ -1614,7 +1614,25 @@ static void test_firmware_uefi_and_secboot_are_unaffected(void) {
               (int)HYPE_ADM_OK, (int)hype_adm_check_firmware(&cfg).status);
 }
 
+static void test_467_shared_with_cpu_set_is_refused(void) {
+    hype_cfg_t cfg;
+
+    hype_cfg_init(&cfg);
+    cfg.vm_count = 1;
+    make_vm(&cfg.vms[0], "a", 1, 512, "a.img");
+    CHECK_INT("467 dedicated, no cpu_set: ok", 0, hype_adm_vm_shared_with_cpu_set(&cfg.vms[0]));
+    cfg.vms[0].has_cpu_set = 1;
+    cfg.vms[0].cpu_set_count = 1;
+    cfg.vms[0].cpu_set[0] = 2;
+    CHECK_INT("467 dedicated with cpu_set: ok", 0, hype_adm_vm_shared_with_cpu_set(&cfg.vms[0]));
+    cfg.vms[0].cpu_mode = HYPE_CFG_CPU_SHARED;
+    CHECK_INT("467 shared with cpu_set: refused", 1, hype_adm_vm_shared_with_cpu_set(&cfg.vms[0]));
+    cfg.vms[0].has_cpu_set = 0;
+    CHECK_INT("467 shared, no cpu_set: ok", 0, hype_adm_vm_shared_with_cpu_set(&cfg.vms[0]));
+}
+
 int main(void) {
+    test_467_shared_with_cpu_set_is_refused();
     test_peers_default_deny();
     test_peers_one_sided_listing_is_bidirectional();
     test_peers_a_pairing_does_not_include_a_third_vm();
