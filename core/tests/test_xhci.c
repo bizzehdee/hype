@@ -1356,7 +1356,32 @@ static void test_792_null_safe(void) {
     hype_xhci_reset_record((hype_xhci_reset_budget_t *)0, 1u);
 }
 
+static void test_803_slot_ctx_from_output_keeps_topology_drops_xhc_fields(void) {
+    uint32_t out[4] = { 0x2831u | (4u << 20) | (4u << 27), 0x00070000u, 0x00000304u, 0x18000005u };
+    uint32_t c[8];
+    unsigned int i;
+
+    for (i = 0; i < 8u; i++) c[i] = 0xDEADBEEFu;
+    hype_xhci_slot_ctx_from_output(c, out);
+    CHECK_HEX("803 slot dword0 copied", out[0], c[0]);
+    CHECK_HEX("803 slot dword1 copied", out[1], c[1]);
+    CHECK_HEX("803 slot dword2 copied", out[2], c[2]);
+    CHECK_HEX("803 slot state/address zeroed", 0u, c[3]);
+    for (i = 4; i < 8u; i++) CHECK_HEX("803 slot reserved zeroed", 0u, c[i]);
+}
+
+static void test_803_seq_reset_ctrl_ctx_drops_and_adds_same_eps(void) {
+    uint32_t eps = (1u << 3) | (1u << 4);
+    uint32_t c[8];
+
+    hype_xhci_input_ctrl_ctx(c, HYPE_XHCI_ADD_SLOT | eps, eps);
+    CHECK_HEX("803 drop = bulk dcis", 0x18u, c[0]);
+    CHECK_HEX("803 add = A0 + bulk dcis", 0x19u, c[1]);
+}
+
 int main(void) {
+    test_803_slot_ctx_from_output_keeps_topology_drops_xhc_fields();
+    test_803_seq_reset_ctrl_ctx_drops_and_adds_same_eps();
     test_744_note_departed_clears_slot_and_owner();
     test_744_note_departed_is_a_no_op_for_a_position_with_nothing_on_it();
     test_744_release_slot_frees_only_that_slot();

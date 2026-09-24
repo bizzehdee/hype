@@ -148,6 +148,13 @@ void hype_xhci_slot_ctx_set_hub(uint32_t sc[8], unsigned int nbr_ports, unsigned
     sc[2] = (sc[2] & ~0x00030000u) | ((ttt & 0x3u) << 16);
 }
 
+void hype_xhci_slot_ctx_from_output(uint32_t sc[8], const uint32_t out[4]) {
+    ctx_zero(sc);
+    sc[0] = out[0];
+    sc[1] = out[1];
+    sc[2] = out[2];
+}
+
 unsigned int hype_xhci_hub_ttt(const uint8_t *hubdesc) {
     /* wHubCharacteristics is bytes 3..4; TT Think Time is its bits 6:5. */
     return (unsigned int)((hubdesc[3] >> 5) & 0x3u);

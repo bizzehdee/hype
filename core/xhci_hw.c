@@ -2991,6 +2991,59 @@ static int ep_recover_halted(hype_xhci_ctrl_t *c, unsigned int slot, unsigned in
 }
 
 /*
+ * #803: reset the HOST side of both bulk endpoints' data toggle / sequence number.
+ *
+ * Clear-HALT resets the DEVICE's toggle to DATA0 / sequence 0. The host's copy is reset only
+ * by Reset Endpoint, and Reset Endpoint works only on a Halted endpoint (xHCI 4.8.1). A bulk
+ * timeout leaves the endpoint Running, so ep_recover()'s Stop takes it to Stopped and Reset
+ * then fails with Context State Error (cc=19): the two sides now disagree, and the next
+ * transfer on that endpoint fails with cc=4, zero bytes moved.
+ *
+ * Measured over every BOT recovery in the hardware logs (133): none had both Reset Endpoint
+ * commands succeed, and all 77 post-recovery `#377` rejections were on an endpoint whose
+ * Reset Endpoint had returned cc=19.
+ *
+ * The 4.8.1 note names the fix: a Configure Endpoint with Drop and Add set for a Stopped
+ * endpoint. Called after ep_recover(), so both endpoints are Stopped and their rings are
+ * already restarted at index 0, producer cycle 1 -- which is what the new contexts point at.
+ */
+static int bulk_seq_reset(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_msc_eps_t *msc,
+                          const xhci_msc_hw_t *m) {
+    xhci_hw_t *hw = HW(c);
+    unsigned int cs = c->ctx_size;
+    unsigned int dci_in = hype_xhci_ep_dci(msc->bulk_in_ep);
+    unsigned int dci_out = hype_xhci_ep_dci(msc->bulk_out_ep);
+    uint32_t eps = (1u << dci_in) | (1u << dci_out);
+    uint32_t ctx[8], out[4], cmd[4], evt[4];
+    unsigned int i;
+    int di = dev_index(hw, slot);
+
+    if (di < 0) return -1;
+    for (i = 0; i < 4u; i++) out[i] = get_le32(hw->dev_ctx[di] + i * 4u);
+
+    zero(hw->input_ctx, XPAGE);
+    hype_xhci_input_ctrl_ctx(ctx, HYPE_XHCI_ADD_SLOT | eps, eps);
+    write_ctx(hw->input_ctx, 0, ctx);
+    hype_xhci_slot_ctx_from_output(ctx, out);
+    write_ctx(hw->input_ctx, cs, ctx);
+    hype_xhci_ep_ctx(ctx, HYPE_XHCI_EP_TYPE_BULK_IN, msc->bulk_in_mps, phys(m->bulk_in_ring), 1);
+    write_ctx(hw->input_ctx, (1u + dci_in) * cs, ctx);
+    hype_xhci_ep_ctx(ctx, HYPE_XHCI_EP_TYPE_BULK_OUT, msc->bulk_out_mps, phys(m->bulk_out_ring), 1);
+    write_ctx(hw->input_ctx, (1u + dci_out) * cs, ctx);
+
+    hype_xhci_trb_configure_endpoint(cmd, phys(hw->input_ctx), slot, (int)hw->cmd_cyc);
+    if (cmd_submit_wait(c, cmd, evt) != 0) {
+        hype_debug_print("host-xhci: #803 sequence reset (slot=%u dci=%u+%u) NO COMPLETION "
+                         "(timed out)\n", slot, dci_in, dci_out);
+        return -1;
+    }
+    hype_debug_print("host-xhci: #803 sequence reset (slot=%u dci=%u+%u) Configure Endpoint "
+                     "drop+add cc=%u%s\n", slot, dci_in, dci_out, hype_xhci_event_cc(evt),
+                     hype_xhci_event_cc(evt) == HYPE_XHCI_CC_SUCCESS ? " (success)" : "");
+    return (hype_xhci_event_cc(evt) == HYPE_XHCI_CC_SUCCESS) ? 0 : -1;
+}
+
+/*
  * #254: Bulk-Only Transport Reset Recovery (USB MSC BOT spec 5.3.4): after ANY
  * failed stage -- a lost completion, an error CC, a bad CSW -- the host may not
  * simply issue the next CBW: the device may still be inside the old transaction
@@ -3009,18 +3062,16 @@ static int bot_recover(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_m
      */
     unsigned int dci_in = hype_xhci_ep_dci(msc->bulk_in_ep);
     unsigned int dci_out = hype_xhci_ep_dci(msc->bulk_out_ep);
+    xhci_msc_hw_t *m = msc_hw_for(c, slot, 0);
     int rc = 0;
 
     hype_debug_print("host-xhci: #254 BOT reset recovery (slot=%u)\n", slot);
     hype_xhci_parked_drop_slot(&hw->parked, slot);
+    if (m == 0) return -1; /* never brought up: nothing to recover */
 
     /* Quiesce both rings first so nothing is in flight during the reset. */
-    {
-        xhci_msc_hw_t *m = msc_hw_for(c, slot, 0);
-        if (m == 0) return -1; /* never brought up: nothing to recover */
-        if (ep_recover(c, slot, dci_in, m->bulk_in_ring, &m->bin_enq, &m->bin_cyc) != 0) rc = -1;
-        if (ep_recover(c, slot, dci_out, m->bulk_out_ring, &m->bout_enq, &m->bout_cyc) != 0) rc = -1;
-    }
+    if (ep_recover(c, slot, dci_in, m->bulk_in_ring, &m->bin_enq, &m->bin_cyc) != 0) rc = -1;
+    if (ep_recover(c, slot, dci_out, m->bulk_out_ring, &m->bout_enq, &m->bout_cyc) != 0) rc = -1;
 
     /* Bulk-Only Mass Storage Reset: class request 0xFF to the interface. */
     if (control_transfer(c, slot, 0x21, 0xFF, 0, (uint16_t)msc->interface_num, 0, 0, 0) != 0) {
@@ -3036,6 +3087,7 @@ static int bot_recover(hype_xhci_ctrl_t *c, unsigned int slot, const hype_xhci_m
         hype_debug_print("host-xhci: #254 Clear-HALT (bulk OUT) failed\n");
         rc = -1;
     }
+    if (bulk_seq_reset(c, slot, msc, m) != 0) rc = -1;
     /*
      * #266: drain the event ring LAST, after every reset step, and before any new
      * work can be issued. ep_recover() restarts the transfer rings at index 0, so a

@@ -247,6 +247,14 @@ void hype_xhci_slot_ctx(uint32_t sc[8], unsigned int route, unsigned int speed,
 void hype_xhci_slot_ctx_set_hub(uint32_t sc[8], unsigned int nbr_ports, unsigned int ttt,
                                 unsigned int mtt);
 
+/*
+ * #803: an input Slot Context copied from the slot's OUTPUT Slot Context (its first four
+ * dwords, as the controller wrote them), for a Configure Endpoint that must not change the
+ * slot. Dword3 (Device Address, Slot State) is controller-owned and is zeroed, as xHCI 6.2.2
+ * asks of software in an input context.
+ */
+void hype_xhci_slot_ctx_from_output(uint32_t sc[8], const uint32_t out[4]);
+
 /* TT Think Time for a hub's Slot Context: wHubCharacteristics (hub descriptor bytes
  * 3..4) bits 6:5, already in the field's own encoding. */
 unsigned int hype_xhci_hub_ttt(const uint8_t *hubdesc);
