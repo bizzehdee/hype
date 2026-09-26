@@ -15012,6 +15012,45 @@ static unsigned fw_1_vms_that_fit(unsigned *out_cores, unsigned *out_threads) {
     return hype_smp_pack(per_core, ncores, want, vi, packed, HYPE_MAX_VCPUS_PER_VM);
 }
 
+/*
+ * #472 (SMP-16): price the shared tier against the pool the dedicated VMs leave, and refuse the
+ * shared VMs it cannot hold. Always reports the arithmetic when a shared VM exists, so a refusal
+ * is checkable from the log alone.
+ */
+static void fw_1_check_tiers(void) {
+    uint32_t threads[HYPE_CPU_TOPOLOGY_MAX];
+    unsigned per_core[HYPE_CPU_TOPOLOGY_MAX];
+    unsigned core_start[HYPE_CPU_TOPOLOGY_MAX];
+    unsigned nthreads, ncores = 0, vi;
+    hype_adm_tiers_t t;
+    hype_adm_result_t r;
+
+    if (g_cpu_topo.count == 0u) return;
+    nthreads = hype_cpu_topology_select_cores(&g_cpu_topo, g_cpu_topo.count, threads,
+                                              HYPE_CPU_TOPOLOGY_MAX, &ncores);
+    if (nthreads == 0u || ncores == 0u) return;
+    fw_1_core_runs(threads, nthreads, ncores, per_core, core_start);
+    r = hype_adm_check_tiers(&g_hype_cfg, per_core, ncores, &t);
+    if (t.shared_vms == 0u) return;
+    HYPE_LOGF(HYPE_LOG_INFO, "adm: tiers -- dedicated %u core(s); shared pool %u core(s) / %u "
+                     "thread(s); %u shared VM(s) asking %u sCPU(s) of a %u limit (ratio %u.%02u) "
+                     "[#472 decision 39]\n", t.dedicated_cores, t.pool_cores, t.pool_threads,
+                     t.shared_vms, t.shared_scpus, t.scpu_limit,
+                     g_hype_cfg.hype.shared_overcommit_x100 / 100u,
+                     g_hype_cfg.hype.shared_overcommit_x100 % 100u);
+    if (r.status == HYPE_ADM_OK) return;
+    HYPE_LOGF(HYPE_LOG_ERROR, "adm: REFUSED -- %s, from vm%u on [#472 section 6i]\n",
+              r.status == HYPE_ADM_ERR_SHARED_RATIO_INVALID
+                  ? "shared VMs need shared_overcommit_ratio >= 1.0"
+              : r.status == HYPE_ADM_ERR_SHARED_POOL_EMPTY
+                  ? "the dedicated VMs take every core, so the shared pool is empty"
+                  : "the shared sCPUs pass shared_overcommit_ratio x pool threads",
+              r.vm_index_a);
+    for (vi = r.vm_index_a; vi < g_hype_cfg.vm_count; vi++) {
+        if (g_hype_cfg.vms[vi].cpu_mode == HYPE_CFG_CPU_SHARED) fw_1_refuse_vm(vi);
+    }
+}
+
 static void fw_1_phase1_config(void) {
     /* #452: the previous boot's log first -- it is the one thing a failed run leaves, and
      * writing it before anything else means a later fault here does not cost it. */
@@ -15217,6 +15256,7 @@ static void fw_1_phase1_config(void) {
                     }
                 }
             }
+            fw_1_check_tiers();
             ir = hype_adm_check_cpu_set(&g_hype_cfg, g_cpu_topo.count);
             if (ir.status != HYPE_ADM_OK) {
                 HYPE_LOGF(HYPE_LOG_ERROR, "adm: REFUSED -- cpu_set breach (code %d) between vm%u and vm%u: "

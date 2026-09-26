@@ -94,6 +94,7 @@ hype_adm_result_t hype_adm_check_vcpus(const hype_cfg_t *cfg, unsigned int physi
     unsigned int i;
 
     for (i = 0; i < cfg->vm_count; i++) {
+        if (cfg->vms[i].cpu_mode == HYPE_CFG_CPU_SHARED) continue;
         total += cfg->vms[i].vcpus;
     }
     if (total > physical_core_count) {
@@ -159,6 +160,59 @@ hype_adm_result_t hype_adm_check_cpu_set(const hype_cfg_t *cfg, unsigned int phy
 
 int hype_adm_vm_shared_with_cpu_set(const hype_cfg_vm_t *vm) {
     return vm->cpu_mode == HYPE_CFG_CPU_SHARED && vm->has_cpu_set;
+}
+
+static unsigned int adm_want(const hype_cfg_vm_t *vm) {
+    return (vm->vcpus != 0u) ? vm->vcpus : 1u;
+}
+
+hype_adm_result_t hype_adm_check_tiers(const hype_cfg_t *cfg, const unsigned int *per_core,
+                                       unsigned int ncores, hype_adm_tiers_t *out) {
+    hype_adm_tiers_t t;
+    unsigned int i, first_shared = HYPE_ADM_NO_VM, running = 0;
+    unsigned long long limit;
+    hype_adm_result_t r = adm_ok();
+
+    t.dedicated_cores = 0;
+    t.pool_cores = 0;
+    t.pool_threads = 0;
+    t.shared_vms = 0;
+    t.shared_scpus = 0;
+    for (i = 0; i < cfg->vm_count; i++) {
+        const hype_cfg_vm_t *vm = &cfg->vms[i];
+        if (vm->cpu_mode == HYPE_CFG_CPU_SHARED) {
+            if (first_shared == HYPE_ADM_NO_VM) first_shared = i;
+            t.shared_vms++;
+            t.shared_scpus += adm_want(vm);
+        } else {
+            t.dedicated_cores += adm_want(vm);
+        }
+    }
+    for (i = t.dedicated_cores; i < ncores; i++) {
+        t.pool_cores++;
+        t.pool_threads += per_core[i];
+    }
+    limit = ((unsigned long long)cfg->hype.shared_overcommit_x100 * t.pool_threads) / 100u;
+    t.scpu_limit = (unsigned int)limit;
+
+    if (t.shared_vms != 0u) {
+        if (cfg->hype.shared_overcommit_x100 < 100u) {
+            r = adm_err(HYPE_ADM_ERR_SHARED_RATIO_INVALID, first_shared, HYPE_ADM_NO_VM);
+        } else if (t.pool_cores == 0u) {
+            r = adm_err(HYPE_ADM_ERR_SHARED_POOL_EMPTY, first_shared, HYPE_ADM_NO_VM);
+        } else {
+            for (i = first_shared; i < cfg->vm_count; i++) {
+                if (cfg->vms[i].cpu_mode != HYPE_CFG_CPU_SHARED) continue;
+                running += adm_want(&cfg->vms[i]);
+                if (running > t.scpu_limit) {
+                    r = adm_err(HYPE_ADM_ERR_SHARED_OVERCOMMIT, i, HYPE_ADM_NO_VM);
+                    break;
+                }
+            }
+        }
+    }
+    if (out != 0) *out = t;
+    return r;
 }
 
 static int target_disk_equal(const hype_cfg_target_disk_t *a, const hype_cfg_target_disk_t *b) {
@@ -558,6 +612,8 @@ hype_adm_result_t hype_adm_check_cpu_budget(const hype_cfg_t *cfg,
          * three-VM config at nothing and pass it against a one-core budget it cannot fit.
          */
         unsigned int want = (vm->vcpus != 0u) ? vm->vcpus : 1u;
+        /* #472: a shared VM costs no core of its own; it draws on the pool check_tiers prices. */
+        if (vm->cpu_mode == HYPE_CFG_CPU_SHARED) continue;
         total += want;
         if (vm->has_cpu_set) {
             for (k = 0; k < vm->cpu_set_count; k++) {
@@ -673,6 +729,8 @@ hype_adm_result_t hype_adm_check_vm_ranges(const hype_cfg_t *cfg,
         /* vcpus == 0 means the key was ABSENT and §5.2's default of 1 applies (see the header):
          * refusing it would refuse most configs. A core count of 0 means enumeration failed, and
          * comparing against an unknown host is worse than not comparing. */
+        /* #472: a shared VM's sCPUs are a share of time, not cores (decision 47). */
+        if (cfg->vms[i].cpu_mode == HYPE_CFG_CPU_SHARED) continue;
         if (physical_core_count != 0u && cfg->vms[i].vcpus > physical_core_count) {
             return adm_err(HYPE_ADM_ERR_VCPUS_EXCEED_HOST, i, HYPE_ADM_NO_VM);
         }

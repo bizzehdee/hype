@@ -1,0 +1,37 @@
+; SMP-16 (#472) leg. QEMU -smp 4: the BSP keeps core 0, so 3 cores / 3 threads for guests.
+; alpha is dedicated (1 core); the pool is the other 2 cores / 2 threads.
+[hype]
+config_version = 1
+@RATIO@
+
+[vm.alpha]
+vcpus = 1
+mem_mb = 768
+boot = installer
+install_media = \iso\test.iso
+firmware = uefi
+os_hint = linux
+net_mode = none
+target_disk = file:\hype\disks\alpha.img
+
+[vm.beta]
+vcpus = 2
+cpu_mode = shared
+mem_mb = 768
+boot = installer
+install_media = \iso\test.iso
+firmware = uefi
+os_hint = linux
+net_mode = none
+target_disk = file:\hype\disks\beta.img
+
+[vm.gamma]
+vcpus = 2
+cpu_mode = shared
+mem_mb = 768
+boot = installer
+install_media = \iso\test.iso
+firmware = uefi
+os_hint = linux
+net_mode = none
+target_disk = file:\hype\disks\gamma.img

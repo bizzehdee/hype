@@ -3407,7 +3407,63 @@ static void test_467_write_back_round_trip_keeps_unknown_keys(void) {
               strstr(written, "isolation_group") != NULL);
 }
 
+static void test_472_shared_hype_keys(void) {
+    hype_cfg_t out;
+    hype_cfg_result_t res;
+    static char written[16384];
+    unsigned int x = 7;
+
+    res = parse_copy("[hype]\nconfig_version = 1\n", &out);
+    CHECK_INT("472 bare hype parses", HYPE_CFG_OK, res.status);
+    CHECK_INT("472 ratio default 4.0", 400, out.hype.shared_overcommit_x100);
+    CHECK_INT("472 slice default 4000us", 4000, out.hype.shared_timeslice_us);
+    hype_cfg_serialize(&out, written, sizeof(written));
+    CHECK_INT("472 defaults are not written", 0, strstr(written, "shared_") != NULL);
+
+    res = parse_copy("[hype]\nconfig_version = 1\nshared_overcommit_ratio = 2.5\n"
+                     "shared_timeslice_us = 2000\n", &out);
+    CHECK_INT("472 explicit keys parse", HYPE_CFG_OK, res.status);
+    CHECK_INT("472 ratio 2.5", 250, out.hype.shared_overcommit_x100);
+    CHECK_INT("472 slice 2000", 2000, out.hype.shared_timeslice_us);
+    CHECK_INT("472 not malformed", 0, out.hype.malformed);
+    hype_cfg_serialize(&out, written, sizeof(written));
+    CHECK_INT("472 ratio written back", 1, strstr(written, "shared_overcommit_ratio = 2.5") != NULL);
+    CHECK_INT("472 slice written back", 1, strstr(written, "shared_timeslice_us = 2000") != NULL);
+
+    res = parse_copy("[hype]\nconfig_version = 1\nshared_overcommit_ratio = 1.25\n", &out);
+    hype_cfg_serialize(&out, written, sizeof(written));
+    CHECK_INT("472 two-digit fraction written back", 1,
+              strstr(written, "shared_overcommit_ratio = 1.25") != NULL);
+
+    /* Below 1.0 parses: admission, not the parser, owns that refusal. */
+    res = parse_copy("[hype]\nconfig_version = 1\nshared_overcommit_ratio = 0.5\n", &out);
+    CHECK_INT("472 ratio 0.5 parses", 50, out.hype.shared_overcommit_x100);
+    CHECK_INT("472 ratio 0.5 is not malformed", 0, out.hype.malformed);
+
+    /* A bad [hype] value is the whole-section fallback of 4.3. */
+    res = parse_copy("[hype]\nconfig_version = 1\nshared_overcommit_ratio = lots\n", &out);
+    CHECK_INT("472 bad ratio marks [hype] malformed", 1, out.hype.malformed);
+    CHECK_INT("472 and the default stands", 400, out.hype.shared_overcommit_x100);
+    res = parse_copy("[hype]\nconfig_version = 1\nshared_timeslice_us = 0\n", &out);
+    CHECK_INT("472 zero slice marks [hype] malformed", 1, out.hype.malformed);
+    res = parse_copy("[hype]\nconfig_version = 1\nshared_timeslice_us = 1\nshared_timeslice_us = 2\n", &out);
+    CHECK_INT("472 duplicate slice marks [hype] malformed", 1, out.hype.malformed);
+    res = parse_copy("[hype]\nconfig_version = 1\nshared_overcommit_ratio = 1\nshared_overcommit_ratio = 2\n", &out);
+    CHECK_INT("472 duplicate ratio marks [hype] malformed", 1, out.hype.malformed);
+
+    CHECK_INT("472 x100 '4'", 0, hype_cfg_parse_x100("4", &x));
+    CHECK_INT("472 x100 '4' value", 400, x);
+    CHECK_INT("472 x100 '0.05'", 0, hype_cfg_parse_x100("0.05", &x));
+    CHECK_INT("472 x100 '0.05' value", 5, x);
+    CHECK_INT("472 x100 three digits refused", -1, hype_cfg_parse_x100("1.125", &x));
+    CHECK_INT("472 x100 bare dot refused", -1, hype_cfg_parse_x100("1.", &x));
+    CHECK_INT("472 x100 leading dot refused", -1, hype_cfg_parse_x100(".5", &x));
+    CHECK_INT("472 x100 trailing junk refused", -1, hype_cfg_parse_x100("2x", &x));
+    CHECK_INT("472 x100 huge refused", -1, hype_cfg_parse_x100("99999999", &x));
+}
+
 int main(void) {
+    test_472_shared_hype_keys();
     test_467_cpu_mode_and_isolation_group_defaults();
     test_467_cpu_mode_and_isolation_group_set();
     test_467_malformed_values_are_refused();

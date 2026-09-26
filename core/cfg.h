@@ -523,6 +523,17 @@ typedef struct {
      */
     char fs_selftest_disk[21]; /* matches hype_disk_entry_t.serial's width */
 
+    /*
+     * #472 / decision 39: the shared tier's maximum sCPU:thread over-commit, in hundredths
+     * (`4.0` -> 400, the default). A value below 100 parses, so admission can refuse it with
+     * its own diagnostic rather than the whole-section fallback. has_* is for write-back only.
+     */
+    unsigned int shared_overcommit_x100;
+    int has_shared_overcommit;
+    /* #470 / decision 39: the shared-tier slice, microseconds (default 4000). */
+    unsigned int shared_timeslice_us;
+    int has_shared_timeslice;
+
     /* Set when the section was present but something in it was rejected: the defaults above apply,
      * and the caller should say so rather than let the operator believe a global took effect. */
     int malformed;
@@ -1032,6 +1043,10 @@ const char *hype_cfg_vm_isolation_group(const hype_cfg_vm_t *vm);
 
 /* #467: "dedicated" or "shared". */
 const char *hype_cfg_cpu_mode_name(hype_cfg_cpu_mode_t mode);
+
+/* #472: parse a non-negative decimal with at most two fraction digits ("4", "4.0", "2.25") into
+ * hundredths. Returns 0, or -1 for anything else. */
+int hype_cfg_parse_x100(const char *s, unsigned int *out);
 
 /*
  * #357: does this VM configure a `target_disk` at all?

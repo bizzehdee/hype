@@ -1631,7 +1631,154 @@ static void test_467_shared_with_cpu_set_is_refused(void) {
     CHECK_INT("467 shared, no cpu_set: ok", 0, hype_adm_vm_shared_with_cpu_set(&cfg.vms[0]));
 }
 
+/* ---- #472 (SMP-16): two-tier admission ---- */
+static void tiers_cfg(hype_cfg_t *cfg, unsigned int n) {
+    unsigned int i;
+    hype_cfg_init(cfg);
+    cfg->vm_count = n;
+    for (i = 0; i < n; i++) {
+        char nm[8] = "vm0";
+        nm[2] = (char)('0' + i);
+        make_vm(&cfg->vms[i], nm, 1, 512, nm);
+    }
+}
+
+static void test_472_dedicated_overlap_still_refused(void) {
+    hype_cfg_t cfg;
+    hype_adm_result_t r;
+
+    tiers_cfg(&cfg, 2);
+    cfg.vms[0].has_cpu_set = 1; cfg.vms[0].cpu_set_count = 1; cfg.vms[0].cpu_set[0] = 3;
+    cfg.vms[1].has_cpu_set = 1; cfg.vms[1].cpu_set_count = 1; cfg.vms[1].cpu_set[0] = 3;
+    r = hype_adm_check_cpu_set(&cfg, 8);
+    CHECK_INT("472 dedicated/dedicated overlap refused", (int)HYPE_ADM_ERR_CPU_SET_OVERLAP, (int)r.status);
+    CHECK_INT("472 names vm a", 0, r.vm_index_a);
+    CHECK_INT("472 names vm b", 1, r.vm_index_b);
+}
+
+static void test_472_dedicated_shared_overlap_refused(void) {
+    hype_cfg_t cfg;
+
+    /* The only way to put a shared VM on a named core is cpu_set, which decision 84 refuses. */
+    tiers_cfg(&cfg, 2);
+    cfg.vms[0].has_cpu_set = 1; cfg.vms[0].cpu_set_count = 1; cfg.vms[0].cpu_set[0] = 2;
+    cfg.vms[1].cpu_mode = HYPE_CFG_CPU_SHARED;
+    cfg.vms[1].has_cpu_set = 1; cfg.vms[1].cpu_set_count = 1; cfg.vms[1].cpu_set[0] = 2;
+    CHECK_INT("472 dedicated VM with its core: fine", 0, hype_adm_vm_shared_with_cpu_set(&cfg.vms[0]));
+    CHECK_INT("472 shared VM naming the same core: refused", 1,
+              hype_adm_vm_shared_with_cpu_set(&cfg.vms[1]));
+}
+
+static void test_472_two_shared_vms_share_the_pool(void) {
+    hype_cfg_t cfg;
+    hype_adm_result_t r;
+    hype_adm_tiers_t t;
+    unsigned int per_core[4] = { 2, 2, 2, 2 };
+
+    tiers_cfg(&cfg, 3);
+    cfg.vms[0].vcpus = 2;                                 /* dedicated: cores 0-1 */
+    cfg.vms[1].cpu_mode = HYPE_CFG_CPU_SHARED; cfg.vms[1].vcpus = 4;
+    cfg.vms[2].cpu_mode = HYPE_CFG_CPU_SHARED; cfg.vms[2].vcpus = 4;
+    r = hype_adm_check_tiers(&cfg, per_core, 4, &t);
+    CHECK_INT("472 two shared VMs on one pool admitted", (int)HYPE_ADM_OK, (int)r.status);
+    CHECK_INT("472 dedicated cores", 2, t.dedicated_cores);
+    CHECK_INT("472 pool cores", 2, t.pool_cores);
+    CHECK_INT("472 pool threads", 4, t.pool_threads);
+    CHECK_INT("472 shared VMs", 2, t.shared_vms);
+    CHECK_INT("472 shared sCPUs", 8, t.shared_scpus);
+    CHECK_INT("472 default limit = 4.0 x 4 threads", 16, t.scpu_limit);
+    /* More configured vCPUs than cores is legal once they are shared. */
+    r = hype_adm_check_vcpus(&cfg, 4);
+    CHECK_INT("472 check_vcpus prices dedicated only", (int)HYPE_ADM_OK, (int)r.status);
+    r = hype_adm_check_vm_ranges(&cfg, 3);
+    CHECK_INT("472 a shared VM's sCPUs are not capped by cores", (int)HYPE_ADM_OK, (int)r.status);
+}
+
+static void test_472_shared_vm_with_empty_pool_refused(void) {
+    hype_cfg_t cfg;
+    hype_adm_result_t r;
+    hype_adm_tiers_t t;
+    unsigned int per_core[2] = { 2, 2 };
+
+    tiers_cfg(&cfg, 3);
+    cfg.vms[0].vcpus = 2;                       /* takes both cores */
+    cfg.vms[1].cpu_mode = HYPE_CFG_CPU_SHARED;
+    cfg.vms[2].cpu_mode = HYPE_CFG_CPU_SHARED;
+    r = hype_adm_check_tiers(&cfg, per_core, 2, &t);
+    CHECK_INT("472 empty pool refused", (int)HYPE_ADM_ERR_SHARED_POOL_EMPTY, (int)r.status);
+    CHECK_INT("472 names the first shared VM", 1, r.vm_index_a);
+    CHECK_INT("472 pool cores 0", 0, t.pool_cores);
+
+    cfg.vms[0].vcpus = 5;                       /* dedicated overflow: pool is still empty */
+    r = hype_adm_check_tiers(&cfg, per_core, 2, 0);
+    CHECK_INT("472 dedicated overflow leaves no pool", (int)HYPE_ADM_ERR_SHARED_POOL_EMPTY,
+              (int)r.status);
+}
+
+static void test_472_overcommit_ratio(void) {
+    hype_cfg_t cfg;
+    hype_adm_result_t r;
+    unsigned int per_core[2] = { 2, 1 };        /* pool of 3 threads */
+
+    tiers_cfg(&cfg, 3);
+    cfg.hype.shared_overcommit_x100 = 200;      /* limit 6 sCPUs */
+    cfg.vms[0].cpu_mode = HYPE_CFG_CPU_SHARED; cfg.vms[0].vcpus = 3;
+    cfg.vms[1].cpu_mode = HYPE_CFG_CPU_SHARED; cfg.vms[1].vcpus = 3;
+    cfg.vms[2].cpu_mode = HYPE_CFG_CPU_SHARED; cfg.vms[2].vcpus = 0; /* absent -> 1 */
+    r = hype_adm_check_tiers(&cfg, per_core, 2, 0);
+    CHECK_INT("472 7 sCPUs over a 6 limit refused", (int)HYPE_ADM_ERR_SHARED_OVERCOMMIT, (int)r.status);
+    CHECK_INT("472 names the VM that crossed the limit", 2, r.vm_index_a);
+    cfg.vms[2].cpu_mode = HYPE_CFG_CPU_DEDICATED; /* now takes core 0: pool = 1 thread, limit 2 */
+    r = hype_adm_check_tiers(&cfg, per_core, 2, 0);
+    CHECK_INT("472 limit shrinks with the pool", (int)HYPE_ADM_ERR_SHARED_OVERCOMMIT, (int)r.status);
+    CHECK_INT("472 first VM already past it", 0, r.vm_index_a);
+    cfg.hype.shared_overcommit_x100 = 600;        /* limit 6 */
+    r = hype_adm_check_tiers(&cfg, per_core, 2, 0);
+    CHECK_INT("472 within the ratio admitted", (int)HYPE_ADM_OK, (int)r.status);
+    cfg.hype.shared_overcommit_x100 = 99;
+    r = hype_adm_check_tiers(&cfg, per_core, 2, 0);
+    CHECK_INT("472 ratio below 1.0 refused", (int)HYPE_ADM_ERR_SHARED_RATIO_INVALID, (int)r.status);
+    CHECK_INT("472 names the first shared VM", 0, r.vm_index_a);
+}
+
+static void test_472_no_shared_vm_no_tier_check(void) {
+    hype_cfg_t cfg;
+    hype_adm_result_t r;
+    hype_adm_tiers_t t;
+    unsigned int per_core[1] = { 2 };
+
+    tiers_cfg(&cfg, 2);                          /* 2 dedicated on 1 core: not this check's job */
+    cfg.hype.shared_overcommit_x100 = 50;
+    r = hype_adm_check_tiers(&cfg, per_core, 1, &t);
+    CHECK_INT("472 dedicated-only config passes the tier check", (int)HYPE_ADM_OK, (int)r.status);
+    CHECK_INT("472 no shared VMs", 0, t.shared_vms);
+    r = hype_adm_check_vcpus(&cfg, 1);
+    CHECK_INT("472 dedicated overcommit still reported", (int)HYPE_ADM_ERR_VCPU_OVERCOMMIT, (int)r.status);
+}
+
+static void test_472_budget_ignores_shared_vms(void) {
+    hype_cfg_t cfg;
+    hype_adm_result_t r;
+
+    tiers_cfg(&cfg, 3);
+    cfg.hype.has_host_cpu_budget = 1;
+    cfg.hype.host_cpu_budget_count = 2;
+    cfg.hype.host_cpu_budget[0] = 1;
+    cfg.hype.host_cpu_budget[1] = 2;
+    cfg.vms[1].cpu_mode = HYPE_CFG_CPU_SHARED; cfg.vms[1].vcpus = 8;
+    cfg.vms[2].cpu_mode = HYPE_CFG_CPU_SHARED; cfg.vms[2].vcpus = 8;
+    r = hype_adm_check_cpu_budget(&cfg, 4);
+    CHECK_INT("472 shared sCPUs do not spend the core budget", (int)HYPE_ADM_OK, (int)r.status);
+}
+
 int main(void) {
+    test_472_dedicated_overlap_still_refused();
+    test_472_dedicated_shared_overlap_refused();
+    test_472_two_shared_vms_share_the_pool();
+    test_472_shared_vm_with_empty_pool_refused();
+    test_472_overcommit_ratio();
+    test_472_no_shared_vm_no_tier_check();
+    test_472_budget_ignores_shared_vms();
     test_467_shared_with_cpu_set_is_refused();
     test_peers_default_deny();
     test_peers_one_sided_listing_is_bidirectional();

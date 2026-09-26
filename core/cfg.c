@@ -645,8 +645,37 @@ enum {
     H_UPLINK_IP = 1u << 8,      /* #405 */
     H_UPLINK_MASK = 1u << 9,
     H_UPLINK_GATEWAY = 1u << 10,
-    H_FS_SELFTEST_DISK = 1u << 11 /* #709 */
+    H_FS_SELFTEST_DISK = 1u << 11, /* #709 */
+    H_SHARED_OVERCOMMIT = 1u << 12, /* #472 */
+    H_SHARED_TIMESLICE = 1u << 13   /* #470 */
 };
+
+int hype_cfg_parse_x100(const char *s, unsigned int *out) {
+    unsigned long long whole = 0, frac = 0;
+    unsigned int digits = 0;
+    const char *p = s;
+
+    if (*p < '0' || *p > '9') return -1;
+    while (*p >= '0' && *p <= '9') {
+        whole = whole * 10u + (unsigned long long)(*p - '0');
+        if (whole > 1000000u) return -1;
+        p++;
+    }
+    if (*p == '.') {
+        p++;
+        if (*p < '0' || *p > '9') return -1;
+        while (*p >= '0' && *p <= '9') {
+            if (digits == 2u) return -1; /* hundredths is the resolution; refuse, never round */
+            frac = frac * 10u + (unsigned long long)(*p - '0');
+            digits++;
+            p++;
+        }
+        if (digits == 1u) frac *= 10u;
+    }
+    if (*p != '\0') return -1;
+    *out = (unsigned int)(whole * 100u + frac);
+    return 0;
+}
 
 static void hype_globals_defaults(hype_cfg_hype_t *h) {
     unsigned char *p = (unsigned char *)h;
@@ -659,6 +688,8 @@ static void hype_globals_defaults(hype_cfg_hype_t *h) {
      * the exceptions -- both have a real, non-zero default. */
     h->config_version = 1u;
     h->cpu_avg_window_secs = 1u;
+    h->shared_overcommit_x100 = 400u;
+    h->shared_timeslice_us = 4000u;
     /*
      * #533: DEBUG, not zero. HYPE_LOG_ERROR is 0, so zeroing this struct would silently make the
      * quietest level the default -- and the default has to be the loudest, because it is what a
@@ -828,6 +859,24 @@ static hype_cfg_status_t apply_hype_field(hype_cfg_hype_t *h, unsigned int *seen
         }
         h->cpu_avg_window_secs = (v == 0u) ? 1u : (unsigned int)v;
         *seen |= H_CPU_AVG_WINDOW;
+        return HYPE_CFG_OK;
+    }
+    if (hype_streq(key, "shared_overcommit_ratio")) {
+        unsigned int x100;
+        if (*seen & H_SHARED_OVERCOMMIT) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        if (hype_cfg_parse_x100(val, &x100) != 0) return HYPE_CFG_ERR_BAD_VALUE;
+        h->shared_overcommit_x100 = x100;
+        h->has_shared_overcommit = 1;
+        *seen |= H_SHARED_OVERCOMMIT;
+        return HYPE_CFG_OK;
+    }
+    if (hype_streq(key, "shared_timeslice_us")) {
+        hype_cfg_status_t st;
+        if (*seen & H_SHARED_TIMESLICE) return HYPE_CFG_ERR_DUPLICATE_KEY;
+        st = parse_uint_field(val, &h->shared_timeslice_us);
+        if (st != HYPE_CFG_OK) return st;
+        h->has_shared_timeslice = 1;
+        *seen |= H_SHARED_TIMESLICE;
         return HYPE_CFG_OK;
     }
     return HYPE_CFG_ERR_UNKNOWN_KEY;
@@ -2407,6 +2456,19 @@ static void serialize_hype(hype_cfg_w_t *w, const hype_cfg_hype_t *h) {
     w_kv_uint(w, "cpu_avg_window_secs", h->cpu_avg_window_secs);
     if (h->fs_selftest_disk[0] != '\0') {
         w_kv(w, "fs_selftest_disk", h->fs_selftest_disk); /* #709 */
+    }
+    if (h->has_shared_overcommit) {
+        char buf[16];
+        unsigned int frac = h->shared_overcommit_x100 % 100u;
+        if (frac % 10u == 0u) {
+            hype_snprintf(buf, sizeof(buf), "%u.%u", h->shared_overcommit_x100 / 100u, frac / 10u);
+        } else {
+            hype_snprintf(buf, sizeof(buf), "%u.%02u", h->shared_overcommit_x100 / 100u, frac);
+        }
+        w_kv(w, "shared_overcommit_ratio", buf);
+    }
+    if (h->has_shared_timeslice) {
+        w_kv_uint(w, "shared_timeslice_us", h->shared_timeslice_us);
     }
 }
 

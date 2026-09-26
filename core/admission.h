@@ -44,7 +44,11 @@ typedef enum {
     HYPE_ADM_ERR_NIC_SHARED,        /* two VMs attach the same [nic.*] */
     HYPE_ADM_ERR_NIC_COUNT_EXCEEDED, /* a VM attaches more NICs than hype can present */
     /* #607 */
-    HYPE_ADM_ERR_FIRMWARE_LEGACY_UNSUPPORTED /* firmware = legacy has no boot path until #128 */
+    HYPE_ADM_ERR_FIRMWARE_LEGACY_UNSUPPORTED, /* firmware = legacy has no boot path until #128 */
+    /* #472 (SMP-16): the shared tier */
+    HYPE_ADM_ERR_SHARED_RATIO_INVALID, /* shared VMs configured while shared_overcommit_ratio < 1.0 */
+    HYPE_ADM_ERR_SHARED_POOL_EMPTY,    /* shared VMs configured and dedicated VMs took every core */
+    HYPE_ADM_ERR_SHARED_OVERCOMMIT     /* the shared sCPUs exceed ratio x pool threads */
 } hype_adm_status_t;
 
 typedef struct {
@@ -95,9 +99,10 @@ hype_adm_result_t hype_adm_check_pool(const hype_cfg_t *cfg, unsigned int vm_cou
 hype_adm_result_t hype_adm_check_memory(const hype_cfg_t *cfg, UINT64 usable_ram_bytes,
                                          UINT64 reserved_bytes);
 
-/* Sums every VM's vcpus and rejects if it exceeds physical_core_count
+/* Sums every DEDICATED VM's vcpus and rejects if it exceeds physical_core_count
  * (the 1:1 pinning model, §3, needs one exclusive physical core per
- * vCPU). */
+ * vCPU). Shared VMs are priced by hype_adm_check_tiers(), in a different currency
+ * (decision 47). */
 hype_adm_result_t hype_adm_check_vcpus(const hype_cfg_t *cfg, unsigned int physical_core_count);
 
 /*
@@ -116,6 +121,33 @@ hype_adm_result_t hype_adm_check_cpu_set(const hype_cfg_t *cfg, unsigned int phy
  * refused: a shared VM runs on the host-wide pool, so a per-VM pin has no defined meaning.
  */
 int hype_adm_vm_shared_with_cpu_set(const hype_cfg_vm_t *vm);
+
+/*
+ * #472 (SMP-16): the two tiers, priced separately (decision 47).
+ *
+ * per_core[i] is the thread count of the i-th core available to guests (BSP core excluded), in
+ * placement order. Dedicated VMs are packed first and cost whole cores; the shared pool is every
+ * core they leave. A shared VM with a cpu_set is refused earlier (decision 84), so a core can
+ * never be both dedicated and pooled.
+ *
+ * Refuses, naming the first shared VM that cannot run:
+ *   - SHARED_RATIO_INVALID: any shared VM while shared_overcommit_ratio < 1.0;
+ *   - SHARED_POOL_EMPTY: any shared VM while the pool has no core;
+ *   - SHARED_OVERCOMMIT: the running sum of shared sCPUs passes ratio x pool threads. Every
+ *     shared VM from vm_index_a on is past the limit, so the caller refuses that suffix.
+ * `out` (may be 0) receives the arithmetic, which the startup diagnostic prints.
+ */
+typedef struct {
+    unsigned int dedicated_cores;
+    unsigned int pool_cores;
+    unsigned int pool_threads;
+    unsigned int shared_vms;
+    unsigned int shared_scpus;  /* sum over every shared VM */
+    unsigned int scpu_limit;    /* ratio x pool threads, rounded down */
+} hype_adm_tiers_t;
+
+hype_adm_result_t hype_adm_check_tiers(const hype_cfg_t *cfg, const unsigned int *per_core,
+                                       unsigned int ncores, hype_adm_tiers_t *out);
 
 /* Rejects if any two VMs' target_disk resolve to the same file: path
  * or the same physical: serial/GUID -- security-critical per §10
