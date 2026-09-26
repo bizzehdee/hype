@@ -4410,39 +4410,54 @@ isn't lost.
     Refusing is the reversible choice. A later decision can give the combination a meaning
     without breaking any config that starts today.
 
-85. **Shared-tier run queues are per pCPU, with no vCPU migration in v1 -- decided
-    (2026-09-24, #468).**
+85. **Shared-tier run queues are per physical core, with no vCPU migration in v1, and a core
+    runs one trust group per slice -- decided (2026-09-24, #468; corrected 2026-09-26, #473).**
 
     SMP-12 (#468) had to choose between one run queue per shared-tier pCPU and one per pool.
     The choice decides whether migration exists at all.
 
-    **The rule.** Each shared-tier hardware thread owns one run queue. A shared vCPU is
-    placed on one thread at admission and stays there for the whole run. Pick-next is
-    round-robin with the fixed `shared_timeslice_us` slice (decision 39): the vCPU at the head
-    of the runnable FIFO runs for one slice, then goes to the tail. A halted, blocked or
-    stopped vCPU leaves the FIFO, and returns to the tail when it becomes runnable again.
+    **The rule.** Each shared-tier physical core owns one run queue. A shared vCPU is placed
+    on one core at admission and stays there for the whole run. At each slice boundary
+    (`shared_timeslice_us`, decision 39) the group of the vCPU at the head of the core's
+    runnable FIFO becomes the core's owner for that slice, and up to one runnable vCPU per
+    hardware thread **of that group only** becomes current. The vCPUs that ran go to the
+    tail. A halted, blocked or stopped vCPU leaves the FIFO, and returns to the tail when it
+    becomes runnable again. A thread whose vCPU stops mid-slice may take a waiting group-mate.
 
-    **Why per pCPU.**
+    **Correction (2026-09-26).** The first version put one queue on each hardware thread and
+    said the queues of one core "only hold vCPUs of one group". That confines G distrusting
+    groups to G disjoint cores for the whole run, so the over-commit decision 47 describes (50
+    single-sCPU VMs, each its own group by default) could not start on a small pool. Decision
+    40 already allows a core to change owner between slices, with a drain and a flush
+    (SMP-18). The queue is therefore per core, and the group is chosen per slice. On a
+    single-thread core, which is every QEMU rig, the two versions behave identically.
+
+    **Why per core.**
     - A queue has one owner core, so pick-next needs no cross-core lock.
-    - Trust groups (decision 40, SMP-17) become a placement rule: the queues of one physical
-      core only hold vCPUs of one group. Pick-next never has to check a group.
-    - A dedicated vCPU is exactly a queue of length one, which is the "one vCPU-run primitive"
-      of decision 39.
+    - All threads of a core change owner together at the slice boundary, which is decision
+      40's drain; `owner_changed` tells the caller a flush is due before the first entry.
+    - Group-mates freely share SMT siblings; an empty sibling of an owned core is counted as
+      idled by quantisation (SMP-21).
+    - A dedicated vCPU is exactly a one-thread queue of length one, which is the "one vCPU-run
+      primitive" of decision 39.
     - No migration means no guest-TSC hand-off between cores and no cross-core cache refill
       on every slice.
 
+    **Placement.** A vCPU goes to a core already holding a group-mate with a free sibling
+    thread, else to the least-loaded core (vCPUs per thread). So a group fills a core before
+    it spreads, and distinct groups spread across cores.
+
     **Why round-robin and nothing cleverer.** It is fair by construction, and its worst-case
-    wait is `(n - 1) × slice` for n runnable vCPUs on one queue. SMP-20 must prove that bound,
+    wait is `(n - 1) × slice` for n runnable vCPUs on one core. SMP-20 must prove that bound,
     and a priority or credit scheduler would make the proof depend on the policy's state.
     Nothing measured asks for a weighted policy yet.
 
-    **The cost, stated plainly.** No load balancing: when every vCPU on one thread is busy and
-    another thread is idle, the idle time is lost. Placement at admission (SMP-16) must spread
-    vCPUs evenly to limit this.
+    **The cost, stated plainly.** No load balancing: when every vCPU on one core is busy and
+    another core is idle, the idle time is lost. Placement spreads vCPUs evenly to limit this.
 
     **Rejected: one queue per pool.** It balances load by construction, but it takes a
-    cross-core lock on every pick, migrates on every slice, and must check the trust group
-    inside pick-next. **Rejected for v1: per-pCPU queues plus a balancer.** A balancer is the
+    cross-core lock on every pick, migrates on every slice, and must coordinate every core's
+    group choice. **Rejected for v1: per-core queues plus a balancer.** A balancer is the
     right way to add migration if SMP-22 measures an imbalance that matters. That needs its
     own decision, with the measurement in front of it.
 
