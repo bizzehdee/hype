@@ -55,6 +55,8 @@
 #include "../core/disk_inventory.h"
 #include "../core/cpu_topology.h"
 #include "../core/smp_pack.h"
+#include "../core/sched.h"
+#include "../arch/x86_64/cpu/coro.h"
 #include "../core/pe_ident.h"
 #include "../core/gpt.h"
 #include "../core/iso_stream.h"
@@ -3764,6 +3766,16 @@ static void fw_1_core_runs(const uint32_t *threads, unsigned nthreads, unsigned 
     }
 }
 
+static hype_cfg_t g_hype_cfg; /* tentative; defined with the config loader below */
+
+/* #469: a VM on the shared tier (decision 39). Its vCPUs run on the pool, not on cores of its own. */
+static int fw_1_vm_is_shared(unsigned vi) {
+    return vi < g_hype_cfg.vm_count && g_hype_cfg.vms[vi].cpu_mode == HYPE_CFG_CPU_SHARED;
+}
+
+static unsigned fw_1_place_shared(const uint32_t *threads, const unsigned *per_core,
+                                  const unsigned *core_start, unsigned first_pool, unsigned ncores);
+
 /*
  * Build the [vm][vcpu] -> host thread map. Returns the number of vCPUs placed.
  *
@@ -3816,6 +3828,10 @@ static unsigned fw_1_place_vcpus_on_threads(void) {
      * packing actually consumed.
      */
     for (vi = 0; vi < g_vm_count; vi++) {
+        if (fw_1_vm_is_shared(vi)) {
+            ncores_wanted = g_cpu_topo.count; /* #469: the pool is every core left over */
+            break;
+        }
         ncores_wanted += g_vms[vi].cores_req ? g_vms[vi].cores_req : 1u;
     }
 
@@ -3834,7 +3850,8 @@ static unsigned fw_1_place_vcpus_on_threads(void) {
      * separately is exactly what drifted in #559 and started two VMs on one core.
      */
     for (vi = 0; vi < g_vm_count && vi < HYPE_CFG_MAX_VMS; vi++) {
-        want[vi] = g_vms[vi].cores_req ? g_vms[vi].cores_req : 1u;
+        want[vi] = fw_1_vm_is_shared(vi) ? HYPE_SMP_PACK_SKIP
+                                         : (g_vms[vi].cores_req ? g_vms[vi].cores_req : 1u);
     }
     nvms = (g_vm_count < HYPE_CFG_MAX_VMS) ? g_vm_count : HYPE_CFG_MAX_VMS;
     (void)hype_smp_pack(per_core, ncores, want, nvms, packed, HYPE_MAX_VCPUS_PER_VM);
@@ -3844,6 +3861,8 @@ static unsigned fw_1_place_vcpus_on_threads(void) {
     for (vi = 0; vi < nvms; vi++) {
         unsigned got = 0, vm_cores = packed[vi].cores, vm_tpc = packed[vi].threads_per_core;
         unsigned c;
+
+        if (fw_1_vm_is_shared(vi)) continue; /* placed on the pool below */
 
         want[vi] = packed[vi].vcpus; /* logical CPUs granted = cores * threads_per_core */
         for (c = 0; c < vm_cores; c++) {
@@ -3902,6 +3921,7 @@ static unsigned fw_1_place_vcpus_on_threads(void) {
         }
     }
     (void)next;
+    placed += fw_1_place_shared(threads, per_core, core_start, ci, ncores);
     g_vcpu_threads_placed = placed;
     g_vcpu_cores_used = ci; /* cores actually consumed */
     hype_debug_print("fw-1 SMP: %u whole physical core(s) granted -> %u logical CPU(s) (%u "
@@ -4044,13 +4064,12 @@ static void fw_1_ap_main(void *arg);
 
 /* #808: hype_ap_start() plus the BSP-vs-AP TSC delta line. Every AP start goes through here so
  * a machine with skewed cores says so once per core, at bring-up, in the log. */
-static int fw_1_ap_start_probed(uint8_t apic_id, unsigned slot, void *arg, uint64_t tsc_hz) {
+static int fw_1_ap_start_probed(uint8_t apic_id, uint64_t stack_top, void *arg, uint64_t tsc_hz) {
     int rc;
     uint64_t bsp_tsc;
     g_fw_1_ap_entry_tsc = 0ull;
     rc = hype_ap_start((volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE, apic_id,
-                       (void *)(uintptr_t)g_ap_tramp_page, g_ap_cr3,
-                       (uint64_t)(uintptr_t)(g_ap_stacks[slot] + HYPE_AP_STACK_BYTES),
+                       (void *)(uintptr_t)g_ap_tramp_page, g_ap_cr3, stack_top,
                        tsc_hz, fw_1_ap_main, arg, g_hype_nx_supported);
     bsp_tsc = hype_rdtsc();
     if (rc == 0 && tsc_hz != 0ull) {
@@ -4111,6 +4130,222 @@ static int fw_1_ap_start_probed(uint8_t apic_id, unsigned slot, void *arg, uint6
     return rc;
 }
 
+/*
+ * SMP-13 (#469): shared-tier cores (plan.md §10 decisions 39, 40, 85).
+ *
+ * A shared core runs several vCPU loops, each a host-side coroutine on its OWN AP stack (the
+ * vCPU's g_ap_stacks slot), so every function-local of run_fw_1_test / fw_1_run_ap_vcpu stays
+ * per-vCPU by construction. The core's scheduler loop runs on a small stack of its own and
+ * switches to the vCPU core/sched picks. A vCPU yields only at fw_1_sched_point(), which its
+ * loop calls where it holds no lock, just before VM entry; its VMCB/VMCS carries its own
+ * NPT/EPT root and ASID/VPID, so the entry after a switch is already the right address space.
+ *
+ * v1 runs a shared core on its FIRST hardware thread only: the rq is built with threads = 1,
+ * so a sibling never runs a second group (decision 40 holds trivially) but also never runs a
+ * group-mate. Gang dispatch across siblings is a follow-up.
+ */
+#define FW_1_SHARED_CORES_MAX 16u
+#define FW_1_CORE_VCPUS_MAX 16u
+#define FW_1_CORE_STACK_BYTES 16384u
+#define FW_1_AP_ARG_CORE_FLAG ((uintptr_t)1 << 20)
+#define FW_1_AP_ARG_CORE(ci) ((uintptr_t)(ci) | FW_1_AP_ARG_CORE_FLAG)
+
+typedef struct {
+    hype_sched_rq_t rq;
+    hype_sched_vcpu_t sv[FW_1_CORE_VCPUS_MAX];
+    uint8_t vm_of[FW_1_CORE_VCPUS_MAX];
+    uint8_t vcpu_of[FW_1_CORE_VCPUS_MAX];
+    uint8_t started[FW_1_CORE_VCPUS_MAX];
+    uint64_t coro_sp[FW_1_CORE_VCPUS_MAX];
+    uint64_t sched_sp;
+    unsigned n;
+    uint32_t apic_id;
+    volatile unsigned running;  /* sv index of the vCPU on the core now */
+    volatile uint64_t switches; /* picks that changed the running vCPU */
+    volatile uint64_t forced;   /* yields at slice expiry */
+    volatile uint64_t voluntary; /* yields by a vCPU with nothing to do (HLT, waits) */
+} fw_1_core_t;
+
+static fw_1_core_t g_fw_1_cores[FW_1_SHARED_CORES_MAX];
+static unsigned g_fw_1_core_count;
+static uint8_t g_fw_1_core_stacks[FW_1_SHARED_CORES_MAX][FW_1_CORE_STACK_BYTES]
+    __attribute__((aligned(16)));
+/* (vm, vcpu) -> shared core index + 1 (0 = dedicated), and its slot on that core. */
+static uint8_t g_fw_1_vcpu_core[HYPE_CFG_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+static uint8_t g_fw_1_vcpu_sv[HYPE_CFG_MAX_VMS][HYPE_MAX_VCPUS_PER_VM];
+
+/* A trust group is numbered by the first VM that names it. */
+static unsigned fw_1_group_of(unsigned vi) {
+    unsigned j;
+    for (j = 0; j < vi && j < g_hype_cfg.vm_count; j++) {
+        if (hype_streq(hype_cfg_vm_isolation_group(&g_hype_cfg.vms[j]),
+                       hype_cfg_vm_isolation_group(&g_hype_cfg.vms[vi]))) {
+            return j;
+        }
+    }
+    return vi;
+}
+
+static unsigned fw_1_place_shared(const uint32_t *threads, const unsigned *per_core,
+                                  const unsigned *core_start, unsigned first_pool,
+                                  unsigned ncores) {
+    unsigned grp[HYPE_CFG_MAX_VMS * 2u], vm_of[HYPE_CFG_MAX_VMS * 2u], cpu_of[HYPE_CFG_MAX_VMS * 2u];
+    unsigned one[FW_1_SHARED_CORES_MAX], out[HYPE_CFG_MAX_VMS * 2u];
+    unsigned n = 0, npool, vi, i, placed = 0;
+
+    g_fw_1_core_count = 0;
+    npool = (ncores > first_pool) ? ncores - first_pool : 0u;
+    if (npool > FW_1_SHARED_CORES_MAX) npool = FW_1_SHARED_CORES_MAX;
+    for (i = 0; i < npool; i++) one[i] = 1u; /* v1: first thread only, see above */
+    for (vi = 0; vi < g_vm_count && vi < HYPE_CFG_MAX_VMS; vi++) {
+        unsigned k, want;
+        if (!fw_1_vm_is_shared(vi)) continue;
+        /* Decision 47: a shared guest sees exactly its sCPU count. */
+        want = g_vms[vi].cores_req ? g_vms[vi].cores_req : 1u;
+        if (want > HYPE_MAX_VCPUS_PER_VM) want = HYPE_MAX_VCPUS_PER_VM;
+        g_vms[vi].vcpu_count = want;
+        g_vms[vi].threads_per_core = 1u;
+        for (k = 0; k < want && n < HYPE_CFG_MAX_VMS * 2u; k++) {
+            grp[n] = fw_1_group_of(vi);
+            vm_of[n] = vi;
+            cpu_of[n] = k;
+            n++;
+        }
+    }
+    if (npool == 0u) {
+        HYPE_LOGF(HYPE_LOG_ERROR, "fw-1 SCHED: %u shared vCPU(s) and no pool core left -- none "
+                  "placed [#469]\n", n);
+        return 0;
+    }
+    (void)per_core;
+    for (i = 0; i < npool; i++) {
+        hype_sched_rq_init(&g_fw_1_cores[i].rq, 0, 1); /* slice set when the core starts */
+        g_fw_1_cores[i].n = 0;
+        g_fw_1_cores[i].apic_id = threads[core_start[first_pool + i]];
+    }
+    g_fw_1_core_count = npool;
+    hype_sched_place(grp, n, one, npool, out);
+    for (i = 0; i < n; i++) {
+        fw_1_core_t *c = &g_fw_1_cores[out[i]];
+        uint32_t apic = c->apic_id;
+        if (c->n >= FW_1_CORE_VCPUS_MAX || apic > 255u) {
+            HYPE_LOGF(HYPE_LOG_ERROR, "fw-1 SCHED: vm%u vCPU %u not placed -- shared core %u is "
+                      "full or its APIC ID is above 255 [#469]\n", vm_of[i], cpu_of[i], out[i]);
+            continue;
+        }
+        hype_sched_vcpu_init(&c->sv[c->n], c->n, grp[i]);
+        hype_sched_add(&c->rq, &c->sv[c->n]);
+        c->vm_of[c->n] = (uint8_t)vm_of[i];
+        c->vcpu_of[c->n] = (uint8_t)cpu_of[i];
+        c->started[c->n] = 0;
+        g_fw_1_vcpu_core[vm_of[i]][cpu_of[i]] = (uint8_t)(out[i] + 1u);
+        g_fw_1_vcpu_sv[vm_of[i]][cpu_of[i]] = (uint8_t)c->n;
+        g_vcpu_thread[vm_of[i]][cpu_of[i]] = apic;
+        g_vcpu_thread_valid[vm_of[i]][cpu_of[i]] = 1u;
+        c->n++;
+        placed++;
+        hype_debug_print("fw-1 SCHED: vm%u vCPU %u -> shared core %u (apic_id=%u, group %u) "
+                         "[#469 decision 85]\n", vm_of[i], cpu_of[i], out[i], (unsigned)apic,
+                         grp[i]);
+    }
+    return placed;
+}
+
+/*
+ * The one place a shared vCPU gives up its core. Called with no lock held, right before VM
+ * entry. `voluntary` = the vCPU has nothing to do (HLT, a wait on a sibling); otherwise it yields
+ * only when its slice is used up and someone else is waiting. Returns 1 when it was switched out
+ * and has just been resumed -- the caller then re-arms its one-shot timer. A dedicated vCPU
+ * returns 0 at the first check.
+ */
+static int fw_1_sched_point(unsigned vm_idx, unsigned vcpu_idx, int voluntary) {
+    fw_1_core_t *c;
+    unsigned ci, k;
+
+    if (vm_idx >= HYPE_CFG_MAX_VMS || vcpu_idx >= HYPE_MAX_VCPUS_PER_VM) return 0;
+    ci = g_fw_1_vcpu_core[vm_idx][vcpu_idx];
+    if (ci == 0u) return 0;
+    c = &g_fw_1_cores[ci - 1u];
+    k = g_fw_1_vcpu_sv[vm_idx][vcpu_idx];
+    if (!voluntary && !hype_sched_slice_expired(&c->rq, hype_rdtsc())) return 0;
+    if (c->rq.head == 0) {
+        c->rq.slice_start = hype_rdtsc(); /* nobody waiting: keep the core, start a new slice */
+        return 0;
+    }
+    if (voluntary) {
+        c->voluntary++;
+    } else {
+        c->forced++;
+    }
+    hype_coro_switch(&c->coro_sp[k], c->sched_sp);
+    return 1;
+}
+
+static void fw_1_coro_entry(void *arg) {
+    unsigned vm_idx = FW_1_AP_ARG_VM((uintptr_t)arg);
+    unsigned vcpu_idx = FW_1_AP_ARG_VCPU((uintptr_t)arg);
+    fw_1_core_t *c = &g_fw_1_cores[g_fw_1_vcpu_core[vm_idx][vcpu_idx] - 1u];
+    unsigned k = g_fw_1_vcpu_sv[vm_idx][vcpu_idx];
+
+    if (vcpu_idx == 0u) {
+        run_fw_1_test(&g_vms[vm_idx], g_fw_1_ops, g_fw_1_kind);
+    } else {
+        fw_1_run_ap_vcpu(&g_vms[vm_idx], vcpu_idx, g_fw_1_ops, g_fw_1_kind);
+    }
+    /* The loop ended (the dedicated path parks the core here): stop this vCPU for good, and
+     * leave the core to its co-tenants. */
+    hype_sched_set_state(&c->rq, &c->sv[k], HYPE_SCHED_STOPPED, hype_rdtsc());
+    HYPE_LOGF(HYPE_LOG_INFO, "fw-1 SCHED: vm%u vCPU %u loop ended -- stopped; its shared core "
+              "keeps running the others [#469]\n", vm_idx, vcpu_idx);
+    for (;;) hype_coro_switch(&c->coro_sp[k], c->sched_sp);
+}
+
+/* #469: what one shared core did, every 5 s -- the numbers a switch count check reads. */
+static void fw_1_core_report(const fw_1_core_t *c, unsigned ci) {
+    uint64_t hz = g_vms[c->vm_of[0]].host_tsc_hz ? g_vms[c->vm_of[0]].host_tsc_hz : 1ull;
+    unsigned k;
+    hype_debug_print("fw-1 SCHED core%u: switches=%llu forced=%llu voluntary=%llu group_switches=%llu "
+                     "[#469]\n", ci, (unsigned long long)c->switches,
+                     (unsigned long long)c->forced, (unsigned long long)c->voluntary,
+                     (unsigned long long)c->rq.group_switches);
+    for (k = 0; k < c->n; k++) {
+        hype_debug_print("fw-1 SCHED core%u: vm%u vCPU %u state=%u slices=%llu run=%llums [#469]\n",
+                         ci, (unsigned)c->vm_of[k], (unsigned)c->vcpu_of[k],
+                         (unsigned)c->sv[k].state, (unsigned long long)c->sv[k].slices,
+                         (unsigned long long)(c->sv[k].run_time * 1000ull / hz));
+    }
+}
+
+static void fw_1_core_sched_run(fw_1_core_t *c) {
+    unsigned last = FW_1_CORE_VCPUS_MAX;
+    uint64_t hz = g_vms[c->vm_of[0]].host_tsc_hz;
+    uint64_t next_report = hype_rdtsc() + hz * 5ull;
+    for (;;) {
+        hype_sched_vcpu_t *v = hype_sched_pick(&c->rq, hype_rdtsc());
+        unsigned k;
+        if (hz != 0ull && hype_rdtsc() >= next_report) {
+            fw_1_core_report(c, (unsigned)(c - g_fw_1_cores));
+            next_report = hype_rdtsc() + hz * 5ull;
+        }
+        if (v == 0) {
+            __asm__ volatile("pause");
+            continue;
+        }
+        k = v->id;
+        if (!c->started[k]) {
+            unsigned slot = fw_1_vcpu_slot(c->vm_of[k], c->vcpu_of[k]);
+            c->coro_sp[k] = hype_coro_init(
+                (uint64_t)(uintptr_t)(g_ap_stacks[slot] + HYPE_AP_STACK_BYTES), fw_1_coro_entry,
+                (void *)FW_1_AP_ARG(c->vm_of[k], c->vcpu_of[k]));
+            c->started[k] = 1u;
+        }
+        if (k != last) c->switches++;
+        last = k;
+        c->running = k;
+        hype_coro_switch(&c->sched_sp, c->coro_sp[k]);
+    }
+}
+
 static void fw_1_ap_main(void *arg) {
     g_fw_1_ap_entry_tsc = hype_rdtsc(); /* #808 TSCSKEW probe -- first thing, see the slot */
     {   /* #815: sync this core's TSC to the BSP before anything reads it. See the gate. */
@@ -4135,8 +4370,15 @@ static void fw_1_ap_main(void *arg) {
     /* STEP 2: `arg` is this core's VM index (0 => g_vms[0] on AP1, 1 =>
      * g_vms[1] on AP2). Selects this core's guest, its own SVM host-save area,
      * and (below) its host_tsc_hz for the LAPIC-timer calibration. */
+    fw_1_core_t *shared_core = 0;
     unsigned vm_idx = FW_1_AP_ARG_VM((uintptr_t)arg);
     unsigned vcpu_idx = FW_1_AP_ARG_VCPU((uintptr_t)arg);
+    if (((uintptr_t)arg & FW_1_AP_ARG_CORE_FLAG) != 0u) {
+        /* #469: a shared core. Its first vCPU lends the core its host-save page and clock. */
+        shared_core = &g_fw_1_cores[(uintptr_t)arg & 0xFFu];
+        vm_idx = shared_core->vm_of[0];
+        vcpu_idx = shared_core->vcpu_of[0];
+    }
     if (vm_idx >= g_vm_count) {
         vm_idx = 0u;
     }
@@ -4281,9 +4523,28 @@ static void fw_1_ap_main(void *arg) {
         if (vm_idx < g_vm_count && vcpu_idx < HYPE_MAX_VCPUS_PER_VM) {
             g_vcpu_timer_reload[vm_idx][vcpu_idx] = (uint32_t)count;
         }
+        if (shared_core != 0) {
+            /* #469: every vCPU on this core arms this core's timer. */
+            unsigned k;
+            for (k = 0; k < shared_core->n; k++) {
+                if (shared_core->vcpu_of[k] == 0u) {
+                    g_ap_timer_reload[shared_core->vm_of[k]] = (uint32_t)count;
+                }
+                g_vcpu_timer_reload[shared_core->vm_of[k]][shared_core->vcpu_of[k]] =
+                    (uint32_t)count;
+            }
+        }
         *lvt = hype_lapic_lvt_timer_oneshot((uint8_t)HYPE_AP_LAPIC_TIMER_VECTOR);
         *icnt = 0; /* armed at the VM-entry site, after host dispatch work */
         hype_sti(); /* enable host interrupts on the AP so the timer fires */
+    }
+    if (shared_core != 0) {
+        shared_core->rq.slice_len = g_vms[vm_idx].host_tsc_hz / 1000000ull *
+                                    g_hype_cfg.hype.shared_timeslice_us;
+        HYPE_LOGF(HYPE_LOG_INFO, "fw-1 SCHED: shared core apic_id=%u up -- %u vCPU(s), slice "
+                  "%u us [#469]\n", (unsigned)shared_core->apic_id, shared_core->n,
+                  g_hype_cfg.hype.shared_timeslice_us);
+        fw_1_core_sched_run(shared_core);
     }
     /* Run the FW-1 guest on THIS (dedicated) core. run_fw_1_test builds the
      * NPT/VMCB/devices and enters the dispatch loop; never returns for a live
@@ -6506,6 +6767,24 @@ static void fw_1_wait_vcpu_parked(hype_fw_vm_t *vm, unsigned vi) {
     while (!vm->vcpu_parked[vi]) {
         spins++;
         __asm__ __volatile__("pause" ::: "memory");
+        /*
+         * #469: a target on the waiter's own shared core cannot park until the waiter yields.
+         * It is suspended at a lock-free point (the AP loop top or the SIPI wait) and parks
+         * without taking the device lock, so yielding here is safe even with it held.
+         */
+        {
+            unsigned vmi = (unsigned)(vm - g_vms);
+            unsigned w;
+            for (w = 0; w < HYPE_MAX_VCPUS_PER_VM; w++) {
+                if (w != vi && g_fw_1_vcpu_core[vmi][w] != 0u &&
+                    g_fw_1_vcpu_core[vmi][w] == g_fw_1_vcpu_core[vmi][vi] &&
+                    g_fw_1_cores[g_fw_1_vcpu_core[vmi][w] - 1u].running ==
+                        g_fw_1_vcpu_sv[vmi][w]) {
+                    (void)fw_1_sched_point(vmi, w, 1);
+                    break;
+                }
+            }
+        }
         if (spins > 200000000ull) {
             hype_debug_print("fw-1 vm%u vCPU %u: did not park for INIT/SIPI -- skipping the "
                              "reset rather than racing its VMCB [#190]\n",
@@ -13437,6 +13716,7 @@ wait_for_sipi:
         }
         spins++;
         __asm__ __volatile__("pause" ::: "memory");
+        (void)fw_1_sched_point(vm_idx, vi, 1); /* #469: waiting for a SIPI is nothing to do */
         if ((spins & 0x3FFFFFFFull) == 0ull) {
             hype_debug_print("fw-1 vm%u vCPU %u: waiting (ctx=%s, state=%u) [#190]\n", vm_idx,
                              vi, ctx ? "ready" : "not created",
@@ -13544,6 +13824,17 @@ wait_for_sipi:
     unsigned int apicv_trace = 0; /* #599 bring-up probe: the first exits after each SIPI */
 #endif
     for (;;) {
+        /*
+         * #469: the slice boundary on a shared core, BEFORE the INIT check: a sibling that
+         * INITs this vCPU and waits for it to park must see it reach the check below after it
+         * resumes, and that path takes no lock. So a vCPU is only ever switched out here or in
+         * the SIPI wait, never holding the shared-device lock.
+         */
+        if (ap_locked) {
+            fw_1_dev_unlock(vm);
+            ap_locked = 0;
+        }
+        (void)fw_1_sched_point(vm_idx, vi, 0);
         /*
          * An INIT revokes RUNNABLE. Go back and park rather than re-entering: the BSP is about
          * to rebuild this VMCB, and running it meanwhile is what produced the #GP storm this
@@ -15005,7 +15296,9 @@ static unsigned fw_1_vms_that_fit(unsigned *out_cores, unsigned *out_threads) {
     fw_1_core_runs(threads, nthreads, ncores, per_core, core_start);
 
     for (vi = 0; vi < g_vm_count && vi < HYPE_CFG_MAX_VMS; vi++) {
-        want[vi] = (vi < g_hype_cfg.vm_count && g_hype_cfg.vms[vi].vcpus)
+        /* #469: a shared VM costs no core; fw_1_check_tiers() prices it against the pool. */
+        want[vi] = fw_1_vm_is_shared(vi) ? HYPE_SMP_PACK_SKIP
+                   : (vi < g_hype_cfg.vm_count && g_hype_cfg.vms[vi].vcpus)
                        ? g_hype_cfg.vms[vi].vcpus
                        : 1u;
     }
@@ -16630,6 +16923,20 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              */
             (void)fw_1_uplink_pump(kind);
             fw_1_mkdisk_pump(); /* TERM-11 (#487): paced qcow2 create, never a blocking one */
+            /*
+             * #469: the slice boundary on a shared core -- the first point in this loop that
+             * holds no lock. The one-shot was armed above, before the switch, so a resumed vCPU
+             * re-arms it (with the VMX drain, as above) to get a full tick of its own.
+             */
+            if (fw_1_sched_point((unsigned)(vm - g_vms), 0u, 0)) {
+                if (kind == HYPE_VMM_KIND_VMX) {
+                    __asm__ volatile("sti\n\tnop\n\tcli" ::: "memory");
+                }
+                hype_lapic_arm_timer_oneshot(
+                    (volatile uint32_t *)(uintptr_t)HYPE_LAPIC_DEFAULT_BASE,
+                    (uint8_t)HYPE_AP_LAPIC_TIMER_VECTOR,
+                    g_ap_timer_reload[(unsigned)(vm - g_vms)]);
+            }
             g_bsp_probe_entry_tsc[(unsigned)(vm - g_vms)] = hype_rdtsc(); /* #483 */
             fw_1_loop_section(vm, 80u); /* #801 s80: VMRUN + guest execution, hype's own cost excluded */
             if (ops->vcpu_run(ctx, &info) != 0) {
@@ -21547,6 +21854,9 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                          */
                         fw_1_dev_unlock(vm);
                         while (hype_rdtsc() - start < wait_tsc) {
+                            /* #469: an idle guest gives its shared core away rather than spin
+                             * a co-tenant's time; the pass after resuming re-evaluates. */
+                            if (fw_1_sched_point((unsigned)(vm - g_vms), 0u, 1)) break;
                             __asm__ volatile("pause");
                         }
                         fw_1_dev_lock(vm);
@@ -25278,7 +25588,9 @@ static int fw_1_start_new_vm(unsigned vi) {
         if (sel < 0) {
             continue;
         }
-        rc = fw_1_ap_start_probed((uint8_t)sel, slot, (void *)FW_1_AP_ARG(vi, cv),
+        rc = fw_1_ap_start_probed((uint8_t)sel,
+                                  (uint64_t)(uintptr_t)(g_ap_stacks[slot] + HYPE_AP_STACK_BYTES),
+                                  (void *)FW_1_AP_ARG(vi, cv),
                                   g_vms[0].host_tsc_hz);
         HYPE_LOGF(HYPE_LOG_INFO, "fw-1 CREATE: vm%u vCPU %u on apic=%d -> rc=%d [#486]\n", vi, cv, sel, rc);
         if (rc == 0) {
@@ -31203,6 +31515,14 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                     for (cv = 0u; cv < nv; cv++) {
                         int sel;
                         unsigned slot = fw_1_vcpu_slot(vi, cv);
+                        if (g_fw_1_vcpu_core[vi][cv] != 0u) {
+                            /* #469: runs on its shared core, which starts once, below. */
+                            if (cv == 0u) {
+                                g_ap_slot_apic_id[vi] = (uint8_t)g_vcpu_thread[vi][cv];
+                                g_ap_slot_valid[vi] = 1;
+                            }
+                            continue;
+                        }
                         if (g_vcpu_thread_valid[vi][cv]) {
                             sel = (int)g_vcpu_thread[vi][cv];
                         } else {
@@ -31260,7 +31580,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                 g_ap_slot_apic_id[vi] = id;
                                 g_ap_slot_valid[vi] = 1;
                             }
-                            rc = fw_1_ap_start_probed(id, slot, (void *)FW_1_AP_ARG(vi, cv),
+                            rc = fw_1_ap_start_probed(
+                                id, (uint64_t)(uintptr_t)(g_ap_stacks[slot] + HYPE_AP_STACK_BYTES),
+                                (void *)FW_1_AP_ARG(vi, cv),
                                                       g_fw_1_host_tsc_hz);
                             if (cv == 0u) {
                                 if (vi == 0u) g_fw_1_ap_rc = rc;
@@ -31287,6 +31609,22 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                             }
                         }
                     }
+                }
+            }
+            {   /* #469: one host core per SHARED core, after every vCPU is on its queue. */
+                unsigned ci;
+                for (ci = 0; ci < g_fw_1_core_count; ci++) {
+                    fw_1_core_t *c = &g_fw_1_cores[ci];
+                    int rc;
+                    if (c->n == 0u) continue;
+                    rc = fw_1_ap_start_probed(
+                        (uint8_t)c->apic_id,
+                        (uint64_t)(uintptr_t)(g_fw_1_core_stacks[ci] + FW_1_CORE_STACK_BYTES),
+                        (void *)FW_1_AP_ARG_CORE(ci), g_fw_1_host_tsc_hz);
+                    HYPE_LOGF(rc == 0 ? HYPE_LOG_INFO : HYPE_LOG_ERROR,
+                              "fw-1 SCHED: shared core %u (apic_id=%u, %u vCPU(s)) start rc=%d "
+                              "[#469]\n", ci, (unsigned)c->apic_id, c->n, rc);
+                    usb_log_flush();
                 }
             }
             /*

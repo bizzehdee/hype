@@ -60,7 +60,7 @@ CORE_SRCS := core/format.c core/console.c core/halt.c core/memmap.c \
              core/cfg.c core/phys_confirm.c core/scancode.c core/xhci.c core/int_in_queue.c core/xhci_hw.c core/usb_msc.c core/usb_hid.c core/blk_usb.c \
              core/fat_write.c core/fat_write_fs.c core/fat_exfat.c core/fat_exfat_fs.c core/fat32_selftest.c \
              core/rtc.c core/rtc_hw.c \
-             core/log_sink.c core/log_split.c core/disk_inventory.c core/cpu_topology.c core/smp_pack.c core/e1000.c core/e1000_hw.c core/arp.c core/virtio_net_ring.c core/nat.c core/e1000_dev_ring.c core/guest_nic.c core/pe_ident.c core/mtrr.c core/guest_mtrr.c core/run_state.c
+             core/log_sink.c core/log_split.c core/disk_inventory.c core/cpu_topology.c core/smp_pack.c core/e1000.c core/e1000_hw.c core/arp.c core/virtio_net_ring.c core/nat.c core/e1000_dev_ring.c core/guest_nic.c core/pe_ident.c core/mtrr.c core/guest_mtrr.c core/run_state.c core/sched.c
 ARCH_SRCS := arch/x86_64/vmm_device_ops.c \
              arch/x86_64/cpu/gdt.c arch/x86_64/cpu/gdt_load.c arch/x86_64/cpu/idt.c \
              arch/x86_64/cpu/idt_load.c arch/x86_64/cpu/isr_decode.c \
@@ -80,7 +80,7 @@ ARCH_SRCS := arch/x86_64/vmm_device_ops.c \
              arch/x86_64/vmx/vmx_bits.c arch/x86_64/vmx/vmx_enable_hw.c arch/x86_64/vmx/vmx_ops.c \
              arch/x86_64/vmx/vmcs_hw.c arch/x86_64/vmx/ept.c
 ARCH_ASM_SRCS := arch/x86_64/cpu/chkstk.S arch/x86_64/cpu/isr_stubs.S arch/x86_64/cpu/ap_trampoline.S \
-             arch/x86_64/vmx/vmx_run.S arch/x86_64/svm/svm_run.S
+             arch/x86_64/vmx/vmx_run.S arch/x86_64/svm/svm_run.S arch/x86_64/cpu/coro.S
 DEVICE_SRCS := devices/pic.c devices/pit.c devices/hpet.c devices/smbios.c devices/pflash.c devices/acpi.c devices/acpi_loader.c \
                devices/fw_cfg.c devices/ahci.c devices/atapi.c devices/ramfb.c devices/pci.c devices/tpm_crb.c \
                devices/cmos.c devices/ps2_keyboard.c devices/ps2_mouse.c devices/bochs_vbe.c \
@@ -118,7 +118,7 @@ ESP       := $(BUILD_DIR)/esp
 # belong with the others -- but it is the one thing that surprises.
 MICRO_DIR   := tests/micro
 MICRO_OUT   := $(BUILD_DIR)/micro
-MICRO_NAMES := hello faulter ram1 cpumsr fwcfg intdeliver pausespin ps2 pflash pci ramfb virtioblk ahci atadisk bochsvbe virtionet netdns netpeer netgoal e1000dns logchatter vmexit vmexitstorm unclaimed apunclaimed
+MICRO_NAMES := hello faulter ram1 cpumsr fwcfg intdeliver pausespin ps2 pflash pci ramfb virtioblk ahci atadisk bochsvbe virtionet netdns netpeer netgoal e1000dns logchatter vmexit vmexitstorm unclaimed apunclaimed sharemem
 MICRO_IMAGES := $(patsubst %,$(MICRO_OUT)/%.bin,$(MICRO_NAMES))
 MICRO_CFLAGS := --target=x86_64-unknown-elf -ffreestanding -fno-stack-protector -fno-pic \
                 -mno-red-zone -mno-sse -Wall -Wextra -Werror -O2 -std=c11

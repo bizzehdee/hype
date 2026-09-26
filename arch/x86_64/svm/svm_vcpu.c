@@ -270,6 +270,11 @@ static void svm_assign_asid(hype_vmcb_t *vmcb, unsigned slot) {
     (void)eax; (void)ecx; (void)edx;
     nasid = hype_svm_nasid_from_cpuid_ebx(ebx);
     asid = hype_svm_asid_for_slot(slot, nasid);
+#ifdef HYPE_469_SHARED_ASID_PROBE
+    /* #469 negative control, never in a default build: every vCPU on ONE tag, so a shared core
+     * switching VMs without a flush should let tests/micro/sharemem.c see the other VM. */
+    asid = 1u;
+#endif
     if (asid == 0u) {
         /* Nothing downstream can detect a guest silently sharing the HOST's ASID
          * tag, so it has to be said here. */

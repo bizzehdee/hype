@@ -54,6 +54,10 @@ typedef struct {
  * the first VM that does not fit means none after it fits either -- the return value is a
  * launchable prefix length, which is what admission needs to report.
  */
+/* #469: a want[] entry that takes no core at all -- a shared-tier VM, which runs on the pool the
+ * dedicated VMs leave (decision 47). It is always satisfied, so it never caps the prefix. */
+#define HYPE_SMP_PACK_SKIP 0xFFFFFFFFu
+
 unsigned int hype_smp_pack(const unsigned int *per_core, unsigned int ncores,
                            const unsigned int *want, unsigned int nvms,
                            hype_smp_pack_vm_t *out, unsigned int max_vcpus_per_vm);

@@ -210,7 +210,22 @@ static void test_degenerate_inputs(void) {
     CHECK(hype_smp_pack(per_core, 0u, want, 1u, out, 8u) == 0u, "zero cores");
 }
 
+static void test_469_skip_takes_no_core(void) {
+    unsigned int per_core[3] = { 2, 2, 2 };
+    unsigned int want[3] = { 1, HYPE_SMP_PACK_SKIP, 1 };
+    hype_smp_pack_vm_t out[3];
+    unsigned int fit = hype_smp_pack(per_core, 3, want, 3, out, 0);
+
+    CHECK(fit == 3u, "469 all three fit (got %u)", fit);
+    CHECK(out[1].cores == 0u, "469 skipped VM has no core");
+    CHECK(out[2].first_core == 1u, "469 VM after it takes the next core");
+    want[0] = 3;
+    fit = hype_smp_pack(per_core, 3, want, 3, out, 0);
+    CHECK(fit == 2u, "469 a skip never caps the prefix; the dedicated VM that misses does (got %u)", fit);
+}
+
 int main(void) {
+    test_469_skip_takes_no_core();
     test_amd_laptop_three_vms_fit();
     test_same_config_non_smt_host();
     test_multi_core_vm();

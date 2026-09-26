@@ -24,6 +24,7 @@ unsigned int hype_smp_pack(const unsigned int *per_core, unsigned int ncores,
         unsigned int cores = 0u, narrowest = 0u;
 
         out[vi].first_core = ci;
+        if (want[vi] == HYPE_SMP_PACK_SKIP) continue;
         /*
          * Take exactly the cores asked for. A core with 0 threads ends the run: select_cores
          * cannot emit one, but trusting that silently would turn a malformed table into an
