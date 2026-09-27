@@ -38,6 +38,9 @@ typedef struct hype_sched_vcpu {
     uint64_t last_scheduled; /* `now` of the last time it became current; 0 = never */
     uint64_t slices;         /* how many times it became current */
     uint64_t run_start;      /* `now` when it last became current */
+    uint64_t steal_time;     /* #477: cumulative ticks spent runnable in the FIFO, not running */
+    uint64_t wait_max;       /* #476: the longest single FIFO wait before running -- the latency */
+    uint64_t wait_start;     /* the queue clock when it last entered the FIFO */
     struct hype_sched_vcpu *next; /* runnable FIFO link */
     int queued;                   /* 1 while in the runnable FIFO */
     int member;                   /* 1 while added to a queue */
@@ -63,7 +66,13 @@ typedef struct {
      * whole core idled because nothing was runnable. */
     uint64_t idle_quantised;
     uint64_t idle_nothing;
+    /* #477: the latest `now` any call has passed. Entries without a time of their own (add, wake)
+     * start their FIFO wait from it, so steal time is charged from at most one call late. */
+    uint64_t clock;
 } hype_sched_rq_t;
+
+/* #477: runnable vCPUs waiting in the FIFO (the run-queue depth, current excluded). */
+unsigned int hype_sched_queued(const hype_sched_rq_t *rq);
 
 /* threads is clamped to 1..HYPE_SCHED_MAX_THREADS. */
 void hype_sched_rq_init(hype_sched_rq_t *rq, uint64_t slice_len, unsigned int threads);

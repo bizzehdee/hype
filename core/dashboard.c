@@ -288,9 +288,10 @@ void hype_dashboard_render(hype_vt_screen_t *s,
         put_field(line, &len, "OS",      7);
         put_field(line, &len, "STATE",   9);
         put_field(line, &len, "CPU",     4);
+        put_field(line, &len, "STEAL",   5);
         put_field(line, &len, "MEM",     7);
         put_field(line, &len, "UPTIME",  9);
-        put_field(line, &len, "MEDIA",  16);
+        put_field(line, &len, "MEDIA",  12);
         line[len] = '\0';
         emit_line(s, line);
     }
@@ -298,10 +299,15 @@ void hype_dashboard_render(hype_vt_screen_t *s,
     for (unsigned i = 0; i < n; i++) {
         const hype_vm_dash_info_t *v = &vms[i];
         unsigned len = 0;
-        char idx[8], cpu[8], mem[12];
+        char idx[8], cpu[8], steal[8], mem[12];
 
         hype_snprintf(idx, sizeof(idx), "%s%u", v->focused ? ">" : "", i + 1u);
         hype_snprintf(cpu, sizeof(cpu), "%u%%", v->cpu_pct);
+        if (v->shared) {
+            hype_snprintf(steal, sizeof(steal), "%u%%", v->steal_pct);
+        } else {
+            hype_snprintf(steal, sizeof(steal), "-");
+        }
         hype_snprintf(mem, sizeof(mem), "%uM", v->mem_mb);
         hype_dashboard_fmt_uptime(up, v->uptime_s);
 
@@ -310,9 +316,10 @@ void hype_dashboard_render(hype_vt_screen_t *s,
         put_field(line, &len, v->os_hint ? v->os_hint : "-", 7);
         put_field(line, &len, v->state ? v->state : "?", 9);
         put_field(line, &len, cpu,         4);
+        put_field(line, &len, steal,       5);
         put_field(line, &len, mem,         7);
         put_field(line, &len, up,          9);
-        put_field(line, &len, v->media ? v->media : "-", 16);
+        put_field(line, &len, v->media ? v->media : "-", 12);
         line[len] = '\0';
         emit_line(s, line);
     }

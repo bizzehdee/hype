@@ -22,6 +22,14 @@ typedef struct {
     uint64_t uptime_s;    /* seconds since this VM last (re)started */
     const char *media;    /* boot media (ISO) short name, or 0 for "-" */
     int focused;          /* nonzero => this row is the currently-focused VM */
+    /*
+     * #477: the shared tier. CPU keeps ONE meaning on both tiers -- the fraction of one physical
+     * core this VM spent in the guest -- so a shared VM given a third of a core reads ~33%.
+     * STEAL is the fraction of wall time it was runnable and waiting for its core; it is shown
+     * only for a shared VM ("-" for a dedicated one, which never waits for a core).
+     */
+    int shared;
+    unsigned steal_pct;
 } hype_vm_dash_info_t;
 
 /*

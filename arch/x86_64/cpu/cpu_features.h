@@ -174,6 +174,13 @@ uint32_t hype_cpu_leaf7_edx(void);
  * CPUID.8000_0008H:EBX bit 12 (IBPB is its own, separate bit on AMD, unlike Intel). */
 int hype_cpu_has_ibpb(hype_cpu_vendor_t vendor, uint32_t leaf7_edx, uint32_t leaf80000008_ebx);
 
+/*
+ * #474: whether IA32_FLUSH_CMD (0x10B) bit 0 (L1D_FLUSH) is real on this host --
+ * CPUID.(EAX=7,ECX=0):EDX bit 28, the same bit on both vendors. AMD parts leave it clear: they are
+ * not affected by L1TF, and writing the MSR there would #GP.
+ */
+int hype_cpu_has_l1d_flush(uint32_t leaf7_edx);
+
 /* Real CPUID.8000_0008H:EBX read, gated on the leaf existing (checked against CPUID.8000_0000H's
  * own reported max extended leaf). Exempt hw shim. */
 uint32_t hype_cpu_leaf80000008_ebx(void);

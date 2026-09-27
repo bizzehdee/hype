@@ -102,6 +102,15 @@ UINT64 hype_memmap_largest_conventional_bytes(const EFI_MEMORY_DESCRIPTOR *map, 
                                               UINTN desc_size);
 
 /*
+ * #475: the largest conventional run CLIPPED to [lo, hi) -- one NUMA node's memory range. Writes
+ * its base to *out_base and returns its size, 0 when nothing free lies in the range. Pure; same
+ * lower-bound caveat as above (descriptors are not merged).
+ */
+UINT64 hype_memmap_largest_conventional_in(const EFI_MEMORY_DESCRIPTOR *map, UINTN map_size,
+                                           UINTN desc_size, UINT64 lo, UINT64 hi,
+                                           UINT64 *out_base);
+
+/*
  * #604: copies every descriptor of one memory type out of the map as base/size pairs, so the
  * caller can keep them after the map is freed. Writes at most `cap` entries and returns how many
  * descriptors matched: a return above `cap` means the copy was truncated. Pure.

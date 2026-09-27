@@ -419,7 +419,68 @@ static void test_473_rq_init_clamps_threads(void) {
     CHECK_INT("473 too many threads -> max", HYPE_SCHED_MAX_THREADS, rq.threads);
 }
 
+/* ---- #477: steal time and run-queue depth ---- */
+static void test_477_steal_time_two_always_runnable(void) {
+    hype_sched_rq_t rq;
+    hype_sched_vcpu_t v[3];
+    uint64_t now = 0;
+    unsigned int i;
+
+    setup(&rq, v, 3);
+    CHECK_INT("477 three queued before the first pick", 3, hype_sched_queued(&rq));
+    hype_sched_pick(&rq, now);
+    CHECK_INT("477 two queued while one runs", 2, hype_sched_queued(&rq));
+    for (i = 0; i < 3000u; i++) {
+        now += SLICE;
+        hype_sched_pick(&rq, now);
+    }
+    /* Three always-runnable vCPUs: each runs one slice in three and waits the other two. */
+    CHECK_INT("477 run time is a third", 1000u * SLICE, v[0].run_time);
+    CHECK_INT("477 steal is two thirds", 1, v[1].steal_time >= 1999u * SLICE &&
+                                              v[1].steal_time <= 2001u * SLICE);
+    CHECK_INT("477 run + steal = wall for v2", 1,
+              v[2].run_time + v[2].steal_time + SLICE >= 3000u * SLICE);
+}
+
+static void test_477_halted_time_is_not_steal(void) {
+    hype_sched_rq_t rq;
+    hype_sched_vcpu_t v[2];
+
+    setup(&rq, v, 2);
+    hype_sched_pick(&rq, 0);                                     /* v0 runs, v1 waits */
+    hype_sched_set_state(&rq, &v[1], HYPE_SCHED_HALTED, 50);     /* waited 50 */
+    hype_sched_pick(&rq, 100);                                   /* v0 again, alone */
+    hype_sched_pick(&rq, 1000);
+    hype_sched_set_state(&rq, &v[1], HYPE_SCHED_RUNNABLE, 1000); /* woken at 1000 */
+    hype_sched_pick(&rq, 1100);                                  /* v1 runs at 1100 */
+    CHECK_INT("477 only the runnable waits count: 50 + 100", 150, v[1].steal_time);
+    hype_sched_set_state(&rq, &v[1], HYPE_SCHED_HALTED, 1150);
+    hype_sched_wake(&rq, &v[1]);                                 /* no time: queue clock 1150 */
+    hype_sched_pick(&rq, 1200);
+    hype_sched_pick(&rq, 1300);
+    CHECK_INT("477 a wake starts its wait from the queue clock", 150 + 50 + 100, v[1].steal_time);
+}
+
+static void test_476_wait_max_is_the_round_robin_bound(void) {
+    hype_sched_rq_t rq;
+    hype_sched_vcpu_t v[4];
+    uint64_t now = 0;
+    unsigned int i, k;
+
+    setup(&rq, v, 4);
+    hype_sched_pick(&rq, now);
+    for (i = 0; i < 400u; i++) {
+        now += SLICE;
+        hype_sched_pick(&rq, now);
+    }
+    /* Four always-runnable vCPUs: nobody waits longer than (4 - 1) slices. */
+    for (k = 0; k < 4u; k++) CHECK_INT("476 wait_max == (n-1) x slice", 3u * SLICE, v[k].wait_max);
+}
+
 int main(void) {
+    test_476_wait_max_is_the_round_robin_bound();
+    test_477_steal_time_two_always_runnable();
+    test_477_halted_time_is_not_steal();
     test_473_same_group_shares_siblings();
     test_473_cross_group_never_shares_a_core();
     test_473_refill_takes_a_group_mate();

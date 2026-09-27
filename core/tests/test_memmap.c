@@ -561,7 +561,31 @@ static void test_collect_runtime_code(void) {
                                        EfiRuntimeServicesCode, 0, 0));
 }
 
+static void test_475_largest_in_range(void) {
+    EFI_MEMORY_DESCRIPTOR m[4];
+    UINT64 b = 0;
+    memset(m, 0, sizeof(m));
+    m[0].Type = EfiConventionalMemory; m[0].PhysicalStart = 0x100000; m[0].NumberOfPages = 0x1000;       /* 1M..17M */
+    m[1].Type = EfiConventionalMemory; m[1].PhysicalStart = 0x80000000ull; m[1].NumberOfPages = 0x100000; /* 2G..6G */
+    m[2].Type = EfiBootServicesData; m[2].PhysicalStart = 0x200000000ull; m[2].NumberOfPages = 0x100000;
+    m[3].Type = EfiConventionalMemory; m[3].PhysicalStart = 0x180000000ull; m[3].NumberOfPages = 0x10000; /* 6G..6.25G */
+    if (hype_memmap_largest_conventional_in(m, sizeof(m), sizeof(m[0]), 0x100000000ull, 0x200000000ull, &b) != 0x80000000ull || b != 0x100000000ull) {
+        printf("FAIL: 475 clip 2G..6G to 4G..8G should give 2 GiB at 4G\n"); failures++;
+    }
+    if (hype_memmap_largest_conventional_in(m, sizeof(m), sizeof(m[0]), 0, 0x80000000ull, &b) != 0x1000000ull || b != 0x100000) {
+        printf("FAIL: 475 range below 2G should give the 16 MiB run\n"); failures++;
+    }
+    if (hype_memmap_largest_conventional_in(m, sizeof(m), sizeof(m[0]), 0x200000000ull, 0x300000000ull, &b) != 0) {
+        printf("FAIL: 475 a range holding only non-conventional memory is empty\n"); failures++;
+    }
+    if (hype_memmap_largest_conventional_in(0, 0, sizeof(m[0]), 0, ~0ull, &b) != 0 ||
+        hype_memmap_largest_conventional_in(m, sizeof(m), sizeof(m[0]), 0, ~0ull, 0) != 0) {
+        printf("FAIL: 475 null inputs are empty\n"); failures++;
+    }
+}
+
 int main(void) {
+    test_475_largest_in_range();
     test_collect_runtime_code();
     test_largest_conventional_block();
     test_type_name();

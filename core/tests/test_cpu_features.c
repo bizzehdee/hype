@@ -171,7 +171,13 @@ static void test_hv_signature_decode(void) {
     CHECK_INT("terminated at 12 characters", 12, (int)strlen(out));
 }
 
+static void test_474_l1d_flush_bit(void) {
+    CHECK_INT("474 L1D_FLUSH bit 28 set", 1, hype_cpu_has_l1d_flush(1u << 28));
+    CHECK_INT("474 L1D_FLUSH bit 28 clear", 0, hype_cpu_has_l1d_flush(~(1u << 28)));
+}
+
 int main(void) {
+    test_474_l1d_flush_bit();
     test_hypervisor_present();
     test_hv_signature_decode();
     test_therm_status_requires_the_dts_bit();

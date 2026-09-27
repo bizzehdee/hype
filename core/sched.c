@@ -19,6 +19,7 @@ void hype_sched_rq_init(hype_sched_rq_t *rq, uint64_t slice_len, unsigned int th
     rq->group_switches = 0;
     rq->idle_quantised = 0;
     rq->idle_nothing = 0;
+    rq->clock = 0;
 }
 
 void hype_sched_vcpu_init(hype_sched_vcpu_t *v, unsigned int id, unsigned int group) {
@@ -29,13 +30,21 @@ void hype_sched_vcpu_init(hype_sched_vcpu_t *v, unsigned int id, unsigned int gr
     v->last_scheduled = 0;
     v->slices = 0;
     v->run_start = 0;
+    v->steal_time = 0;
+    v->wait_max = 0;
+    v->wait_start = 0;
     v->next = 0;
     v->queued = 0;
     v->member = 0;
     v->thread = -1;
 }
 
+static void tick(hype_sched_rq_t *rq, uint64_t now) {
+    if (now > rq->clock) rq->clock = now;
+}
+
 static void fifo_push(hype_sched_rq_t *rq, hype_sched_vcpu_t *v) {
+    v->wait_start = rq->clock;
     v->next = 0;
     if (rq->tail != 0) {
         rq->tail->next = v;
@@ -66,6 +75,8 @@ static void fifo_unlink(hype_sched_rq_t *rq, hype_sched_vcpu_t *v) {
         it = it->next;
     }
     fifo_unlink_after(rq, prev, v);
+    /* Leaving the FIFO without running (halted, stopped, removed): its wait still counts. */
+    if (rq->clock > v->wait_start) v->steal_time += rq->clock - v->wait_start;
 }
 
 /* A `now` behind run_start (a caller clock glitch) charges nothing rather than wrapping. */
@@ -76,6 +87,10 @@ static void charge_current(hype_sched_rq_t *rq, hype_sched_vcpu_t *v, uint64_t n
 }
 
 static void make_current(hype_sched_rq_t *rq, hype_sched_vcpu_t *v, unsigned int t, uint64_t now) {
+    if (now > v->wait_start) {
+        v->steal_time += now - v->wait_start;
+        if (now - v->wait_start > v->wait_max) v->wait_max = now - v->wait_start;
+    }
     rq->current[t] = v;
     v->thread = (int)t;
     v->run_start = now;
@@ -107,6 +122,7 @@ int hype_sched_add(hype_sched_rq_t *rq, hype_sched_vcpu_t *v) {
 }
 
 int hype_sched_remove(hype_sched_rq_t *rq, hype_sched_vcpu_t *v, uint64_t now) {
+    tick(rq, now);
     if (!v->member) return -1;
     if (v->thread >= 0) {
         charge_current(rq, v, now);
@@ -122,6 +138,7 @@ hype_sched_vcpu_t *hype_sched_pick(hype_sched_rq_t *rq, uint64_t now) {
     unsigned int t, filled = 0;
     unsigned int group;
 
+    tick(rq, now);
     for (t = 0; t < rq->threads; t++) {
         hype_sched_vcpu_t *v = rq->current[t];
         if (v == 0) continue;
@@ -154,6 +171,7 @@ hype_sched_vcpu_t *hype_sched_pick(hype_sched_rq_t *rq, uint64_t now) {
 }
 
 hype_sched_vcpu_t *hype_sched_refill(hype_sched_rq_t *rq, unsigned int thread, uint64_t now) {
+    tick(rq, now);
     if (thread >= rq->threads || rq->current[thread] != 0 || !rq->has_owner) return 0;
     return take_group(rq, rq->owner, thread, now);
 }
@@ -174,6 +192,7 @@ int hype_sched_slice_expired(const hype_sched_rq_t *rq, uint64_t now) {
 
 int hype_sched_set_state(hype_sched_rq_t *rq, hype_sched_vcpu_t *v, hype_sched_state_t state,
                          uint64_t now) {
+    tick(rq, now);
     if (!v->member) return -1;
     if (v->state == state) return 0;
     if (v->state == HYPE_SCHED_RUNNABLE) {
@@ -238,6 +257,13 @@ void hype_sched_place(const unsigned int *group, unsigned int n, const unsigned 
         }
         out_core[i] = (unsigned int)(mate >= 0 ? mate : best);
     }
+}
+
+unsigned int hype_sched_queued(const hype_sched_rq_t *rq) {
+    const hype_sched_vcpu_t *it;
+    unsigned int n = 0;
+    for (it = rq->head; it != 0; it = it->next) n++;
+    return n;
 }
 
 int hype_sched_check(const hype_sched_rq_t *rq) {

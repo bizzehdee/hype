@@ -4461,6 +4461,34 @@ isn't lost.
     right way to add migration if SMP-22 measures an imbalance that matters. That needs its
     own decision, with the measurement in front of it.
 
+86. **Phase 0 allocates for the default over-commit: (usable cores − 1) × 4 VMs -- decided
+    (2026-09-26, #476).**
+
+    Decision 33 bounded the VM count by the dedicated tier: a VM is granted whole cores, so at
+    most usable cores − 1 VMs, and Phase 0 sized the per-VM state (4.7 MB each) and the vCPU
+    context pools to that. The shared tier runs more VMs than cores by design (decision 47), and
+    with the old bound a 4-core host could never start a fourth VM however small.
+
+    **The rule.** Phase 0, which runs before the config can be read, allocates per-VM state for
+    (usable cores − 1) × 4 VMs, capped at `HYPE_CFG_MAX_VMS`, and vCPU contexts for
+    max(cores, 8) × 4. The 4 is the default `shared_overcommit_ratio`: the one over-commit figure
+    known before the config. A config asking for more VMs than Phase 0 allocated is capped, with
+    the existing loud line (#341).
+
+    **Cost.** About 56 MB on a 4-core host and 280 MB at the 63-VM cap; every validation machine
+    has at least 8 GB. The dedicated tier's admission bound is unchanged: this is an allocation
+    ceiling, not an admission rule.
+
+    **Rejected: size from the config.** Phase 0 must not depend on a disk read (#450).
+    **Rejected: grow the arenas at runtime.** They are reserved before ExitBootServices, and a
+    second reservation afterwards has no allocator to come from.
+
+    **Tag aliasing that this exposes.** More vCPU contexts than the CPU has ASIDs (nested QEMU
+    reports NASID = 16) or VPIDs makes two vCPUs share a TLB tag. A dedicated core never meets
+    its tag-mate; a shared core can switch straight from one to the other. So on a shared core a
+    resuming vCPU whose tag equals its predecessor's flushes that tag before entry. Distinct tags
+    need no flush.
+
 ## 11. Pre-M0 readiness checklist
 
 Concrete, actionable items to close out before M0 work starts, beyond what

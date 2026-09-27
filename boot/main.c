@@ -56,6 +56,7 @@
 #include "../core/cpu_topology.h"
 #include "../core/smp_pack.h"
 #include "../core/sched.h"
+#include "../core/numa.h"
 #include "../arch/x86_64/cpu/coro.h"
 #include "../core/pe_ident.h"
 #include "../core/gpt.h"
@@ -1474,6 +1475,9 @@ typedef struct hype_fw_vm {
     volatile uint64_t stat_uptime_ms; /* #263: accumulated RUNNING time, not wall-clock */
     hype_vm_uptime_t uptime_acc;      /* #263: the accumulator behind it */
     hype_vm_cpu_t cpu_acc;            /* #264: sliding-window busy-time CPU% */
+    hype_vm_cpu_t steal_acc;          /* #477: the same window over vCPU 0's steal time */
+    unsigned numa_node;               /* #475: the node of vCPU 0's core; 0 on a one-node host */
+    unsigned stat_steal_pct;          /* #477: shared tier only */
     volatile uint64_t stat_idle_ms;
     volatile unsigned stat_cpu_pct;
     /* M8-4..7: lifecycle state, read by this VM's loop each iteration and posted
@@ -1937,6 +1941,18 @@ static uint64_t g_housecost_tsc[HYPE_HOUSECOST_VMS][HYPE_HOUSECOST_SLOTS];
 static uint64_t g_housecost_mark[HYPE_HOUSECOST_VMS];
 static uint16_t g_housecost_prev[HYPE_HOUSECOST_VMS];
 
+/* #470: the longest single stretch in one section, per VM, and which section -- excluding s79
+ * (it contains the shared-core switch-out) and s80 (guest execution). A totals-only HOUSECOST
+ * cannot say what stretched one slice by 80 ms; this can. */
+static uint64_t g_housecost_max_tsc[HYPE_HOUSECOST_VMS];
+static uint16_t g_housecost_max_code[HYPE_HOUSECOST_VMS];
+/* #470 probe: the longest section within the CURRENT slice (reset at each yield point), and a
+ * histogram of which section it was whenever a forced yield came > 10 ms late. */
+static uint64_t g_slice_sect_max[HYPE_HOUSECOST_VMS];
+static uint16_t g_slice_sect_code[HYPE_HOUSECOST_VMS];
+static uint32_t g_late_sect_hist[HYPE_HOUSECOST_VMS][8];
+static uint16_t g_late_sect_codes[HYPE_HOUSECOST_VMS][8];
+
 static void fw_1_loop_section(hype_fw_vm_t *vm, uint16_t code) {
     unsigned vi = (unsigned)(vm - g_vms);
     uint64_t now;
@@ -1950,6 +1966,15 @@ static void fw_1_loop_section(hype_fw_vm_t *vm, uint16_t code) {
                 g_housecost_tsc[vi][k] += now - g_housecost_mark[vi];
                 break;
             }
+        }
+        if (now - g_housecost_mark[vi] > g_slice_sect_max[vi]) {
+            g_slice_sect_max[vi] = now - g_housecost_mark[vi];
+            g_slice_sect_code[vi] = g_housecost_prev[vi];
+        }
+        if (g_housecost_prev[vi] != 79u && g_housecost_prev[vi] != 80u &&
+            now - g_housecost_mark[vi] > g_housecost_max_tsc[vi]) {
+            g_housecost_max_tsc[vi] = now - g_housecost_mark[vi];
+            g_housecost_max_code[vi] = g_housecost_prev[vi];
         }
     }
     g_housecost_mark[vi] = now;
@@ -3775,6 +3800,56 @@ static int fw_1_vm_is_shared(unsigned vi) {
 
 static unsigned fw_1_place_shared(const uint32_t *threads, const unsigned *per_core,
                                   const unsigned *core_start, unsigned first_pool, unsigned ncores);
+static hype_numa_t g_numa; /* #475: tentative; filled by fw_1_numa_probe() before placement */
+
+/*
+ * #475: on a multi-node host, reorder the cores node by node (stable within a node), so packing
+ * in order hands a VM cores of one node wherever that node has enough. A one-node host is left
+ * exactly as it was -- the no-op the ticket requires.
+ */
+static void fw_1_numa_order_cores(uint32_t *threads, unsigned nthreads, unsigned ncores,
+                                  unsigned *per_core, unsigned *core_start) {
+    uint32_t sorted[HYPE_CPU_TOPOLOGY_MAX];
+    unsigned nd, ci, k, n = 0;
+
+    if (g_numa.nnodes <= 1u) return;
+    for (nd = 0; nd < g_numa.nnodes; nd++) {
+        for (ci = 0; ci < ncores; ci++) {
+            if (per_core[ci] == 0u ||
+                hype_numa_node_of_apic(&g_numa, threads[core_start[ci]]) != nd) {
+                continue;
+            }
+            for (k = 0; k < per_core[ci] && n < HYPE_CPU_TOPOLOGY_MAX; k++) {
+                sorted[n++] = threads[core_start[ci] + k];
+            }
+        }
+    }
+    if (n != nthreads) return; /* a thread matched no node: keep the enumeration order */
+    for (k = 0; k < n; k++) threads[k] = sorted[k];
+    fw_1_core_runs(threads, nthreads, ncores, per_core, core_start);
+}
+
+/* #475: record each VM's node (vCPU 0's), and say so when its vCPUs span more than one. */
+static void fw_1_numa_note_vm(unsigned vi) {
+    unsigned k, lo, hi;
+    if (g_numa.nnodes <= 1u || !g_vcpu_thread_valid[vi][0]) return;
+    lo = hi = hype_numa_node_of_apic(&g_numa, g_vcpu_thread[vi][0]);
+    for (k = 1; k < HYPE_MAX_VCPUS_PER_VM; k++) {
+        unsigned nd;
+        if (!g_vcpu_thread_valid[vi][k]) continue;
+        nd = hype_numa_node_of_apic(&g_numa, g_vcpu_thread[vi][k]);
+        if (nd < lo) lo = nd;
+        if (nd > hi) hi = nd;
+    }
+    g_vms[vi].numa_node = lo == hi ? lo : hype_numa_node_of_apic(&g_numa, g_vcpu_thread[vi][0]);
+    if (lo != hi) {
+        HYPE_LOGF(HYPE_LOG_WARN, "numa: vm%u vCPUs span nodes %u..%u -- no single node had its cores "
+                  "free; its RAM goes with vCPU 0 (node %u) [#475 decision 39]\n", vi, lo, hi,
+                  g_vms[vi].numa_node);
+    } else {
+        hype_debug_print("numa: vm%u on node %u [#475]\n", vi, lo);
+    }
+}
 
 /*
  * Build the [vm][vcpu] -> host thread map. Returns the number of vCPUs placed.
@@ -3843,6 +3918,7 @@ static unsigned fw_1_place_vcpus_on_threads(void) {
     g_vcpu_cores_used = ncores;
 
     fw_1_core_runs(threads, nthreads, ncores, per_core, core_start);
+    fw_1_numa_order_cores(threads, nthreads, ncores, per_core, core_start);
 
     /*
      * Price every VM in cores with the SAME function admission uses (#560), then lay its vCPUs
@@ -3922,6 +3998,7 @@ static unsigned fw_1_place_vcpus_on_threads(void) {
     }
     (void)next;
     placed += fw_1_place_shared(threads, per_core, core_start, ci, ncores);
+    for (vi = 0; vi < nvms; vi++) fw_1_numa_note_vm(vi);
     g_vcpu_threads_placed = placed;
     g_vcpu_cores_used = ci; /* cores actually consumed */
     hype_debug_print("fw-1 SMP: %u whole physical core(s) granted -> %u logical CPU(s) (%u "
@@ -4145,6 +4222,9 @@ static int fw_1_ap_start_probed(uint8_t apic_id, uint64_t stack_top, void *arg, 
  * group-mate. Gang dispatch across siblings is a follow-up.
  */
 #define FW_1_SHARED_CORES_MAX 16u
+/* #476 / plan.md decision 86: Phase 0's VM and vCPU-context ceiling, as a multiple of the
+ * dedicated bound -- the default shared_overcommit_ratio, the one number known before the config. */
+#define FW_1_PHASE0_OVERCOMMIT 4u
 #define FW_1_CORE_VCPUS_MAX 16u
 #define FW_1_CORE_STACK_BYTES 16384u
 #define FW_1_AP_ARG_CORE_FLAG ((uintptr_t)1 << 20)
@@ -4164,9 +4244,73 @@ typedef struct {
     volatile uint64_t switches; /* picks that changed the running vCPU */
     volatile uint64_t forced;   /* yields at slice expiry */
     volatile uint64_t voluntary; /* yields by a vCPU with nothing to do (HLT, waits) */
+    /* #470: how late a forced yield came, past the end of its slice, in TSC ticks. */
+    volatile uint64_t overrun_max;
+    volatile uint64_t overrun_sum;
+    volatile uint64_t overrun_late; /* forced yields more than one host tick (1 ms) late */
+    /* #474: µarch flushes issued when a pick handed the core to another trust group. */
+    volatile uint64_t flushes;
+    volatile uint64_t flush_tsc_sum;
+    volatile uint64_t flush_tsc_max;
+    unsigned prev;                  /* sv index that ran before the current one, or FW_1_CORE_VCPUS_MAX */
+    uint8_t yielded[FW_1_CORE_VCPUS_MAX]; /* has come back through fw_1_sched_point() once */
+    uint64_t over_max_k[FW_1_CORE_VCPUS_MAX]; /* #470: worst overrun by each vCPU, TSC ticks */
+    int warm;                       /* every vCPU here is past its one-time VM setup */
+    volatile int in_vcpu;           /* 1 while a vCPU coroutine runs, 0 in the scheduler loop */
+    volatile uint64_t tag_flushes;  /* resumes that shared a TLB tag with the previous runner */
 } fw_1_core_t;
 
+static void vmm_request_nested_tlb_flush(hype_vmm_kind_t kind, hype_vcpu_ctx_t *ctx);
+
+/*
+ * #476: ASIDs (SVM) and VPIDs (VMX) are clamped when the vCPU pool outgrows them -- nested QEMU
+ * reports NASID = 16 -- so two vCPUs can carry ONE tag. On a dedicated core that never meets
+ * another tag-mate; on a shared core it can follow one straight onto the same TLB. So a resuming
+ * vCPU whose tag equals its predecessor's flushes its tag before entering: the only case in which
+ * a switch needs a flush for memory isolation. Distinct tags need nothing.
+ */
+static void fw_1_tag_check(fw_1_core_t *c, unsigned k) {
+    hype_vcpu_ctx_t *me, *other;
+    uint32_t tm, to;
+    if (c->prev >= c->n || c->prev == k || g_fw_1_ops == 0 || g_fw_1_ops->vcpu_tlb_tag == 0) return;
+    me = g_vms[c->vm_of[k]].vcpu[c->vcpu_of[k]];
+    other = g_vms[c->vm_of[c->prev]].vcpu[c->vcpu_of[c->prev]];
+    if (me == 0 || other == 0) return;
+    tm = g_fw_1_ops->vcpu_tlb_tag(me);
+    to = g_fw_1_ops->vcpu_tlb_tag(other);
+    if (tm != to) return;
+    vmm_request_nested_tlb_flush(g_fw_1_kind, me);
+    c->tag_flushes++;
+}
+
+/* #474: which flush controls this CPU enumerates; probed once, on the BSP, at admission. */
+static int g_fw_1_flush_l1d;
+static int g_fw_1_flush_ibpb;
+
+static void fw_1_flush_probe(void) {
+    hype_cpu_vendor_t vend = hype_cpu_detect_vmm_kind_diag().vendor;
+    uint32_t e7 = hype_cpu_leaf7_edx();
+    g_fw_1_flush_l1d = hype_cpu_has_l1d_flush(e7);
+    g_fw_1_flush_ibpb = hype_cpu_has_ibpb(vend, e7, hype_cpu_leaf80000008_ebx());
+}
+
+/*
+ * #474 (decision 40, SMP-18): the core now belongs to a different trust group -- flush before the
+ * incoming group's first entry. Only here: within a group the flush is pure cost. L1D via
+ * IA32_FLUSH_CMD (0x10B) and IBPB via IA32_PRED_CMD (0x49), each only where enumerated.
+ */
+static void fw_1_group_flush(fw_1_core_t *c) {
+    uint64_t t0 = hype_rdtsc(), dt;
+    if (g_fw_1_flush_l1d) fw_1_wrmsr(0x10Bu, 1u);
+    if (g_fw_1_flush_ibpb) fw_1_wrmsr(0x49u, 1u);
+    dt = hype_rdtsc() - t0;
+    c->flushes++;
+    c->flush_tsc_sum += dt;
+    if (dt > c->flush_tsc_max) c->flush_tsc_max = dt;
+}
+
 static fw_1_core_t g_fw_1_cores[FW_1_SHARED_CORES_MAX];
+static volatile uint64_t g_fw_1_dump_hook_calls, g_fw_1_dump_hook_flagged, g_fw_1_dump_hook_yields;
 static unsigned g_fw_1_core_count;
 static uint8_t g_fw_1_core_stacks[FW_1_SHARED_CORES_MAX][FW_1_CORE_STACK_BYTES]
     __attribute__((aligned(16)));
@@ -4212,6 +4356,10 @@ static unsigned fw_1_place_shared(const uint32_t *threads, const unsigned *per_c
             n++;
         }
     }
+    if (n == 0u) {
+        g_fw_1_core_count = 0;
+        return 0; /* no shared VM: nothing to place, nothing to say */
+    }
     if (npool == 0u) {
         HYPE_LOGF(HYPE_LOG_ERROR, "fw-1 SCHED: %u shared vCPU(s) and no pool core left -- none "
                   "placed [#469]\n", n);
@@ -4221,6 +4369,7 @@ static unsigned fw_1_place_shared(const uint32_t *threads, const unsigned *per_c
     for (i = 0; i < npool; i++) {
         hype_sched_rq_init(&g_fw_1_cores[i].rq, 0, 1); /* slice set when the core starts */
         g_fw_1_cores[i].n = 0;
+        g_fw_1_cores[i].prev = FW_1_CORE_VCPUS_MAX;
         g_fw_1_cores[i].apic_id = threads[core_start[first_pool + i]];
     }
     g_fw_1_core_count = npool;
@@ -4253,7 +4402,16 @@ static unsigned fw_1_place_shared(const uint32_t *threads, const unsigned *per_c
 
 /*
  * The one place a shared vCPU gives up its core. Called with no lock held, right before VM
- * entry. `voluntary` = the vCPU has nothing to do (HLT, a wait on a sibling); otherwise it yields
+ * entry.
+ *
+ * #470: why a guest cannot defer this. Every entry arms the core's one-shot LAPIC timer (1 ms),
+ * and the host interrupt it raises is intercepted independently of the guest's IF -- SVM
+ * INTR intercept + V_INTR_MASKING, VMX external-interrupt exiting. So `cli; jmp .`, PAUSE loops
+ * and a stray MWAIT (masked in CPUID, not intercepted, but woken by the pending physical
+ * interrupt) all exit within one tick; an interrupt shadow delays that by one instruction;
+ * HLT exits at once. Every exit returns through this loop, so the slice is checked at least
+ * once per tick. What CAN stretch a slice is hype's own handling of one exit (a slow USB media
+ * read, #803) -- that is host latency, and it is what overrun_* measures. `voluntary` = the vCPU has nothing to do (HLT, a wait on a sibling); otherwise it yields
  * only when its slice is used up and someone else is waiting. Returns 1 when it was switched out
  * and has just been resumed -- the caller then re-arms its one-shot timer. A dedicated vCPU
  * returns 0 at the first check.
@@ -4272,12 +4430,34 @@ static int fw_1_sched_point(unsigned vm_idx, unsigned vcpu_idx, int voluntary) {
         c->rq.slice_start = hype_rdtsc(); /* nobody waiting: keep the core, start a new slice */
         return 0;
     }
+    c->yielded[k] = 1u;
     if (voluntary) {
         c->voluntary++;
-    } else {
+    } else if (c->warm) {
+        uint64_t now = hype_rdtsc();
+        uint64_t end = c->rq.slice_start + c->rq.slice_len;
+        uint64_t over = (now > end) ? now - end : 0ull;
+        uint64_t hz = g_vms[vm_idx].host_tsc_hz;
         c->forced++;
+        c->overrun_sum += over;
+        if (over > c->overrun_max) c->overrun_max = over;
+        if (over > c->over_max_k[k]) c->over_max_k[k] = over;
+        if (hz != 0ull && over > hz / 100ull && vm_idx < HYPE_HOUSECOST_VMS) {
+            unsigned h;
+            for (h = 0; h < 8u; h++) {
+                if (g_late_sect_hist[vm_idx][h] == 0u || g_late_sect_codes[vm_idx][h] ==
+                                                             g_slice_sect_code[vm_idx]) {
+                    g_late_sect_codes[vm_idx][h] = g_slice_sect_code[vm_idx];
+                    g_late_sect_hist[vm_idx][h]++;
+                    break;
+                }
+            }
+        }
+        if (hz != 0ull && over > hz / 1000ull) c->overrun_late++;
     }
     hype_coro_switch(&c->coro_sp[k], c->sched_sp);
+    fw_1_tag_check(c, k);
+    if (vm_idx < HYPE_HOUSECOST_VMS) g_slice_sect_max[vm_idx] = 0;
     return 1;
 }
 
@@ -4304,15 +4484,54 @@ static void fw_1_coro_entry(void *arg) {
 static void fw_1_core_report(const fw_1_core_t *c, unsigned ci) {
     uint64_t hz = g_vms[c->vm_of[0]].host_tsc_hz ? g_vms[c->vm_of[0]].host_tsc_hz : 1ull;
     unsigned k;
-    hype_debug_print("fw-1 SCHED core%u: switches=%llu forced=%llu voluntary=%llu group_switches=%llu "
+    HYPE_LOGF(HYPE_LOG_INFO, "fw-1 SCHED core%u: switches=%llu forced=%llu voluntary=%llu group_switches=%llu "
                      "[#469]\n", ci, (unsigned long long)c->switches,
                      (unsigned long long)c->forced, (unsigned long long)c->voluntary,
                      (unsigned long long)c->rq.group_switches);
+    HYPE_LOGF(HYPE_LOG_INFO, "fw-1 SCHED core%u: runq=%u idle_quantised=%llu idle_nothing=%llu (thread-slices) "
+                     "[#477]\n", ci, hype_sched_queued(&c->rq),
+                     (unsigned long long)c->rq.idle_quantised,
+                     (unsigned long long)c->rq.idle_nothing);
+    HYPE_LOGF(HYPE_LOG_INFO, "fw-1 SCHED core%u: overrun max=%lluus mean=%lluus late(>1ms)=%llu of %llu "
+                     "forced [#470]\n", ci,
+                     (unsigned long long)(c->overrun_max * 1000000ull / hz),
+                     (unsigned long long)(c->forced ? c->overrun_sum * 1000000ull / hz / c->forced
+                                                    : 0ull),
+                     (unsigned long long)c->overrun_late, (unsigned long long)c->forced);
+    HYPE_LOGF(HYPE_LOG_INFO, "fw-1 SCHED core%u: shared-tag flushes=%llu dump-hook calls=%llu "
+              "flagged=%llu yields=%llu [#476]\n", ci, (unsigned long long)c->tag_flushes,
+              (unsigned long long)g_fw_1_dump_hook_calls,
+              (unsigned long long)g_fw_1_dump_hook_flagged,
+              (unsigned long long)g_fw_1_dump_hook_yields);
+    HYPE_LOGF(HYPE_LOG_INFO, "fw-1 SCHED core%u: flushes=%llu of group_switches=%llu cost mean=%lluns "
+                     "max=%lluns (l1d=%d ibpb=%d) [#474]\n", ci,
+                     (unsigned long long)c->flushes, (unsigned long long)c->rq.group_switches,
+                     (unsigned long long)(c->flushes ? c->flush_tsc_sum * 1000000000ull / hz /
+                                                           c->flushes
+                                                     : 0ull),
+                     (unsigned long long)(c->flush_tsc_max * 1000000000ull / hz),
+                     g_fw_1_flush_l1d, g_fw_1_flush_ibpb);
     for (k = 0; k < c->n; k++) {
-        hype_debug_print("fw-1 SCHED core%u: vm%u vCPU %u state=%u slices=%llu run=%llums [#469]\n",
+        if (c->vcpu_of[k] == 0u && c->vm_of[k] < HYPE_HOUSECOST_VMS) {
+            HYPE_LOGF(HYPE_LOG_INFO, "fw-1 SCHED core%u: vm%u longest host section s%u = %lluus; "
+                      "late(>10ms) slices by section: s%u=%u s%u=%u s%u=%u [#470]\n",
+                      ci, (unsigned)c->vm_of[k], (unsigned)g_housecost_max_code[c->vm_of[k]],
+                      (unsigned long long)(g_housecost_max_tsc[c->vm_of[k]] * 1000000ull / hz),
+                      (unsigned)g_late_sect_codes[c->vm_of[k]][0], g_late_sect_hist[c->vm_of[k]][0],
+                      (unsigned)g_late_sect_codes[c->vm_of[k]][1], g_late_sect_hist[c->vm_of[k]][1],
+                      (unsigned)g_late_sect_codes[c->vm_of[k]][2], g_late_sect_hist[c->vm_of[k]][2]);
+        }
+        HYPE_LOGF(HYPE_LOG_INFO, "fw-1 SCHED core%u: vm%u vCPU %u state=%u slices=%llu run=%llums "
+                         "steal=%llums wait_max=%lluus over_max=%lluus last=%llums-ago "
+                         "[#469 #470 #476 #477]\n",
                          ci, (unsigned)c->vm_of[k], (unsigned)c->vcpu_of[k],
                          (unsigned)c->sv[k].state, (unsigned long long)c->sv[k].slices,
-                         (unsigned long long)(c->sv[k].run_time * 1000ull / hz));
+                         (unsigned long long)(c->sv[k].run_time * 1000ull / hz),
+                         (unsigned long long)(c->sv[k].steal_time * 1000ull / hz),
+                         (unsigned long long)(c->sv[k].wait_max * 1000000ull / hz),
+                         (unsigned long long)(c->over_max_k[k] * 1000000ull / hz),
+                         (unsigned long long)((hype_rdtsc() - c->sv[k].last_scheduled) *
+                                              1000ull / hz));
     }
 }
 
@@ -4321,17 +4540,33 @@ static void fw_1_core_sched_run(fw_1_core_t *c) {
     uint64_t hz = g_vms[c->vm_of[0]].host_tsc_hz;
     uint64_t next_report = hype_rdtsc() + hz * 5ull;
     for (;;) {
-        hype_sched_vcpu_t *v = hype_sched_pick(&c->rq, hype_rdtsc());
+        hype_sched_vcpu_t *v;
         unsigned k;
+        /* Reported BEFORE the pick, so a pick's group switch and its flush land in one report. */
         if (hz != 0ull && hype_rdtsc() >= next_report) {
             fw_1_core_report(c, (unsigned)(c - g_fw_1_cores));
             next_report = hype_rdtsc() + hz * 5ull;
         }
+        v = hype_sched_pick(&c->rq, hype_rdtsc());
         if (v == 0) {
             __asm__ volatile("pause");
             continue;
         }
         k = v->id;
+        if (!c->warm) {
+            /*
+             * #470/#476: latency is measured from the point every vCPU here has finished its
+             * one-time VM setup (kernel load, NPT build) -- seconds of host work inside its first
+             * slice that no guest can cause. From then on overrun and wait_max are steady state.
+             */
+            unsigned j, all = 1u;
+            for (j = 0; j < c->n; j++) all &= c->yielded[j];
+            if (all) {
+                for (j = 0; j < c->n; j++) c->sv[j].wait_max = 0;
+                c->warm = 1;
+            }
+        }
+        if (c->rq.owner_changed) fw_1_group_flush(c);
         if (!c->started[k]) {
             unsigned slot = fw_1_vcpu_slot(c->vm_of[k], c->vcpu_of[k]);
             c->coro_sp[k] = hype_coro_init(
@@ -4340,10 +4575,53 @@ static void fw_1_core_sched_run(fw_1_core_t *c) {
             c->started[k] = 1u;
         }
         if (k != last) c->switches++;
+        c->prev = last;
         last = k;
         c->running = k;
+        c->in_vcpu = 1;
         hype_coro_switch(&c->sched_sp, c->coro_sp[k]);
+        c->in_vcpu = 0;
     }
+}
+
+/*
+ * #470/#476: a VM's periodic diagnostic dump (every 30 s, section s81) prints hundreds of lines
+ * byte by byte through the serial port -- ~80-160 ms under nested QEMU. On a shared core that
+ * time came out of the co-tenants' share: measured as 90-160 ms slice overruns, waits stacking
+ * to 519 ms, and 1.7% of a co-tenant's PIT ticks coalesced. So inside that block (flagged below)
+ * a vCPU-0 loop may yield between log records. Narrowly: only on a shared core with no same-VM
+ * sibling on it -- the loop holds its OWN VM's device lock there, which no co-tenant needs -- and
+ * never while this core holds the USB transfer lock, which a co-tenant's media read would spin on.
+ */
+static volatile uint8_t g_fw_1_dump_yield[HYPE_CFG_MAX_VMS];
+static volatile int g_fw_1_record_kbd_pump; /* #808's drain, armed only with the USB log sink */
+
+static void fw_1_record_hook(void) {
+    uint32_t apic;
+    unsigned ci, j, k, vmi;
+    fw_1_core_t *c = 0;
+
+    if (g_fw_1_record_kbd_pump) hype_host_kbd_pump();
+    if (g_fw_1_core_count == 0u) return;
+    apic = (*(volatile uint32_t *)(uintptr_t)(HYPE_LAPIC_DEFAULT_BASE + 0x20u)) >> 24;
+    for (ci = 0; ci < g_fw_1_core_count; ci++) {
+        if (g_fw_1_cores[ci].n != 0u && g_fw_1_cores[ci].apic_id == apic) c = &g_fw_1_cores[ci];
+    }
+    if (c == 0 || !c->in_vcpu) return;
+    g_fw_1_dump_hook_calls++;
+    k = c->running;
+    vmi = c->vm_of[k];
+    if (c->vcpu_of[k] != 0u || !g_fw_1_dump_yield[vmi]) return;
+    g_fw_1_dump_hook_flagged++;
+
+    for (j = 0; j < c->n; j++) {
+        if (j != k && c->vm_of[j] == vmi) return;
+    }
+    {
+        unsigned holder = 0xFFFFFFFFu;
+        if (hype_blk_usb_lock_held_us(&holder) != 0ull && holder == apic) return;
+    }
+    if (fw_1_sched_point(vmi, 0u, 0)) g_fw_1_dump_hook_yields++;
 }
 
 static void fw_1_ap_main(void *arg) {
@@ -5180,6 +5458,20 @@ static void fw_1_reserve_guest_pool(EFI_BOOT_SERVICES *bs, uint64_t usable_ram_b
                      (unsigned long long)(usable_ram_bytes / (1024ull * 1024ull)));
 }
 
+static hype_ram_pool_t g_node_pool[HYPE_NUMA_MAX_NODES];
+static uint8_t g_node_pool_ready[HYPE_NUMA_MAX_NODES];
+static unsigned g_guest_pool_node;
+
+/* #475: the node pool a VM's guest RAM comes from, or 0 for the main pool (one-node host, a VM on
+ * the main pool's node, or a node with no pool). Only guest RAM follows the node. */
+static hype_ram_pool_t *fw_1_node_pool_for(unsigned vi, unsigned kind) {
+    unsigned nd;
+    if (kind != HYPE_POOL_KIND_RAM || g_numa.nnodes <= 1u || vi >= g_vm_count) return 0;
+    nd = g_vms[vi].numa_node;
+    if (nd >= HYPE_NUMA_MAX_NODES || nd == g_guest_pool_node || !g_node_pool_ready[nd]) return 0;
+    return &g_node_pool[nd];
+}
+
 /*
  * Carve guest-owned memory. Falls back to a direct reservation when no pool exists, so a host
  * too fragmented to give up one big block still boots. Names the VM and the shortfall on
@@ -5198,6 +5490,22 @@ static uint64_t fw_1_pool_carve(EFI_BOOT_SERVICES *bs, unsigned vm_index, unsign
             return 0ull;
         }
         return hype_alloc_pages_any_2mb_aligned(bs, bytes);
+    }
+    {
+        hype_ram_pool_t *np = fw_1_node_pool_for(vm_index, kind);
+        if (np != 0) {
+            if (hype_ram_pool_carve(np, bytes, vm_index, kind, &base, &shortfall) ==
+                HYPE_RAM_POOL_OK) {
+                HYPE_LOGF(HYPE_LOG_INFO, "numa: vm%u %s %llu MiB @0x%llx on node %u, with its vCPUs "
+                          "[#475]\n", vm_index, what, (unsigned long long)(bytes >> 20),
+                          (unsigned long long)base, g_vms[vm_index].numa_node);
+                return base;
+            }
+            HYPE_LOGF(HYPE_LOG_WARN, "numa: vm%u node %u pool short by %llu MiB -- its %s goes to "
+                      "node %u, ACROSS NODES from its vCPUs [#475]\n", vm_index,
+                      g_vms[vm_index].numa_node, (unsigned long long)(shortfall >> 20), what,
+                      g_guest_pool_node);
+        }
     }
     st = hype_ram_pool_carve(&g_guest_pool, bytes, vm_index, kind, &base, &shortfall);
     if (st != HYPE_RAM_POOL_OK) {
@@ -5234,10 +5542,101 @@ static uint64_t fw_1_pool_carve(EFI_BOOT_SERVICES *bs, unsigned vm_index, unsign
  * structural rather than incidental: a restart finds its OWN carve (pool memory is reused, so a
  * missed zero hands a previous guest's RAM to the next one) and zeroes it again.
  */
+/*
+ * #475: the per-node pools, reserved only on a multi-node host (fw_1_reserve_node_pools). The main
+ * g_guest_pool serves the node it lies on; a VM on another node carves its RAM from that node's
+ * pool, and falls back to the main pool -- across nodes, and said so -- when that one is empty.
+ */
+static void fw_1_reserve_node_pools(EFI_BOOT_SERVICES *bs) {
+    EFI_MEMORY_DESCRIPTOR *map = 0;
+    UINTN map_size = 0, desc_size = 0, map_key = 0;
+    unsigned nd, m;
+
+    if (g_numa.nnodes <= 1u) return;
+    g_guest_pool_node = g_guest_pool_ready ? hype_numa_node_of_addr(&g_numa, g_guest_pool.base) : 0u;
+    /*
+     * The main pool was reserved before SRAT was read, from the largest free block -- which can
+     * run across a node boundary and swallow the next node's memory (measured: QEMU -numa, the
+     * pool at 0x161a00000 left node 1 with 0 MiB free). Trim it at the end of its own node's range
+     * and hand the tail back; it has no carves yet, so nothing moves.
+     */
+    if (g_guest_pool_ready && hype_ram_pool_used(&g_guest_pool) == 0ull) {
+        for (m = 0; m < g_numa.nmem; m++) {
+            uint64_t rend = g_numa.mem_base[m] + g_numa.mem_len[m];
+            uint64_t pend = g_guest_pool.base + g_guest_pool.size;
+            uint64_t keep_end = rend & ~(HYPE_RAM_POOL_ALIGN - 1ull);
+            if (g_guest_pool.base < g_numa.mem_base[m] || g_guest_pool.base >= rend || pend <= rend ||
+                keep_end <= g_guest_pool.base) {
+                continue;
+            }
+            ((EFI_STATUS(EFIAPI *)(EFI_PHYSICAL_ADDRESS, UINTN))bs->FreePages)(
+                keep_end, (UINTN)((pend - keep_end) / 4096ull));
+            (void)hype_ram_pool_init(&g_guest_pool, g_guest_pool.base, keep_end - g_guest_pool.base);
+            HYPE_LOGF(HYPE_LOG_INFO, "numa: main pool trimmed to node %u's end -- %llu MiB kept, %llu "
+                      "MiB returned [#475]\n", g_guest_pool_node,
+                      (unsigned long long)(g_guest_pool.size >> 20),
+                      (unsigned long long)((pend - keep_end) >> 20));
+            break;
+        }
+    }
+    HYPE_LOGF(HYPE_LOG_INFO, "numa: the main guest pool (0x%llx) is on node %u [#475]\n",
+              (unsigned long long)g_guest_pool.base, g_guest_pool_node);
+    if (hype_memmap_get(bs, &map, &map_size, &desc_size, &map_key) != EFI_SUCCESS) return;
+    for (nd = 0; nd < g_numa.nnodes; nd++) {
+        uint64_t best = 0, best_base = 0, base, avail, want;
+        EFI_PHYSICAL_ADDRESS a;
+        if (g_guest_pool_ready && nd == g_guest_pool_node) continue;
+        for (m = 0; m < g_numa.nmem; m++) {
+            uint64_t b = 0, sz;
+            if (g_numa.mem_node[m] != nd) continue;
+            sz = hype_memmap_largest_conventional_in(map, map_size, desc_size, g_numa.mem_base[m],
+                                                     g_numa.mem_base[m] + g_numa.mem_len[m], &b);
+            if (sz > best) {
+                best = sz;
+                best_base = b;
+            }
+        }
+        base = (best_base + HYPE_RAM_POOL_ALIGN - 1ull) & ~(HYPE_RAM_POOL_ALIGN - 1ull);
+        avail = (best > base - best_base) ? best - (base - best_base) : 0ull;
+        want = (avail - avail / 8ull) & ~(HYPE_RAM_POOL_ALIGN - 1ull); /* keep 1/8 for firmware */
+        a = base;
+        if (want < 64ull * 1024ull * 1024ull ||
+            bs->AllocatePages(AllocateAddress, EfiLoaderData, want / 4096ull, &a) != EFI_SUCCESS ||
+            hype_ram_pool_init(&g_node_pool[nd], a, want) != HYPE_RAM_POOL_OK) {
+            HYPE_LOGF(HYPE_LOG_WARN, "numa: node %u -- no pool (largest free run %llu MiB); its VMs "
+                      "take RAM from node %u [#475]\n", nd, (unsigned long long)(best >> 20),
+                      g_guest_pool_node);
+            continue;
+        }
+        g_node_pool_ready[nd] = 1u;
+        HYPE_LOGF(HYPE_LOG_INFO, "numa: node %u pool %llu MiB at 0x%llx [#475]\n", nd,
+                  (unsigned long long)(want >> 20), (unsigned long long)a);
+    }
+    bs->FreePool(map);
+}
+
+/* #475: every byte guests can be carved from -- the main pool plus any node pools. */
+static uint64_t fw_1_pool_capacity(void) {
+    uint64_t total = g_guest_pool_ready ? g_guest_pool.size : 0ull;
+    unsigned nd;
+    for (nd = 0; nd < HYPE_NUMA_MAX_NODES; nd++) {
+        if (g_node_pool_ready[nd]) total += g_node_pool[nd].size;
+    }
+    return total;
+}
+
 static int fw_1_ensure_guest_ram(hype_fw_vm_t *vmp, unsigned vi) {
     const hype_ram_carve_t *c;
     if (vmp->ram_bytes == 0ull) {
         return -1;
+    }
+    c = fw_1_node_pool_for(vi, HYPE_POOL_KIND_RAM) != 0
+            ? hype_ram_pool_find(fw_1_node_pool_for(vi, HYPE_POOL_KIND_RAM), vi, HYPE_POOL_KIND_RAM)
+            : 0;
+    if (c != 0) {
+        vmp->ram_host_phys = c->base;
+        hype_guest_ram_zero((void *)(uintptr_t)vmp->ram_host_phys, vmp->ram_bytes);
+        return 0;
     }
     c = hype_ram_pool_find(&g_guest_pool, vi, HYPE_POOL_KIND_RAM);
     if (c != 0) {
@@ -9154,6 +9553,17 @@ static void fw_1_publish_and_render(hype_fw_vm_t *vm, uint64_t *last_gop_flush_t
         hype_vm_cpu_sample(&vm->cpu_acc, g_fw_1_vmrun_tsc, now_gf,
                            (uint64_t)g_hype_cfg.hype.cpu_avg_window_secs * g_fw_1_host_tsc_hz);
         vm->stat_cpu_pct = hype_vm_cpu_pct(&vm->cpu_acc);
+        {   /* #477: steal, sampled on vCPU 0's own core, which owns this sv entry. */
+            unsigned vs_ = (unsigned)(vm - g_vms);
+            if (vs_ < HYPE_CFG_MAX_VMS && g_fw_1_vcpu_core[vs_][0] != 0u) {
+                const fw_1_core_t *c_ = &g_fw_1_cores[g_fw_1_vcpu_core[vs_][0] - 1u];
+                hype_vm_cpu_sample(&vm->steal_acc, c_->sv[g_fw_1_vcpu_sv[vs_][0]].steal_time,
+                                   now_gf,
+                                   (uint64_t)g_hype_cfg.hype.cpu_avg_window_secs *
+                                       g_fw_1_host_tsc_hz);
+                vm->stat_steal_pct = hype_vm_cpu_pct(&vm->steal_acc);
+            }
+        }
         (void)idle_pct;
 
         /*
@@ -10324,6 +10734,8 @@ static void fw_1_render_console(void) {
             info[ninfo].cpu_pct = (ready && g_vms[i].lifecycle == HYPE_VM_RUNNING)
                                   ? g_vms[i].stat_cpu_pct
                                   : 0u;
+            info[ninfo].shared = (i < HYPE_CFG_MAX_VMS && g_fw_1_vcpu_core[i][0] != 0u);
+            info[ninfo].steal_pct = info[ninfo].shared ? g_vms[i].stat_steal_pct : 0u;
             info[ninfo].mem_mb = g_vms[i].mem_mb;
             info[ninfo].uptime_s = g_vms[i].stat_uptime_ms / 1000u;
             info[ninfo].media = g_vms[i].media != 0 ? g_vms[i].media : fw_1_default_media_name(i);
@@ -14920,6 +15332,20 @@ wait_for_sipi:
          */
         if (ap_at_hlt && (ap_injected_something || ap_hlt_eventinj_staged)) {
             vmm_wake_hlt(kind, ctx);
+        } else if (ap_at_hlt) {
+            /*
+             * #471: halted with nothing to wake for. On a shared core, give the core away now
+             * rather than re-entering the same HLT for the rest of the slice. Whatever arrives
+             * meanwhile is queued against THIS vCPU (its guest LAPIC and pending_irr), and the
+             * next time it is picked this epilogue advances its timers and delivers it. The lock
+             * is dropped first, as at the loop top, so a same-core sibling waiting for this vCPU
+             * to park never waits on it.
+             */
+            if (ap_locked) {
+                fw_1_dev_unlock(vm);
+                ap_locked = 0;
+            }
+            (void)fw_1_sched_point(vm_idx, vi, 1);
         }
     }
     if (ap_locked) { /* #484: only unlock if this AP actually holds it */
@@ -15325,6 +15751,16 @@ static void fw_1_check_tiers(void) {
     fw_1_core_runs(threads, nthreads, ncores, per_core, core_start);
     r = hype_adm_check_tiers(&g_hype_cfg, per_core, ncores, &t);
     if (t.shared_vms == 0u) return;
+    hype_debug_set_record_yield(fw_1_record_hook); /* #476: a shared core's dump yield */
+    fw_1_flush_probe();
+    HYPE_LOGF((g_fw_1_flush_l1d && g_fw_1_flush_ibpb) ? HYPE_LOG_INFO : HYPE_LOG_WARN,
+              "adm: shared tier cross-group flush -- L1D %s, IBPB %s%s [#474 decision 40]\n",
+              g_fw_1_flush_l1d ? "yes" : "NOT ENUMERATED",
+              g_fw_1_flush_ibpb ? "yes" : "NOT ENUMERATED",
+              (g_fw_1_flush_l1d && g_fw_1_flush_ibpb)
+                  ? ""
+                  : " -- this CPU cannot provide that part of the separation between trust groups "
+                    "(AMD parts are not affected by L1TF and do not enumerate L1D_FLUSH)");
     HYPE_LOGF(HYPE_LOG_INFO, "adm: tiers -- dedicated %u core(s); shared pool %u core(s) / %u "
                      "thread(s); %u shared VM(s) asking %u sCPU(s) of a %u limit (ratio %u.%02u) "
                      "[#472 decision 39]\n", t.dedicated_cores, t.pool_cores, t.pool_threads,
@@ -15499,7 +15935,7 @@ static void fw_1_phase1_config(void) {
             unsigned int fit = 0u;
             uint64_t shortfall = 0ull;
             hype_cfg_t *acfg = &g_hype_cfg;
-            uint64_t pool_bytes = g_guest_pool_ready ? g_guest_pool.size : 0ull;
+            uint64_t pool_bytes = fw_1_pool_capacity();
 
             if (pool_bytes == 0ull) {
                 hype_debug_print("adm: no reserved pool to check against -- guest RAM admission is "
@@ -15768,6 +16204,14 @@ static void fw_1_phase1_config(void) {
             load_input_script(&g_vms[vi], vi);
         }
     }
+
+    /*
+     * #475: placement is decided HERE, at admission, on a multi-node host -- the RAM carves just
+     * below need each VM's node, and the node comes from the cores it will run on. The AP-start
+     * path places again, from the same inputs, to the same answer. A one-node host skips this,
+     * so its boot sequence is unchanged.
+     */
+    if (g_numa.nnodes > 1u) (void)fw_1_place_vcpus_on_threads();
 
     /* vm0's own RAM carve, and then every secondary's firmware copy, RAM and vdisk. */
     (void)fw_1_ensure_guest_ram(&g_vms[0], 0u);
@@ -16739,7 +17183,22 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
             fw_1_publish_and_render(vm, &last_gop_flush_tsc,
                                     perf_boot_start_tsc, perf_hlt_wait_tsc, total_exits, ex_hlt, &eb);
         }
-            {
+            if (g_fw_1_vcpu_core[(unsigned)(vm - g_vms)][0] != 0u) {
+                /*
+                 * #476: a paused or stopped VM on a SHARED core gives the core away. Without this
+                 * the gate `continue`s past the entry-side yield point forever and starves every
+                 * co-tenant -- a VM that faulted would take the core down with it, the exact
+                 * hypervisor-wide event plan.md 6g forbids. The device lock is dropped around the
+                 * yield, so a same-core sibling vCPU can never wait on it.
+                 */
+                fw_1_dev_unlock(vm);
+                if (!fw_1_sched_point((unsigned)(vm - g_vms), 0u, 1)) {
+                    uint64_t t0 = fb_tsc_begin();
+                    while (g_fw_1_host_tsc_hz != 0 && hype_rdtsc() - t0 < g_fw_1_host_tsc_hz / 1000u) {
+                    }
+                }
+                fw_1_dev_lock(vm);
+            } else {
                 uint64_t t0 = fb_tsc_begin();
                 while (g_fw_1_host_tsc_hz != 0 && hype_rdtsc() - t0 < g_fw_1_host_tsc_hz / 1000u) {
                     /* ~1ms */
@@ -16952,6 +17411,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                 g_bsp_probe_rip[vp_] = info.guest_rip;
             }
             fw_1_dev_lock(vm);
+            fw_1_loop_section(vm, 82u); /* #470 s82: after the post-exit lock -- s81 is the wait for it */
             /* #484: an NMI pended for the BSP by another vCPU, delivered on its own core. */
             if (vm->nmi_pending[0]) {
                 vm->nmi_pending[0] = 0u;
@@ -17142,6 +17602,8 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
              * `localhost login` -- out of the captured window. */
             if (last_exhist_tsc == 0 || now_eh - last_exhist_tsc >= 30ULL * g_fw_1_host_tsc_hz) {
                 last_exhist_tsc = now_eh;
+                g_fw_1_dump_yield[(unsigned)(vm - g_vms)] = 1u; /* #476: see fw_1_record_hook */
+
                 /*
                  * #349: dump this VM's on-screen TERMINAL as text. hype already emulates the
                  * guest UART and tees it here (the "vmN ttyS0|" lines), so a guest that uses its
@@ -18858,6 +19320,7 @@ static void run_fw_1_test(hype_fw_vm_t *vm, const hype_vmm_ops_t *ops, hype_vmm_
                         "fw-1 CORE: vm%u run_fw_1_test executing on apic_id=%u (0=BSP 1=AP1 2=AP2)\n",
                         (unsigned int)(vm - g_vms), (unsigned int)exec_apic_id);
                 }
+                g_fw_1_dump_yield[(unsigned)(vm - g_vms)] = 0u;
             }
         }
 
@@ -25884,7 +26347,7 @@ static void term_create_finish(void) {
     if (g_guest_pool_ready) {
         ar = hype_adm_check_pool(&cand, cand.vm_count,
                                  (uint64_t)HYPE_FW_1_GUEST_RAM_MB * 1024ull * 1024ull,
-                                 g_guest_pool.size, g_vms[0].combined_size,
+                                 fw_1_pool_capacity(), g_vms[0].combined_size,
                                  HYPE_FW_1_VDISK_BYTES, HYPE_RAM_POOL_ALIGN, &fit, &shortfall);
         if (ar.status != HYPE_ADM_OK) {
             term_resultf("create: REFUSED -- the %llu MiB pool is short by %llu MiB for this VM "
@@ -28158,7 +28621,8 @@ static int usb_log_setup(const hype_blk_backend_t *be) {
              * pushed byte-by-byte through the serial port and the GOP console. Draining between
              * records bounds that to one record.
              */
-            hype_debug_set_record_yield(hype_host_kbd_pump);
+            g_fw_1_record_kbd_pump = 1;
+            hype_debug_set_record_yield(fw_1_record_hook); /* kbd pump + #476 dump yield */
             hype_fatal_set_flush_hook(usb_log_fatal_flush); /* #513: a panic must reach the stick */
             /* #643: as close to this generation's first line as the boot order allows -- the
              * flush a few lines up already carried anything buffered since TSC=0 (the build
@@ -28798,6 +29262,74 @@ static unsigned int fw_1_exec_exempt_ranges(hype_exec_range_t *out, unsigned int
     return n;
 }
 
+/*
+ * SMP-19 (#475): the host NUMA topology, read from ACPI SRAT/SLIT through the UEFI configuration
+ * table's ACPI 2.0 RSDP, before ExitBootServices. No RSDP, no XSDT or no SRAT leaves ONE node,
+ * which is every current dev and validation machine: then nothing downstream changes.
+ */
+static hype_numa_t g_numa;
+
+static uint32_t numa_rd32(const uint8_t *p) {
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static void fw_1_numa_probe(EFI_SYSTEM_TABLE *st) {
+    static const uint8_t acpi20[16] = { 0x71, 0xe8, 0x68, 0x88, 0xf1, 0xe4, 0xd3, 0x11,
+                                        0xbc, 0x22, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81 };
+    typedef struct { EFI_GUID guid; void *table; } cfg_ent_t;
+    const cfg_ent_t *ct = (const cfg_ent_t *)st->ConfigurationTable;
+    const uint8_t *rsdp = 0, *xsdt, *srat = 0, *slit = 0;
+    uint32_t xlen, k;
+    UINTN i;
+    unsigned nd;
+
+    hype_numa_init(&g_numa);
+    for (i = 0; ct != 0 && i < st->NumberOfTableEntries && rsdp == 0; i++) {
+        const uint8_t *g = (const uint8_t *)&ct[i].guid;
+        unsigned b;
+        for (b = 0; b < 16u && g[b] == acpi20[b]; b++) {
+        }
+        if (b == 16u) rsdp = (const uint8_t *)ct[i].table;
+    }
+    if (rsdp == 0 || rsdp[15] < 2u) {
+        hype_debug_print("numa: no ACPI 2.0 RSDP -- one node assumed [#475]\n");
+        return;
+    }
+    xsdt = (const uint8_t *)(uintptr_t)((uint64_t)numa_rd32(rsdp + 24) |
+                                        ((uint64_t)numa_rd32(rsdp + 28) << 32));
+    if (xsdt == 0 || xsdt[0] != 'X' || xsdt[1] != 'S' || xsdt[2] != 'D' || xsdt[3] != 'T') {
+        hype_debug_print("numa: RSDP has no XSDT -- one node assumed [#475]\n");
+        return;
+    }
+    xlen = numa_rd32(xsdt + 4);
+    for (k = 36u; k + 8u <= xlen; k += 8u) {
+        const uint8_t *t = (const uint8_t *)(uintptr_t)((uint64_t)numa_rd32(xsdt + k) |
+                                                        ((uint64_t)numa_rd32(xsdt + k + 4) << 32));
+        if (t == 0) continue;
+        if (t[0] == 'S' && t[1] == 'R' && t[2] == 'A' && t[3] == 'T') srat = t;
+        if (t[0] == 'S' && t[1] == 'L' && t[2] == 'I' && t[3] == 'T') slit = t;
+    }
+    if (srat == 0 || hype_numa_parse_srat(&g_numa, srat, numa_rd32(srat + 4)) != 0) {
+        hype_debug_print("numa: no SRAT -- one node assumed [#475]\n");
+        return;
+    }
+    if (slit != 0) (void)hype_numa_parse_slit(&g_numa, slit, numa_rd32(slit + 4));
+    hype_debug_print("numa: SRAT names %u node(s), %u CPU(s), %u memory range(s)%s%s [#475]\n",
+                     g_numa.nnodes, g_numa.ncpu, g_numa.nmem, g_numa.has_slit ? ", SLIT" : "",
+                     g_numa.dropped ? " -- SOME ENTRIES DROPPED (capacity/malformed)" : "");
+    for (nd = 0; nd < g_numa.nnodes; nd++) {
+        unsigned c, m, ncpu = 0;
+        uint64_t bytes = 0;
+        for (c = 0; c < g_numa.ncpu; c++) ncpu += (g_numa.cpu_node[c] == nd);
+        for (m = 0; m < g_numa.nmem; m++) {
+            if (g_numa.mem_node[m] == nd) bytes += g_numa.mem_len[m];
+        }
+        hype_debug_print("numa: node %u (domain %u): %u CPU(s), %llu MiB, distance to node 0 = %u "
+                         "[#475]\n", nd, (unsigned)g_numa.domain[nd], ncpu,
+                         (unsigned long long)(bytes >> 20), (unsigned)g_numa.dist[nd][0]);
+    }
+}
+
 EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     hype_stack_protector_init(); /* #604/#711: reseed before any local array is touched */
     EFI_MEMORY_DESCRIPTOR *map = 0;
@@ -29110,6 +29642,8 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
                                    "UEFI cannot tell them apart, CPUID leaf 0x1A can [#360]\n",
                                    ncores, nsmt);
             }
+            fw_1_numa_probe(SystemTable);
+            fw_1_reserve_node_pools(SystemTable->BootServices);
             hype_debug_print(
                                "%s -- %u usable, %u AP(s), consecutive=%d%s [#360]\n", ids,
                                g_cpu_topo.count, hype_cpu_topology_ap_count(&g_cpu_topo),
@@ -29155,6 +29689,10 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
     {
         unsigned usable = g_cpu_topo.count;
         g_max_vms = (usable > 1u) ? (usable - 1u) : 1u;
+        /* #476 / decision 86: the shared tier runs more VMs than cores, and Phase 0 cannot read the
+         * config, so it allocates for the DEFAULT over-commit (4.0) -- 4.7 MB per VM. */
+        g_max_vms *= FW_1_PHASE0_OVERCOMMIT;
+        if (g_max_vms > HYPE_CFG_MAX_VMS) g_max_vms = HYPE_CFG_MAX_VMS;
         if (g_max_vms < 2u) {
             g_max_vms = 2u; /* the built-in default is two VMs; never allocate below it */
         }
@@ -29208,7 +29746,9 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable
          * both guests down with no panic -- so the floor is the cheap side to err on.
          */
         unsigned vi;
-        unsigned total_vcpus = (g_cpu_topo.count > 8u) ? g_cpu_topo.count : 8u;
+        /* #476 / decision 86: shared VMs add contexts beyond one per core. */
+        unsigned total_vcpus = ((g_cpu_topo.count > 8u) ? g_cpu_topo.count : 8u) *
+                               FW_1_PHASE0_OVERCOMMIT;
         /* #450: every slot Phase 0 allocated for, not just the ones the built-in default will
          * use -- fw_1_vcpu_slot() indexes by VM, so a slot with a zero vcpu_count is a slot the
          * AP-start path cannot reason about. Phase 1 re-resolves these from the real config. */

@@ -39,7 +39,7 @@ static void test_core_panic_alert_is_shown(void) {
      * for a VM whose vCPU had gone. The alert is the only thing that distinguishes the two.
      */
     hype_vt_screen_t *s = malloc(sizeof(*s));
-    hype_vm_dash_info_t vms[1] = { { "vm0", "linux", "running", 0, 512, 0, NULL, 0 } };
+    hype_vm_dash_info_t vms[1] = { { "vm0", "linux", "running", 0, 512, 0, NULL, 0, 0, 0 } };
 
     hype_vt_screen_init(s, 100, 30);
     hype_dashboard_render(s, vms, 1, 0, "", NULL, "** 1 CORE PANIC(S) -- apic=2 halted **", NULL);
@@ -480,7 +480,25 @@ static void test_focus_preserves_normal_two_vm_cycle(void) {
           hype_term_focus_apply(1, HYPE_TERM_FOCUS_NONE, 0u, avail, 2u) == 1);
 }
 
+static void test_477_steal_column(void) {
+    hype_vt_screen_t *s = malloc(sizeof(*s));
+    hype_vm_dash_info_t vms[2] = {
+        { "hog", "none", "running", 33, 64, 10, 0, 0, 1, 67 },
+        { "dedi", "linux", "running", 98, 512, 10, 0, 0, 0, 0 },
+    };
+    hype_vt_screen_init(s, 80, 25);
+    hype_dashboard_render(s, vms, 2, 10, "", NULL, NULL, NULL);
+    CHECK("477 STEAL header", row_has(s, 2, "STEAL"));
+    CHECK("477 shared row: a third of a core", row_has(s, 3, "33%"));
+    CHECK("477 shared row: two thirds stolen", row_has(s, 3, "67%"));
+    CHECK("477 dedicated row: CPU unchanged", row_has(s, 4, "98%"));
+    CHECK("477 dedicated row: no steal figure", row_has(s, 4, "98%  -"));
+    CHECK("477 header still ends in MEDIA inside 80 columns", row_has(s, 2, "MEDIA"));
+    free(s);
+}
+
 int main(void) {
+    test_477_steal_column();
     /* --- uptime formatting --- */
     char up[16];
     hype_dashboard_fmt_uptime(up, 0);       CHECK("uptime 0", strcmp(up, "00:00:00") == 0);
@@ -493,8 +511,8 @@ int main(void) {
     hype_vt_screen_init(s, 80, 25);
 
     hype_vm_dash_info_t vms[2] = {
-        { "alpine", "linux", "running", 3, 6144, 754, "test.iso", 1 },
-        { "fedora", "linux", "off",     0, 6144, 0,   0,          0 },
+        { "alpine", "linux", "running", 3, 6144, 754, "test.iso", 1, 0, 0 },
+        { "fedora", "linux", "off",     0, 6144, 0,   0,          0, 0, 0 },
     };
     hype_dash_text_t *res = malloc(sizeof(*res));
     hype_dash_text_reset(res);

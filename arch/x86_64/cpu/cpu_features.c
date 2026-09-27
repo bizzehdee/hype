@@ -122,6 +122,10 @@ int hype_cpu_has_ibpb(hype_cpu_vendor_t vendor, uint32_t leaf7_edx, uint32_t lea
     return 0;
 }
 
+int hype_cpu_has_l1d_flush(uint32_t leaf7_edx) {
+    return (int)((leaf7_edx >> 28) & 1u);
+}
+
 /* #604: NX/XD, vendor-agnostic -- see the header. */
 int hype_cpu_has_nx(uint32_t leaf80000001_edx) {
     return (int)((leaf80000001_edx >> 20) & 1u);

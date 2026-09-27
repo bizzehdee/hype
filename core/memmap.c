@@ -141,6 +141,33 @@ UINT64 hype_memmap_largest_conventional_bytes(const EFI_MEMORY_DESCRIPTOR *map, 
     return largest;
 }
 
+UINT64 hype_memmap_largest_conventional_in(const EFI_MEMORY_DESCRIPTOR *map, UINTN map_size,
+                                           UINTN desc_size, UINT64 lo, UINT64 hi,
+                                           UINT64 *out_base) {
+    UINTN count = (desc_size > 0) ? (map_size / desc_size) : 0;
+    UINTN i;
+    const UINT8 *base = (const UINT8 *)map;
+    UINT64 largest = 0;
+
+    if (map == (const EFI_MEMORY_DESCRIPTOR *)0 || out_base == (UINT64 *)0) {
+        return 0;
+    }
+    for (i = 0; i < count; i++) {
+        const EFI_MEMORY_DESCRIPTOR *d = (const EFI_MEMORY_DESCRIPTOR *)(base + i * desc_size);
+        UINT64 s, e;
+        if (d->Type != EfiConventionalMemory) continue;
+        s = d->PhysicalStart;
+        e = s + d->NumberOfPages * 4096ULL;
+        if (s < lo) s = lo;
+        if (e > hi) e = hi;
+        if (e > s && e - s > largest) {
+            largest = e - s;
+            *out_base = s;
+        }
+    }
+    return largest;
+}
+
 UINTN hype_memmap_collect_type(const EFI_MEMORY_DESCRIPTOR *map, UINTN map_size, UINTN desc_size,
                                UINT32 type, hype_memmap_range_t *out, UINTN cap) {
     UINTN count = (desc_size > 0) ? (map_size / desc_size) : 0;
