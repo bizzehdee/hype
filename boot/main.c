@@ -4539,13 +4539,24 @@ static void fw_1_core_sched_run(fw_1_core_t *c) {
     unsigned last = FW_1_CORE_VCPUS_MAX;
     uint64_t hz = g_vms[c->vm_of[0]].host_tsc_hz;
     uint64_t next_report = hype_rdtsc() + hz * 5ull;
+    uint64_t report_deadline = 0; /* #818, set once a report is due but deferred */
     for (;;) {
         hype_sched_vcpu_t *v;
         unsigned k;
-        /* Reported BEFORE the pick, so a pick's group switch and its flush land in one report. */
+        /* Reported BEFORE the pick, so a pick's group switch and its flush land in one report.
+         *
+         * #818: this print runs in the scheduler's own context, between one vCPU's exit and the
+         * next pick -- it has no coroutine to yield to, so its cost lands directly on whichever
+         * co-tenant is waiting for this pick. Defer it past a waiting co-tenant when possible,
+         * but never more than 1 s, so the diagnostic cadence stays bounded rather than silently
+         * starved on a permanently busy core. */
         if (hz != 0ull && hype_rdtsc() >= next_report) {
-            fw_1_core_report(c, (unsigned)(c - g_fw_1_cores));
-            next_report = hype_rdtsc() + hz * 5ull;
+            if (report_deadline == 0ull) report_deadline = hype_rdtsc() + hz;
+            if (hype_sched_queued(&c->rq) == 0u || hype_rdtsc() >= report_deadline) {
+                fw_1_core_report(c, (unsigned)(c - g_fw_1_cores));
+                next_report = hype_rdtsc() + hz * 5ull;
+                report_deadline = 0ull;
+            }
         }
         v = hype_sched_pick(&c->rq, hype_rdtsc());
         if (v == 0) {
@@ -4621,7 +4632,10 @@ static void fw_1_record_hook(void) {
         unsigned holder = 0xFFFFFFFFu;
         if (hype_blk_usb_lock_held_us(&holder) != 0ull && holder == apic) return;
     }
-    if (fw_1_sched_point(vmi, 0u, 0)) g_fw_1_dump_hook_yields++;
+    /* #818: voluntary, not forced -- a waiting co-tenant must not have to wait for THIS vCPU's
+     * slice clock to expire before the dump gives the core back, and the dump's own cost must
+     * not land in the forced/overrun stats that are supposed to measure guest-caused stalls. */
+    if (fw_1_sched_point(vmi, 0u, 1)) g_fw_1_dump_hook_yields++;
 }
 
 static void fw_1_ap_main(void *arg) {

@@ -112,7 +112,6 @@ static uint32_t g_notify_off = NOT_FOUND;
 static uint32_t g_isr_off = NOT_FOUND;
 static uint32_t g_device_off = NOT_FOUND;
 static uint32_t g_notify_mult;
-static unsigned g_dev;
 
 /*
  * Explicit MOV forms rather than plain volatile stores, for the reason virtioblk.c records: hype
@@ -175,7 +174,6 @@ static int find_nic(void) {
             micro_puts(", id ");
             micro_put_hex((id >> 16) & 0xFFFFu);
             micro_puts("\n");
-            g_dev = dev;
             return (int)dev;
         }
     }
