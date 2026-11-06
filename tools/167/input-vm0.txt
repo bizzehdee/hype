@@ -1,0 +1,67 @@
+# #167: drive bsdinstall's text-mode installer over the serial console (ttyu0) one screen at a
+# time. Accept defaults throughout -- auto (ZFS/UFS) partitioning on the target disk, default
+# distribution set, a password, no further network/service config beyond defaults -- since the
+# ticket's bar is "boots to install", not a specific partitioning scheme.
+# The prompt does not appear until ~230s into boot on this rig (measured), well past a casual
+# timeout guess -- 280s of headroom past that.
+timeout 280000
+expect Console type [vt100]:
+send \n
+# bsdinstall's resizewin probe over serial times out (nothing answers a cursor-position-report
+# over this pipe), and it falls back to the VIDEO console (ttyv0) for its real dialog(1) TUI --
+# matched here via the same `expect` against hype's periodic screen-text snapshot, same mechanism
+# already used for GRUB/boot-menu text. From here on, input goes to the KEYBOARD (sendkey), not
+# the serial port, since that is the console the TUI actually reads.
+timeout 60000
+# NOT `expect Install` -- the "FreeBSD Installer" title banner above the dialog box contains
+# that substring and renders well before the button row does, so that pattern matched early and
+# the keypress landed before the TUI was interactive. The bracketed button text is unique to the
+# fully-rendered Welcome screen.
+expect [  Install  ]
+# `sendkey` (PS/2) reaches the i8042 cleanly (confirmed in the log -- make+break scancodes read
+# back, FIFO drains) but never advances the dialog, however long this waits. "Dual Console:
+# Serial Primary, Video Secondary" is the reason: FreeBSD treats the SERIAL console as primary
+# here, and the video console ("screen|", where this text renders) is only a mirror -- input
+# routing follows the primary console. Send over serial instead.
+delay 2000
+send \n
+
+timeout 30000
+expect Set Hostname
+delay 1000
+send hype-vm0\n
+
+# Plain Enter here picks "Packages (Tech Preview)" (the SECOND button, not the leftmost
+# "Distribution Sets" -- focus must carry over from a previous screen rather than defaulting
+# left). That path then needs a local/offline package repo this ISO doesn't carry, and bsdinstall
+# aborts a few screens later. Tab once first to flip focus to the classic, ISO-bundled
+# Distribution Sets path, which needs no network and no package repo.
+timeout 30000
+expect Select Installation Type
+delay 1000
+send \t\n
+
+timeout 30000
+expect Distribution Select
+delay 1000
+# KNOWN ISSUE, not yet solved: plain Tab+Enter here jumps straight from the first checklist
+# item to the OK button without visiting individual items, confirming all of bsdinstall's
+# defaults (base-dbg, kernel-dbg, lib32-dbg, lib32 unchecked/checked as shipped). kernel-dbg
+# and lib32 are not actually present on this disc1 ISO (only the DVD image carries them), so
+# confirming with them checked leads to a "Network Installation: some files were not found"
+# notice, then (no NIC in this rig) "No network interfaces" -> Abort -> Restart loop.
+#
+# A raw-ESC-byte arrow-key sequence (DOWN SPACE DOWN DOWN SPACE) to uncheck them before Tab
+# was tried and had NO visible effect on the checkboxes -- inconclusive whether the escape
+# sequence isn't being recognized as arrow keys over this transport, or something else ate
+# it. Needs its own targeted diagnostic (e.g. a single bare SPACE on the default-focused item,
+# checking whether THAT alone visibly toggles anything) before trying arrows again.
+#
+# FreeBSD's own supported non-interactive path (/etc/installerconfig, kickstart/preseed
+# equivalent) would sidestep this whole class of problem but needs the install media itself
+# to carry that file, which means rebuilding the ISO rather than scripting the TUI -- a
+# bigger change, not attempted here.
+send \t\n
+
+delay 15000
+pass reached-distribution-select-screen
