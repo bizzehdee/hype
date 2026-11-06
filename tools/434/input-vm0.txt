@@ -1,0 +1,14 @@
+# #434: get a key into cdboot's "Press any key to boot from CD or DVD" prompt (same trap as
+# #436's own script -- an early fixed-delay key drains out of the 8042 FIFO before Windows boot
+# application polls it, so this waits for the reconstructed guest screen first), then give Setup
+# time to reach its GUI and demonstrate keyboard/mouse interaction before ending the script.
+timeout 120000
+expect Press any key to boot from CD or DVD.
+sendkey \n
+# Setup leaves text mode once it loads its GUI; there is nothing left to `expect` against, so the
+# rest of this script is time-based. 180s is generous headroom past #436's own measured boot time
+# for a guest that must additionally pass the Secure Boot + TPM 2.0 compatibility gate.
+delay 180000
+sendmouse 20 20 0
+sendkey \n
+pass win11-setup-interacted
