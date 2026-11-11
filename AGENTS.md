@@ -88,6 +88,23 @@ document in `.learnings/`. Read the document before touching anything near it.
   interactive confirm, non-empty-partition-table guard.
   [`.learnings/invariant-physical-write-guard.md`](.learnings/invariant-physical-write-guard.md)
 
+## Waiting on and killing processes
+
+Never match a process by command-line pattern (`pgrep -f`, `pkill -f`, `ps | grep`) from a
+shell command that contains that same pattern. The shell running the command matches itself,
+so a `while pgrep -f X` loop never ends and a `pkill -f X` kills its own shell.
+
+- Capture the PID at launch (`cmd & pid=$!`) and wait with `wait $pid` or
+  `while kill -0 $pid 2>/dev/null; do sleep 5; done`. Kill by PID.
+- For a job started by an earlier command, have the launcher write a pidfile and read that.
+- If a pattern match is unavoidable, match the executable name only
+  (`pgrep -x qemu-system-x86_64`), or break the self-match with a bracket
+  (`pgrep -f 'run-16[7]\.sh'`).
+- Do not watch a background job with a separate polling loop. Run the job itself as the
+  background command, so its exit is what notifies you.
+- Do not chain a check and a long run so that the check's failure is hidden
+  (`lint && run; tail log` shows a stale log when the lint fails). Stop on the failed check.
+
 ## License
 
 Project license is **GPLv3**. Any third-party code adapted in (e.g. AHCI/NVMe or
