@@ -12,7 +12,7 @@
 
 ## The lesson
 
-- Always pass `--limit 800` (or higher) to `gh project item-list`. A silent
+- Always pass `--limit 5000` to `gh project item-list` and check the returned item count equals `.totalCount` (a fixed 800 was itself outgrown at 819 items on 2026-11-11). A silent
   truncation reads as "that row does not exist."
 - To read Priority (or any single-select the item-list omits), use a batch
   GraphQL query, ~40 ids at a time.

@@ -21,9 +21,12 @@ if a command rejects one):
 
 ## Known limits — read before trusting output
 
-- `gh project item-list` silently truncates at 400 rows. It returns success and
-  a partial list, so the truncation looks like "that row does not exist".
-  **Always pass `--limit 800`.**
+- `gh project item-list` silently truncates at `--limit` (default 30). It
+  returns success and a partial list, so the truncation looks like "that row
+  does not exist". `gh` pages internally, so the limit can be any size.
+  **Always pass `--limit 5000` and check that the number of items returned
+  equals `.totalCount` in the JSON.** If they differ, raise the limit; do not
+  trust the list.
 - `gh project item-list` cannot read single-select fields such as **Priority**.
   Use the GraphQL query below, about 40 ids per batch.
 - Never pipe a `gh` command into `head` and judge the result. The pipe hides the
@@ -35,7 +38,7 @@ if a command rejects one):
 List every item with its Status:
 
 ```sh
-gh project item-list 3 --owner bizzehdee --limit 800 --format json
+gh project item-list 3 --owner bizzehdee --limit 5000 --format json
 ```
 
 One issue, with its project rows, labels, milestone and links:

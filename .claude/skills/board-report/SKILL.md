@@ -6,12 +6,12 @@ description: How to audit the hype board and summarise findings — building a t
 # Board reports and audits — hype
 
 A board report is only useful if the underlying read is complete. `gh project
-item-list` truncates silently at 400 rows and returns success. Always pass
-`--limit 800`, and state the row count you actually read in the report.
+item-list` truncates silently at its `--limit` and returns success. Always pass
+`--limit 5000`, and state the row count you actually read in the report.
 
 ## Building a snapshot
 
-1. Read every item: `gh project item-list 3 --owner bizzehdee --limit 800
+1. Read every item: `gh project item-list 3 --owner bizzehdee --limit 5000
    --format json`. Save the JSON to a file and work from the file.
 2. Compare the row count against the project item total from
    `gh project view 3 --owner bizzehdee --format json`. If the numbers differ,
