@@ -1,0 +1,12 @@
+# #167 boot 2: the disk bsdinstall wrote, booted with no installer media. Log in as root with the
+# password boot 1 set and ask the installed system what it is.
+timeout 240000
+expect login:
+send root\n
+timeout 30000
+expect Password:
+send hype167\n
+expect root@hype-vm0
+send uname -sr; df -h /\n
+expect FreeBSD 15.0-RELEASE
+pass freebsd-installed-disk-boots

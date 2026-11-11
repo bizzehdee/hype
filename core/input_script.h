@@ -26,9 +26,10 @@
  * overflow are all hard errors that name the offending line.
  */
 
-/* Enough for the isolation scripts and any plausible sibling; the parser reports
- * overflow rather than silently truncating, so raising this is safe. */
-#define HYPE_INPUT_SCRIPT_MAX_DIRECTIVES 64u
+/* The parser reports overflow rather than silently truncating, so raising this is safe.
+ * 128 since #167: driving an OS installer's TUI end to end costs about three directives a
+ * screen (expect, delay, send), and bsdinstall alone has more than twenty screens. */
+#define HYPE_INPUT_SCRIPT_MAX_DIRECTIVES 128u
 /* Longest expect pattern / send payload. The runner's rolling match window is
  * sized from this, so it bounds memory in #279 too. */
 #define HYPE_INPUT_SCRIPT_MAX_ARG 128u

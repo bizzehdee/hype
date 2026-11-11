@@ -897,6 +897,106 @@ static void test_chain_bad_requests_complete_with_ioerr(void) {
 }
 
 /*
+ * #167: a segment need not be a whole number of sectors -- only the request's total must be.
+ * FreeBSD's vtblk passes buffers that are not page-aligned, so a sector straddles two segments;
+ * hype used to IOERR that, which failed `newfs` under bsdinstall. The straddled sector goes
+ * through a bounce buffer, and the bytes must land exactly as if the buffer were contiguous.
+ */
+static void test_chain_ragged_segments_straddle_sectors(void) {
+    tq_t q;
+    /* 4 sectors: a sector split 300/212, one whole sector inside segment 2, a sector split
+     * 200/312 -- so a batched whole sector sits between two bounced ones. */
+    uint32_t split[4] = {300u, 724u, 712u, 312u};
+    /* One sector spread over three segments: the middle one neither starts nor finishes it. */
+    uint32_t three[3] = {100u, 100u, 312u};
+    uint32_t short_total[2] = {500u, 500u};
+    uint32_t halves[2] = {256u, 256u};
+    uint32_t whole_then_halves[3] = {512u, 256u, 256u};
+    uint32_t halves_then_whole[3] = {256u, 256u, 512u};
+    uint32_t empty[1] = {0u};
+    unsigned i;
+
+    tq_init(&q, HYPE_VIRTIO_BLK_T_OUT, 1);
+    for (i = 0; i < 2048u; i++) {
+        q.gbuf[i] = (uint8_t)(i * 7u + 3u);
+    }
+    tq_chain(&q, split, 4, 0);
+    tq_submit(&q, 0);
+    CHECK_HEX("ragged write runs", 0, tq_run(&q));
+    CHECK_HEX("ragged write status OK", HYPE_VIRTIO_BLK_S_OK, q.status);
+    CHECK_HEX("ragged write landed byte-exact", 0, memcmp(q.img + 512u, q.gbuf, 2048u));
+    CHECK_HEX("ragged write left the sector before alone", 0x10u, q.img[511]);
+    CHECK_HEX("ragged write left the sector after alone", 0x15u, q.img[5u * 512u]);
+    CHECK_HEX("ragged write logged no rejection", 0u, tq_reject_count);
+
+    tq_init(&q, HYPE_VIRTIO_BLK_T_IN, 2);
+    tq_chain(&q, split, 4, HYPE_VIRTQ_DESC_F_WRITE);
+    tq_submit(&q, 0);
+    CHECK_HEX("ragged read runs", 0, tq_run(&q));
+    CHECK_HEX("ragged read status OK", HYPE_VIRTIO_BLK_S_OK, q.status);
+    CHECK_HEX("ragged read returned byte-exact", 0, memcmp(q.gbuf, q.img + 2u * 512u, 2048u));
+    CHECK_HEX("ragged read used_len = data + status", 2049u, tq_get32(q.used + 4 + 4));
+
+    tq_init(&q, HYPE_VIRTIO_BLK_T_OUT, 3);
+    memset(q.gbuf, 0xA7, 512u);
+    tq_chain(&q, three, 3, 0);
+    tq_submit(&q, 0);
+    CHECK_HEX("three-segment sector runs", 0, tq_run(&q));
+    CHECK_HEX("three-segment sector status OK", HYPE_VIRTIO_BLK_S_OK, q.status);
+    CHECK_HEX("three-segment sector landed", 0, memcmp(q.img + 3u * 512u, q.gbuf, 512u));
+
+    tq_init(&q, HYPE_VIRTIO_BLK_T_IN, 3);
+    tq_chain(&q, three, 3, HYPE_VIRTQ_DESC_F_WRITE);
+    tq_submit(&q, 0);
+    CHECK_HEX("three-segment read runs", 0, tq_run(&q));
+    CHECK_HEX("three-segment read returned", 0, memcmp(q.gbuf, q.img + 3u * 512u, 512u));
+
+    /* The total is what must be sector-sized. */
+    tq_init(&q, HYPE_VIRTIO_BLK_T_OUT, 1);
+    tq_chain(&q, short_total, 2, 0);
+    tq_submit(&q, 0);
+    CHECK_HEX("ragged total does not abort the notify", 0, tq_run(&q));
+    CHECK_HEX("ragged total reported IOERR", HYPE_VIRTIO_BLK_S_IOERR, q.status);
+    CHECK_HEX("ragged total named in the log", 1, tq_reject_says("whole number of sectors"));
+
+    tq_init(&q, HYPE_VIRTIO_BLK_T_OUT, 1);
+    tq_chain(&q, empty, 1, 0);
+    tq_submit(&q, 0);
+    CHECK_HEX("empty segment does not abort the notify", 0, tq_run(&q));
+    CHECK_HEX("empty segment reported IOERR", HYPE_VIRTIO_BLK_S_IOERR, q.status);
+    CHECK_HEX("empty segment named in the log", 1, tq_reject_says("segment is empty"));
+
+    /* The bounced sector is bounds-gated like any other: each backend call it makes can fail. */
+    tq_init(&q, HYPE_VIRTIO_BLK_T_OUT, TQ_SECTORS);
+    tq_chain(&q, halves, 2, 0);
+    tq_submit(&q, 0);
+    CHECK_HEX("bounced write past the end runs", 0, tq_run(&q));
+    CHECK_HEX("bounced write past the end IOERR", HYPE_VIRTIO_BLK_S_IOERR, q.status);
+
+    tq_init(&q, HYPE_VIRTIO_BLK_T_IN, TQ_SECTORS);
+    tq_chain(&q, halves, 2, HYPE_VIRTQ_DESC_F_WRITE);
+    tq_submit(&q, 0);
+    CHECK_HEX("bounced read past the end runs", 0, tq_run(&q));
+    CHECK_HEX("bounced read past the end IOERR", HYPE_VIRTIO_BLK_S_IOERR, q.status);
+
+    tq_init(&q, HYPE_VIRTIO_BLK_T_OUT, TQ_SECTORS);
+    tq_chain(&q, whole_then_halves, 3, 0);
+    tq_submit(&q, 0);
+    CHECK_HEX("pending batch past the end runs", 0, tq_run(&q));
+    CHECK_HEX("pending batch past the end IOERR", HYPE_VIRTIO_BLK_S_IOERR, q.status);
+
+    tq_init(&q, HYPE_VIRTIO_BLK_T_OUT, TQ_SECTORS - 1u);
+    memset(q.gbuf, 0x5A, 1024u);
+    tq_chain(&q, halves_then_whole, 3, 0);
+    tq_submit(&q, 0);
+    CHECK_HEX("batch after a bounced sector, past the end, runs", 0, tq_run(&q));
+    CHECK_HEX("batch after a bounced sector, past the end, IOERR", HYPE_VIRTIO_BLK_S_IOERR,
+              q.status);
+    CHECK_HEX("the in-bounds bounced sector still landed", 0x5Au,
+              q.img[(TQ_SECTORS - 1u) * 512u]);
+}
+
+/*
  * VALID-2: process_virtio_blk_queue() is shared, vendor-neutral code, and every
  * guest-supplied address in it (the ring bases, each descriptor, every data
  * segment, the status byte) is already routed through guest_dma_xlate() ->
@@ -1514,6 +1614,7 @@ int main(void) {
     test_chain_cycle_is_rejected();
     test_chain_malformed_shapes_change_nothing();
     test_chain_bad_requests_complete_with_ioerr();
+    test_chain_ragged_segments_straddle_sectors();
     test_chain_via_real_gpa_map_translates_and_succeeds();
     test_chain_data_segment_outside_mapped_region_is_rejected();
     test_get_id_returns_the_serial_nul_padded();

@@ -1277,6 +1277,15 @@ static void virtio_blk_reject_val(const char *why, uint32_t value) {
     }
 }
 
+/* Byte copy for the straddled-sector bounce (#167). At most one sector, on a path only a
+ * misaligned guest buffer reaches, so plain bytes: no libc memcpy in this freestanding build. */
+static void virtio_blk_copy(uint8_t *dst, const uint8_t *src, uint32_t n) {
+    uint32_t i;
+    for (i = 0; i < n; i++) {
+        dst[i] = src[i];
+    }
+}
+
 static void virtio_blk_reject(const char *why) {
     g_virtio_blk_rejects++;
     if (g_virtio_blk_rejects > HYPE_VIRTIO_BLK_REJECT_LOG_MAX) {
@@ -1485,8 +1494,8 @@ int process_virtio_blk_queue(hype_virtio_blk_t *dev, const hype_blk_backend_t *b
 
         /* GLADDER/M5-7a: dispatch through the bounds-gated hype_blk_backend vtable
          * (#89) instead of a raw host buffer, so the frontend is backend-agnostic
-         * (file / physical / qcow2). virtio-blk data is always a whole-sector
-         * multiple; the LBA+count bounds check lives inside hype_blk_backend_*.
+         * (file / physical / qcow2). a virtio-blk request's data totals a whole number
+         * of sectors (its segments need not, #167); the LBA+count bounds check lives inside hype_blk_backend_*.
          * The guest data buffer is itself translated+bounded before the copy. */
         if (req_type == HYPE_VIRTIO_BLK_T_OUT || req_type == HYPE_VIRTIO_BLK_T_IN) {
             /*
@@ -1515,11 +1524,17 @@ int process_virtio_blk_queue(hype_virtio_blk_t *dev, const hype_blk_backend_t *b
             hype_blk_seg_t wsegs[HYPE_VIRTIO_BLK_SEG_MAX];
             uint32_t nw = 0;
             uint64_t wbatch_lba = sector;
+            /* #167: the one sector a request may have straddling two segments, and how many of
+             * its bytes the segments walked so far have supplied (write) or consumed (read). */
+            uint8_t carry[HYPE_VIRTIO_BLK_SECTOR_SIZE];
+            uint32_t carry_len = 0;
+            const int is_write = (req_type == HYPE_VIRTIO_BLK_T_OUT);
 
             for (;;) {
                 hype_virtq_desc_t seg;
                 uint32_t nsec;
-                void *gbuf;
+                uint32_t left;
+                uint8_t *gbuf;
 
                 /* Cannot fail: virtq_validate_chain() already walked this exact
                  * list. Checked anyway rather than assuming, since a failure here
@@ -1531,46 +1546,110 @@ int process_virtio_blk_queue(hype_virtio_blk_t *dev, const hype_blk_backend_t *b
                 if ((seg.flags & HYPE_VIRTQ_DESC_F_NEXT) == 0) {
                     break; /* this is the status descriptor -- chain done */
                 }
-                nsec = seg.len / HYPE_VIRTIO_BLK_SECTOR_SIZE;
                 /*
-                 * Each segment must itself be a whole number of sectors. The spec
-                 * only constrains the total, but the backend is addressed in
-                 * sectors, so a segment that splits one would need a bounce
-                 * buffer this freestanding build has nowhere to allocate. Such a
-                 * request is COMPLETED with IOERR rather than left dangling: the
-                 * guest gets an error it can report, instead of an I/O that never
-                 * returns. Linux's block layer aligns every segment to the
-                 * logical block size, so this is not a case it can produce.
+                 * #167: a segment need NOT be a whole number of sectors. The spec constrains only
+                 * the request's total, and FreeBSD's vtblk hands over buffers that are not
+                 * page-aligned (newfs, through the raw device), so one 4 KiB write arrives as two
+                 * segments split at a page boundary in the middle of a sector. Refusing that with
+                 * IOERR, as this did, made `newfs` on vtbd0 fail and bsdinstall stop at "Error
+                 * mounting partition". Linux's block layer aligns every segment, which is why no
+                 * Linux guest ever tripped it.
+                 *
+                 * The backend is addressed in sectors, so a sector that straddles two segments
+                 * goes through `carry`, a one-sector bounce buffer on this stack. Whole sectors
+                 * inside a segment still move directly, with no copy.
                  */
-                if ((seg.len % HYPE_VIRTIO_BLK_SECTOR_SIZE) != 0u || nsec == 0u) {
-                    err = "data segment is not a whole number of sectors";
+                if (seg.len == 0u) {
+                    err = "data segment is empty";
                     break;
                 }
-                gbuf = (void *)(uintptr_t)hype_guest_dma_xlate(dma_map, seg.addr, seg.len);
+                gbuf = (uint8_t *)(uintptr_t)hype_guest_dma_xlate(dma_map, seg.addr, seg.len);
                 if (gbuf == 0) {
                     err = "data segment failed bounds check";
                     break;
                 }
-                if (req_type == HYPE_VIRTIO_BLK_T_OUT) {
-                    if (nw == HYPE_VIRTIO_BLK_SEG_MAX) {
-                        if (hype_blk_backend_writev(be, wbatch_lba, wsegs, nw) != 0) {
+                left = seg.len;
+
+                /* Finish the sector the previous segment left part-way through. */
+                if (carry_len != 0u) {
+                    uint32_t take = HYPE_VIRTIO_BLK_SECTOR_SIZE - carry_len;
+                    if (take > left) {
+                        take = left;
+                    }
+                    if (is_write) {
+                        virtio_blk_copy(carry + carry_len, gbuf, take);
+                    } else {
+                        virtio_blk_copy(gbuf, carry + carry_len, take);
+                    }
+                    carry_len += take;
+                    gbuf += take;
+                    left -= take;
+                    if (carry_len == HYPE_VIRTIO_BLK_SECTOR_SIZE) {
+                        if (is_write) {
+                            /* `carry` is reused, so it cannot sit in the batch: land what is
+                             * pending, then this sector, and restart the batch after it. */
+                            if (nw != 0u &&
+                                hype_blk_backend_writev(be, wbatch_lba, wsegs, nw) != 0) {
+                                err = "backend rejected the transfer";
+                                break;
+                            }
+                            nw = 0;
+                            if (hype_blk_backend_write(be, seg_lba, 1u, carry) != 0) {
+                                err = "backend rejected the transfer";
+                                break;
+                            }
+                            wbatch_lba = seg_lba + 1u;
+                        }
+                        seg_lba++;
+                        carry_len = 0;
+                    }
+                }
+
+                /* The whole sectors in the middle of this segment, straight from guest memory. */
+                nsec = left / HYPE_VIRTIO_BLK_SECTOR_SIZE;
+                if (nsec != 0u) {
+                    if (is_write) {
+                        if (nw == HYPE_VIRTIO_BLK_SEG_MAX) {
+                            if (hype_blk_backend_writev(be, wbatch_lba, wsegs, nw) != 0) {
+                                err = "backend rejected the transfer";
+                                break;
+                            }
+                            wbatch_lba = seg_lba;
+                            nw = 0;
+                        }
+                        wsegs[nw].buf = gbuf;
+                        wsegs[nw].count = nsec;
+                        nw++;
+                    } else if (hype_blk_backend_read(be, seg_lba, nsec, gbuf) != 0) {
+                        err = "backend rejected the transfer";
+                        break;
+                    }
+                    seg_lba += nsec;
+                    gbuf += nsec * HYPE_VIRTIO_BLK_SECTOR_SIZE;
+                    left -= nsec * HYPE_VIRTIO_BLK_SECTOR_SIZE;
+                }
+
+                /* A tail shorter than a sector starts a straddled one. */
+                if (left != 0u) {
+                    if (is_write) {
+                        virtio_blk_copy(carry, gbuf, left);
+                    } else {
+                        if (hype_blk_backend_read(be, seg_lba, 1u, carry) != 0) {
                             err = "backend rejected the transfer";
                             break;
                         }
-                        wbatch_lba = seg_lba;
-                        nw = 0;
+                        virtio_blk_copy(gbuf, carry, left);
                     }
-                    wsegs[nw].buf = gbuf;
-                    wsegs[nw].count = nsec;
-                    nw++;
-                } else if (hype_blk_backend_read(be, seg_lba, nsec, gbuf) != 0) {
-                    err = "backend rejected the transfer";
-                    break;
+                    carry_len = left;
                 }
-                seg_lba += nsec;
                 xfer_bytes += seg.len;
                 nsegs++;
                 cur = seg.next;
+            }
+            if (err == 0 && carry_len != 0u) {
+                /* The TOTAL is what the spec requires to be sector-sized. Completed with IOERR
+                 * rather than left dangling, so the guest gets an error it can report. */
+                err = "request data is not a whole number of sectors";
             }
             if (err == 0 && nw != 0u &&
                 hype_blk_backend_writev(be, wbatch_lba, wsegs, nw) != 0) {
@@ -1598,9 +1677,9 @@ int process_virtio_blk_queue(hype_virtio_blk_t *dev, const hype_blk_backend_t *b
              * #310: hand back the device's serial string. FreeBSD's vtblk issues this during
              * attach and reports "error getting device identifier: 45" when it is refused.
              *
-             * Deliberately NOT folded into the T_IN path above: that path requires every
-             * segment to be a whole-sector multiple, and this one carries a single 20-byte
-             * device-writable segment, so reusing it would IOERR the request instead.
+             * Deliberately NOT folded into the T_IN path above: that path requires the
+             * request's data to total a whole number of sectors, and this one carries a single
+             * 20-byte device-writable segment, so reusing it would IOERR the request instead.
              */
             hype_virtq_desc_t seg;
 
